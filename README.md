@@ -7,6 +7,7 @@ Interactive notebooks for the courses I take: every lecture rewritten as lessons
 | Notebook | Course | Lessons | Language | Updated |
 |---|---|---|---|---|
 | [SMBUD Notebook](https://valerypotrebina.github.io/polimi-notebooks/smbud/) | Systems and Methods for Big and Unstructured Data · Politecnico di Milano · 2026-27 | 40 | English | 2026-10-07 |
+| [Тетрадь AN2DL](https://valerypotrebina.github.io/polimi-notebooks/an2dl/) | Нейросети с нуля: главы 1–3 конспекта, с рисунками и живыми демонстрациями | 27 | Русский | 2026-10-07 |
 
 Personal study notes. They are not official course material and are not endorsed by Politecnico di Milano or the course instructors. Quotations from the course slides are used for study purposes; the model answers are the author's own, since no official solutions are published.
 
