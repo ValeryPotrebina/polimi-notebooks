@@ -1,0 +1,1504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Streams into Hadoop: Storm, Flume and Sqoop · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l33">
+
+<header class="lesson-head">
+  <h1>Streams into Hadoop: Storm, Flume and Sqoop</h1>
+  <p class="lede">After this lesson you will say why a Storm topology never finishes and which task each tuple reaches, build and size a Flume flow of sources, channels and sinks from its properties file, and copy a relational table into HDFS or Hive with Sqoop.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>Page 943 shows a black-and-white photograph: a wooden chute on trestles through a forest, water rushing down it, a log riding the water. That is a flume — a channel that floats logs from where the trees are cut to the sawmill. Apache Flume took the name, and its design is in the picture: many places produce, one place consumes, the channel carries the load in between.</p>
+  <p>A web shop runs 64 web servers, each sending 2,000 log lines a second into Hadoop. One night HDFS — the sawmill — stops for an hour; the servers do not. Where do the 460 million lines of that hour wait, and how big must the waiting room be?</p>
+  <p>The answer is the one-line rule of thumb of page 963 — a single multiplication. On the way come Storm, which computes on data that never ends, and Sqoop, which does not stream at all.</p>
+</div>
+
+
+<section id="l33-stream">
+  <h2>A computation that never finishes</h2>
+
+  <p>Every tool so far reads an input that has already ended. A MapReduce job (<a href="l30.html">lesson 30</a>), a Pig script or a Hive query (<a href="l32.html">lesson 32</a>) starts from files in HDFS, runs, and stops. Page 924: "Lots of tools for data (i.e. batch) processing", but "None of them are realtime systems which is becoming a real requirement for businesses". A fraud alert cannot wait for the file to end, because that file never ends.</p>
+
+  <p>The course notes describe the shift: in streaming, data "gets transformed and analyzed continuously as it is generated" instead of being stored first and processed later (notes, ch. 4). The input is a <mark class="key">data stream</mark>, an unbounded sequence of time-varying data. The query stays registered and runs over the data flowing past, and since nobody can wait for the end of an unbounded input, it looks at limited <mark class="key">windows</mark> of it — the clicks of the last minute. On the notes' throughput–latency map this is the "Continuous" zone: low latency, paid for with throughput.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-batch">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Batch: a finished input file goes into a job; the job writes one result and stops">
+        <path d="M20 40 H50 L60 50 V90 H20 Z" class="fi-paper"/>
+        <path d="M50 40 V50 H60 Z" class="fi-soft"/>
+        <text x="40" y="108" class="tx-sm tx-mid">input</text>
+        <line x1="64" y1="65" x2="106" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="110" y="50" width="80" height="30" class="fi-paper st-s4 sw-2"/>
+        <text x="150" y="70" class="tx-mono tx-mid">job</text>
+        <line x1="190" y1="65" x2="228" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <path d="M234 45 H254 L262 53 V85 H234 Z" class="fi-paper"/>
+        <path d="M254 45 V53 H262 Z" class="fi-soft"/>
+        <text x="248" y="104" class="tx-sm tx-mid">result</text>
+        <text x="130" y="128" class="tx-sm tx-mid">the job runs</text>
+        <rect x="60" y="136" width="140" height="12" class="fw-s4 st-s4"/>
+        <line x1="200" y1="128" x2="200" y2="166" class="sw-2"/>
+        <text x="210" y="148" class="tx-hand">ends</text>
+        <line x1="20" y1="160" x2="282" y2="160" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="282" y="182" class="tx-sm tx-muted tx-end">time</text>
+      </svg>
+      <p class="fig-label">Batch: the input has ended, and so does the job</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Stream: an unbounded row of tuples flows into a topology, which keeps emitting results and never stops">
+        <text x="6" y="70" class="tx-muted">…</text>
+        <rect x="22" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="38" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="54" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="70" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="86" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <line x1="102" y1="65" x2="136" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="140" y="50" width="80" height="30" class="fi-paper st-s5 sw-2"/>
+        <text x="180" y="70" class="tx-mono tx-mid">topology</text>
+        <line x1="220" y1="65" x2="240" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="244" y="57" width="10" height="16" class="fw-s1 st-s1"/>
+        <rect x="258" y="57" width="10" height="16" class="fw-s1 st-s1"/>
+        <rect x="272" y="57" width="10" height="16" class="fw-s1 st-s1"/>
+        <text x="286" y="70" class="tx-muted">…</text>
+        <text x="60" y="104" class="tx-sm tx-mid">unbounded tuples</text>
+        <text x="262" y="104" class="tx-sm tx-mid">results</text>
+        <text x="150" y="128" class="tx-sm tx-mid">the topology runs</text>
+        <rect x="60" y="136" width="222" height="12" class="fw-s5 st-s5"/>
+        <line x1="20" y1="160" x2="282" y2="160" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="282" y="182" class="tx-sm tx-muted tx-end">time</text>
+        <text x="130" y="192" class="tx-hand tx-mid">never ends</text>
+      </svg>
+      <p class="fig-label">Stream: the input never ends, nor does the topology</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Batch against stream. In batch, MapReduce, Pig and Hive read an input that is already complete, and the job stops when it has read it. In a stream, Storm's input is an "Unbounded sequence of tuples" (p. 927), and the topology keeps producing results until someone kills it.</figcaption>
+  </figure>
+
+  <aside class="margin-note">BackType was bought by Twitter in May 2011; Storm became open source that September and an Apache top-level project in 2014 (Nathan Marz's history of Storm, in the resources).</aside>
+
+  <p>Storm, page 924, was "Developed by BackType which was acquired by Twitter" and "provides realtime computation" with four promises: "Scalable" — each piece of the computation runs as many parallel tasks; "Guarantees no data loss"; "Extremely robust and fault-tolerant" — a dead worker is restarted, a dead machine's work reassigned; "Programming language agnostic". "Realtime" means low latency, results within seconds, not a hard deadline.</p>
+
+  <div class="pitfall">
+    <p>"Guarantees no data loss, so every tuple is processed exactly once." No: Storm's documentation promises at-least-once processing. A tuple that is not fully processed in time is replayed from the spout, so nothing is lost — but after a failure the same tuple can be processed twice, and a counter can count it twice.</p>
+  </div>
+
+  <h3>Four words: stream, spout, bolt, topology</h3>
+
+  <div class="def">
+    <p><dfn>Stream</dfn> — "Unbounded sequence of tuples" (p. 927). A <mark class="key">tuple</mark> is a named list of values, such as (word: "fresh").</p>
+    <p><dfn>Spout</dfn> — "Source of streams" (p. 928): it reads from outside — a message queue, a log, an API — and emits tuples.</p>
+    <p><dfn>Bolt</dfn> — "Processes input streams and produces new streams: Can implement functions such as filters, aggregation, join, etc" (p. 929).</p>
+    <p><dfn>Topology</dfn> — "Network of spouts and bolts" (p. 930): a directed graph in which each bolt subscribes to the streams of other components.</p>
+  </div>
+
+  <p>A topology is the streaming counterpart of a MapReduce job, with two differences: it is any graph, not a fixed map-then-reduce pair, and, in the words of the Storm tutorial, "a MapReduce job eventually finishes, whereas a topology processes messages forever (or until you kill it)". Storm is not the last stream processor of the course: Spark Streaming, in module 11 (<a href="l38.html">lesson 38</a>), accepts inputs from "Kafka, Flume, Twitter, TCP Sockets" (p. 1200) — Flume, the second tool of this lesson, among them.</p>
+
+  <h3>The cluster</h3>
+
+  <p>Page 925 draws three groups of machines (Fig. 2). <mark class="key">Nimbus</mark>, the "Master node (similar to Hadoop JobTracker)", ships a topology's code to the cluster, assigns its tasks to machines and reassigns them when a machine fails — the JobTracker of <a href="l31.html">lesson 31</a>. The <mark class="key">Supervisors</mark> "Run worker processes" on the worker machines. Between them sits ZooKeeper, "Used for cluster coordination".</p>
+
+  <p>Why a third party? Nimbus and the Supervisors never talk directly: assignments and heartbeats go through ZooKeeper. Both daemons are "fail-fast and stateless; all state is kept in Zookeeper or on a local disk" (Storm tutorial), so either can be killed and restarted without loss, and while Nimbus is down the running topologies keep running.</p>
+
+  <figure class="fig fig--plain" id="l33-fig-cluster">
+    <svg class="dia" viewBox="0 0 560 256" role="img" aria-label="A Storm cluster: Nimbus, the master node, exchanges information with three ZooKeeper machines, which exchange information with five Supervisors; Nimbus and the Supervisors are not connected directly">
+      <line x1="126" y1="125" x2="224" y2="125" class="sw-3" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <line x1="276" y1="125" x2="404" y2="125" class="sw-3" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <rect x="78" y="111" width="44" height="28" class="fi-paper st-s6 dash sw-3"/>
+      <line x1="85" y1="118" x2="115" y2="118" class="st-muted"/>
+      <line x1="85" y1="125" x2="115" y2="125" class="st-muted"/>
+      <line x1="85" y1="132" x2="115" y2="132" class="st-muted"/>
+      <rect x="228" y="61" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="68" x2="265" y2="68" class="st-muted"/>
+      <line x1="235" y1="75" x2="265" y2="75" class="st-muted"/>
+      <line x1="235" y1="82" x2="265" y2="82" class="st-muted"/>
+      <rect x="228" y="111" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="118" x2="265" y2="118" class="st-muted"/>
+      <line x1="235" y1="125" x2="265" y2="125" class="st-muted"/>
+      <line x1="235" y1="132" x2="265" y2="132" class="st-muted"/>
+      <rect x="228" y="161" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="168" x2="265" y2="168" class="st-muted"/>
+      <line x1="235" y1="175" x2="265" y2="175" class="st-muted"/>
+      <line x1="235" y1="182" x2="265" y2="182" class="st-muted"/>
+      <rect x="408" y="31" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="38" x2="445" y2="38" class="st-muted"/>
+      <line x1="415" y1="45" x2="445" y2="45" class="st-muted"/>
+      <line x1="415" y1="52" x2="445" y2="52" class="st-muted"/>
+      <rect x="408" y="71" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="78" x2="445" y2="78" class="st-muted"/>
+      <line x1="415" y1="85" x2="445" y2="85" class="st-muted"/>
+      <line x1="415" y1="92" x2="445" y2="92" class="st-muted"/>
+      <rect x="408" y="111" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="118" x2="445" y2="118" class="st-muted"/>
+      <line x1="415" y1="125" x2="445" y2="125" class="st-muted"/>
+      <line x1="415" y1="132" x2="445" y2="132" class="st-muted"/>
+      <rect x="408" y="151" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="158" x2="445" y2="158" class="st-muted"/>
+      <line x1="415" y1="165" x2="445" y2="165" class="st-muted"/>
+      <line x1="415" y1="172" x2="445" y2="172" class="st-muted"/>
+      <rect x="408" y="191" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="198" x2="445" y2="198" class="st-muted"/>
+      <line x1="415" y1="205" x2="445" y2="205" class="st-muted"/>
+      <line x1="415" y1="212" x2="445" y2="212" class="st-muted"/>
+      <text x="8" y="70" class="tx-sm">Master node</text>
+      <text x="8" y="92" class="tx-sm">(like the JobTracker)</text>
+      <text x="100" y="160" class="tx-sm tx-mid">Nimbus</text>
+      <text x="250" y="212" class="tx-sm tx-mid">ZooKeeper</text>
+      <text x="250" y="234" class="tx-sm tx-mid">cluster coordination</text>
+      <text x="430" y="20" class="tx-sm tx-mid">Supervisors</text>
+      <text x="552" y="248" class="tx-sm tx-end">run worker processes</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The Storm cluster of p. 925. Nimbus, the master, wears the dashed outline of a coordinator. It never talks to the Supervisors directly: assignments and heartbeats pass through ZooKeeper, which keeps the state, so a crashed Nimbus does not stop the running topologies.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">A topology is a graph of spouts and bolts that never finishes; Nimbus assigns its tasks, the Supervisors run them, ZooKeeper holds the state.</mark></p>
+</section>
+
+
+<section id="l33-grouping">
+  <h2>Which task gets the tuple?</h2>
+
+  <p>"Spouts and bolts execute as many tasks across the cluster" (p. 931): every component gets a number of tasks, each running the same code on a share of the tuples. Scaling a topology means raising those numbers, not rewriting the code. The word count of the Storm tutorial — sentences in, a running count per word out — sets them in the last argument:</p>
+
+<pre><code>// Storm tutorial word count: 5 spout, 8 split, 12 count tasks
+TopologyBuilder builder = new TopologyBuilder();
+builder.setSpout("sentences", new RandomSentenceSpout(), 5);
+builder.setBolt("split", new SplitSentence(), 8)
+        .shuffleGrouping("sentences");
+builder.setBolt("count", new WordCount(), 12)
+        .fieldsGrouping("split", new Fields("word"));</code></pre>
+
+  <p>Each emitted tuple raises the question of page 932: "When a tuple is emitted which task does it go to?" The answer is the <mark class="key">stream grouping</mark>, declared on every edge when a bolt subscribes to a stream — <code>.shuffleGrouping(…)</code> and <code>.fieldsGrouping(…)</code> above. Page 933 lists four.</p>
+
+  <figure class="tbl-fig" id="l33-tbl-groupings">
+    <figcaption>The four stream groupings of p. 933, and what each is for.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>grouping</th><th>the slide</th><th>what it gives</th><th>use it for</th></tr></thead>
+        <tbody>
+          <tr><td>shuffle</td><td>"pick a random task"</td><td>even load; any task may get any tuple</td><td>stateless steps: parse, filter, split a sentence</td></tr>
+          <tr class="is-key"><td>fields</td><td>"consistent hashing on a subset of tuple fields"</td><td>the same field values always reach the same task</td><td>state per key: a count per word, a session per user</td></tr>
+          <tr><td>all</td><td>"send to all tasks"</td><td>every task gets a copy</td><td>broadcast: a configuration change, a small lookup table</td></tr>
+          <tr><td>global</td><td>"pick task with lowest id"</td><td>one task sees the whole stream</td><td>a single total or top-N; no parallelism on that edge</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">The slide says consistent hashing. Storm's documentation describes the hash of the fields modulo the number of tasks. For the exam the property is what counts: same values, same task.</aside>
+
+  <p>Counting decides between them. A count task keeps a counter per word in its own memory. With shuffle grouping the "fresh" tuples spread over all the tasks, each holding a part of the count; no task knows the total. With fields grouping on "word", every "fresh" lands on one task, which therefore holds the true count — the streaming twin of the MapReduce rule "same key, same reducer" (<a href="l30.html">lesson 30</a>). Fig. 3 adds a report bolt on global grouping, so that one task sees every count.</p>
+
+  <figure class="fig fig--plain" id="l33-fig-wordcount">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="The word-count topology: the spout sentences with two tasks feeds the bolt split with three tasks by shuffle grouping; split feeds the bolt count with three tasks by fields grouping on word; count feeds the bolt report with one task by global grouping">
+      <rect x="20" y="80" width="90" height="70" rx="8" class="fi-paper sw-2"/>
+      <rect x="165" y="70" width="90" height="90" rx="8" class="fi-paper sw-2"/>
+      <rect x="310" y="70" width="90" height="90" rx="8" class="fi-paper sw-2"/>
+      <rect x="455" y="95" width="90" height="40" rx="8" class="fi-paper sw-2"/>
+      <circle cx="65" cy="100" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="65" cy="130" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="210" cy="88" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="210" cy="115" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="210" cy="142" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="355" cy="88" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="355" cy="115" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="355" cy="142" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="500" cy="115" r="10" class="fw-s1 st-s1 sw-2"/>
+      <line x1="112" y1="115" x2="161" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="257" y1="115" x2="306" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="402" y1="115" x2="451" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="65" y="34" class="tx-sm tx-muted tx-mid">spout</text>
+      <text x="210" y="34" class="tx-sm tx-muted tx-mid">bolt</text>
+      <text x="355" y="34" class="tx-sm tx-muted tx-mid">bolt</text>
+      <text x="500" y="34" class="tx-sm tx-muted tx-mid">bolt</text>
+      <text x="65" y="58" class="tx-mono tx-sm tx-mid">sentences</text>
+      <text x="210" y="58" class="tx-mono tx-sm tx-mid">split</text>
+      <text x="355" y="58" class="tx-mono tx-sm tx-mid">count</text>
+      <text x="500" y="58" class="tx-mono tx-sm tx-mid">report</text>
+      <text x="137" y="190" class="tx-sm tx-mid">shuffle</text>
+      <text x="282" y="190" class="tx-sm tx-mid">fields: word</text>
+      <text x="427" y="190" class="tx-sm tx-mid">global</text>
+      <text x="282" y="234" class="tx-hand tx-mid">same word, same task</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The word count of the Storm tutorial plus a report bolt, with 2, 3, 3 and 1 tasks (the circles). Every edge declares its grouping: any task may split any sentence, all tuples of one word must meet in one count task, and a single report task sees every count.</figcaption>
+  </figure>
+
+  <p>Now route the words yourself. The widget makes <strong>one insight</strong> impossible to miss: fields grouping keeps the same word on the same task — and that is what makes a parallel count correct.</p>
+
+  <div class="widget" id="l33-w-topo">
+    <h3 class="widget-title">Topology playground: where does each word go?</h3>
+    <p class="widget-intro">The word count of Fig. 3 without the report bolt. The spout emits six short posts from a farmers' market, over and over; the split bolt turns each post into word tuples; each count task keeps its own counters. Set the number of tasks per component and the grouping of the edge split → count (the edge spout → split stays on shuffle), then emit sentences. The drawing shows the tuples of the last sentence, the table what every count task has counted so far. Fields grouping hashes the word (FNV-1a, a simple string hash) modulo the number of tasks; shuffle draws the task at random with a fixed seed, so every run after Reset is the same.</p>
+    <ol class="tasks">
+      <li>Shuffle grouping, 3 count tasks. Press <em>One sentence</em>: the post is "fresh eggs and fresh milk". Before you look: do its two "fresh" tuples reach the same count task? Then press <em>Reset</em> and <em>Next round</em> twice (12 sentences, 8 times "fresh"). Which task holds 8?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The two "fresh" of the first post go to tasks 0 and 1. After 12 sentences no task holds 8: task 0 has 6, tasks 1 and 2 have 1 each. The sum is right, but no single task knows it, and the readout turns red.</p></details>
+      </li>
+      <li>Switch to fields grouping (the run starts again) and press <em>Next round</em> twice. Predict how many columns of the "fresh" row are filled.
+        <details class="answer"><summary>What you should see</summary>
+          <p>One: task 1 holds "fresh" 8 times, the true count, together with "milk" (4). Every word lives in exactly one task — the same word always goes to the same task, which is the insight of the widget. Look at the load too: task 0 counted only "honey" (6 tuples), task 2 counted 18. Fields grouping spreads the keys, not the tuples.</p></details>
+      </li>
+      <li>Choose all grouping and 4 count tasks, then press <em>Next round</em> twice: 36 word tuples. Predict the deliveries on the edge split → count, and what each task holds for "fresh".
+        <details class="answer"><summary>What you should see</summary>
+          <p>144 deliveries, 4 copies of every tuple, and every task holds "fresh" 8: exact, but counted four times over. All grouping is for things every task needs, such as a new configuration — not for sharing work.</p></details>
+      </li>
+      <li>Choose global grouping, still 4 count tasks, and run two rounds. Which task works? Then set the spout to 2 tasks and the split to 4 and run two rounds again — do the counts change?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Task 0, the lowest id, receives all 36 tuples; tasks 1–3 stay idle, so the parallelism of the count bolt is wasted. Global grouping suits one final total or a top-N. More spout or split tasks change nothing in the counts: neither component keeps state, so any of their tasks can handle any sentence.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-topo', function (root, ui) {
+    var SENT = ['fresh eggs and fresh milk', 'honey and bread', 'fresh bread', 'milk and honey', 'fresh honey', 'eggs and bread'];
+    var WORDS = ['fresh', 'and', 'eggs', 'milk', 'honey', 'bread'], WATCH = 'fresh';
+    var GNAME = { shuffle: 'shuffle', fields: 'fields: word', all: 'all', global: 'global' };
+    /* FNV-1a on the characters of the word: the widget's stand-in for "the hash of the field" */
+    function fnv(w) { var h = 0x811c9dc5, i; for (i = 0; i < w.length; i++) { h ^= w.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h; }
+
+    var st, player = null;
+    function fresh() {
+      st = { k: 0, tuples: 0, deliveries: 0, counts: [{}, {}, {}, {}], load: [0, 0, 0, 0], truth: {}, rng: Course.rng(7), last: null };
+    }
+    fresh();
+    function restart() { if (player) player.reset(); else fresh(); }
+
+    var nSpout = ui.slider({ label: 'spout tasks', min: 1, max: 2, step: 1, value: 1, onInput: function () { restart(); } });
+    var nSplit = ui.slider({ label: 'split tasks', min: 1, max: 4, step: 1, value: 2, onInput: function () { restart(); } });
+    var nCount = ui.slider({ label: 'count tasks', min: 1, max: 4, step: 1, value: 3, onInput: function () { restart(); } });
+    var grouping = ui.select('grouping of split → count (p. 933)', [
+      { value: 'shuffle', label: 'shuffle: random task' },
+      { value: 'fields', label: 'fields on "word"' },
+      { value: 'all', label: 'all: every task' },
+      { value: 'global', label: 'global: lowest id' }
+    ], function () { restart(); }, 'shuffle');
+
+    function nS() { return Math.max(1, Math.round(Number(nSpout.value))); }
+    function nP() { return Math.max(1, Math.round(Number(nSplit.value))); }
+    function nC() { return Math.max(1, Math.min(4, Math.round(Number(nCount.value)))); }
+
+    function emit() {
+      var c = nC(), g = grouping.value, sentence = SENT[st.k % SENT.length], sp = st.k % nS(), pt = st.rng.int(0, nP() - 1), routes = [];
+      sentence.split(' ').forEach(function (w) {
+        var to = [], i;
+        if (g === 'shuffle') to = [st.rng.int(0, c - 1)];
+        else if (g === 'fields') to = [fnv(w) % c];
+        else if (g === 'all') { for (i = 0; i < c; i++) to.push(i); }
+        else to = [0];
+        to.forEach(function (x) { st.counts[x][w] = (st.counts[x][w] || 0) + 1; st.load[x]++; });
+        st.deliveries += to.length; st.tuples++; st.truth[w] = (st.truth[w] || 0) + 1;
+        routes.push({ w: w, to: to });
+      });
+      st.k++;
+      st.last = { sentence: sentence, spout: sp, split: pt, routes: routes };
+    }
+
+    player = ui.player({ ms: 700, label: 'Run the stream', stepLabel: 'One sentence', onTick: function () { emit(); }, onReset: function () { fresh(); } });
+    ui.button('Next round: six sentences', function () { for (var i = 0; i < 6; i++) emit(); });
+
+    var roN = ui.readout('sentences · word tuples'), roD = ui.readout('deliveries split → count'), roF = ui.readout('who counts “fresh”');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'tuples of the last sentence', color: 's1', mark: 'line' },
+      { label: 'a tuple carrying “fresh”', color: 'ink', mark: 'hl' },
+      { label: 'a task that just received tuples', color: 's1', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 300, { label: 'The word-count topology: spout tasks, split tasks and count tasks drawn as circles in their component boxes; arrows show where the tuples of the last sentence went, with the tuples that carry the word fresh highlighted, and a badge next to each count task gives the number of tuples it just received' });
+    var wrap = Course.el('div', { 'class': 'scroll-x' }), table = Course.el('table', { 'class': 'tbl tbl--center' });
+    wrap.appendChild(table);
+    ui.stage.appendChild(wrap);
+
+    var Y0 = 60, H = 192, R = 13, CX = { spout: 65, split: 250, count: 420 };
+    function cy(i, n) { return Y0 + (i + 0.5) * H / n; }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function arrow(x1, y1, x2, y2, hl) {
+      var dx = x2 - x1, dy = y2 - y1, d = Math.sqrt(dx * dx + dy * dy) || 1;
+      var sx = x1 + dx * (R + 1) / d, sy = y1 + dy * (R + 1) / d, ex = x2 - dx * (R + 3) / d, ey = y2 - dy * (R + 3) / d;
+      if (hl) S('line', { x1: sx, y1: sy, x2: ex, y2: ey, 'class': 'hl' });
+      S('line', { x1: sx, y1: sy, x2: ex, y2: ey, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' });
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var a = nS(), b = nP(), c = nC(), L = st.last, recv = [0, 0, 0, 0], hlTo = [false, false, false, false], i;
+      if (L) L.routes.forEach(function (r) { r.to.forEach(function (t) { recv[t]++; if (r.w === WATCH) hlTo[t] = true; }); });
+      [['spout', 'sentences', 20, 90], ['bolt', 'split', 200, 100], ['bolt', 'count', 380, 120]].forEach(function (bx) {
+        S('rect', { x: bx[2], y: 50, width: bx[3], height: 212, rx: 8, 'class': 'fi-paper sw-2' });
+        T(bx[2] + bx[3] / 2, 20, bx[0], 'tx-sm tx-muted tx-mid');
+        T(bx[2] + bx[3] / 2, 40, bx[1], 'tx-mono tx-sm tx-mid');
+      });
+      T(155, 290, 'shuffle', 'tx-sm tx-mid');
+      T(340, 290, GNAME[grouping.value], 'tx-sm tx-mid');
+      if (L) {
+        arrow(CX.spout, cy(L.spout, a), CX.split, cy(L.split, b), false);
+        for (i = 0; i < c; i++) if (recv[i]) arrow(CX.split, cy(L.split, b), CX.count, cy(i, c), hlTo[i]);
+      }
+      for (i = 0; i < a; i++) {
+        S('circle', { cx: CX.spout, cy: cy(i, a), r: R, 'class': L && L.spout === i ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        T(CX.spout, cy(i, a) + 5, String(i), 'tx-mono tx-sm tx-mid');
+      }
+      for (i = 0; i < b; i++) {
+        S('circle', { cx: CX.split, cy: cy(i, b), r: R, 'class': L && L.split === i ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        T(CX.split, cy(i, b) + 5, String(i), 'tx-mono tx-sm tx-mid');
+      }
+      for (i = 0; i < c; i++) {
+        S('circle', { cx: CX.count, cy: cy(i, c), r: R, 'class': recv[i] ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        T(CX.count, cy(i, c) + 5, String(i), 'tx-mono tx-sm tx-mid');
+        if (recv[i]) T(442, cy(i, c) + 5, '+' + recv[i], 'tx-mono tx-sm');
+      }
+    }
+    function tableHtml() {
+      var c = nC(), h = '<thead><tr><th>word</th>', i;
+      for (i = 0; i < c; i++) h += '<th>task ' + i + '</th>';
+      h += '<th>true count</th></tr></thead><tbody>';
+      WORDS.forEach(function (w) {
+        h += '<tr' + (w === WATCH ? ' class="is-key"' : '') + '><td><code>' + w + '</code></td>';
+        for (i = 0; i < c; i++) { var v = st.counts[i][w] || 0; h += '<td class="num">' + (v ? v : '·') + '</td>'; }
+        h += '<td class="num">' + (st.truth[w] || 0) + '</td></tr>';
+      });
+      return h + '</tbody>';
+    }
+    function lastText() {
+      var L = st.last;
+      if (!L) return 'Press One sentence: the spout emits its first post, “fresh eggs and fresh milk”.';
+      var parts = L.routes.map(function (r) { return r.w + ' → ' + (r.to.length > 1 ? 'every task' : 'task ' + r.to[0]); });
+      return 'Last: “' + L.sentence + '” — spout task ' + L.spout + ' → split task ' + L.split + ' (shuffle) → count: ' + parts.join(', ') + '.';
+    }
+
+    ui.onChange(function () {
+      var c = nC(), g = grouping.value, holders = [], i, truth = st.truth[WATCH] || 0, txt, tone;
+      roN.set(st.k + ' · ' + st.tuples);
+      roD.set(st.deliveries + (g === 'all' && c > 1 ? ' (' + c + ' copies of each tuple)' : '') + ' · per task: ' + st.load.slice(0, c).join(' · '));
+      for (i = 0; i < c; i++) if (st.counts[i][WATCH]) holders.push(i);
+      if (!truth) txt = 'not seen yet';
+      else if (g === 'all' && c > 1) txt = 'every task: ' + truth + ' each — exact, but counted ' + c + ' times over';
+      else if (holders.length === 1) { txt = 'task ' + holders[0] + ' only: ' + truth + ', the true count' + (g === 'global' && c > 1 ? ' — the other tasks stay idle' : ''); tone = 'good'; }
+      else { txt = 'tasks ' + holders.join(', ') + ': ' + holders.map(function (h) { return st.counts[h][WATCH]; }).join(' + ') + ' — no task knows the total ' + truth; tone = 'bad'; }
+      roF.set(txt, tone);
+      note.set(lastText());
+      draw();
+      table.innerHTML = tableHtml();
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l33-flume">
+  <h2>Flume: a pond at every station</h2>
+
+  <p>Before anything can run on Hadoop, the data has to get there. Page 935 asks: "How do you get your data from these sources to Hadoop?" — the sources being an RDBMS and applications (Fig. 4). Every Hadoop component exposes a Java API (p. 936), so each application could write into HDFS itself; page 937 lists why that is not enough: "Multiple events", "Streaming", "Diverse sources", "Buffering" — "Flume and Sqoop can help!"</p>
+
+  <figure class="fig fig--plain" id="l33-fig-ways">
+    <svg class="dia" viewBox="0 0 560 210" role="img" aria-label="The two ways into Hadoop: events from application servers are pushed continuously by Flume; the rows of a relational table are pulled in bulk by Sqoop; both arrive in Hadoop, that is HDFS, HBase or Hive">
+      <rect x="20" y="44" width="44" height="28" class="fi-paper"/>
+      <line x1="27" y1="51" x2="57" y2="51" class="st-muted"/>
+      <line x1="27" y1="58" x2="57" y2="58" class="st-muted"/>
+      <line x1="27" y1="65" x2="57" y2="65" class="st-muted"/>
+      <rect x="76" y="44" width="44" height="28" class="fi-paper"/>
+      <line x1="83" y1="51" x2="113" y2="51" class="st-muted"/>
+      <line x1="83" y1="58" x2="113" y2="58" class="st-muted"/>
+      <line x1="83" y1="65" x2="113" y2="65" class="st-muted"/>
+      <rect x="20" y="132" width="40" height="24" class="fw-s3 st-s3"/>
+      <rect x="60" y="132" width="40" height="24" class="fw-s3 st-s3"/>
+      <rect x="100" y="132" width="40" height="24" class="fw-s3 st-s3"/>
+      <rect x="20" y="156" width="40" height="24" class="fi-paper"/>
+      <rect x="60" y="156" width="40" height="24" class="fi-paper"/>
+      <rect x="100" y="156" width="40" height="24" class="fi-paper"/>
+      <rect x="20" y="180" width="40" height="24" class="fi-paper"/>
+      <rect x="60" y="180" width="40" height="24" class="fi-paper"/>
+      <rect x="100" y="180" width="40" height="24" class="fi-paper"/>
+      <line x1="124" y1="58" x2="216" y2="58" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="220" y="43" width="80" height="30" class="fi-paper sw-2"/>
+      <line x1="300" y1="58" x2="418" y2="86" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="144" y1="168" x2="216" y2="168" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="220" y="153" width="80" height="30" class="fi-paper sw-2"/>
+      <line x1="300" y1="168" x2="418" y2="150" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="422" y="44" width="118" height="146" rx="8" class="fi-paper sw-2"/>
+      <text x="20" y="30" class="tx-sm">applications</text>
+      <text x="20" y="120" class="tx-sm">RDBMS</text>
+      <text x="260" y="63" class="tx-mono tx-mid">Flume</text>
+      <text x="260" y="98" class="tx-sm tx-mid">push · continuous</text>
+      <text x="260" y="173" class="tx-mono tx-mid">Sqoop</text>
+      <text x="260" y="203" class="tx-sm tx-mid">pull · bulk</text>
+      <text x="481" y="80" class="tx-bold tx-mid">Hadoop</text>
+      <text x="481" y="112" class="tx-sm tx-mid">HDFS</text>
+      <text x="481" y="138" class="tx-sm tx-mid">HBase</text>
+      <text x="481" y="164" class="tx-sm tx-mid">Hive</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The question of p. 935 — one arrow from two sources to Hadoop — answered with two tools. Events from applications are pushed into Hadoop continuously by Flume; the rows of a relational table are pulled in bulk by Sqoop, when an import runs.</figcaption>
+  </figure>
+
+  <p>The producers are many, their number "changes constantly", and they sit "in different governance zones, data centers, continents" (p. 940). Their data drifts too: a data center moves to IPv6, a developer "changes logs (again)", a JSON record gains a field (p. 941). Code on every producer would have to follow every change.</p>
+
+  <p>Page 939 gives the definition: "Apache Flume is a continuous data ingestion system" — open-source, reliable, scalable, manageable, customizable — that carries logs, click streams, sensor data, social streams and feeds to storage (HDFS, S3), to query systems (Hive, HBase, Cassandra…) or to search engines. It was "Originally designed to be a log aggregation system by Cloudera Engineers" and "Evolved to handle any type of streaming event data" (p. 943). Flume moves data; it does not compute on it.</p>
+
+  <h3>The agent: source, channel, sink</h3>
+
+  <p>The <mark class="key">agent</mark> is the "Simplest unit in Flume" (p. 944): one process that connects "any number of sources to any number of data stores" through three kinds of component (p. 948).</p>
+
+  <div class="def">
+    <p><dfn>Source</dfn> — "Accepts incoming Data", "Scales as required", "Writes data to Channel".</p>
+    <p><dfn>Channel</dfn> — "Stores data in the order received".</p>
+    <p><dfn>Sink</dfn> — "Removes data from Channel", "Sends data to downstream Agent or Destination".</p>
+  </div>
+
+  <p>What travels is an <dfn>event</dfn>, "the base unit of communication between components" (p. 946): a <mark class="key">header</mark> of metadata that "Can be used for routing content", and a <mark class="key">body</mark>, the "actual content" (p. 947) — bytes that Flume never needs to understand. The arrows of page 946 matter: "Source pushes events", "Sink polls for events". The sink keeps asking the channel "Got any events?", and the channel never calls anyone. Page 966 adds the cardinalities: "Source – Channel: many-to-many", "Channel– Sink: one-to-many (sink reads only from one channel)".</p>
+
+  <figure class="fig fig--plain" id="l33-fig-agent">
+    <svg class="dia" viewBox="0 0 560 230" role="img" aria-label="A Flume agent: an event made of headers and body enters the source, which pushes it into the channel, a queue of events; the sink polls the channel, takes events and writes them to HDFS. A dashed box marks the source transaction from the source into the channel, a second dashed box the sink transaction from the channel to HDFS">
+      <rect x="124" y="20" width="342" height="170" rx="10" class="fi-paper sw-2"/>
+      <rect x="144" y="96" width="156" height="46" rx="6" class="st-muted dash fi-none"/>
+      <rect x="300" y="96" width="254" height="46" rx="6" class="st-muted dash fi-none"/>
+      <rect x="12" y="89" width="90" height="60" class="fi-paper sw-2"/>
+      <rect x="12" y="89" width="90" height="26" class="fw-s3 st-s3"/>
+      <rect x="12" y="115" width="90" height="34" class="fw-s1 st-s1"/>
+      <line x1="104" y1="119" x2="146" y2="119" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="150" y="104" width="66" height="30" class="fi-paper sw-2"/>
+      <line x1="216" y1="119" x2="238" y2="119" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="240" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="254" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="268" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="282" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="296" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="310" y="108" width="14" height="22" class="fi-paper st-muted"/>
+      <rect x="324" y="108" width="14" height="22" class="fi-paper st-muted"/>
+      <rect x="338" y="108" width="14" height="22" class="fi-paper st-muted"/>
+      <line x1="394" y1="112" x2="356" y2="112" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="354" y1="127" x2="392" y2="127" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="396" y="104" width="66" height="30" class="fi-paper sw-2"/>
+      <line x1="462" y1="119" x2="498" y2="119" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="500" y="104" width="50" height="30" class="fi-paper sw-2"/>
+      <text x="57" y="79" class="tx-sm tx-mid">event</text>
+      <text x="57" y="107" class="tx-sm tx-mid">headers</text>
+      <text x="57" y="138" class="tx-sm tx-mid">body</text>
+      <text x="136" y="44" class="tx-sm">Flume agent</text>
+      <text x="183" y="124" class="tx-sm tx-mid">source</text>
+      <text x="222" y="84" class="tx-sm tx-mid">push</text>
+      <text x="380" y="84" class="tx-sm tx-mid">got any events?</text>
+      <text x="429" y="124" class="tx-sm tx-mid">sink</text>
+      <text x="525" y="124" class="tx-sm tx-mid">HDFS</text>
+      <text x="296" y="162" class="tx-sm tx-mid">channel</text>
+      <text x="210" y="182" class="tx-sm tx-mid">source TX</text>
+      <text x="430" y="182" class="tx-sm tx-mid">sink TX</text>
+      <text x="552" y="220" class="tx-hand tx-end">commit after delivery</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> One agent, as on pp. 946–949. The source pushes events into the channel inside its transaction; the sink polls ("Got any events?"), takes a batch inside its own transaction and commits only once HDFS has it. The slides draw the channel as a database cylinder; it is a queue.</figcaption>
+  </figure>
+
+  <h3>Transactions</h3>
+
+  <p>Agents chain: page 945 draws a "Distributed Pipeline Architecture" of agents from the web logs to HDFS, each with its own channel, one agent's sink feeding the next agent's source. Page 949: "Source uses transactions to write to the channel", "Sink uses transactions to remove data from the channel", "Sink transaction commits only after successful transfer of data". The source commits a batch only when the channel has accepted all of it. The sink takes a batch, delivers it — to HDFS, or to the next agent's source, which commits it into its own channel — and only then commits, removing the batch. On any failure the transaction rolls back and the events stay put: a baton released only into another hand.</p>
+
+  <aside class="redpen" data-page="949">
+    <p class="claim">"This ensures no data loss in Flume pipeline"</p>
+    <p class="fix">The transactions make every hand-off safe while the agents run: an event leaves a channel only after the next hop has it. That is no loss in transit with a durable (file) channel, and it is at-least-once, not exactly-once: a batch retried after a failed commit can arrive twice. With a memory channel, the events in the channel are lost when the agent process dies.</p>
+    <p class="because">Page 968 calls the memory channel "Not persistent", page 962 warns of the "duplication impact" of large batches, and the Flume user guide says that "any events still left in the memory channel when an agent process dies can't be recovered" — try the crash button of the widget below. Page 986 repeats the claim ("Flume never loses any data in transit between Agents"): the exam may print it, so know it and its conditions.</p>
+  </aside>
+
+  <h3>Why channels?</h3>
+
+  <p>Page 951 gives three reasons: the channel "Buffers data and insulates downstream from load spikes", "Provides persistent store for data in case the process restarts", and "Provides flow ordering* and transactional guarantees". The asterisk has no footnote; page 986 qualifies it: a "weak ordering guarantee, i.e., in the absence of failures the data will arrive in the order it was received". The chart of page 951 tells a channel's life: nearly empty in steady state; growing when the destination fails; at "Channel Full" the source's puts fail too and the pressure moves upstream; once the destination is restored, the backlog drains.</p>
+
+  <p>Page 968 offers two kinds. A <mark class="key">memory channel</mark> is an "In-memory queue", "Fast", "Not persistent", "Limited capacity". The other, "Disk", is the <mark class="key">file channel</mark> of a configuration (<code>type = file</code>): it writes events to local disk, survives a restart and can be far larger, at the price of speed.</p>
+</section>
+
+
+<section id="l33-tiers">
+  <h2>From three web servers to a converging flow</h2>
+
+  <p>Pages 952–956 tell the case Flume was built for: web-server logs into HDFS. With "only 3 web servers at the time of launch", an "Ad-hoc solution will likely suffice!" (p. 953). Growth brings the challenges: "How do you manage your output paths on HDFS?" and "How do you maintain your client code in face of changing environment as well as requirements?"</p>
+
+  <p>One Flume agent between the servers and HDFS (p. 954) brings "Insulation from HDFS downtime", "Quick offload of logs from Web Server machines" and "Better Network utilization" — but "What if the Flume node goes down?" Two agents, every server connected to both (p. 955), give "Redundancy and Availability" and "Automatic load balancing and failover", until more servers arrive. The scalable answer is a <mark class="key">converging flow</mark> (p. 956): agents near the servers, aggregated by tier 2 and tier 3 "before being put into destination system".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-tiers">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="Before: three web servers, each with its own arrow straight into HDFS">
+        <text x="20" y="24" class="tx-sm">web servers</text>
+        <line x1="64" y1="60" x2="206" y2="108" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="64" y1="115" x2="206" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="64" y1="170" x2="206" y2="122" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="20" y="46" width="44" height="28" class="fi-paper"/>
+        <line x1="27" y1="53" x2="57" y2="53" class="st-muted"/>
+        <line x1="27" y1="60" x2="57" y2="60" class="st-muted"/>
+        <line x1="27" y1="67" x2="57" y2="67" class="st-muted"/>
+        <rect x="20" y="101" width="44" height="28" class="fi-paper"/>
+        <line x1="27" y1="108" x2="57" y2="108" class="st-muted"/>
+        <line x1="27" y1="115" x2="57" y2="115" class="st-muted"/>
+        <line x1="27" y1="122" x2="57" y2="122" class="st-muted"/>
+        <rect x="20" y="156" width="44" height="28" class="fi-paper"/>
+        <line x1="27" y1="163" x2="57" y2="163" class="st-muted"/>
+        <line x1="27" y1="170" x2="57" y2="170" class="st-muted"/>
+        <line x1="27" y1="177" x2="57" y2="177" class="st-muted"/>
+        <rect x="210" y="100" width="70" height="30" class="fi-paper sw-2"/>
+        <text x="245" y="120" class="tx-mid">HDFS</text>
+        <text x="245" y="152" class="tx-sm tx-mid">output paths?</text>
+        <text x="20" y="214" class="tx-hand">code on every server</text>
+      </svg>
+      <p class="fig-label">Before: no Flume (p. 953)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="After: eight client agents send to two aggregating agents, each with a dotted alternate path to the other aggregator; the two aggregators write to HDFS with thicker arrows">
+        <line x1="74" y1="28" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="50" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="72" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="94" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="116" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="138" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="160" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="182" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="28" x2="136" y2="57" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="50" x2="136" y2="59" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="72" x2="136" y2="63" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="94" x2="136" y2="65" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="116" x2="136" y2="145" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="138" x2="136" y2="147" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="160" x2="136" y2="151" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="182" x2="136" y2="153" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="180" y1="61" x2="228" y2="98" class="st-s1 sw-4" marker-end="url(#arr-s1)"/>
+        <line x1="180" y1="149" x2="228" y2="112" class="st-s1 sw-4" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="28" x2="36" y2="28" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="50" x2="36" y2="50" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="72" x2="36" y2="72" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="94" x2="36" y2="94" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="116" x2="36" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="138" x2="36" y2="138" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="160" x2="36" y2="160" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="182" x2="36" y2="182" class="st-s1" marker-end="url(#arr-s1)"/>
+        <rect x="40" y="21" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="43" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="65" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="87" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="109" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="131" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="153" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="175" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="140" y="51" width="40" height="20" rx="4" class="fi-paper sw-2"/>
+        <rect x="140" y="139" width="40" height="20" rx="4" class="fi-paper sw-2"/>
+        <rect x="232" y="90" width="56" height="30" class="fi-paper sw-2"/>
+        <text x="260" y="110" class="tx-mid">HDFS</text>
+        <text x="57" y="214" class="tx-sm tx-mid">tier 1</text>
+        <text x="160" y="214" class="tx-sm tx-mid">tier 2</text>
+        <text x="236" y="168" class="tx-hand tx-mid">bigger batches</text>
+      </svg>
+      <p class="fig-label">After: a converging flow (p. 956)</p>
+    </div>
+    <figcaption><b>Fig. 6.</b> The log aggregation case. Before: each web server writes to HDFS itself — fine at launch, but every server carries client code and manages its own output paths. After: tiers of agents converge on the destination; inner agents carry more traffic and deliver bigger batches, and the dotted paths to a second aggregator give failover. The slide draws 16, 4 and 3 agents in three tiers; the sketch has two tiers.</figcaption>
+  </figure>
+
+  <aside class="margin-note">On these slides "batch size" means how much an agent sends downstream per unit of time. In a Flume configuration, batchSize is the number of events in one transaction.</aside>
+
+  <p>Why converge? HDFS prefers a few writers that write big files (<a href="l31.html">lesson 31</a>): every file costs memory on the NameNode. "Closer a tier is to the destination, larger the batch size it delivers downstream", hence the "Optimized handling of destination systems". Per agent, the event volume "is least in the outermost tier" and "highest in the innermost tier" (p. 958); per tier, "In steady state, all tiers carry same event volume", while "Transient variations in flow are absorbed and ironed out by channels" (p. 959). Same total, fewer agents: more for each.</p>
+
+  <h3>Three rules of thumb</h3>
+
+  <p>"What we know" (p. 960): the number of web servers, the log volume per server per unit time, the destination and its routing, the worst-case downtime of the destination. "What we will calculate": the number of tiers, the exit batch sizes, the channel capacity — one rule each, pp. 961–964:</p>
+
+  <div class="formula">
+    \[ N_{t+1} = \left\lceil N_t / f \right\rceil, \quad 4 \le f \le 16 \]
+    \[ B_t = V / N_t \]
+    \[ C = r_{\text{in}}^{\max} \times T_{\text{out}}^{\max} \]
+    <dl class="legend">
+      <dt>\(N_t\)</dt><dd>number of agents in tier \(t\); tier 1 holds the client agents</dd>
+      <dt>\(f\)</dt><dd>fan-in: "One Aggregating Agent (A) can be used with anywhere from 4 to 16 client Agents" (p. 961)</dd>
+      <dt>\(V\)</dt><dd>steady-state event volume entering the flow, the same in every tier (p. 959)</dd>
+      <dt>\(B_t\)</dt><dd>exit batch size of one agent of tier \(t\): "total exit data volume divided by number of Agents in a tier" (p. 962)</dd>
+      <dt>\(C\)</dt><dd>channel capacity: "worst case data ingest rate sustained over the worst case downstream outage interval" (p. 963)</dd>
+      <dt>\(r_{\text{in}}^{\max}\)</dt><dd>worst-case ingest rate, in events per second</dd>
+      <dt>\(T_{\text{out}}^{\max}\)</dt><dd>worst-case downstream outage, in seconds</dd>
+    </dl>
+  </div>
+
+  <p>The slides state the rules in words; the first formula is the 4-to-16 ratio applied tier after tier. The figure of p. 962 draws the second one: \(n\) client agents send \(k\) each, so one downstream agent must deliver \(n * k + \Delta\) and two deliver \((n * k + \Delta)/2\) each, \(\Delta\) being the extra room. Each rule has its "Considerations": the tiers must also provide "routing, load-balancing and failover"; "Having some extra room is good", and large batches make duplicates costly; "Multiple disks will yield better performance", and "Channel size impacts the back-pressure buildup in the pipeline" — a bigger channel delays the moment the producers are refused. Each has a "Test" too: load-test steady state, peak and fail-over, and expect to "need more disk space than the physical footprint of the data size". The web shop of the hook, step by step:</p>
+
+  <ol class="steps" id="l33-steps-sizing">
+    <li><p>What we know: 64 web servers, 2,000 events per second each, 500 bytes per event; destination HDFS, no routing; worst outage of HDFS: one hour, 3,600 seconds.</p></li>
+    <li><p>Tiers (p. 961): one client agent per server gives \(N_1 = 64\). A fan-in of 8 gives \(N_2 = 8\). Another 8 would give a single aggregator, and a single agent is a single point of failure (p. 954); a fan-in of 4 gives \(N_3 = 2\).</p> \[ 64 \to 8 \to 2 \]</li>
+    <li><p>Volume (p. 959): in steady state every tier carries what enters the flow — 64 MB per second at 500 bytes per event.</p> \[ V = 64 \times 2000 = 128\,000 \ \text{events/s} \]</li>
+    <li><p>Exit batch size per agent (p. 962): tier 1 sends 2,000 events/s per agent, tier 2 sends 16,000, tier 3 sends 64,000. Add head-room \(\Delta\), and test fail-over: with one tier-3 agent down, the other must drain all 128,000 alone.</p> \[ B_3 = 128\,000 / 2 = 64\,000 \]</li>
+    <li><p>Channel capacity (p. 963): tier 3 must hold everything that arrives during the outage — 460.8 million events of 500 bytes, about 230 GB, so 115 GB per agent. That is a file channel spread over several disks; a memory channel cannot come close.</p> \[ \begin{aligned} C &amp;= 128\,000 \times 3600 \\ &amp;\approx 4.6 \times 10^{8} \ \text{events} \end{aligned} \]</li>
+  </ol>
+</section>
+
+
+<section id="l33-config">
+  <h2>An agent in ten lines of properties</h2>
+
+  <p>Running Flume takes two steps (p. 970): "Configure agent(s) in property file", then "Run Flume agent from console". One file can describe several agents; <code class="nw">--name</code> picks the one to start.</p>
+
+<pre><code>$ flume-ng agent --conf-file spool-to-logger.properties \
+  --name agent1</code></pre>
+
+  <p>Page 971 is the whole file of a "1-1-1" agent — one source, one channel, one sink:</p>
+
+<pre><code># spool-to-logger.properties (p. 971)
+agent1.sources = source1
+agent1.sinks = sink1
+agent1.channels = channel1
+
+agent1.sources.source1.channels = channel1
+agent1.sinks.sink1.channel = channel1
+
+agent1.sources.source1.type = spooldir
+agent1.sources.source1.spoolDir = /Users/udi/tmp/spooldir
+
+agent1.sinks.sink1.type = logger
+agent1.channels.channel1.type = file</code></pre>
+
+  <p>Read it in three blocks. First the names of the components of <code>agent1</code>. Then the wiring: a source lists its <code>channels</code>, plural, because it may feed several; a sink names its <code>channel</code>, singular — the rule of page 966 is in the key names. Last, each component's <code>type</code> and properties. This agent turns every line of every file dropped into the spooling directory into an event, keeps it in a file channel and prints it with the logger sink.</p>
+
+  <p>The catalogue (pp. 967–969). Sources: Spooling Directory — "Text Files, Immutable, Unique name", since the source tracks files by name and stops with an error if a file changes or a name comes back (Flume user guide) — SysLog, Exec (the output of a command such as <code class="nw">tail -F</code>) and Custom. Channels: Memory and Disk. Sinks: HDFS, HBase, "Console Log" and "Local Directory" — in a configuration, the logger sink (<code>type = logger</code>) and the file_roll sink.</p>
+
+  <h3>The HDFS sink</h3>
+
+<pre><code># p. 972: the logger sink replaced by an HDFS sink
+agent1.sinks.sink1.type = hdfs
+agent1.sinks.sink1.hdfs.path = /tmp/flume
+agent1.sinks.sink1.hdfs.filePrefix = events
+agent1.sinks.sink1.hdfs.fileSuffix = .log
+agent1.sinks.sink1.hdfs.inUsePrefix = _
+agent1.sinks.sink1.hdfs.fileType = DataStream</code></pre>
+
+  <p><code>hdfs</code> is the short name of the class on the slide, <code>org.apache.flume.sink.hdfs.HDFSEventSink</code>. Files land in <code>/tmp/flume</code> as <code>events.&lt;timestamp&gt;.log</code> — the answer to page 953's "output paths". While a file is being written its name starts with <code>_</code>, and Hadoop jobs skip such files: no job reads half a file. The sink "rolls" — closes the file, opens a new one — and "By default, files are rolled over every 30 seconds", with <code>rollCount</code> and <code>rollSize</code> as further triggers (p. 973). <code>fileType</code> picks "SequenceFile = binary format", "DataStream = uncompressed files (text)" or "CompressedStream = compressed files" (p. 974).</p>
+
+  <div class="tip"><p>The 30 seconds of p. 973 are <code>hdfs.rollInterval</code>. The Flume user guide gives the other two triggers defaults too — <code>rollSize</code> 1024 bytes, <code>rollCount</code> 10 events — and the first trigger to fire wins, so a busy sink with default settings closes a file after 10 events or 1 KB, whichever comes first, and fills HDFS with tiny files. Set a trigger to 0 to switch it off.</p></div>
+
+  <h3>HTTP in, folders by header</h3>
+
+  <p>Page 975 swaps the source for an HTTP server, in front of a memory channel of 1,000 events:</p>
+
+<pre><code># p. 975: an HTTP source on port 8989 and a memory channel
+httpagent.sources.http-source.type = org.apache.flume.source.http.HTTPSource
+httpagent.sources.http-source.bind = localhost
+httpagent.sources.http-source.port = 8989
+httpagent.channels.ch.type = memory
+httpagent.channels.ch.capacity = 1000</code></pre>
+
+  <aside class="margin-note">The command of p. 976 is printed with curly quotes and an unclosed body string; the version here can be typed.</aside>
+
+  <p>Clients post events in a "Fixed format: header + body" (p. 976): a JSON array of objects with <code>headers</code> and <code>body</code>. When the channel is full, the source answers HTTP 503 (Flume user guide): back-pressure the client can see.</p>
+
+<pre><code>$ curl -X POST -H 'Content-Type: application/json; charset=UTF-8' \
+  -d '[{"headers": {"eventheader1": "event1", "eventheader2": "event2"},
+        "body": "This is the body1"}]' \
+  http://localhost:8989</code></pre>
+
+  <p>"Bucketing" (p. 977) is the "Dynamic assignment of files to folders": <code>%{topic}</code> in the path is replaced, event by event, by the value of the header <code>topic</code>, so the slide's event with <code>"topic" : "topic1"</code> lands in <code>/tmp/flume/http/topic1/</code>. Header names are case-sensitive: the slide's "Topic" is <code>topic</code> in the path and in the event. Time-based bucketing (p. 978) uses date escapes:</p>
+
+<pre><code># p. 977: one folder per value of the header topic
+httpagent.sinks.hdfs-sink.hdfs.path = /tmp/flume/http/%{topic}
+
+# p. 978: one folder per hour, read from the sink's own clock
+agent1.sinks.sink1.hdfs.useLocalTimeStamp = true
+agent1.sinks.sink1.hdfs.path = /tmp/flume/twitterinterceptor/%Y/%m/%d/%H</code></pre>
+
+  <p>Time escapes need a <code>timestamp</code> header, which the HTTP and spooling sources do not add by themselves; <code>useLocalTimeStamp = true</code> lets the sink use its own clock instead. A folder per hour is the partition-per-directory layout that Hive reads (<a href="l32.html">lesson 32</a>).</p>
+
+  <aside class="margin-note">"They must exist already in HBASE" (p. 979): the table and the column family must; the qualifier pCol appears with the first write, as columns do in HBase (lesson 32).</aside>
+
+  <p>The same events can also go to HBase (p. 979):</p>
+
+<pre><code># p. 979: each event into the column test:pCol of the HBase table test_table
+agent1.sinks.hbaseSink.type = org.apache.flume.sink.hbase.AsyncHBaseSink
+agent1.sinks.hbaseSink.table = test_table
+agent1.sinks.hbaseSink.columnFamily = test
+agent1.sinks.hbaseSink.serializer = org.apache.flume.sink.hbase.SimpleAsyncHbaseEventSerializer
+agent1.sinks.hbaseSink.serializer.payloadColumn = pCol</code></pre>
+
+  <h3>Several channels, selectors and interceptors</h3>
+
+  <p>A source can "replicate or multiplex data across many channels", each drained by its own sink (p. 950). Page 980 wires one HTTP source to two channels — <code>ch1</code> into an HDFS sink, <code>ch2</code> into a logger sink:</p>
+
+<pre><code># p. 980: one source, two channels, two sinks
+httpagent.sources = http-source
+httpagent.sinks = hdfs-sink log-sink
+httpagent.channels = ch1 ch2
+
+httpagent.sources.http-source.channels = ch1 ch2
+httpagent.sinks.hdfs-sink.channel = ch1
+httpagent.sinks.log-sink.channel = ch2</code></pre>
+
+  <p>Which event goes where is decided by the source's <mark class="key">channel selector</mark> (p. 981): "Replicating • Default • Every event sent everywhere", or "Multiplexing • routes events to channels based on their headers". Page 982 adds four lines — "If show = 1, route to ch1", if show = 2, to ch2. The selector belongs to the source: routing happens before the channels.</p>
+
+<pre><code># p. 982: route by the header show (without these lines: replicating)
+httpagent.sources.http-source.selector.type = multiplexing
+httpagent.sources.http-source.selector.header = show
+httpagent.sources.http-source.selector.mapping.1 = ch1
+httpagent.sources.http-source.selector.mapping.2 = ch2</code></pre>
+
+  <aside class="margin-note">The Flume user guide lists no keywords property for this class: it samples 1 % of all tweets and sends them on as Avro events.</aside>
+
+  <p>Social media is one more source (p. 983): a Twitter source takes the four credentials of a Twitter developer account, which the slide masks, and a list of keywords. Pages 985 and 978 complete its pipeline: keep the tweets about the election, file them into one HDFS folder per hour.</p>
+
+<pre><code># p. 983: tweets as events (the slide masks the credentials as **)
+agent1.sources.source1.type = org.apache.flume.source.twitter.TwitterSource
+agent1.sources.source1.consumerKey = **
+agent1.sources.source1.consumerSecret = **
+agent1.sources.source1.accessToken = **
+agent1.sources.source1.accessTokenSecret = **
+agent1.sources.source1.keywords = @realDonaldTrump, @HillaryClinton</code></pre>
+
+  <p>Last, an <mark class="key">interceptor</mark> "can process events based on their contents or headers": "Simple data processing", "Overhead for Flume", "To be used with caution!" (p. 984). It runs inside the source on every event, so a slow one slows ingestion. Page 985 keeps only the events whose body matches a regular expression; <code>excludeEvents = true</code> would drop them instead.</p>
+
+<pre><code># p. 985, with the registration line it needs: keep only events whose body contains "election"
+agent1.sources.source1.interceptors = regexInterceptor
+agent1.sources.source1.interceptors.regexInterceptor.type = regex_filter
+agent1.sources.source1.interceptors.regexInterceptor.regex = .*election.*
+agent1.sources.source1.interceptors.regexInterceptor.excludeEvents = false</code></pre>
+
+  <div class="pitfall"><p>"The three lines of page 985 install the filter." Not alone: an interceptor works only once its name is listed on the source, as in the first line above (<code>a1.sources.r1.interceptors = i1 i2</code> in the Flume user guide). Without that line, nothing is filtered.</p></div>
+
+  <p>Now build flows and push load through them. The widget makes one insight visible: <strong>a channel absorbs the difference between what arrives and what can leave, and once it is full the refusal moves upstream</strong> — so its capacity must cover the worst ingest rate over the worst outage.</p>
+
+  <div class="widget" id="l33-w-flume">
+    <h3 class="widget-title">Flume agent builder: wire a flow, then hit it</h3>
+    <p class="widget-intro">Pick a flow: one agent as on p. 975, one agent with two channels and two sinks as on p. 980, or four client agents converging on an aggregator. Four web servers post 100 events a second each; between t = 10 s and t = 30 s comes a load spike, an HDFS outage, or both. Channels are rows of cells that fill up. The properties file after the readouts is generated from the flow you chose. The rates (100, 300 and 600 events a second) and the file channel's 20,000 events are the widget's round numbers — a real file channel holds a million by default; the memory channel's 1,000 is the value of p. 975.</p>
+    <ol class="tasks">
+      <li>One agent, memory channel, HDFS down, spike × 1. Before you press <em>Run</em>: 400 events a second arrive and none can leave. When is the channel of 1,000 full, and how many events are refused by t = 30 s? Then repeat with the file channel.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Full about 2.5 s into the outage (1,000 / 400); from then on the source refuses everything: about 7,000 events by t = 30 s. The rule of p. 963 asks for 400 × 20 = 8,000 events, as the last readout says. The file channel takes them all: it peaks near 8,000 at t = 30 s, then drains at 600 − 400 = 200 a second and is empty again around t = 70 s.</p></details>
+      </li>
+      <li>Converging flow, memory channels, HDFS down, spike × 1. Predict which channel fills first, and when the web servers start being refused.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The aggregator, by t = 13 s. Its source then refuses the clients' batches (dashed arrows), and each client channel grows by 100 events a second: full by t = 23 s. Only then are the web servers refused — about 3,000 events by t = 30 s, against 7,000 with a single agent. Every hop buffers, and back-pressure travels upstream one tier at a time.</p></details>
+      </li>
+      <li>Converging flow, HDFS up (switch the outage off), spike × 3. Where is the spike absorbed — with memory channels, then with file channels?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Each client gets 300 events a second and can send 300, so tier 1 passes the spike on. The aggregator gets 1,200 but writes only 600 to HDFS: with memory channels it is full by t = 12 s, the clients by t = 19 s, and about 7,000 events are refused. With file channels the aggregator absorbs (1,200 − 600) × 20 = 12,000 events and drains them over the next 60 s: "Transient variations in flow are absorbed and ironed out by channels" (p. 959).</p></details>
+      </li>
+      <li>Two channels, memory, HDFS down. With the replicating selector, does the logger keep printing during the outage? Switch to multiplexing and compare; read the selector lines in the file. Finally, press <em>Crash</em> during the outage, while the channels hold events — once with memory, once with file channels.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Replicating puts every event into both channels, so once <code>ch1</code> is full (t = 13 s) the source refuses everything and the logger starves too. With multiplexing only the <code>show = 1</code> half is refused (about 3,000 events) and <code>show = 2</code> keeps reaching the logger; the file gains the four selector lines of p. 982. A crash empties a memory channel — the events are lost, though the web servers were told they were delivered — while a file channel finds them on disk after the restart.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-flume', function (root, ui) {
+    var PROD = 100, NWS = 4, W0 = 10, W1 = 30, TMAX = 90, SUB = 20, DT = 1 / SUB;
+    var CAP = { memory: 1000, file: 20000 }, DRAIN_HDFS = 600, DRAIN_LOG = 600, DRAIN_HOP = 300;
+    var s = null, player = null;
+
+    function fresh() {
+      s = { t: 0, ch: 0, ch1: 0, ch2: 0, agg: 0, cl: [0, 0, 0, 0], hdfs: 0, log: 0, refused: 0, lost: 0, refNow: false, hop: false, prev: 0, crash: null };
+    }
+    fresh();
+    function restart() { if (player) player.reset(); else fresh(); }
+
+    var flow = ui.select('flow', [
+      { value: 'one', label: 'one agent (p. 975)' },
+      { value: 'two', label: 'two channels and sinks (p. 980)' },
+      { value: 'conv', label: '4 clients → aggregator' }
+    ], function () { restart(); }, 'one');
+    var chan = ui.select('channel type (p. 968)', [
+      { value: 'memory', label: 'memory: 1,000 events' },
+      { value: 'file', label: 'file (“Disk”): 20,000' }
+    ], function () { restart(); }, 'memory');
+    var sel = ui.select('selector (two channels only)', [
+      { value: 'replicating', label: 'replicating (default)' },
+      { value: 'multiplexing', label: 'multiplexing on show' }
+    ], function () { restart(); }, 'replicating');
+    var spike = ui.slider({ label: 'load spike, t = 10–30 s', min: 1, max: 4, step: 0.5, value: 1, format: function (v) { return '× ' + v; }, onInput: function () { restart(); } });
+    var down = ui.toggle('HDFS down from t = 10 s to 30 s', true, function () { restart(); });
+
+    function m0() { return Math.max(1, Number(spike.value) || 1); }
+    function C() { return CAP[chan.value] || 1000; }
+    function win(t) { return t >= W0 - 1e-9 && t < W1 - 1e-9; }
+    function fill() { var f = flow.value; return f === 'one' ? s.ch : f === 'two' ? s.ch1 + s.ch2 : s.agg + s.cl[0] + s.cl[1] + s.cl[2] + s.cl[3]; }
+
+    /* one simulated second in 20 small steps: each sink drains first, then the sources accept what fits */
+    function second() {
+      if (s.t >= TMAX) return;
+      var cap = C(), f = flow.value, ref0 = s.refused, hop = false, k, i;
+      s.prev = fill();
+      for (k = 0; k < SUB; k++) {
+        var t = s.t + k * DT, w = win(t), m = w ? m0() : 1, capH = (w && down.value) ? 0 : DRAIN_HDFS, a, d, acc;
+        if (f === 'one') {
+          d = Math.min(s.ch, capH * DT); s.ch -= d; s.hdfs += d;
+          a = NWS * PROD * m * DT; acc = Math.max(0, Math.min(a, cap - s.ch)); s.ch += acc; s.refused += a - acc;
+        } else if (f === 'two') {
+          d = Math.min(s.ch1, capH * DT); s.ch1 -= d; s.hdfs += d;
+          d = Math.min(s.ch2, DRAIN_LOG * DT); s.ch2 -= d; s.log += d;
+          a = NWS * PROD * m * DT;
+          if (sel.value === 'replicating') { acc = Math.max(0, Math.min(a, cap - s.ch1, cap - s.ch2)); s.ch1 += acc; s.ch2 += acc; s.refused += a - acc; }
+          else {
+            var h = a / 2, x1 = Math.max(0, Math.min(h, cap - s.ch1)), x2 = Math.max(0, Math.min(h, cap - s.ch2));
+            s.ch1 += x1; s.ch2 += x2; s.refused += (h - x1) + (h - x2);
+          }
+        } else {
+          d = Math.min(s.agg, capH * DT); s.agg -= d; s.hdfs += d;
+          var want = s.cl.map(function (x) { return Math.min(x, DRAIN_HOP * DT); });
+          var tw = want[0] + want[1] + want[2] + want[3], take = Math.max(0, Math.min(tw, cap - s.agg));
+          if (tw > 0) { for (i = 0; i < 4; i++) s.cl[i] -= want[i] * take / tw; s.agg += take; }
+          if (tw - take > 1e-6) hop = true;
+          for (i = 0; i < 4; i++) { a = PROD * m * DT; acc = Math.max(0, Math.min(a, cap - s.cl[i])); s.cl[i] += acc; s.refused += a - acc; }
+        }
+      }
+      s.t += 1; s.refNow = s.refused - ref0 > 1e-6; s.hop = hop;
+    }
+    function crash() {
+      var f = flow.value, mem = chan.value === 'memory', amount = f === 'one' ? s.ch : f === 'two' ? s.ch1 + s.ch2 : s.agg;
+      if (mem) { if (f === 'one') s.ch = 0; else if (f === 'two') { s.ch1 = 0; s.ch2 = 0; } else s.agg = 0; s.lost += amount; }
+      s.crash = { t: s.t, amount: amount, mem: mem };
+    }
+
+    player = ui.player({ ms: 150, max: TMAX, label: 'Run 90 s', stepLabel: 'One second', onTick: function () { second(); }, onReset: function () { fresh(); } });
+    ui.button('Crash and restart the agent next to HDFS', function () { crash(); }, { kind: 'ghost' });
+
+    var roT = ui.readout('time'), roF = ui.readout('channel fill'), roD = ui.readout('delivered'),
+        roR = ui.readout('refused at the source (HTTP 503)'), roL = ui.readout('lost in crashes'), roN = ui.readout('buffer the HDFS-side channel needs');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'events moving', color: 's1', mark: 'line' },
+      { label: 'blocked: the next hop refuses', color: 's1', mark: 'dash' },
+      { label: 'events waiting in a channel', color: 's1', mark: 'square' },
+      { label: 'refused at a source', color: 'bad', mark: 'cross' },
+      { label: 'destination down', color: 'bad', mark: 'dash' }
+    ]);
+    var svg = ui.svg(560, 280, { label: 'The chosen Flume flow: web servers on the left post events to the agent or agents; every channel is a row of cells that fills up; arrows carry events to HDFS or to the logger, dashed when the next hop refuses them; crosses mark refused events and a dead HDFS' });
+    /* the generated properties file sits after the readouts, so that the drawing stays next to the controls */
+    var fileBox = Course.el('details', { 'class': 'widget-note', open: '' }), pre = Course.el('pre'), code = Course.el('code');
+    fileBox.appendChild(Course.el('summary', { text: 'The properties file of this flow, generated from the drawing' }));
+    pre.appendChild(code);
+    fileBox.appendChild(pre);
+    root.insertBefore(fileBox, root.querySelector('.tasks'));
+
+    function fmt(x) { return String(Math.round(Math.max(0, x))).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, txt, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: txt }); }
+    function machine(cx, cy) {
+      S('rect', { x: cx - 22, y: cy - 14, width: 44, height: 28, 'class': 'fi-paper' });
+      [-7, 0, 7].forEach(function (dd) { S('line', { x1: cx - 15, y1: cy + dd, x2: cx + 15, y2: cy + dd, 'class': 'st-muted' }); });
+    }
+    function arrow(x1, y1, x2, y2, dashed) { S('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': 'st-s1 sw-2' + (dashed ? ' dash' : ''), 'marker-end': 'url(#arr-s1)' }); }
+    function cross(x, y, r) {
+      S('line', { x1: x - r, y1: y - r, x2: x + r, y2: y + r, 'class': 'st-bad sw-3' });
+      S('line', { x1: x - r, y1: y + r, x2: x + r, y2: y - r, 'class': 'st-bad sw-3' });
+    }
+    function queue(x, y, n, w, h, frac) {
+      var filled = frac > 0.0005 ? Math.max(1, Math.round(Math.min(1, frac) * n)) : 0, i;
+      for (i = 0; i < n; i++) S('rect', { x: x + i * w, y: y, width: w, height: h, 'class': i < filled ? 'fi-s1 st-paper' : 'fi-paper st-muted' });
+    }
+    function box(x, y, w, h, label) { S('rect', { x: x, y: y, width: w, height: h, 'class': 'fi-paper sw-2' }); if (label) T(x + w / 2, y + h / 2 + 5, label, 'tx-sm tx-mid'); }
+    /* a dead destination: a red dashed ring around its box, and the word "down" under it */
+    function deadRing(x, y, w, h, lx, ly) { S('rect', { x: x - 5, y: y - 5, width: w + 10, height: h + 10, rx: 4, 'class': 'st-bad sw-2 dash fi-none' }); T(lx, ly, 'down', 'tx-sm tx-bad tx-mid'); }
+    function agentBox(x, y, w, h) { S('rect', { x: x, y: y, width: w, height: h, rx: 10, 'class': 'fi-paper sw-2' }); }
+    function hdfsDown() { return s.t > 0 && win(s.t - 0.5) && down.value; }
+    function servers(tx, tys, refusing) {
+      T(10, 22, 'web servers', 'tx-sm');
+      [70, 120, 170, 220].forEach(function (cy, i) {
+        machine(32, cy);
+        arrow(54, cy, tx - 2, tys[i], false);
+        if (refusing) cross((54 + tx) / 2, (cy + tys[i]) / 2, 6);
+      });
+    }
+
+    function drawOne(cap) {
+      var dn = hdfsDown();
+      servers(135, [131, 141, 149, 159], s.refNow);
+      agentBox(118, 95, 324, 100);
+      T(280, 86, 'httpagent', 'tx-mono tx-sm tx-mid');
+      box(135, 130, 66, 30, 'source');
+      arrow(201, 145, 220, 145, false);
+      T(282, 124, 'channel', 'tx-sm tx-mid');
+      queue(222, 134, 10, 12, 22, s.ch / cap);
+      T(282, 182, fmt(s.ch) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      arrow(342, 145, 360, 145, false);
+      box(362, 130, 66, 30, 'sink');
+      arrow(428, 145, 476, 145, dn);
+      box(478, 128, 72, 34, 'HDFS');
+      if (dn) deadRing(478, 128, 72, 34, 514, 192);
+    }
+    function drawTwo(cap) {
+      var dn = hdfsDown(), mux = sel.value === 'multiplexing';
+      servers(135, [138, 146, 154, 162], s.refNow && !mux);
+      agentBox(118, 50, 324, 205);
+      T(280, 42, 'httpagent', 'tx-mono tx-sm tx-mid');
+      T(130, 74, 'selector: ' + (sel.value === 'replicating' ? 'replicating' : 'multiplexing on show'), 'tx-sm');
+      box(135, 135, 66, 30, 'source');
+      arrow(201, 145, 220, 113, false);
+      arrow(201, 155, 220, 199, false);
+      if (s.refNow && mux) cross(210, 130, 6);          /* only the events for ch1 are refused */
+      T(214, 116, 'ch1', 'tx-mono tx-sm tx-end');
+      queue(222, 100, 10, 12, 22, s.ch1 / cap);
+      T(282, 140, fmt(s.ch1) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      T(214, 206, 'ch2', 'tx-mono tx-sm tx-end');
+      queue(222, 190, 10, 12, 22, s.ch2 / cap);
+      T(282, 230, fmt(s.ch2) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      arrow(342, 111, 360, 111, false);
+      arrow(342, 201, 360, 201, false);
+      box(362, 96, 66, 30, 'sink 1');
+      box(362, 186, 66, 30, 'sink 2');
+      arrow(428, 111, 476, 111, dn);
+      arrow(428, 201, 476, 201, false);
+      box(478, 94, 72, 34, 'HDFS');
+      box(478, 184, 72, 34, 'logger');
+      if (dn) deadRing(478, 94, 72, 34, 514, 158);
+    }
+    function drawConv(cap) {
+      var dn = hdfsDown();
+      T(4, 22, 'web servers', 'tx-sm');
+      [60, 110, 160, 210].forEach(function (cy, i) {
+        machine(26, cy);
+        arrow(48, cy, 76, cy, false);
+        if (s.refNow) cross(62, cy, 6);
+        agentBox(78, cy - 17, 140, 34);
+        queue(100, cy - 9, 8, 12, 18, s.cl[i] / cap);
+        arrow(218, cy, 270, 160 + (cy - 135) * 0.3, s.hop);
+      });
+      T(148, 252, 'each: ' + fmt(s.cl[0]) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      T(148, 272, '4 client agents', 'tx-sm tx-mid');
+      T(362, 110, 'aggregator', 'tx-sm tx-mid');
+      agentBox(272, 120, 180, 80);
+      queue(302, 150, 10, 12, 20, s.agg / cap);
+      T(362, 190, fmt(s.agg) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      arrow(452, 160, 482, 160, dn);
+      box(488, 143, 62, 34, 'HDFS');
+      if (dn) deadRing(488, 143, 62, 34, 519, 206);
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var cap = C();
+      if (flow.value === 'one') drawOne(cap); else if (flow.value === 'two') drawTwo(cap); else drawConv(cap);
+    }
+
+    var HDFS_SINK = ['hdfs.path = /tmp/flume', 'hdfs.filePrefix = events', 'hdfs.fileSuffix = .log', 'hdfs.inUsePrefix = _', 'hdfs.fileType = DataStream'];
+    function chanLines(prefix, name) {
+      return chan.value === 'memory'
+        ? [prefix + '.channels.' + name + '.type = memory', prefix + '.channels.' + name + '.capacity = 1000']
+        : [prefix + '.channels.' + name + '.type = file', prefix + '.channels.' + name + '.capacity = 20000'];
+    }
+    /* bind: one agent that takes the posts of four other machines listens on 0.0.0.0; a client agent of the
+       converging flow runs on its own web server, so localhost (the value of p. 975) is enough */
+    function httpLines(prefix, bind) {
+      var L = [prefix + '.sources.http-source.type = org.apache.flume.source.http.HTTPSource', prefix + '.sources.http-source.bind = ' + bind, prefix + '.sources.http-source.port = 8989'];
+      return bind === 'localhost' ? L : ['# bind 0.0.0.0: the web servers post from other machines (p. 975 binds localhost)'].concat(L);
+    }
+    function sinkLines(prefix, name, path) {
+      return [prefix + '.sinks.' + name + '.type = hdfs'].concat(HDFS_SINK.map(function (l, i) { return prefix + '.sinks.' + name + '.' + (i === 0 && path ? 'hdfs.path = ' + path : l); }));
+    }
+    function fileText() {
+      var f = flow.value, L = [];
+      if (f === 'one') {
+        L = ['# httpagent.properties — the flow of p. 975, channel type as chosen', 'httpagent.sources = http-source', 'httpagent.sinks = hdfs-sink', 'httpagent.channels = ch', '',
+          'httpagent.sources.http-source.channels = ch', 'httpagent.sinks.hdfs-sink.channel = ch', ''].concat(httpLines('httpagent', '0.0.0.0'), [''], sinkLines('httpagent', 'hdfs-sink', '/tmp/flume/hdfs'), [''], chanLines('httpagent', 'ch'));
+      } else if (f === 'two') {
+        L = ['# httpagent.properties — the wiring of p. 980, channel types as chosen', 'httpagent.sources = http-source', 'httpagent.sinks = hdfs-sink log-sink', 'httpagent.channels = ch1 ch2', '',
+          'httpagent.sources.http-source.channels = ch1 ch2', 'httpagent.sinks.hdfs-sink.channel = ch1', 'httpagent.sinks.log-sink.channel = ch2', ''].concat(httpLines('httpagent', '0.0.0.0'));
+        if (sel.value === 'multiplexing') L = L.concat(['httpagent.sources.http-source.selector.type = multiplexing', 'httpagent.sources.http-source.selector.header = show',
+          'httpagent.sources.http-source.selector.mapping.1 = ch1', 'httpagent.sources.http-source.selector.mapping.2 = ch2']);
+        else L.push('# no selector lines: replicating is the default (p. 981)');
+        L = L.concat([''], sinkLines('httpagent', 'hdfs-sink', '/tmp/flume/http'), ['httpagent.sinks.log-sink.type = logger', ''], chanLines('httpagent', 'ch1'), chanLines('httpagent', 'ch2'));
+      } else {
+        L = ['# client1.properties (client1 … client4, one per web server)', 'client1.sources = http-source', 'client1.sinks = avro-sink', 'client1.channels = ch', '',
+          'client1.sources.http-source.channels = ch', 'client1.sinks.avro-sink.channel = ch', ''].concat(httpLines('client1', 'localhost'), ['',
+          '# the hop to the next agent (Flume user guide, not on the slides)',
+          'client1.sinks.avro-sink.type = avro', 'client1.sinks.avro-sink.hostname = aggregator-host', 'client1.sinks.avro-sink.port = 4545', ''], chanLines('client1', 'ch'), ['',
+          '# aggregator.properties', 'aggregator.sources = avro-source', 'aggregator.sinks = hdfs-sink', 'aggregator.channels = ch', '',
+          'aggregator.sources.avro-source.channels = ch', 'aggregator.sinks.hdfs-sink.channel = ch', '',
+          'aggregator.sources.avro-source.type = avro', 'aggregator.sources.avro-source.bind = 0.0.0.0', 'aggregator.sources.avro-source.port = 4545', ''],
+          sinkLines('aggregator', 'hdfs-sink', '/tmp/flume'), [''], chanLines('aggregator', 'ch'));
+      }
+      return L.join('\n');
+    }
+
+    function needText() {
+      var rate = NWS * PROD * m0(), dur = W1 - W0, txt;
+      if (flow.value === 'two' && sel.value === 'multiplexing') rate = rate / 2;
+      if (down.value) txt = fmt(rate) + '/s × ' + dur + ' s = ' + fmt(rate * dur) + ' events (rule of p. 963, computed)';
+      else if (rate > DRAIN_HDFS) txt = '(' + fmt(rate) + ' − ' + fmt(DRAIN_HDFS) + ')/s × ' + dur + ' s = ' + fmt((rate - DRAIN_HDFS) * dur) + ' events (computed)';
+      else txt = 'none: HDFS takes ' + fmt(DRAIN_HDFS) + '/s, more than the ' + fmt(rate) + '/s that arrive';
+      return txt + ' · capacity: ' + fmt(C());
+    }
+    function phaseText() {
+      var f = flow.value, cap = C(), w = s.t > 0 && win(s.t - 0.5), dn = w && down.value, now = fill();
+      if (s.crash && s.t - s.crash.t <= 3) {
+        if (!s.crash.amount) return 'Crash at t = ' + s.crash.t + ' s: the channel was empty, so there was nothing to lose.';
+        return s.crash.mem
+          ? 'Crash at t = ' + s.crash.t + ' s: the memory channel held ' + fmt(s.crash.amount) + ' events, and they are gone — although the web servers had been told they were delivered.'
+          : 'Crash at t = ' + s.crash.t + ' s: the file channel’s ' + fmt(s.crash.amount) + ' events were on disk, and they are still there after the restart.';
+      }
+      if (s.t === 0) return 'Press Run. Four web servers post 100 events a second each — 400 in all — and HDFS can take 600 a second. From t = 10 s to t = 30 s comes the spike or the outage you chose.';
+      if (s.t >= TMAX) return 'End of the run: Reset to start again, or change a setting.';
+      if (s.refNow) {
+        if (f === 'conv') return 'Back-pressure has reached the web servers: the aggregator is full, the client channels are full, and the client sources answer HTTP 503.';
+        if (f === 'two' && sel.value === 'replicating') return 'ch1 is full, and replicating must put every event into both channels: the source refuses everything, so the logger starves too.';
+        if (f === 'two') return 'ch1 is full: the events with show = 1 are refused, while those with show = 2 still reach the logger.';
+        return 'The channel is full: the source refuses new events and the web servers get HTTP 503 (p. 951, “Channel Full”).';
+      }
+      if (f === 'conv' && s.hop) return 'The aggregator is full: its source refuses part of the clients’ batches, their sinks roll back and retry, and the client channels grow — back-pressure moves upstream one hop at a time.';
+      if (dn && now > s.prev + 0.5) return 'HDFS is down: the sink delivers nothing, and every arriving event stays in the channel (p. 951, “Downstream Failure”).';
+      if (w && now > s.prev + 0.5) return 'The spike brings more events than the sink can drain: the channel absorbs the difference.';
+      if (now < s.prev - 0.5) return 'The flow is back to normal and the sink drains faster than events arrive: the backlog shrinks (p. 951, “Downstream Restored”).';
+      return 'Steady state: what comes in goes out, and the channel stays nearly empty.';
+    }
+
+    ui.onChange(function () {
+      var cap = C(), f = flow.value, full = function (x) { return x >= cap - 0.5 ? ' (full)' : ''; };
+      roT.set('t = ' + s.t + ' s of ' + TMAX + (s.t > 0 && win(s.t - 0.5) ? (down.value ? ' · HDFS down' : '') + (m0() > 1 ? ' · spike × ' + m0() : '') : ''));
+      if (f === 'one') roF.set('channel: ' + fmt(s.ch) + ' / ' + fmt(cap) + full(s.ch));
+      else if (f === 'two') roF.set('ch1: ' + fmt(s.ch1) + full(s.ch1) + ' · ch2: ' + fmt(s.ch2) + full(s.ch2) + ' (of ' + fmt(cap) + ')');
+      else roF.set('aggregator: ' + fmt(s.agg) + full(s.agg) + ' · each client: ' + fmt(s.cl[0]) + full(s.cl[0]) + ' (of ' + fmt(cap) + ')');
+      roD.set('to HDFS: ' + fmt(s.hdfs) + (f === 'two' ? ' · to the logger: ' + fmt(s.log) : ''));
+      roR.set(fmt(s.refused), s.refused > 0.5 ? 'bad' : 'good');
+      roL.set(fmt(s.lost), s.lost > 0.5 ? 'bad' : 'good');
+      roN.set(needText());
+      note.set(phaseText());
+      draw();
+      code.textContent = fileText();
+    });
+  });
+  </script>
+
+  <p>Page 986 sums Flume up: it "is suitable for large volume data collection, especially when data is being produced in multiple locations"; "Once planned and sized appropriately, Flume will practically run itself"; it gives a weak ordering guarantee, transactional exchange between agents, and "rich out-of-the box features such as contextual routing".</p>
+</section>
+
+
+<section id="l33-sqoop">
+  <h2>Sqoop: the nightly truck</h2>
+
+  <p>The other source of page 935 is a relational database. Sqoop (p. 988): "Importing from relational DB sources", "PULL-based (no streams)", "Bulk imports", "With one command line action, import data from RDBMS to HDFS/Hive", with connectors for MySQL, Oracle, SQL Server, PostgreSQL. Its use cases (p. 989): an "Occasional copy for running map-reduce tasks", and "Keep RDBMS for transactional needs and periodically dump data on HDFS" — transactions stay on the database, analysis moves to Hadoop. Flume is a pipe that never closes; Sqoop is a truck that drives when called.</p>
+
+<pre><code># p. 990: copy the table tradingDays of the MySQL database nseProd into HDFS, one mapper
+sqoop import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--table=tradingDays \
+--target-dir /mysql/nseProd \
+--m 1</code></pre>
+
+  <aside class="margin-note">The Sqoop user guide writes <span class="nw">-m 1</span> or <span class="nw">--num-mappers 1</span>; the slides write <span class="nw">--m 1</span>.</aside>
+
+  <p>Read it: the tool (<code>import</code>), the JDBC address of the database <code>nseProd</code> on a local MySQL, the credentials, the table, the HDFS directory to create, the number of mappers. Behind the command Sqoop runs a MapReduce job with map tasks only: each mapper reads its share of the table with its own <code>SELECT</code> and writes its own file (<code>part-m-00000</code>, …) into the target directory.</p>
+
+  <h3>How the rows are split</h3>
+
+  <p>The shares are ranges of a column, by default the primary key: Sqoop asks the database for its smallest and largest value and cuts that interval into as many ranges of equal width as there are mappers (Fig. 7). <code class="nw">--split-by</code> names another column — "explicitly specify the column to use for splitting rows between mappers" (p. 992) — when there is no primary key or it splits badly. Equal widths are not equal row counts: a key with big gaps leaves some mappers idle.</p>
+
+  <figure class="fig fig--plain" id="l33-fig-split">
+    <svg class="dia" viewBox="0 0 560 256" role="img" aria-label="A Sqoop import with four mappers: the minimum and maximum of the key, 1 and 4000, are cut into four ranges of a thousand ids; each range goes to one mapper, and each mapper writes one file into the target directory">
+      <rect x="60" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <rect x="170" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <rect x="280" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <rect x="390" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <line x1="115" y1="78" x2="115" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="225" y1="78" x2="225" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="335" y1="78" x2="335" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="445" y1="78" x2="445" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="70" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <rect x="180" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <rect x="290" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <rect x="400" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <line x1="115" y1="152" x2="115" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="225" y1="152" x2="225" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="335" y1="152" x2="335" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="445" y1="152" x2="445" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <path d="M95 170 H125 L135 180 V220 H95 Z" class="fi-paper"/>
+      <path d="M125 170 V180 H135 Z" class="fi-soft"/>
+      <path d="M205 170 H235 L245 180 V220 H205 Z" class="fi-paper"/>
+      <path d="M235 170 V180 H245 Z" class="fi-soft"/>
+      <path d="M315 170 H345 L355 180 V220 H315 Z" class="fi-paper"/>
+      <path d="M345 170 V180 H355 Z" class="fi-soft"/>
+      <path d="M425 170 H455 L465 180 V220 H425 Z" class="fi-paper"/>
+      <path d="M455 170 V180 H465 Z" class="fi-soft"/>
+      <text x="280" y="26" class="tx-mono tx-sm tx-mid">SELECT MIN(id), MAX(id) FROM tradingDays</text>
+      <text x="50" y="67" class="tx-mono tx-sm tx-end">id</text>
+      <text x="115" y="67" class="tx-mono tx-sm tx-mid">1–1000</text>
+      <text x="225" y="67" class="tx-mono tx-sm tx-mid">1001–2000</text>
+      <text x="335" y="67" class="tx-mono tx-sm tx-mid">2001–3000</text>
+      <text x="445" y="67" class="tx-mono tx-sm tx-mid">3001–4000</text>
+      <text x="115" y="140" class="tx-mono tx-sm tx-mid">mapper 0</text>
+      <text x="225" y="140" class="tx-mono tx-sm tx-mid">mapper 1</text>
+      <text x="335" y="140" class="tx-mono tx-sm tx-mid">mapper 2</text>
+      <text x="445" y="140" class="tx-mono tx-sm tx-mid">mapper 3</text>
+      <text x="280" y="246" class="tx-mono tx-sm tx-mid">part-m-00000 … part-m-00003</text>
+    </svg>
+    <figcaption><b>Fig. 7.</b> A Sqoop import with four mappers. Sqoop asks for the smallest and largest value of the split column — the primary key by default — cuts that interval into four ranges of equal width, and gives each range to one mapper, which runs its own <code>SELECT</code> and writes its own file. The key values are invented for the picture.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="991">
+    <p class="claim">"Sqoop uses the primary key to decide how many mappers to use, and for splitting the rows among mappers" · "--m 1 fixes 1 mapper / mandatory if the table you are importing doesn’t have a primary key, or if you are importing a query"</p>
+    <p class="fix">The number of mappers is set by <code class="nw">-m</code> (<code class="nw">--num-mappers</code>) and is four by default; the primary key only decides how the rows are split among them. One mapper is needed when the table has no primary key and no <code class="nw">--split-by</code> column is given. A query import can run in parallel too, with <code class="nw">--split-by</code>.</p>
+    <p class="because">The Sqoop user guide: "By default, four tasks are used"; without a primary key and without <code class="nw">--split-by</code> "import will fail unless the number of mappers is explicitly set to one"; a free-form query is either run in parallel, for which "You must also select a splitting column with --split-by", or "imported serially, by specifying a single map task with -m 1". The exam may print the slide's sentence: know what it says and what Sqoop does.</p>
+  </aside>
+
+  <p>Instead of a whole table, a query (p. 993): "Instead of full table", "<code>$CONDITIONS</code> mandatory". The slide prints only the option; the complete command needs a target directory and either one mapper or a split column:</p>
+
+<pre><code># p. 993, completed: three columns of the 2016 rows, four mappers split on month
+sqoop import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--query 'select year, month, day from tradingDays where year=2016 and $CONDITIONS' \
+--split-by month \
+--target-dir /mysql/tradingDays2016 \
+-m 4</code></pre>
+
+  <p>Sqoop replaces the token <code>$CONDITIONS</code> in each mapper's copy of the query with that mapper's range of <code>month</code>. It is not a shell variable: the single quotes keep the shell away from it.</p>
+
+  <h3>Into Hive, and only what is new</h3>
+
+  <p>Two more options turn the import into a Hive table (p. 994). The target directory is new: like every MapReduce job, Sqoop refuses to write into an output directory that already exists, and <code>/mysql/nseProd</code> was taken by the first import.</p>
+
+<pre><code># p. 994: the same table, registered in Hive as tradingDays
+sqoop import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--table=tradingDays \
+--hive-import \
+--hive-table=tradingDays \
+--target-dir /mysql/table/tradingDays2 \
+--m 1</code></pre>
+
+  <aside class="redpen" data-page="994">
+    <p class="claim">"Sqoop will create an external table and point the table to the directory in HDFS"</p>
+    <p class="fix">By default <code class="nw">--hive-import</code> creates an ordinary (managed) Hive table and moves the imported files into Hive's warehouse directory; nothing stays in the target directory, and dropping the table deletes the data.</p>
+    <p class="because">The Sqoop user guide: "Sqoop will generate a Hive script containing a CREATE TABLE operation defining your columns using Hive's types, and a LOAD DATA INPATH statement to move the data files into Hive's warehouse directory." The files end up under the warehouse directory of p. 909 (<a href="l32.html">lesson 32</a>), like those of any table Hive manages; an external table would leave them where they are. The exam is matched against the slides and may quote this sentence: know what it says and what Sqoop does.</p>
+  </aside>
+
+  <p>Re-importing a whole table every night copies the same rows again and again. Page 995: "Import only the new data" — "Save an import configuration as a JOB and call it later on repetitively". The incremental options pick rows by a <mark class="key">check column</mark>, "Ideally a timestamp of last update of the row": "LastValue saves the max value of the column at every import", and a "Further import will get data &gt; LastValue" (p. 998). Mode <code>lastmodified</code> (p. 997) is for rows that get updated; the user guide's other mode, <code>append</code>, for tables that only grow with an increasing id. The saved job keeps the last value, so each <code>sqoop job --exec myjob</code> (p. 999) continues where the previous run stopped. The corrected job below carries one line the slide lacks, the flag <code class="nw">--append</code> — not to be confused with the mode <code>append</code>: every run writes into the same <code>/mysql/nseProd</code>, and without it Sqoop refuses to import into a directory that already exists (red pen below).</p>
+
+<pre><code># p. 997, corrected: save an incremental import as the job myjob
+sqoop job \
+--create myjob \
+-- import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--table=tradingDays \
+--target-dir /mysql/nseProd \
+--append \
+--m 1 \
+--incremental lastmodified \
+--check-column ts</code></pre>
+
+<pre><code># p. 999: run it now, and every night after
+sqoop job --exec myjob</code></pre>
+
+  <aside class="redpen" data-page="997">
+    <p class="claim">"--import \" … "--target-dir /mysql/nseProd \" / "--m 1" / "--incremental lastmodified" / "—check-column ts"</p>
+    <p class="fix">The tool to save comes after a bare <code class="nw">--</code> and a space: <code class="nw">-- import \</code>. Every line but the last needs its <code>\</code>, so <code class="nw">--m 1 \</code> and <code class="nw">--incremental lastmodified \</code>, and the last option is <code class="nw">--check-column ts</code> with two hyphens. Page 996 has the same <code class="nw">--import</code>. And a job meant to be called "repetitively" (p. 995) needs <code class="nw">--append</code>: <code>/mysql/nseProd</code> already exists — the import of p. 990 created it, and every run after the first finds it again.</p>
+    <p class="because">The Sqoop user guide gives the syntax <code>sqoop job (generic-args) (job-args) [-- [subtool-name] (subtool-args)]</code> and the example <code>sqoop job --create myjob -- import --connect …</code>. As printed, the shell would end the command after <code class="nw">--m 1</code>. On the directory, the same guide: "If the destination directory already exists in HDFS, Sqoop will refuse to import and overwrite that directory's contents. If you use the --append argument, Sqoop will import data to a temporary directory and then rename the files into the normal target directory". The exam is matched against the slides: recognise the printed form, write the corrected one.</p>
+  </aside>
+
+  <p>Two blind spots come with incremental imports. An updated row arrives in HDFS a second time, in a new file next to its old copy; Sqoop's merge tool, with <code class="nw">--merge-key</code>, folds the copies into one (Sqoop user guide). And a deleted row is never noticed: nothing changes in its check column.</p>
+
+  <figure class="tbl-fig" id="l33-tbl-vs">
+    <figcaption>Flume and Sqoop, the two answers to the question of p. 935.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Flume</th><th>Sqoop</th></tr></thead>
+        <tbody>
+          <tr><td>reads from</td><td>applications: logs, events, clicks, sensors, social streams</td><td>relational databases, through JDBC connectors</td></tr>
+          <tr><td>control</td><td>push: sources receive and push into channels (sinks poll)</td><td>pull: "PULL-based (no streams)"</td></tr>
+          <tr><td>timing</td><td>continuous, agents run all the time</td><td>occasional or periodic, when the command or job runs</td></tr>
+          <tr><td>unit</td><td>the event: headers + body, in transactional batches</td><td>rows of a table or of a query, in bulk</td></tr>
+          <tr><td>parallelism</td><td>more agents, tiers, several channels and sinks</td><td><code class="nw">-m</code> mappers on ranges of the split column</td></tr>
+          <tr><td>writes to</td><td>HDFS (bucketed by header or time), HBase, logger, …</td><td>HDFS files or a Hive table</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Back to the hook. The 460 million lines of that hour wait in the channels of a converging flow, the biggest ones in the tier next to HDFS: 128,000 events a second for 3,600 seconds (p. 963), about 230 GB — 115 GB for each of its two agents, on file channels over several disks, where the memory channel of p. 975 holds a thousand events. Counting what flows past is Storm's job, with fields grouping on the word; the product table that sits still in the shop's database comes by truck: Sqoop, once a night, <code class="nw">--incremental lastmodified</code>.</p>
+</section>
+
+
+<section id="l33-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Storm, Flume and Sqoop are not among the practical topics of the rules, and no past paper has an exercise on them: they belong to the theory part. Below are theory questions in the forms the readme of the past papers names — multiple choice, true or false, open answers; wrong answers may carry a penalty, announced just before the exam — a computation with a rule the slides give, and one exercise in writing a configuration and a command.</p>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-grouping">
+    <div class="exam-q" lang="en">
+      <p>A Storm topology counts the occurrences of each word in a stream of sentences. A bolt splits the sentences and emits one tuple per word to a counting bolt with several tasks, each keeping a counter per word. Which stream grouping lets the counting tasks share the work while the count of each word stays exact in a single task?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Shuffle grouping <span class="fb">It shares the work, but the tuples of one word reach random tasks: each task holds a partial count, and no task holds the total.</span></li>
+      <li>All grouping <span class="fb">Every task receives every tuple and counts everything: the counts are exact but computed in every task, so no work is shared.</span></li>
+      <li data-correct>Fields grouping on the field "word" <span class="fb">The task is chosen by hashing the word ("consistent hashing on a subset of tuple fields", p. 933): the same word always reaches the same task, and different words spread over the tasks.</span></li>
+      <li>Global grouping <span class="fb">All tuples go to the task with the lowest id: the counts are exact, but one task does all the work.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Fields grouping on "word". The tuple is routed by a hash of the chosen field, so all tuples with the same word reach the same task, which therefore holds the exact count for that word, while different words are spread over the tasks. Shuffle grouping would split each word's count over several tasks; all grouping would make every task count everything; global grouping would send everything to one task.</p></div>
+      <div class="exam-note"><p>The point of the question is the link between grouping and state: a bolt that keeps state per key needs the tuples of that key in one place. Each wrong option is right about something else — shuffle for stateless bolts, all for broadcasts, global for one final total — which is what makes them tempting.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-storm">
+    <div class="exam-q" lang="en">
+      <p>Describe the main concepts of Apache Storm — stream, spout, bolt, topology — and the components of a Storm cluster. In what does a Storm topology differ from a MapReduce job?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Storm is a distributed system for realtime computation, developed at BackType, which Twitter acquired. A stream is an unbounded sequence of tuples, a tuple being a named list of values. A spout is a source of streams: it reads data from an external source and emits tuples. A bolt processes one or more input streams and produces new streams; it can implement filters, aggregations, joins or any function. A topology is a network of spouts and bolts — a directed graph — and every component runs as many tasks across the cluster; a stream grouping (shuffle, fields, all, global) decides which task receives each tuple. The cluster has a master node, Nimbus, similar to Hadoop's JobTracker, which distributes the code, assigns tasks to machines and monitors failures; a ZooKeeper cluster used for coordination, which keeps the cluster state; and Supervisors on the worker machines, which run the worker processes. A MapReduce job reads a bounded input and finishes; a topology processes an unbounded stream with low latency and runs until it is killed.</p></div>
+      <div class="exam-note"><p>A complete answer has four definitions, three components and the one difference "finishes / never finishes". If there is room, add why ZooKeeper sits between Nimbus and the Supervisors: they keep no state of their own, so either can be restarted, and the topologies keep running while Nimbus is down (Storm tutorial).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-tx">
+    <div class="exam-q" lang="en">
+      <p>Explain how Apache Flume moves events from a source to a sink within an agent, and from one agent to the next, without losing them. What does this mechanism not guarantee?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>A Flume agent hosts a source, a channel and a sink. The source accepts incoming data, turns it into events (headers with metadata, used for routing, and a body with the content) and writes them into the channel inside a transaction, which commits only when the channel has accepted the whole batch. The sink polls the channel and removes a batch inside its own transaction, and commits only after a successful transfer — when the destination, such as HDFS, has written it, or when the source of the next agent has committed it into its own channel. On any failure the transaction rolls back and the events stay in the channel to be retried. An event therefore leaves a channel only when the next hop holds it, and no event is lost in transit between agents. Not guaranteed: durability with a memory channel, which is not persistent — its events are lost if the agent process dies, so only a file (disk) channel survives a restart; exactly-once delivery, since a batch retried after a failed commit can arrive twice; and strict ordering, since Flume gives only a weak ordering guarantee: events arrive in the order received in the absence of failures.</p></div>
+      <div class="exam-note"><p>The slides print "This ensures no data loss" (p. 949): repeat it, then add its conditions — the red pen of this lesson. The question asks for both halves: the mechanism first, then the three limits.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-order">
+    <div class="exam-q" lang="en">
+      <p>True or false: Apache Flume guarantees that events always reach the destination in the order in which the source received them.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Only "in the absence of failures": page 986 calls it a "weak ordering guarantee". If an agent dies and its web servers fail over to the second agent (p. 955), the events held in the first agent's file channel arrive after newer ones.</span></li>
+      <li data-correct>False <span class="fb">Page 986: "Flume provides weak ordering guarantee, i.e., in the absence of failures the data will arrive in the order it was received". "Always" is what makes the statement false.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. Flume provides only a weak ordering guarantee: in the absence of failures, events arrive in the order in which they were received. After a failure — for example an agent that dies and whose producers fail over to another agent — events can arrive out of order.</p></div>
+      <div class="exam-note"><p>Look for the absolute word: the slide's guarantee holds only without failures. Page 951's "flow ordering*" carries the same restriction in its asterisk.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="3.6" data-tol="0.05" data-unit="million events" id="l33-exam-capacity">
+    <div class="exam-q" lang="en">
+      <p>Consider the farmers' market system of the Exam of 12 Sep 2025: farmers sell their products at local markets, and every sale is sent as an event to a tier of Flume agents that writes into HDFS. In the worst case the tier ingests 1,500 events per second, and HDFS may be unavailable for up to 40 minutes. Following the rule of thumb of the slides, what channel capacity does the tier need, in millions of events?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Channel capacity = worst-case ingest rate × worst-case downstream outage = 1,500 events/s × 2,400 s = 3,600,000 events, i.e. 3.6 million events, spread over the agents of the tier. At this size a file channel is needed, on several disks, with more disk space than the raw data.</p></div>
+      <div class="exam-note"><p>The rule of p. 963, as worded on the summary of p. 964; the scenario is the paper's, the question is ours. The usual slip is to leave the minutes unconverted: 1,500 × 40 = 60,000 events cover only 40 seconds of outage.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about Apache Flume and Apache Sqoop are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>In a Flume agent, a source may write to several channels, while a sink reads from exactly one channel. <span class="fb">True: "Source – Channel: many-to-many", "Channel– Sink: one-to-many (sink reads only from one channel)" (p. 966).</span></li>
+      <li>The Flume channel pushes events to the sink as soon as they arrive. <span class="fb">False: "Source pushes events", "Sink polls for events" (p. 946); the channel is passive.</span></li>
+      <li>With a memory channel, the events waiting in the channel survive a crash of the agent process. <span class="fb">False: the memory channel is "Not persistent" (p. 968); only the file (disk) channel keeps events across a restart.</span></li>
+      <li data-correct>The multiplexing channel selector routes each event to channels according to the value of one of its headers. <span class="fb">True: "routes events to channels based on their headers" (p. 981), e.g. header show = 1 to ch1 (p. 982).</span></li>
+      <li data-correct>Sqoop is pull-based: it reads the relational database in bulk when the import runs. <span class="fb">True: "PULL-based (no streams)", "Bulk imports" (p. 988).</span></li>
+      <li>Sqoop streams every new row of a table into HDFS as soon as the row is inserted. <span class="fb">False: there are "no streams" (p. 988); an incremental job fetches the new rows only when it is executed.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: the first, the fourth and the fifth. The sink polls the channel; a memory channel is not persistent; Sqoop imports in bulk when it is run, not as a stream.</p></div>
+      <div class="exam-note"><p>Each false statement swaps one word of a slide: push for poll, survives for "Not persistent", streams for "no streams". With a possible penalty, tick only what a slide sentence supports.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-hospital">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise in writing a configuration and a command.</b> Consider the ER model of the hospital heating management system of the Exam of 30 Jan 2026: a Hospital (Hospital_ID, Name) has Buildings (Building_ID, Name, Year), Departments (Department_ID, Specialty, N_Beds, Head_Physician_ID) and Heating Systems (Heater_Sys_ID, Heating_Power), which heat Floors. Every heating system posts a reading each minute as a JSON event over HTTP, with a header <code>building</code> that holds its Building_ID. The Department table, whose primary key is the integer Department_ID, lives in the hospital's MySQL database <code>hospitaldb</code>.</p>
+      <p>(a) Write the properties file of a Flume agent <code>heatagent</code> that receives the readings on port 8989 and writes them as plain text files into HDFS under <code>/hospital/readings</code>, one folder per building, without losing the readings held by the agent if its process restarts. (b) Write the Sqoop command that copies the Department table into the HDFS directory <code>/hospital/departments</code> with two mappers.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>heatagent.sources = http-source
+heatagent.sinks = hdfs-sink
+heatagent.channels = ch
+
+heatagent.sources.http-source.channels = ch
+heatagent.sinks.hdfs-sink.channel = ch
+
+heatagent.sources.http-source.type = org.apache.flume.source.http.HTTPSource
+heatagent.sources.http-source.bind = 0.0.0.0
+heatagent.sources.http-source.port = 8989
+
+heatagent.sinks.hdfs-sink.type = hdfs
+heatagent.sinks.hdfs-sink.hdfs.path = /hospital/readings/%{building}
+heatagent.sinks.hdfs-sink.hdfs.filePrefix = readings
+heatagent.sinks.hdfs-sink.hdfs.fileSuffix = .log
+heatagent.sinks.hdfs-sink.hdfs.inUsePrefix = _
+heatagent.sinks.hdfs-sink.hdfs.fileType = DataStream
+
+heatagent.channels.ch.type = file</code></pre>
+<pre><code>sqoop import \
+--connect jdbc:mysql://localhost:3306/hospitaldb \
+--username=admin \
+--password=password \
+--table=Department \
+--target-dir /hospital/departments \
+-m 2</code></pre>
+        <p>(a) The agent is started with <code>flume-ng agent --conf-file heatagent.properties --name heatagent</code>. <code>%{building}</code> puts each reading in the folder of its header value; <code>DataStream</code> writes plain text; the file channel keeps the waiting readings on disk across a restart, which a memory channel would not. (b) The two mappers split the rows by ranges of the primary key Department_ID, so no <code class="nw">--split-by</code> is needed; each writes one file into the new directory.</p>
+      </div>
+      <div class="exam-note"><p>The exercise is ours, in the setting of a past paper; no paper so far asks for Flume or Sqoop code. It tests three ideas: the wiring keys (<code>channels</code> on the source, <code>channel</code> on the sink), header bucketing in the HDFS path, and the file channel as the answer to "without losing". <code>bind = 0.0.0.0</code> accepts posts from other machines; the slide's <code>localhost</code> accepts only local ones.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l33-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A count bolt with 3 tasks receives words by shuffle grouping. After a while, what does task 0 hold for the word "fresh"?</p>
+    <ul class="options">
+      <li>The exact number of times "fresh" appeared in the stream <span class="fb">Only fields (or global) grouping would bring every "fresh" to one task; here tasks 1 and 2 got some of them.</span></li>
+      <li>Nothing, since shuffle grouping sends everything to the task with the lowest id <span class="fb">That is global grouping.</span></li>
+      <li data-correct>A part of the count; the rest is spread over tasks 1 and 2 <span class="fb">Shuffle picks a random task for each tuple, so every task holds a partial count — the widget showed 6 + 1 + 1.</span></li>
+      <li>Three times the true count, one copy per task <span class="fb">Copies to every task are all grouping, and even then each task holds the true count once, not three times.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">You raise a word count from 1 to 4 tasks per bolt and keep its groupings: shuffle into the split bolt, fields on "word" into the count bolt. Which statements hold? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>The split bolt still works: splitting a sentence needs no memory of other sentences <span class="fb">A stateless bolt can take any tuple on any task — that is why shuffle grouping is fine there.</span></li>
+      <li>The counts are now spread over 4 tasks, so a final sum over the tasks is needed <span class="fb">Not with fields grouping: each word is counted in one task only.</span></li>
+      <li>Global grouping on the count bolt would have done just as well <span class="fb">The counts would be exact, but one task would do all the work and the other three would idle.</span></li>
+      <li data-correct>Each word is still counted by exactly one count task <span class="fb">Fields grouping hashes the word, so the same word always reaches the same task, whatever the number of tasks.</span></li>
+    </ul>
+    <p class="q-fb">Grouping follows state: stateless steps take shuffle, per-key state takes fields.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In a converging Flume flow of three tiers, HDFS goes down and stays down. In which order do the channels fill?</p>
+    <ul class="options">
+      <li>Tier 1 first, since it is the closest to the web servers <span class="fb">Tier 1 can keep sending as long as tier 2 accepts; it fills last.</span></li>
+      <li>All tiers at the same time, since every tier carries the same volume <span class="fb">Same throughput in steady state (p. 959) is not the same fill: only the tier that cannot deliver fills.</span></li>
+      <li>None of them: the sinks keep their events until HDFS is back <span class="fb">Sinks hold nothing: a failed sink transaction rolls back, and the events stay in the channel.</span></li>
+      <li data-correct>Tier 3 first, then tier 2, then tier 1: back-pressure moves upstream one hop at a time <span class="fb">The tier next to HDFS stops draining and fills; then its source refuses tier 2's batches, and so on — the widget's converging flow.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An agent with a memory channel holds 800 events when its process is killed. After the restart…</p>
+    <ul class="options">
+      <li data-correct>the 800 events are gone <span class="fb">The memory channel is "Not persistent" (p. 968); the source had committed them, so the producers think they were delivered.</span></li>
+      <li>the sink delivers them, since its transaction had not committed <span class="fb">The rollback protects against a failed delivery while the agent lives; the memory itself is gone.</span></li>
+      <li>the source asks the web servers to send them again <span class="fb">The source had already committed them into the channel; nothing remembers them.</span></li>
+      <li>nothing is lost, because every channel writes to disk <span class="fb">Only the file channel — the slides' "Disk" — does.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An agent has the two channels of p. 980 and the multiplexing selector of p. 982. An event arrives with the header show = 2. Where does it end up?</p>
+    <ul class="options">
+      <li>In ch1 and ch2: every event goes everywhere <span class="fb">That is the replicating selector, the default when no selector is configured.</span></li>
+      <li data-correct>Only in ch2, so it is printed by the logger sink and never reaches HDFS <span class="fb">"If show = 2, route ch2" (p. 982), and ch2 is drained by log-sink (p. 980).</span></li>
+      <li>In ch1, because the selector reads the body of the event <span class="fb">The selector reads a header, here show; the body is never looked at.</span></li>
+      <li>Wherever the HDFS sink decides <span class="fb">The selector belongs to the source; each sink just drains its one channel.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">You run <code>sqoop import</code> with <code class="nw">-m 4</code> on a table that has no primary key, and no <code class="nw">--split-by</code>. What happens?</p>
+    <ul class="options">
+      <li>Sqoop splits on the first column of the table <span class="fb">Sqoop does not guess a split column.</span></li>
+      <li>Four mappers each read the whole table <span class="fb">That would copy every row four times; Sqoop refuses instead.</span></li>
+      <li>It works, because the primary key only decides the number of mappers <span class="fb">The other way round: <code class="nw">-m</code> sets the number, the key the split — the red pen of p. 991.</span></li>
+      <li data-correct>The import fails: give a split column with <code class="nw">--split-by</code>, or run one mapper with <code class="nw">-m 1</code> <span class="fb">Without a column to cut into ranges there is no way to share the rows among four mappers.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these situations call for Sqoop rather than Flume? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>The data is a customers table in a MySQL database <span class="fb">Relational tables are Sqoop's input, through a JDBC connector.</span></li>
+      <li>Web servers write log lines all day long <span class="fb">A never-ending stream of events: Flume.</span></li>
+      <li data-correct>A copy once a night is enough, and only the rows changed since yesterday are needed <span class="fb">A saved job with <code class="nw">--incremental lastmodified</code> and a check column.</span></li>
+      <li>Events must land in different HDFS folders according to one of their headers <span class="fb">Bucketing with <code>%{header}</code> in the path of Flume's HDFS sink.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l33-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Batch tools read inputs that have ended; a stream is an unbounded sequence of tuples, queried continuously over windows. Storm computes on streams with topologies — graphs of spouts (sources of streams) and bolts (processing) that run until killed — on a cluster where Nimbus assigns, the Supervisors run and ZooKeeper coordinates.</li>
+    <li>Every component runs as many tasks; the stream grouping of each edge decides which task gets a tuple: shuffle (random), fields (same values, same task — needed for per-key state such as a word count), all (a copy to every task), global (the task with the lowest id). Storm's "no data loss" is at-least-once.</li>
+    <li>A Flume agent is source → channel → sink: the source accepts data and pushes events (headers + body) into the channel, which stores them in the order received; the sink polls, removes and delivers. A source may feed many channels; a sink reads one.</li>
+    <li>Transactions on both sides of the channel, with the sink committing only after delivery, prevent loss in transit — with a durable (file) channel, at-least-once, and with weak ordering. A memory channel is fast but loses its events in a crash.</li>
+    <li>Converging flows are sized with three rules: 4 to 16 client agents per aggregator; exit batch size = tier exit volume / agents in the tier; channel capacity = worst ingest rate × worst outage. A properties file declares names, wires sources to channels and sinks to one channel each, and sets types: HDFS sink with path, prefixes and file type, bucketing by header or time, replicating or multiplexing selectors, interceptors.</li>
+    <li>Sqoop pulls tables or query results in bulk through JDBC, as a map-only MapReduce job: <code class="nw">-m</code> mappers on ranges of the primary key or <code class="nw">--split-by</code>; <code>$CONDITIONS</code> in a <code class="nw">--query</code>; <code class="nw">--hive-import</code> into a managed Hive table; saved incremental jobs with a check column and a last value.</li>
+  </ul>
+  <aside class="cheat" id="l33-cheat">
+    <dl>
+      <dt>Stream (p. 927)</dt><dd>unbounded sequence of tuples; a tuple is a named list of values</dd>
+      <dt>Spout · bolt (pp. 928–929)</dt><dd>source of streams · processes input streams and produces new streams (filters, aggregation, join)</dd>
+      <dt>Topology (p. 930)</dt><dd>network of spouts and bolts; runs until killed; components execute as many tasks (p. 931)</dd>
+      <dt>Storm cluster (p. 925)</dt><dd>Nimbus: master node, similar to the JobTracker · ZooKeeper: cluster coordination, holds the state · Supervisors: run worker processes</dd>
+      <dt>Stream grouping (p. 933)</dt><dd>shuffle: random task · fields: hash of fields, same values → same task · all: every task · global: lowest task id</dd>
+      <dt>Storm guarantee</dt><dd>"no data loss" = at-least-once: tuples replayed, duplicates possible</dd>
+      <dt>Flume</dt><dd>"a continuous data ingestion system" (p. 939), born for log aggregation at Cloudera</dd>
+      <dt>Agent (p. 948)</dt><dd>source (accepts, writes to channel) → channel (stores in order received) → sink (removes, sends downstream)</dd>
+      <dt>Event (p. 947)</dt><dd>header: metadata, used for routing · body: actual content</dd>
+      <dt>Push · poll (p. 946)</dt><dd>source pushes events · sink polls for events</dd>
+      <dt>Cardinalities (p. 966)</dt><dd>source–channel many-to-many · channel–sink one-to-many: a sink reads one channel</dd>
+      <dt>Channels (p. 968)</dt><dd>memory: in-memory queue, fast, not persistent, limited capacity · Disk = file channel (<code>type = file</code>): durable</dd>
+      <dt>Ordering (p. 986)</dt><dd>weak: in the order received, in the absence of failures</dd>
+      <dt>Tiers (p. 961)</dt><dd>one aggregating agent per 4 to 16 client agents</dd>
+      <dt>Exit batch size (p. 962)</dt><dd>\(B_t = V / N_t\): tier exit volume / agents in the tier</dd>
+      <dt>Channel capacity (p. 963)</dt><dd>\(C = r_{\text{in}}^{\max} \times T_{\text{out}}^{\max}\): worst ingest rate × worst outage</dd>
+      <dt>Start an agent (p. 970)</dt><dd><code>flume-ng agent --conf-file spool-to-logger.properties --name agent1</code></dd>
+      <dt>Wiring (p. 971)</dt><dd><code>agent1.sources.source1.channels = channel1</code> (plural) · <code>agent1.sinks.sink1.channel = channel1</code> (singular)</dd>
+      <dt>HDFS sink (pp. 972–974)</dt><dd><code>type = hdfs</code>, <code>hdfs.path</code>, <code>hdfs.filePrefix</code>, <code>hdfs.fileSuffix</code>, <code>hdfs.inUsePrefix = _</code>, <code>hdfs.fileType = DataStream</code>; rolls "every 30 seconds" (p. 973) or earlier, at the first of <code>rollInterval</code>, <code>rollSize</code>, <code>rollCount</code> to fire</dd>
+      <dt>Bucketing (pp. 977–978)</dt><dd><code>hdfs.path = /tmp/flume/http/%{topic}</code> · <code>…/%Y/%m/%d/%H</code> with <code>hdfs.useLocalTimeStamp = true</code></dd>
+      <dt>Selectors (pp. 981–982)</dt><dd>replicating: default, every event to every channel · <code>selector.type = multiplexing</code>, <code>selector.header = show</code>, <code>selector.mapping.1 = ch1</code></dd>
+      <dt>Interceptor (pp. 984–985)</dt><dd><code>sources.source1.interceptors = regexInterceptor</code>, then <code>….regexInterceptor.type = regex_filter</code>, <code>regex = .*election.*</code>, <code>excludeEvents = false</code></dd>
+      <dt>Sqoop (p. 988)</dt><dd>import from relational DBs; pull-based, no streams; bulk; one command</dd>
+      <dt>Import (p. 990)</dt><dd><code>sqoop import --connect jdbc:mysql://localhost:3306/nseProd --username=qt --password=password --table=tradingDays --target-dir /mysql/nseProd --m 1</code></dd>
+      <dt>Mappers and split</dt><dd><code class="nw">-m</code> mappers (default 4); ranges of the primary key or of <code class="nw">--split-by col</code>; <code class="nw">-m 1</code> when there is no key and no split column</dd>
+      <dt>Query import (p. 993)</dt><dd><code>--query '… where … and $CONDITIONS'</code> with <code class="nw">--target-dir</code>, and <code class="nw">--split-by</code> or <code class="nw">-m 1</code></dd>
+      <dt>Hive (p. 994)</dt><dd><code>--hive-import --hive-table=tradingDays</code>: a managed table, files moved into the warehouse</dd>
+      <dt>Incremental job (pp. 995–999)</dt><dd><code>sqoop job --create myjob -- import … --append --incremental lastmodified --check-column ts</code> · <code>sqoop job --exec myjob</code>; next run gets data &gt; LastValue; <code class="nw">--append</code> lets each run write into the existing target directory</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l33-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="http://nathanmarz.com/blog/history-of-apache-storm-and-lessons-learned.html" target="_blank" rel="noopener">History of Apache Storm and lessons learned</a>
+      <span class="res-by">Nathan Marz, creator of Storm</span>
+      <p class="res-why">How Storm was built at BackType, bought with it by Twitter, and released in 2011 — the story behind the first line of p. 924, told by Storm's creator, whom the deck thanks on p. 1000.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://storm.apache.org/releases/current/Tutorial.html" target="_blank" rel="noopener">Storm Tutorial</a>
+      <span class="res-by">Apache Storm documentation</span>
+      <p class="res-why">Nimbus, Supervisors and ZooKeeper, streams, spouts and bolts, and the word-count topology with its shuffle and fields groupings: pp. 925–933 in prose, with the code of section 2.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://flume.apache.org/FlumeUserGuide.html" target="_blank" rel="noopener">Flume User Guide</a>
+      <span class="res-by">Apache Flume project</span>
+      <p class="res-why">The source of the Flume slides: the agent and multi-agent figures, the catalogues of sources, channels and sinks with every property, selectors and interceptors. Keep it open next to section 5 and the widget's generated file.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://sqoop.apache.org/docs/1.4.7/SqoopUserGuide.html" target="_blank" rel="noopener">Sqoop User Guide (v1.4.7)</a>
+      <span class="res-by">Apache Sqoop project</span>
+      <p class="res-why">Controlling parallelism, free-form query imports with <code>$CONDITIONS</code>, Hive imports, incremental imports and saved jobs — the sentences the red pens of section 6 quote. Sqoop has since retired to the Apache Attic; the ideas live on in Spark's JDBC reader.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.oreilly.com/radar/the-world-beyond-batch-streaming-101/" target="_blank" rel="noopener">Streaming 101: The world beyond batch</a>
+      <span class="res-by">Tyler Akidau, O'Reilly Radar</span>
+      <p class="res-why">Bounded against unbounded data, event time against processing time, and fixed, sliding and session windows, with figures: the frame of the course notes' chapter on streaming, taken further.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Flume and Sqoop bring in data you own: your servers' logs, your database's tables. Much of the data worth having lives on other people's websites. How do you get that?</p>
+</aside>
+
+</main>
+</body>
+</html>

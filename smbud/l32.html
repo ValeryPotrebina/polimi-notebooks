@@ -1,0 +1,1380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Hadoop ecosystem: HBase, Pig, Hive, Impala · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the toy relations under the jobs widget (rows of tuples that wrap on a phone) and the clickable boxes of its plan; no component covers them; tokens only */
+.l32-rel { padding: 0.7rem 1rem 0.9rem; display: grid; gap: 0.45rem; font-family: var(--f-display); font-size: var(--t-sm); color: var(--ink); }
+.l32-rel-h, .l32-rel-m { margin: 0; font-size: var(--t-xs); line-height: 1.45; }
+.l32-rel-h { font-weight: 650; color: var(--ink-2); }
+.l32-rel-m { color: var(--ink); }
+.l32-tuples { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.l32-tuple { font-family: var(--f-mono); font-size: var(--t-xs); line-height: 1.35; padding: 0.06rem 0.35rem; color: var(--ink); background: color-mix(in srgb, var(--s1) 10%, var(--paper)); border: 1px solid color-mix(in srgb, var(--s1) 50%, var(--paper)); border-radius: var(--radius); overflow-wrap: anywhere; }
+.l32-hit { cursor: pointer; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l32">
+
+<header class="lesson-head">
+  <h1>The Hadoop ecosystem: HBase, Pig, Hive, Impala</h1>
+  <p class="lede">After this lesson you will address an HBase cell and say why its empty cells cost nothing, count the MapReduce jobs a Pig script or a Hive query becomes, explain how Hive skips the partitions a query does not need, and say what Impala gains — and gives up — by not using MapReduce at all.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>Page 900 asks a question every website asks itself: "find the top 5 most visited pages by users aged 18-25". Page 901 answers it in Java for MapReduce — three columns of code too small to read. Page 902 answers it in nine lines of Pig. The nine lines still run on MapReduce: Pig writes the jobs for you.</p>
+  <p>Then the deck turns to SQL. Hive asks the question in SQL and also runs MapReduce underneath. Impala asks it in the same SQL without MapReduce, and its slide promises: "Always faster then Hive at least 10 times" (p. 921). Hive is still on that slide, doing things Impala cannot. Why would anyone keep an engine that is ten times slower?</p>
+  <p>The answer is not about speed, and it comes in the last section. On the way you meet a table where an empty cell costs nothing, a script that becomes exactly three jobs, and a query that skips almost the whole table without opening it.</p>
+</div>
+
+
+<section id="l32-hbase">
+  <h2>HBase: a sorted map that looks like a table</h2>
+
+  <p>In <a href="l31.html">lesson 31</a> HDFS stored huge files that MapReduce reads whole, in batch. The deck that follows stacks four projects on it, one per complaint. Page 891 names three — "Pig – High-level language for data analysis", "HBase – Table storage for semi-structured data", "Hive – SQL-like Query language and Metastore" — and Impala comes later (Table 1).</p>
+
+  <figure class="tbl-fig" id="l32-tbl-map">
+    <figcaption>Table 1. The four projects of this lesson and the complaint each one answers.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Project</th><th>What it is</th><th>You want…</th><th>What runs</th></tr></thead>
+        <tbody>
+          <tr><td>HBase</td><td>table storage on HDFS (pp. 893–897)</td><td>one row, now, by its key</td><td>its own servers; no MapReduce</td></tr>
+          <tr><td>Pig</td><td>a data-flow language (pp. 899–904)</td><td>no hand-written Java</td><td>the MapReduce jobs it generates</td></tr>
+          <tr><td>Hive</td><td>SQL-like HiveQL and a Metastore (pp. 906–913)</td><td>SQL over your files</td><td>the MapReduce jobs it generates</td></tr>
+          <tr><td>Impala</td><td>an MPP SQL engine (pp. 915–922)</td><td>SQL answers while you wait</td><td>its own daemons, straight on HDFS</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Start with HBase. Page 893 describes it in five lines: "Modeled on Google's Bigtable", "Key-valued row/column store", "Billions of rows/millions on columns", "Column-oriented - nulls are free", "Untyped - stores byte[]". The example of the next slide explains each line.</p>
+
+  <h3>A zoo in one row</h3>
+
+  <p>A zoo keeps one row per enclosure (p. 894). The row key is <code>enclosure1</code>. Its columns are grouped into two <mark class="key">column families</mark>: <code>animal:</code>, with the columns <code>animal:type</code> and <code>animal:size</code>, and <code>repairs:</code>, with <code>repairs:cost</code>. At time t1 the enclosure held a big lion; at time t2 a zebra moved in. The slide draws one row with two timestamp lines — t1: lion, big; t2: zebra — plus a repair cost of 1000 EUR (see the red pen below).</p>
+
+  <aside class="margin-note">The slides draw the zoo; the rules behind it — rows sorted by key, families declared with the table, the newest version answering a read — come from the Bigtable paper and the HBase reference guide (background).</aside>
+
+  <div class="def">
+    <p><dfn>Row key</dfn> — the key of a row, <code>enclosure1</code>. Rows are kept sorted by it.</p>
+    <p><dfn>Column family</dfn> — a group of columns declared in the table's schema, normally when the table is created (<code>animal:</code>, <code>repairs:</code>), and stored apart from the other families.</p>
+    <p><dfn>Column</dfn> — written <code>family:qualifier</code>, as <code>animal:type</code>. The qualifier is never declared: any row can start using a new one at any time.</p>
+    <p><dfn>Timestamp</dfn> — when a cell was written. A cell keeps several versions, one per timestamp, and a plain read returns the newest.</p>
+    <p><dfn>Cell</dfn> — one value, addressed by row key, column and timestamp. The value is a <code>byte[]</code>: HBase has no types.</p>
+  </div>
+
+  <div class="formula" id="l32-f-cell">
+    \[ (\text{row}, \text{column}, \text{timestamp}) \mapsto \text{value} \]
+    <dl class="legend">
+      <dt>row</dt><dd>the row key, <code>enclosure1</code></dd>
+      <dt>column</dt><dd>family:qualifier, <code>animal:type</code></dd>
+      <dt>timestamp</dt><dd>t1, t2, … — one per version of the cell</dd>
+      <dt>value</dt><dd>uninterpreted bytes, <code>byte[]</code></dd>
+    </dl>
+  </div>
+
+  <p>That is the whole data model: a map from cell addresses to bytes — in the Bigtable paper's words, "a sparse, distributed, persistent multidimensional sorted map" (background). The table of p. 894 is one way of drawing it.</p>
+
+  <h3>What is written to disk</h3>
+
+  <p>Page 895 shows the other way. Each column family is stored separately, as a list of entries, and each entry is a key <code>(row, timestamp, column)</code> with its value. Family <code>animal:</code> holds three entries — <code>(enclosure1, t2, animal:type)</code> zebra, <code>(enclosure1, t1, animal:size)</code> big, <code>(enclosure1, t1, animal:type)</code> lion. Family <code>repairs:</code> holds one, <code>(enclosure1, t1, repairs:cost)</code> 1000 EUR. Four entries in all.</p>
+
+  <p>The empty cells of the table have no entry. Nothing marks them and nothing reserves room for them: a missing entry simply is the null. That is "nulls are free". Space grows with the cells you write, not with rows times columns — why a store like this suits "semi-structured data" (p. 891), where every row fills a different handful of columns out of thousands. A relational table keeps a slot, or at least a NULL marker, for every declared column in every row (Fig. 1).</p>
+
+  <p class="memo"><mark class="key">HBase stores one entry per written cell, (row, timestamp, column) → value, family by family; an empty cell is not stored at all.</mark></p>
+
+  <figure class="fig fig--pair fig--plain" id="l32-fig-nulls">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="A relational table zoo with the columns key, type, size and cost and three rows: enclosure1 zebra, big, 1000 EUR; enclosure2 giraffe, NULL, NULL; enclosure3 NULL, NULL, 250 EUR. Nine slots, four of them NULL.">
+        <rect x="8" y="20" width="92" height="24" class="fw-s3 st-s3"/>
+        <rect x="100" y="20" width="64" height="24" class="fw-s3 st-s3"/>
+        <rect x="164" y="20" width="56" height="24" class="fw-s3 st-s3"/>
+        <rect x="220" y="20" width="72" height="24" class="fw-s3 st-s3"/>
+        <text x="54" y="37" class="tx-mono tx-sm tx-mid">key</text>
+        <text x="132" y="37" class="tx-mono tx-sm tx-mid">type</text>
+        <text x="192" y="37" class="tx-mono tx-sm tx-mid">size</text>
+        <text x="256" y="37" class="tx-mono tx-sm tx-mid">cost</text>
+
+        <rect x="8" y="44" width="92" height="26" class="fi-paper"/>
+        <rect x="100" y="44" width="64" height="26" class="fi-paper"/>
+        <rect x="164" y="44" width="56" height="26" class="fi-paper"/>
+        <rect x="220" y="44" width="72" height="26" class="fi-paper"/>
+        <text x="14" y="62" class="tx-mono tx-sm">enclosure1</text>
+        <text x="132" y="62" class="tx-mono tx-sm tx-mid">zebra</text>
+        <text x="192" y="62" class="tx-mono tx-sm tx-mid">big</text>
+        <text x="256" y="62" class="tx-mono tx-sm tx-mid">1000 EUR</text>
+
+        <rect x="8" y="70" width="92" height="26" class="fi-paper"/>
+        <rect x="100" y="70" width="64" height="26" class="fi-paper"/>
+        <rect x="164" y="70" width="56" height="26" class="fw-ink"/>
+        <rect x="220" y="70" width="72" height="26" class="fw-ink"/>
+        <text x="14" y="88" class="tx-mono tx-sm">enclosure2</text>
+        <text x="132" y="88" class="tx-mono tx-sm tx-mid">giraffe</text>
+        <text x="192" y="88" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+        <text x="256" y="88" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+
+        <rect x="8" y="96" width="92" height="26" class="fi-paper"/>
+        <rect x="100" y="96" width="64" height="26" class="fw-ink"/>
+        <rect x="164" y="96" width="56" height="26" class="fw-ink"/>
+        <rect x="220" y="96" width="72" height="26" class="fi-paper"/>
+        <text x="14" y="114" class="tx-mono tx-sm">enclosure3</text>
+        <text x="132" y="114" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+        <text x="192" y="114" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+        <text x="256" y="114" class="tx-mono tx-sm tx-mid">250 EUR</text>
+
+        <text x="8" y="150" class="tx-sm">3 rows × 3 declared columns = 9 slots,</text>
+        <text x="8" y="168" class="tx-sm">4 of them hold NULL</text>
+        <text x="8" y="216" class="tx-hand">a slot for every column</text>
+      </svg>
+      <p class="fig-label">Before: a relational table</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="The same zoo in HBase: family animal holds four entries, (enclosure1, t1, animal:size) big, (enclosure1, t2, animal:type) zebra, (enclosure1, t1, animal:type) lion, (enclosure2, t3, animal:type) giraffe; family repairs holds two, (enclosure1, t1, repairs:cost) 1000 EUR and (enclosure3, t4, repairs:cost) 250 EUR. Empty cells have no entry.">
+        <text x="8" y="14" class="tx-sm tx-bold">family animal:</text>
+        <rect x="8" y="22" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="22" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="37" class="tx-mono tx-sm">(enclosure1, t1, animal:size)</text>
+        <text x="255" y="37" class="tx-mono tx-sm tx-mid">big</text>
+        <rect x="8" y="48" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="48" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="63" class="tx-mono tx-sm">(enclosure1, t2, animal:type)</text>
+        <text x="255" y="63" class="tx-mono tx-sm tx-mid">zebra</text>
+        <rect x="8" y="74" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="74" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="89" class="tx-mono tx-sm">(enclosure1, t1, animal:type)</text>
+        <text x="255" y="89" class="tx-mono tx-sm tx-mid">lion</text>
+        <rect x="8" y="100" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="100" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="115" class="tx-mono tx-sm">(enclosure2, t3, animal:type)</text>
+        <text x="255" y="115" class="tx-mono tx-sm tx-mid">giraffe</text>
+
+        <text x="8" y="146" class="tx-sm tx-bold">family repairs:</text>
+        <rect x="8" y="154" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="154" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="169" class="tx-mono tx-sm">(enclosure1, t1, repairs:cost)</text>
+        <text x="255" y="169" class="tx-mono tx-sm tx-mid">1000 EUR</text>
+        <rect x="8" y="180" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="180" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="195" class="tx-mono tx-sm">(enclosure3, t4, repairs:cost)</text>
+        <text x="255" y="195" class="tx-mono tx-sm tx-mid">250 EUR</text>
+
+        <text x="8" y="236" class="tx-hand">empty cells: nothing</text>
+      </svg>
+      <p class="fig-label">After: HBase, one entry per written cell</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> The same zoo twice. Before: a relational table keeps a slot in every row for every declared column, and 4 of its 9 slots hold NULL. After: HBase keeps one entry per written cell, family by family — the four entries of p. 895, a giraffe written into enclosure2 at t3 and a repair of enclosure3 at t4 — and an empty cell is simply absent. The lion is still there too, as an older version of <code>animal:type</code>.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="894">
+    <p class="claim">enclosure1 · t2 · zebra · (empty) · 1000 EUR (the t2 line of the table "HBase - Data Model")</p>
+    <p class="fix">The cost was written once, so it has one timestamp — and the two slides give it two. Page 895 stores it as "(enclosure1, t1, repairs:cost) 1000 EUR". Following p. 895, as this lesson and its widget do, the cost belongs on the t1 line of the table, next to lion and big.</p>
+    <p class="because">The two slides are two views of the same four entries, so a version cannot carry t2 in one and t1 in the other: one of the two timestamps is a slip. The code of p. 896 never writes <code>repairs:cost</code>, so it cannot settle which. The exam may be matched against either printed picture: read 1000 EUR as one version of <code>repairs:cost</code>, written once, whichever line it is drawn on.</p>
+  </aside>
+
+  <h3>Writing and reading by key</h3>
+
+  <p>The code of p. 896 writes exactly this data, with the HBase API of the time:</p>
+
+<pre><code>// p. 896: lion and big at t1, then zebra at t2
+HTable table = …
+Text row = new Text("enclosure1");
+Text col1 = new Text("animal:type");
+Text col2 = new Text("animal:size");
+BatchUpdate update = new BatchUpdate(row);
+update.put(col1, "lion".getBytes("UTF-8"));
+update.put(col2, "big".getBytes("UTF-8"));
+table.commit(update);
+
+update = new BatchUpdate(row);
+update.put(col1, "zebra".getBytes("UTF-8"));
+table.commit(update);</code></pre>
+
+  <aside class="margin-note">On the slide the second put misses a closing quote: "big".getBytes("UTF-8)). A typo; the block here closes it.</aside>
+
+  <p>Read it aloud. A <code>BatchUpdate</code> collects the writes for one row; <code>commit</code> sends them together, so lion and big share a timestamp, t1. The second <code>BatchUpdate</code> writes only <code>animal:type</code>, at t2. Nothing is written to <code>animal:size</code> at t2: p. 894 leaves that cell empty, p. 895 has no entry for it, and a read of <code>animal:size</code> still returns big, its newest version. Every value goes in as bytes — <code>"lion".getBytes("UTF-8")</code> is "Untyped - stores byte[]" in code.</p>
+
+  <p>Page 897 lists the reads. There are three, and only three:</p>
+
+<pre><code>// p. 897: a cell (newest version: zebra), a row, a scan
+Cell = table.getRow("enclosure1")
+            .getColumn("animal:type").getValue();
+RowResult = table.getRow( "enclosure1" );
+Scanner s = table.getScanner( new String[] { "animal:type" } );</code></pre>
+
+  <p>"Retrieve a cell", "Retrieve a row", "Scan through a range of rows": by key, by key, by a range of keys. Rows are kept sorted, so a range is one contiguous read. Nothing else: no SQL, no join, no secondary index — a condition on a value can only be checked while scanning (background, HBase guide). To find "all enclosures of the savannah", put the area into the row key so they sort together — the reasoning of Cassandra's partition key (<a href="l21.html">lesson 21</a>).</p>
+
+  <p>The slide's classes date from 2008; today they are <code>Put</code>, <code>Get</code> and <code>Scan</code> (background). Answer the exam with the slide's names. In today's HBase shell the zoo takes six lines:</p>
+
+<pre><code># HBase shell today (background): the zoo of pp. 894–897
+create 'zoo', {NAME =&gt; 'animal', VERSIONS =&gt; 3}, 'repairs'
+put 'zoo', 'enclosure1', 'animal:type', 'lion'
+put 'zoo', 'enclosure1', 'animal:size', 'big'
+put 'zoo', 'enclosure1', 'animal:type', 'zebra'
+get 'zoo', 'enclosure1', {COLUMN =&gt; 'animal:type', VERSIONS =&gt; 2}
+scan 'zoo', {COLUMNS =&gt; 'animal:type'}</code></pre>
+
+  <p>The <code>get</code> returns zebra, then lion. A family keeps only as many versions as it was created with — one by default since HBase 0.96 (background); the slide's example keeps two.</p>
+
+  <div class="pitfall">
+    <p>"Column-oriented, so HBase is the store for averaging one column over a billion rows." No. On p. 893 "Column-oriented" means that column families are stored apart; inside a family the columns of a row sit together under its key, row by row. A column store in the sense of <a href="l20.html#l20-colstore">lesson 20</a> keeps the values of each column together, in a piece of their own, as the Parquet files of section 5 do. Keep the slide's label and give its meaning: a sparse column-family store, built for access by key.</p>
+  </div>
+
+  <p>If the zoo reminds you of Cassandra (<a href="l20.html">lesson 20</a>), it should: both copy Bigtable's data model. Underneath, HBase keeps its files in HDFS and gives each range of rows to exactly one server, under a master, while Cassandra has no master (<a href="l22.html#l22-hbase">lesson 22</a> draws both). In the Hadoop stack HBase is the "online data access" of p. 835: random reads and writes by key, next to engines that read whole files.</p>
+
+  <p>Now write some cells yourself: every put adds exactly one entry to one family's list, and a get returns the newest version while the older ones stay stored.</p>
+
+  <div class="widget" id="l32-w-sparse">
+    <h3 class="widget-title">Sparse table, free nulls</h3>
+    <p class="widget-intro">Above, the logical view of the table <code>zoo</code>: three row keys, two column families, five qualifiers. A filled cell shows its newest value, with one dot under it per stored version; a dotted cell is empty, and a greyed row key has no cell at all — for HBase that row does not exist yet. Below, the physical view: what HBase stores, one list per column family, in HBase's order (row key, column, newest version first; p. 895 lists the same entries in another order). Choose a row key, a column and a value, then put, get or scan. It starts from the four entries of p. 895.</p>
+    <ol class="tasks">
+      <li>Before touching anything: the drawing has 3 rows and 5 columns, and each family could take a million more qualifiers. How many entries are stored? Predict, then read the lower half and the readout.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Four — the entries of p. 895. Twelve of the fifteen drawn cells are empty and have no entry; enclosure2 and enclosure3 have no cell at all, so they do not exist as rows yet. A million more empty qualifiers would cost exactly the same: nothing.</p></details>
+      </li>
+      <li>Keep <code>enclosure1</code> and <code>animal:type</code> and press <em>get the cell</em>. Which value comes back, and is lion still stored?
+        <details class="answer"><summary>What you should see</summary>
+          <p>zebra, written at t2: the newest version. lion stays in the list as <code>(enclosure1, t1, animal:type)</code>, tagged older. A put adds a version; it does not overwrite. That is how p. 894 can show lion and zebra in the same row.</p></details>
+      </li>
+      <li>Choose <code>enclosure2</code>, <code>animal:diet</code> — a qualifier nobody has used — and hay, then predict: how many entries will a put add, to which list, and do enclosure1 and enclosure3 change? Press <em>put</em>.
+        <details class="answer"><summary>What you should see</summary>
+          <p>One entry, <code>(enclosure2, t3, animal:diet)</code> hay, in the list of <code>animal:</code>. Nothing else changes: no table change, no NULL in the other rows, and enclosure2 now exists. Only the families are fixed in advance; qualifiers are free.</p></details>
+      </li>
+      <li>Put giraffe into <code>enclosure3</code>, <code>animal:type</code>. Now predict what <em>scan the column</em> returns for <code>animal:type</code>, and in which order. Then try putting Rossi into <code>animal:size</code>: does HBase object?
+        <details class="answer"><summary>What you should see</summary>
+          <p>enclosure1 zebra, then enclosure3 giraffe, in row-key order; enclosure2 has no <code>animal:type</code> and is skipped. That is p. 897's <code>getScanner</code> on <code>animal:type</code>. And HBase accepts Rossi as a size without a word: it stores bytes and checks no type.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-sparse', function (root, ui) {
+    var ROWS = ['enclosure1', 'enclosure2', 'enclosure3'];
+    var COLS = ['animal:type', 'animal:size', 'animal:diet', 'repairs:cost', 'repairs:by'];
+    var QUAL = ['type', 'size', 'diet', 'cost', 'by'];
+    var FAMS = [{ name: 'animal:', cols: [0, 1, 2] }, { name: 'repairs:', cols: [3, 4] }];
+    var VALUES = ['giraffe', 'lion', 'small', 'hay', '250 EUR', 'Rossi'];
+    var MAXE = 10, entries, clock, last;
+
+    function reset() {
+      entries = [
+        { r: 0, c: 0, t: 1, v: 'lion' }, { r: 0, c: 1, t: 1, v: 'big' },
+        { r: 0, c: 3, t: 1, v: '1000 EUR' }, { r: 0, c: 0, t: 2, v: 'zebra' }
+      ];
+      clock = 2;
+      last = { op: 'start' };
+    }
+    reset();
+
+    var rowSel = ui.select('row key', ROWS.map(function (r, i) { return { value: String(i), label: r }; }), null, '0');
+    var colSel = ui.select('column (family:qualifier)', COLS.map(function (c, i) { return { value: String(i), label: c }; }), null, '0');
+    var valSel = ui.select('value that put writes', VALUES.map(function (v) { return { value: v, label: v }; }), null, 'giraffe');
+    ui.button('put', function () {
+      if (entries.length >= MAXE) { last = { op: 'full' }; return; }
+      clock += 1;
+      var e = { r: +rowSel.value, c: +colSel.value, t: clock, v: valSel.value };
+      entries.push(e);
+      last = { op: 'put', e: e };
+    }, { kind: 'primary' });
+    ui.button('get the cell', function () { last = { op: 'get', r: +rowSel.value, c: +colSel.value }; });
+    ui.button('scan the column', function () { last = { op: 'scan', c: +colSel.value }; });
+    ui.button('back to the slide', function () { reset(); }, { kind: 'ghost', icon: 'refresh' });
+
+    var roStored = ui.readout('entries stored');
+    var roEmpty = ui.readout('empty cells in the drawing');
+    var roLast = ui.readout('last operation');
+    ui.note('Beyond the five columns drawn, each family could take a million more qualifiers (an illustration of "millions on columns", p. 893): none is stored until a cell is written. HBase checks no value — "Untyped - stores byte[]" — so any value goes into any column.');
+    ui.legend([
+      { label: 'a written cell', color: 's1', mark: 'square' },
+      { label: 'column family; key of a stored entry', color: 's3', mark: 'area' },
+      { label: 'touched by the last operation', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 470, { label: 'Above, the logical view of the table zoo: three row keys, the column families animal and repairs with five qualifiers, written cells filled with their newest value and empty cells dotted. Below, the physical view: per column family, the list of stored entries, each a key (row, timestamp, column) and a value.' });
+
+    function famOf(c) { return c < 3 ? 0 : 1; }
+    function key(e) { return e.r + ',' + e.c + ',' + e.t; }
+    function versions(r, c) {
+      return entries.filter(function (e) { return e.r === r && e.c === c; }).sort(function (a, b) { return b.t - a.t; });
+    }
+    function sortedFam(f) {
+      return entries.filter(function (e) { return famOf(e.c) === f; }).sort(function (a, b) {
+        if (a.r !== b.r) return a.r - b.r;
+        if (a.c !== b.c) return COLS[a.c] < COLS[b.c] ? -1 : 1;
+        return b.t - a.t;
+      });
+    }
+    function cellName(r, c) { return ROWS[r] + ', ' + COLS[c]; }
+    function entryTxt(e) { return '(' + ROWS[e.r] + ', t' + e.t + ', ' + COLS[e.c] + ')'; }
+    function touched() {
+      var T = { cells: {}, tags: {} };
+      if (last.op === 'put') { T.cells[last.e.r + ',' + last.e.c] = true; T.tags[key(last.e)] = 'new'; }
+      if (last.op === 'get') {
+        T.cells[last.r + ',' + last.c] = true;
+        versions(last.r, last.c).forEach(function (e, i) { T.tags[key(e)] = i === 0 ? 'newest' : 'older'; });
+      }
+      if (last.op === 'scan') {
+        ROWS.forEach(function (rk, r) {
+          var vs = versions(r, last.c);
+          if (vs.length) { T.cells[r + ',' + last.c] = true; T.tags[key(vs[0])] = 'returned'; }
+        });
+      }
+      return T;
+    }
+    function describe() {
+      if (last.op === 'start') return 'the four entries of p. 895: lion and big at t1, zebra at t2, 1000 EUR at t1';
+      if (last.op === 'full') return 'the widget keeps at most ' + MAXE + ' entries: press "back to the slide"';
+      if (last.op === 'put') return 'put ' + cellName(last.e.r, last.e.c) + ' = "' + last.e.v + '" → one new entry ' + entryTxt(last.e) + ' in family ' + FAMS[famOf(last.e.c)].name;
+      if (last.op === 'get') {
+        var vs = versions(last.r, last.c);
+        if (!vs.length) return 'get ' + cellName(last.r, last.c) + ' → nothing: there is no entry, the cell is empty';
+        var s = 'get ' + cellName(last.r, last.c) + ' → "' + vs[0].v + '" (t' + vs[0].t + '), the newest version';
+        if (vs.length > 1) s += '; still stored: ' + vs.slice(1).map(function (e) { return '"' + e.v + '" (t' + e.t + ')'; }).join(', ');
+        return s;
+      }
+      if (last.op === 'scan') {
+        var hits = [], miss = [];
+        ROWS.forEach(function (rk, r) {
+          var vs = versions(r, last.c);
+          if (vs.length) hits.push(rk + ' → "' + vs[0].v + '"'); else miss.push(rk);
+        });
+        return 'scan ' + COLS[last.c] + ' → ' + (hits.length ? hits.join('; ') : 'no row has this column') + (miss.length ? ' (skipped, no cell: ' + miss.join(', ') + ')' : '');
+      }
+      return '';
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    var X0 = 124, CWS = [88, 76, 76, 104, 86], CX = [], RY = 86, RH = 42;
+    CWS.reduce(function (x, w) { CX.push(x); return x + w; }, X0);
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var tt = touched(), used = {};
+      entries.forEach(function (e) { used[e.c] = true; });
+      T(12, 20, 'logical view: the table zoo', 'tx-sm tx-bold');
+      FAMS.forEach(function (f) {
+        var x1 = CX[f.cols[0]], w = f.cols.reduce(function (s, c) { return s + CWS[c]; }, 0);
+        S('rect', { x: x1 + 3, y: 30, width: w - 6, height: 24, 'class': 'fw-s3 st-s3' });
+        T(x1 + w / 2, 47, f.name, 'tx-mono tx-sm tx-mid');
+      });
+      QUAL.forEach(function (q, c) { T(CX[c] + CWS[c] / 2, 74, q, 'tx-mono tx-sm tx-mid' + (used[c] ? '' : ' tx-muted')); });
+      ROWS.forEach(function (rk, r) {
+        var y = RY + r * RH, exists = entries.some(function (e) { return e.r === r; });
+        T(12, y + 20, rk, 'tx-mono tx-sm' + (exists ? '' : ' tx-muted'));
+        COLS.forEach(function (cn, c) {
+          var x = CX[c] + 3, w = CWS[c] - 6, vs = versions(r, c);
+          if (tt.cells[r + ',' + c]) S('rect', { x: x - 2, y: y - 2, width: w + 4, height: 34, 'class': 'hl' });
+          if (vs.length) {
+            S('rect', { x: x, y: y, width: w, height: 30, 'class': 'fw-s1 st-s1' });
+            T(x + w / 2, y + 20, vs[0].v, 'tx-sm tx-mid');
+            for (var k = 0; k < Math.min(vs.length, 6); k++) S('circle', { cx: x + 6 + k * 8, cy: y + 36, r: 2.5, 'class': 'fi-s1 st-none' });
+          } else {
+            S('rect', { x: x, y: y, width: w, height: 30, 'class': 'st-muted dots' });
+          }
+        });
+      });
+      T(12, RY + 3 * RH + 16, '+ a million more qualifiers per family, all empty', 'tx-sm tx-muted');
+      var y = RY + 3 * RH + 54;
+      T(12, y, 'physical view: what HBase stores, one list per family', 'tx-sm tx-bold');
+      y += 12;
+      [0, 1].forEach(function (f) {
+        var list = sortedFam(f);
+        T(12, y + 18, 'family ' + FAMS[f].name, 'tx-mono tx-sm');
+        y += 28;
+        list.forEach(function (e) {
+          var tag = tt.tags[key(e)];
+          if (tag && tag !== 'older') S('rect', { x: 9, y: y - 3, width: 466, height: 30, 'class': 'hl' });
+          S('rect', { x: 12, y: y, width: 330, height: 24, 'class': 'fw-s3 st-s3' });
+          S('rect', { x: 342, y: y, width: 130, height: 24, 'class': 'fi-paper' });
+          T(20, y + 17, entryTxt(e), 'tx-mono tx-sm');
+          T(407, y + 17, e.v, 'tx-mono tx-sm tx-mid');
+          if (tag) T(482, y + 17, tag, 'tx-sm' + (tag === 'older' ? ' tx-muted' : ''));
+          y += 30;
+        });
+        if (!list.length) { T(20, y + 16, '(no entries)', 'tx-sm tx-muted'); y += 30; }
+        y += 8;
+      });
+      svg.setAttribute('viewBox', '0 0 560 ' + Math.ceil(y + 4));
+    }
+
+    ui.onChange(function () {
+      var na = entries.filter(function (e) { return famOf(e.c) === 0; }).length, written = {};
+      entries.forEach(function (e) { written[e.r + ',' + e.c] = true; });
+      roStored.set(entries.length + ' (animal: ' + na + ', repairs: ' + (entries.length - na) + ')');
+      roEmpty.set((15 - Object.keys(written).length) + ' of 15 — stored for them: 0 bytes');
+      roLast.set(describe());
+      draw();
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l32-pig">
+  <h2>Pig: nine lines, three MapReduce jobs</h2>
+
+  <p>Page 899 introduces Pig: "Started at Yahoo! Research"; it "Expresses sequences of MapReduce jobs"; its "Data model: nested "bags" of items"; it "Provides relational (SQL) operators (JOIN, GROUP BY, etc.)"; and it is "Easy to plug in Java functions". The language is Pig Latin; Pig compiles a script into MapReduce jobs and runs them in order.</p>
+
+  <p>The question of p. 900: user data (name, age) in one file, website data (user, url) in another; find the top 5 most visited pages by users aged 18–25. The slide draws its plan as eight boxes: load users, filter by age, load pages, join on name, group on url, count clicks, order by clicks, take top 5.</p>
+
+  <aside class="margin-note">The Java of p. 901 keeps the top 100, not 5: its last job is named "Top 100 sites". A slip inherited from the original example; nothing else depends on it.</aside>
+
+  <p>Page 901 builds that plan in Java, every box by hand. To join, each mapper tags its records with the file they came from ("1" for pages, "2" for users), and a reducer splits them by the tag and forms every pair. To count, a mapper emits a 1 per visit and a reducer adds them up. To sort by clicks, a mapper swaps each pair so that the count becomes the key the framework sorts on. To keep the top, a single reducer stops after N records. Five jobs are chained by hand; each but the last writes its output to a temporary HDFS directory for the next one.</p>
+
+  <p>Page 902 says the same in nine lines of Pig Latin:</p>
+
+<pre><code>-- p. 902: top 5 pages of users aged 18-25
+Users = load 'users' as (name, age);
+Filtered = filter Users by age &gt;= 18 and age &lt;= 25;
+Pages = load 'pages' as (user, url);
+Joined = join Filtered by name, Pages by user;
+Grouped = group Joined by url;
+Summed = foreach Grouped generate group, COUNT(Joined) as clicks;
+Sorted = order Summed by clicks desc;
+Top5 = limit Sorted 5;
+store Top5 into 'top5sites';</code></pre>
+
+  <aside class="margin-note">The slide writes count(Joined). Pig's function names are case-sensitive and the built-in is COUNT (background: the Pig Latin reference), so the script here writes it in capitals.</aside>
+
+  <p>Read it line by line. Each line but the last names a new <mark class="key">relation</mark> — a bag of tuples — built from earlier ones: <code>load</code> reads a file with a declared schema, <code>filter</code> keeps the users aged 18 to 25, <code>join</code> pairs each kept user with every visit whose <code>user</code> equals their <code>name</code>. Then the line that shows Pig's data model: <code>group Joined by url</code> counts nothing. It produces one tuple per url, <code>(group, Joined)</code>, whose second field is the bag of all joined tuples with that url — the "nested bag" of p. 899. <code>foreach … generate</code> outputs, per group, the url and <code>COUNT(Joined)</code>, the size of its bag: the clicks. Nothing runs until the <code>store</code> (background): Pig plans the whole flow at once.</p>
+
+  <p>In SQL the same question is a single statement (section 4 writes it in HiveQL); Pig spreads it over one step per line. "Easy to plug in Java functions" means user-defined functions, Java classes called by name inside <code>foreach</code> or <code>filter</code> (background).</p>
+
+  <h3>Ease of translation: where the jobs come from</h3>
+
+  <p>Page 903 lays the script next to the plan: each box is one statement, in order. Page 904, the final build of the same slide, frames the boxes into three MapReduce jobs: Job 1 holds load users, filter by age, load pages and join on name; Job 2 holds group on url and count clicks; Job 3 holds order by clicks and take top 5. Why these three?</p>
+
+  <ol class="steps" id="l32-steps-jobs">
+    <li><p>A MapReduce job has at most one shuffle: map, then shuffle and sort, then reduce (<a href="l30.html">lesson 30</a>). Data is regrouped by a new key across the network once per job — or never, in a map-only job.</p></li>
+    <li><p>A join on name needs every kept user and every visit with the same name on one machine: a shuffle keyed by name. The two loads and the filter look at one tuple at a time, so they run in the map phase before it. Join on the reduce side: that is Job 1.</p></li>
+    <li><p>Grouping by url needs all joined tuples with the same url together: a shuffle keyed by url. It is a different key, so it needs a second job. Its map side reads Job 1's output from HDFS; counting each bag is its reduce side: Job 2.</p></li>
+    <li><p>Ordering by clicks needs the counts sorted across all urls: a shuffle keyed by clicks, a third job. Its reduce side reads them in order and keeps the first 5: Job 3.</p></li>
+    <li><p>So the number of jobs is the number of operators that need a shuffle — JOIN, GROUP, ORDER: three. Every other statement rides along in a map or a reduce phase of one of them.</p></li>
+  </ol>
+
+  <p class="memo"><mark class="key">Pig cuts a script into one MapReduce job per operator that needs a shuffle — JOIN, GROUP, ORDER — and folds every other statement into those jobs.</mark></p>
+
+  <aside class="margin-note">Real Pig adds one small job before the ORDER: it samples the counts to pick the key ranges of a global sort (background: the Pig Latin paper). The exam follows the slide's three.</aside>
+
+  <p>The Java of p. 901 used five jobs: its author wrote the two loads as separate map-only jobs. Pig needs three and writes fewer temporary files, but every job it keeps still costs a start-up and an output written to HDFS for the next job. Pig saves mostly your time, not the cluster's.</p>
+
+  <p>The widget runs the script on a toy dataset, one box at a time, and shows the jobs cut exactly at the shuffles. Its engine menu also runs the question in HiveQL and in Impala — come back to it after sections 4 and 5.</p>
+
+  <div class="widget" id="l32-w-jobs">
+    <h3 class="widget-title">Nine lines, three jobs</h3>
+    <p class="widget-intro">The plan of p. 900, framed into the jobs of p. 904. Step through it with <em>Next</em>, or click a box: the readouts show the statement, where it runs and what the shuffle moves; under the drawing, the tuples after that step, computed on a toy dataset of 8 users and 16 visits. Blue arrows carry data across the network; a dashed arrow means "written to HDFS, read by the next job". The Hive and Impala plans are our simplified sketches; only the Pig frames are printed on the slide.</p>
+    <ol class="tasks">
+      <li>Step to <em>Join on name</em>. Before you look at the panel: which tuples does the shuffle move, and do the users outside 18–25 travel?
+        <details class="answer"><summary>What you should see</summary>
+          <p>21 tuples keyed by name: the 5 users aged 18–25 and all 16 visits. bob (34), eli (17) and gus (41) were dropped by the filter on the map side and never travel; their 4 visits do travel, and find no partner in the join. The result, Joined, has 12 tuples.</p></details>
+      </li>
+      <li>Step to <em>Group on url</em> and predict the shape of one tuple of Grouped. Then step to <em>Count clicks</em>: where does the number 3 for news come from?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Each tuple is a url and a bag: <code>(news, {(ann, 19, ann, news), (cai, 22, cai, news), (dev, 25, dev, news)})</code> — a nested bag. <code>COUNT(Joined)</code> counts that bag: 3. GROUP collects, the foreach counts.</p></details>
+      </li>
+      <li>Switch on <em>stop after the count</em>. Predict the number of jobs before you read it.
+        <details class="answer"><summary>What you should see</summary>
+          <p>2. Without ORDER there is no third shuffle, so no third job: the counts are stored at the end of Job 2. LIMIT alone would not need a job of its own either — in the slide's plan it runs on the reduce side of the ORDER.</p></details>
+      </li>
+      <li>After reading the Hive and Impala sections, switch the engine. Predict for each: how many MapReduce jobs, and what is written to HDFS between the steps?
+        <details class="answer"><summary>What you should see</summary>
+          <p>HiveQL: three jobs again — the same three shuffles, generated from SQL — and the outputs of jobs 1 and 2 go through HDFS. Impala: no job at all; the same three moves of data become exchanges that stream rows in memory, and nothing is written until the result. The toy results are identical: the engines differ in how they run the plan, not in what they compute.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-jobs', function (root, ui) {
+    var USERS = [['ann', 19], ['bob', 34], ['cai', 22], ['dev', 25], ['eli', 17], ['fay', 18], ['gus', 41], ['hal', 23]];
+    var PAGES = [['ann', 'news'], ['ann', 'maps'], ['bob', 'news'], ['cai', 'news'], ['cai', 'mail'], ['cai', 'game'], ['dev', 'maps'], ['dev', 'news'],
+                 ['eli', 'game'], ['fay', 'mail'], ['fay', 'shop'], ['gus', 'shop'], ['hal', 'game'], ['hal', 'shop'], ['hal', 'wiki'], ['bob', 'wiki']];
+    var FILTERED = USERS.filter(function (u) { return u[1] >= 18 && u[1] <= 25; });
+    var JOINED = [];
+    FILTERED.forEach(function (u) { PAGES.forEach(function (p) { if (p[0] === u[0]) JOINED.push([u[0], u[1], p[0], p[1]]); }); });
+    var G = {};
+    JOINED.forEach(function (t) { (G[t[3]] = G[t[3]] || []).push(t); });
+    var GROUPED = Object.keys(G).sort().map(function (k) { return [k, G[k]]; });
+    var SUMMED = GROUPED.map(function (g) { return [g[0], g[1].length]; });
+    var SORTED = SUMMED.slice().sort(function (a, b) { return b[1] - a[1] || (a[0] < b[0] ? -1 : 1); });
+    var TOP5 = SORTED.slice(0, 5);
+    var DATA = [USERS, FILTERED, PAGES, JOINED, GROUPED, SUMMED, SORTED, TOP5];
+    var NAMES = ['Users', 'Filtered', 'Pages', 'Joined', 'Grouped', 'Summed', 'Sorted', 'Top5'];
+
+    var STEPS = [
+      { box: 'Load Users', pig: "Users = load 'users' as (name, age);", sql: 'FROM users u', job: 1 },
+      { box: 'Filter by age', pig: 'Filtered = filter Users by age >= 18 and age <= 25;', sql: 'WHERE u.age >= 18 AND u.age <= 25', job: 1 },
+      { box: 'Load Pages', pig: "Pages = load 'pages' as (user, url);", sql: 'JOIN pages p', job: 1 },
+      { box: 'Join on name', pig: 'Joined = join Filtered by name, Pages by user;', sql: 'ON (u.name = p.username)', job: 1 },
+      { box: 'Group on url', pig: 'Grouped = group Joined by url;', sql: 'GROUP BY p.url', job: 2 },
+      { box: 'Count clicks', pig: 'Summed = foreach Grouped generate group, COUNT(Joined) as clicks;', sql: 'SELECT p.url, COUNT(*) AS clicks', job: 2 },
+      { box: 'Order by clicks', pig: 'Sorted = order Summed by clicks desc;', sql: 'ORDER BY clicks DESC', job: 3 },
+      { box: 'Take top 5', pig: 'Top5 = limit Sorted 5;', sql: 'LIMIT 5', job: 3 },
+      { box: 'store', pig: "store Top5 into 'top5sites';", sql: '(the rows go back to the client)', job: 3 }
+    ];
+    var BOX = [[40, 40], [40, 100], [370, 40], [205, 160], [205, 250], [205, 306], [205, 396], [205, 452]], BW = 150, BH = 32;
+
+    var eng = ui.select('engine', [
+      { value: 'pig', label: 'Pig Latin (pp. 902–904)' },
+      { value: 'hive', label: 'HiveQL, the same question' },
+      { value: 'impala', label: 'Impala, the same SQL' }
+    ], null, 'pig');
+    var drop = ui.toggle('stop after the count (no ORDER, no LIMIT)', false);
+    var step = ui.stepper({ steps: 9 });
+    var roCode = ui.readout('statement');
+    var roWhere = ui.readout('where it runs');
+    var roJobs = ui.readout('MapReduce jobs');
+    var roDisk = ui.readout('written to HDFS on the way');
+    ui.legend([
+      { label: 'data crossing the network (shuffle or exchange)', color: 's1', mark: 'line' },
+      { label: 'stored in HDFS in between', color: 's1', mark: 'dash' },
+      { label: 'the step shown', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 520, { label: 'The plan of p. 900 as eight boxes: load users, filter by age and load pages feed a join on name, then group on url, count clicks, order by clicks and take top 5, and the result is stored. Frames mark the three MapReduce jobs of p. 904, or for Impala one plan without jobs; blue arrows mark data that crosses the network.' });
+    var panel = Course.el('div', { 'class': 'l32-rel' });
+    ui.stage.appendChild(panel);
+
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function tup(a) { return '(' + a.join(', ') + ')'; }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function line(pts, cls, mk) {
+      var a = { points: pts.map(function (p) { return p[0] + ',' + p[1]; }).join(' '), 'class': cls };
+      if (mk) a['marker-end'] = 'url(#' + mk + ')';
+      return S('polyline', a);
+    }
+
+    function whereTxt(i, e, dropped) {
+      var mr = e !== 'impala';
+      if (dropped && (i === 6 || i === 7)) return 'removed: without ORDER there is no third shuffle, so no third job';
+      if (mr) {
+        return [
+          'job 1, map side: one tuple at a time, no shuffle needed',
+          'job 1, map side: the filter drops users as they are read',
+          'job 1, map side: each visit is tagged and keyed by its user',
+          'job 1: the shuffle on name brings each user and their visits together; the join runs on the reduce side',
+          'job 2: its map side reads job 1’s output from HDFS; the shuffle on url ' + (e === 'pig' ? 'builds one bag per url' : 'brings the rows of each url together'),
+          'job 2, reduce side: ' + (e === 'pig' ? 'COUNT of each bag' : 'COUNT(*) per url') + ' (a combiner may pre-count on the map side)',
+          'job 3: the shuffle on clicks delivers the counts sorted',
+          'job 3, reduce side: keep the first 5',
+          dropped ? 'end of job 2: the counts are ' + (e === 'pig' ? 'stored in HDFS' : 'sent to the client')
+                  : 'end of job 3: the top 5 are ' + (e === 'pig' ? 'stored in HDFS as top5sites' : 'sent to the client')
+        ][i];
+      }
+      return [
+        'a scan fragment on every node, reading its local blocks',
+        'inside the scanners: the age condition is pushed down into the read',
+        'a scan fragment on every node, reading its local blocks',
+        'an exchange by name streams rows to the nodes that join them, in memory',
+        'an exchange by url streams partial counts to the nodes that merge them',
+        'aggregation, in memory',
+        'rows stream to the coordinator, which sorts them',
+        'the coordinator keeps the first 5',
+        'the coordinator returns the rows to the client; nothing was written on the way'
+      ][i];
+    }
+    function jobsTxt(e, dropped) {
+      if (e === 'pig') return dropped ? '2 — one per shuffle: JOIN, GROUP (by the rule)' : '3 — one per shuffle: JOIN, GROUP, ORDER (p. 904)';
+      if (e === 'hive') return dropped ? '2 — the same shuffles as Pig (our sketch)' : '3 — the same three shuffles as Pig (our sketch)';
+      return dropped ? 'none — one plan, 2 exchanges in memory (our sketch)' : 'none — one plan, 3 exchanges in memory (our sketch)';
+    }
+    function diskTxt(e, dropped) {
+      if (e === 'impala') return 'nothing between the steps: rows stream in memory';
+      return dropped ? 'the output of job 1 (12 tuples), then the result' : 'the outputs of job 1 (12 tuples) and job 2 (6 tuples), then the result';
+    }
+    var SCHEMA = ['(name, age)', '(name, age)', '(user, url)', '(name, age, user, url)', '(group, bag of joined tuples)', '(url, clicks)', '(url, clicks)', '(url, clicks)'];
+
+    function fillPanel(i, e, dropped) {
+      while (panel.firstChild) panel.removeChild(panel.firstChild);
+      var pig = e === 'pig', head, moved = '', rows = [];
+      if (dropped && (i === 6 || i === 7)) {
+        head = 'removed from the script: nothing is computed here';
+      } else {
+        var k = i === 8 ? (dropped ? 5 : 7) : i, d = DATA[k];
+        rows = k === 4 ? d.map(function (g) { return '(' + g[0] + ', {' + g[1].map(tup).join(', ') + '})'; }) : d.map(tup);
+        head = (i === 8 ? (pig ? 'stored in HDFS: ' : 'returned to the client: ') : 'after this step: ') +
+               (pig ? NAMES[k] + ', ' : '') + d.length + (pig ? ' tuples ' : ' rows ') +
+               (k === 4 && !pig ? '(url, the joined rows of that url)' : SCHEMA[k]) + ' — toy data, computed by the widget';
+        var verb = e === 'impala' ? 'the exchange streams ' : 'the shuffle moves ';
+        if (i === 3) moved = verb + '21 tuples keyed by name: the 5 users aged 18–25 and all 16 visits. bob, eli and gus were dropped on the map side; their 4 visits travel and find no partner.';
+        if (i === 4) moved = verb + '12 tuples keyed by url' + (e === 'impala' ? ' (in a real plan, partial counts)' : ' (a combiner could send partial counts instead)') + '.';
+        if (i === 6) moved = (e === 'impala' ? 'the coordinator receives ' : 'the shuffle moves ') + '6 tuples keyed by clicks; they arrive sorted. Ties may come out in any order.';
+      }
+      panel.appendChild(Course.el('p', { 'class': 'l32-rel-h', text: head }));
+      if (moved) panel.appendChild(Course.el('p', { 'class': 'l32-rel-m', text: moved }));
+      if (rows.length) {
+        var box = Course.el('div', { 'class': 'l32-tuples' });
+        rows.forEach(function (t) { box.appendChild(Course.el('span', { 'class': 'l32-tuple', text: t })); });
+        panel.appendChild(box);
+      }
+    }
+
+    function draw(i, e, dropped) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mr = e !== 'impala', cur = STEPS[i].job;
+      if (dropped && i === 8) cur = 2;
+      if (mr) {
+        S('rect', { x: 24, y: 24, width: 522, height: 184, rx: 10, 'class': cur === 1 ? 'sw-3' : 'st-muted' });
+        T(34, 198, 'Job 1', 'tx-bold');
+        S('rect', { x: 190, y: 236, width: 180, height: 116, rx: 10, 'class': cur === 2 ? 'sw-3' : 'st-muted' });
+        T(176, 300, 'Job 2', 'tx-bold tx-end');
+        if (!dropped) {
+          S('rect', { x: 190, y: 382, width: 180, height: 116, rx: 10, 'class': cur === 3 ? 'sw-3' : 'st-muted' });
+          T(176, 446, 'Job 3', 'tx-bold tx-end');
+        }
+      } else {
+        S('rect', { x: 24, y: 24, width: 522, height: dropped ? 336 : 474, rx: 10, 'class': 'st-muted dash' });
+        T(34, 252, 'one plan,', 'tx-bold');
+        T(34, 276, 'no jobs', 'tx-bold');
+      }
+      line([[115, 72], [115, 96]], 'sw-2', 'arr');
+      line([[115, 132], [115, 176], [201, 176]], 'st-s1 sw-3', 'arr-s1');
+      line([[445, 72], [445, 176], [359, 176]], 'st-s1 sw-3', 'arr-s1');
+      T(280, 148, mr ? 'shuffle on name' : 'exchange by name', 'tx-sm tx-mid');
+      line([[280, 192], [280, 246]], 'st-s1 sw-3' + (mr ? ' dash' : ''), 'arr-s1');
+      if (mr) T(290, 224, 'HDFS', 'tx-sm');
+      T(382, 272, mr ? 'shuffle on url' : 'exchange by url', 'tx-sm');
+      line([[280, 282], [280, 302]], 'sw-2', 'arr');
+      var fy;
+      if (!dropped) {
+        line([[280, 338], [280, 392]], 'st-s1 sw-3' + (mr ? ' dash' : ''), 'arr-s1');
+        if (mr) T(290, 370, 'HDFS', 'tx-sm');
+        T(382, 418, mr ? 'shuffle on clicks' : 'to the coordinator', 'tx-sm');
+        line([[280, 428], [280, 448]], 'sw-2', 'arr');
+        line([[355, 468], [424, 468]], 'sw-2', 'arr');
+        fy = 444;
+      } else {
+        line([[280, 338], [280, 392]], 'st-muted dash');
+        line([[280, 428], [280, 448]], 'st-muted dash');
+        line([[355, 322], [424, 322]], 'sw-2', 'arr');
+        fy = 298;
+      }
+      BOX.forEach(function (b, k) {
+        var removed = dropped && (k === 6 || k === 7), shuf = k === 3 || k === 4 || k === 6;
+        if (k === i) S('rect', { x: b[0] - 4, y: b[1] - 4, width: BW + 8, height: BH + 8, rx: 6, 'class': 'hl' });
+        var r = S('rect', { x: b[0], y: b[1], width: BW, height: BH, rx: 4, 'class': removed ? 'fi-paper st-muted dash l32-hit' : 'fi-paper l32-hit' + (shuf ? ' sw-3' : ' sw-2') });
+        var t = T(b[0] + BW / 2, b[1] + 21, STEPS[k].box, 'tx-sm tx-mid l32-hit' + (removed ? ' tx-muted' : ''));
+        r.addEventListener('click', function () { step.go(k); });
+        t.addEventListener('click', function () { step.go(k); });
+      });
+      var fileNode;
+      if (e === 'pig') {
+        if (i === 8) S('rect', { x: 424, y: fy - 6, width: 56, height: 62, rx: 6, 'class': 'hl' });
+        fileNode = S('path', { d: 'M432 ' + fy + ' H462 L472 ' + (fy + 10) + ' V' + (fy + 50) + ' H432 Z', 'class': 'fi-paper l32-hit' });
+        S('path', { d: 'M462 ' + fy + ' V' + (fy + 10) + ' H472 Z', 'class': 'fi-soft' });
+        T(452, fy + 68, dropped ? 'clicks' : 'top5sites', 'tx-mono tx-sm tx-mid');
+      } else {
+        if (i === 8) S('rect', { x: 422, y: fy + 6, width: 76, height: 38, rx: 8, 'class': 'hl' });
+        fileNode = S('rect', { x: 428, y: fy + 12, width: 64, height: 26, rx: 6, 'class': 'fi-paper l32-hit' });
+        T(460, fy + 30, 'client', 'tx-sm tx-mid');
+      }
+      fileNode.addEventListener('click', function () { step.go(8); });
+    }
+
+    ui.onChange(function () {
+      var i = step.index, e = eng.value, dropped = drop.value;
+      var removed = dropped && (i === 6 || i === 7);
+      var code = e === 'pig' ? STEPS[i].pig : STEPS[i].sql;
+      if (i === 8 && dropped && e === 'pig') code = "store Summed into 'clicks';";
+      roCode.set('<code>' + esc(code) + '</code>' + (removed ? ' — removed' : ''));
+      roWhere.set(whereTxt(i, e, dropped));
+      roJobs.set(jobsTxt(e, dropped));
+      roDisk.set(diskTxt(e, dropped));
+      fillPanel(i, e, dropped);
+      draw(i, e, dropped);
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l32-hive">
+  <h2>Hive: SQL and a Metastore over plain files</h2>
+
+  <p>Page 906: Hive was "Developed at Facebook" and is "Used for majority of Facebook jobs". It is a "Relational database" built on Hadoop — with the quotation marks on the slide. It "Maintains list of table schemas", offers an "SQL-like query language (HiveQL)", "Can call Hadoop Streaming scripts from HiveQL" and "Supports table partitioning, clustering, complex data types, some optimizations".</p>
+
+  <p>The quotation marks are the point. Hive looks relational — tables, typed columns, SELECT, JOIN, GROUP BY — but has no storage or execution engine of its own: a query becomes MapReduce jobs over files in HDFS and takes as long as they take. In the Hive tutorial's words, "Hive is not designed for online transaction processing. It is best used for traditional data warehousing tasks" (background).</p>
+
+  <div class="pitfall">
+    <p>"Hadoop Streaming scripts, so Hive does stream processing." No. Hadoop Streaming is MapReduce's way of running a mapper or a reducer written in any language — a program that reads records on standard input and writes key-value pairs on standard output (background). Processing data that never stops arriving is something else: Storm, in <a href="l33.html">lesson 33</a>.</p>
+  </div>
+
+  <h3>The architecture: metadata up here, data down there</h3>
+
+  <aside class="margin-note">JobTracker and TaskTracker are the Hadoop 1 names in the figure; YARN replaced them, as lesson 31 shows.</aside>
+
+  <p>Follow a query through p. 907 (Fig. 2). It arrives through the command line interface, the web interface, or the Thrift server, where programs connect with JDBC or ODBC as to any SQL database. The <mark class="key">Driver</mark> compiles, optimizes and executes it: the compiler turns HiveQL into a plan of MapReduce jobs, looking the tables up in the <mark class="key">Metastore</mark> — columns and types, partitions, and where in HDFS each table lives — and the executor submits the jobs to Hadoop, whose JobTracker runs their tasks next to the blocks.</p>
+
+  <figure class="fig fig--plain" id="l32-fig-hive">
+    <svg class="dia" viewBox="0 0 560 410" role="img" aria-label="Hive's architecture: inside Hive, the command line interface, the web interface and the Thrift server with JDBC and ODBC above a Driver of compiler, optimizer and executor, with the Metastore of schemas and partitions beside them. The Driver sends MapReduce jobs down to Hadoop and receives results; in Hadoop, the JobTracker, the NameNode and machines running a DataNode and a TaskTracker.">
+      <rect x="10" y="10" width="540" height="200" rx="10"/>
+      <text x="26" y="38" class="tx-bold tx-lg">Hive</text>
+      <rect x="246" y="20" width="72" height="30" class="fi-paper"/>
+      <rect x="324" y="20" width="72" height="30" class="fi-paper"/>
+      <text x="282" y="40" class="tx-sm tx-mid">JDBC</text>
+      <text x="360" y="40" class="tx-sm tx-mid">ODBC</text>
+      <line x1="282" y1="50" x2="282" y2="62" class="st-muted"/>
+      <line x1="360" y1="50" x2="360" y2="62" class="st-muted"/>
+      <rect x="26" y="62" width="100" height="36" class="fi-paper"/>
+      <rect x="134" y="62" width="100" height="36" class="fi-paper"/>
+      <rect x="242" y="62" width="158" height="36" class="fi-paper"/>
+      <text x="76" y="85" class="tx-sm tx-mid">CLI</text>
+      <text x="184" y="85" class="tx-sm tx-mid">Web UI</text>
+      <text x="321" y="85" class="tx-sm tx-mid">Thrift server</text>
+      <rect x="26" y="110" width="374" height="86" class="fi-paper sw-2"/>
+      <text x="213" y="142" class="tx-bold tx-mid">Driver</text>
+      <text x="213" y="174" class="tx-sm tx-mid">compiler · optimizer · executor</text>
+      <rect x="414" y="62" width="122" height="134" class="fw-s3 st-s3"/>
+      <text x="475" y="122" class="tx-bold tx-mid">Metastore</text>
+      <text x="475" y="152" class="tx-sm tx-mid">schemas,</text>
+      <text x="475" y="176" class="tx-sm tx-mid">partitions</text>
+
+      <line x1="180" y1="198" x2="180" y2="246" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="246" y1="248" x2="246" y2="200" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="170" y="230" class="tx-sm tx-end">jobs</text>
+      <text x="256" y="230" class="tx-sm">results</text>
+
+      <rect x="10" y="250" width="540" height="150" rx="10"/>
+      <text x="26" y="278" class="tx-bold">Hadoop: MapReduce + HDFS</text>
+      <rect x="26" y="294" width="140" height="34" class="fi-paper st-s6 dash sw-2"/>
+      <rect x="180" y="294" width="140" height="34" class="fi-paper st-s6 dash sw-2"/>
+      <text x="96" y="316" class="tx-sm tx-mid">JobTracker</text>
+      <text x="250" y="316" class="tx-sm tx-mid">NameNode</text>
+      <rect x="344" y="296" width="44" height="28" class="fi-paper"/>
+      <line x1="351" y1="303" x2="381" y2="303" class="st-muted"/>
+      <line x1="351" y1="310" x2="381" y2="310" class="st-muted"/>
+      <line x1="351" y1="317" x2="381" y2="317" class="st-muted"/>
+      <rect x="400" y="296" width="44" height="28" class="fi-paper"/>
+      <line x1="407" y1="303" x2="437" y2="303" class="st-muted"/>
+      <line x1="407" y1="310" x2="437" y2="310" class="st-muted"/>
+      <line x1="407" y1="317" x2="437" y2="317" class="st-muted"/>
+      <rect x="456" y="296" width="44" height="28" class="fi-paper"/>
+      <line x1="463" y1="303" x2="493" y2="303" class="st-muted"/>
+      <line x1="463" y1="310" x2="493" y2="310" class="st-muted"/>
+      <line x1="463" y1="317" x2="493" y2="317" class="st-muted"/>
+      <text x="422" y="348" class="tx-sm tx-mid">DataNode + TaskTracker</text>
+      <text x="300" y="386" class="tx-hand">the files live here</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> Hive's architecture (p. 907), redrawn. A query enters through the CLI, the web interface or the Thrift server (JDBC, ODBC); the Driver compiles, optimizes and executes it with the table definitions of the Metastore. What leaves Hive are MapReduce jobs (orange) for the JobTracker; they run where the HDFS blocks are, and results come back (blue). Dashed ochre outlines: the two masters of Hadoop 1.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Hive keeps the metadata — schemas, partitions, locations — in its Metastore; the data stays in HDFS as plain files, and its queries run as MapReduce jobs.</mark></p>
+
+  <h3>Tables, partitions, buckets</h3>
+
+  <p>Page 908 lists the data model. <b>Tables</b> have "Typed columns (int, float, string, date, boolean)" and "Also, array/map/struct for JSON-like data": one column can hold a list, a dictionary or a record, which a flat SQL table cannot. <b>Partitions</b> split a table by the values of one or more columns — "e.g., to range-partition tables by date". <b>Buckets</b> are "Hash partitions within ranges (useful for sampling, join optimization)": inside a partition, the rows are spread over a fixed number of files by hashing one column — the "clustering" of p. 906.</p>
+
+  <div class="formula" id="l32-f-bucket">
+    \[ \text{bucket}(r) = \operatorname{hash}(r.\text{col}) \bmod N \]
+    <dl class="legend">
+      <dt>\(r\)</dt><dd>a row of the partition</dd>
+      <dt>col</dt><dd>the bucketing column, for example <code>userid</code></dd>
+      <dt>\(N\)</dt><dd>the number of bucket files, fixed when the table is created</dd>
+    </dl>
+  </div>
+
+  <p>Both uses follow from the hash. One bucket out of N is a sample of about one row in N, spread evenly over the values. And two tables bucketed on the same join key can be joined bucket by bucket, since equal keys always land in matching buckets (background: in HiveQL, <code>CLUSTERED BY (userid) INTO 32 BUCKETS</code>).</p>
+
+  <div class="pitfall">
+    <p>"Hive range-partitions a table by date, one partition per range of dates." Not quite: a Hive partition holds one value of the partition columns — one directory per (dt, country) pair on p. 910. A date range in a query reads every single-day partition inside the range (p. 911). The slide's "range-partition" says what you can do with date partitions, not how they are cut; the exam may quote the printed line.</p>
+  </div>
+
+  <h3>Storage: directories and flat files</h3>
+
+  <p>Page 909 says where everything lives: a "Warehouse directory in HDFS – e.g., /user/hive/warehouse"; "Table row data stored in subdirectories of warehouse"; "Partitions form subdirectories of table directories"; "Actual data stored in flat files – Control char-delimited text, or SequenceFiles – With custom SerDe, can use arbitrary format".</p>
+
+  <p>So a table is a directory, a partition is a directory inside it, and the rows are ordinary files: text with control-character delimiters, or SequenceFiles, Hadoop's binary key-value format. A <mark class="key">SerDe</mark> (serializer/deserializer) turns the bytes of a file into typed rows when a query reads them, and back when it writes. Hive checks nothing when files arrive: the Metastore's schema is applied at read time — the schema on read of <a href="l04.html#l04-shift">lesson 4</a>. And any other tool that reads HDFS can use the same files; Impala will. A table created with <code>CREATE EXTERNAL TABLE … LOCATION '…'</code> goes one step further: Hive registers files that stay where they are, and dropping the table deletes only its definition (background).</p>
+
+  <p>Page 910 creates the table that the rest of the deck queries:</p>
+
+<pre><code>-- p. 910: page views, one directory per (dt, country) pair
+CREATE TABLE page_views(viewTime INT, userid BIGINT,
+                        page_url STRING, referrer_url STRING,
+                        ip STRING COMMENT 'User IP address')
+COMMENT 'This is the page view table'
+PARTITIONED BY(dt STRING, country STRING)
+STORED AS SEQUENCEFILE;</code></pre>
+
+  <p>Five typed columns, a comment on <code>ip</code> and one on the table. <code>PARTITIONED BY</code> declares <code>dt</code> and <code>country</code>, which are not in the column list: their values live in directory names, not in the files. <code>STORED AS SEQUENCEFILE</code> picks the file format. In the slide's words, "Partitioning breaks table into separate files for each (dt, country) pair".</p>
+
+  <p>The slide's example paths, "/hive/page_view/dt=2008-06-08,country=USA" and "…,country=CA", are a shorthand, with <code>page_view</code> for <code>page_views</code>. In HDFS each partition column is one directory level, under the warehouse of p. 909: <code>/user/hive/warehouse/page_views/dt=2008-06-08/country=USA/</code>, and next to it <code>…/country=CA/</code> (Fig. 3 below draws the tree).</p>
+
+  <p>The Hive CLI of p. 913 lists and describes tables:</p>
+
+<pre><code>hive&gt; show tables;
+hive&gt; describe page_views;
+hive&gt; describe extended page_views;</code></pre>
+
+  <p>"List tables", "Describe a table", "More information": all three answer from the Metastore, without a job (background). <code>describe</code> prints the columns and their types, partition columns included; <code>describe extended</code> adds the HDFS location, the file format and the SerDe.</p>
+</section>
+
+
+<section id="l32-query">
+  <h2>Asking Hive: partition pruning, joins and groups</h2>
+
+  <p>Page 911 asks: "Find all page views coming from xyz.com on March 31st". As printed:</p>
+
+<pre><code>-- p. 911 as printed (see the red pen)
+SELECT page_views.*
+FROM page_views
+WHERE page_views.date &gt;= '2008-03-01'
+AND page_views.date &lt;= '2008-03-31'
+AND page_views.referrer_url like '%xyz.com';</code></pre>
+
+  <p>And the point of the slide: "Hive only reads partition 2008-03-01,* instead of scanning entire table". The mechanism has a name.</p>
+
+  <div class="def">
+    <p><dfn>Partition pruning</dfn> — before any job starts, the compiler matches the conditions on partition columns against the list of partitions in the Metastore, and only the matching directories become the input of the MapReduce jobs. The other directories are never opened.</p>
+  </div>
+
+  <p>The two conditions of the query play opposite roles. The condition on the date is about a partition column — <code>dt</code> on p. 910, see the red pen — and its values are directory names, so the compiler can decide on it without reading a byte. The condition on <code>referrer_url</code> is about a column inside the files: it can only be checked row by row, by the mappers, on whatever survived the pruning. It reduces the output, never the input (Fig. 3).</p>
+
+  <aside class="redpen" data-page="911">
+    <p class="claim">"Find all page views coming from xyz.com on March 31st" — "WHERE page_views.date &gt;= '2008-03-01' AND page_views.date &lt;= '2008-03-31'" — "Hive only reads partition 2008-03-01,*"</p>
+    <p class="fix">The three disagree. The column is <code>dt</code> — the table of p. 910 has no column <code>date</code> — and, read on <code>dt</code>, the query selects the whole of March: Hive reads the 31 day-directories <code>dt=2008-03-01</code> to <code>dt=2008-03-31</code>, every country of each. For March 31st alone, write <code>dt = '2008-03-31'</code>: Hive then reads <code>2008-03-31,*</code>.</p>
+    <p class="because">The partition column declared on p. 910 is <code>dt</code>, and pruning keeps exactly the partitions whose values satisfy the condition: a range of 31 days keeps 31 days, not the first one. The Hive tutorial runs the same query to get "all the page_views in the month of 03/2008" (background). The lesson the slide wants to teach — Hive reads only the matching partitions "instead of scanning entire table" — is right either way. The exam may be matched against the printed slide: know what it prints, and the correct count.</p>
+  </aside>
+
+  <p>Corrected for March 31st:</p>
+
+<pre><code>-- from xyz.com on March 31st: reads only dt=2008-03-31
+SELECT page_views.*
+FROM page_views
+WHERE page_views.dt = '2008-03-31'
+AND page_views.referrer_url LIKE '%xyz.com';</code></pre>
+
+  <p>For the whole month, keep the slide's range on <code>dt</code>: 31 days of every country. The range works on a STRING column because dates written <code>yyyy-mm-dd</code> sort as strings in date order.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l32-fig-prune">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Without a condition on a partition column: the query WHERE referrer_url LIKE '%xyz.com' reads every directory of page_views, both countries of every day of March.">
+        <text x="8" y="18" class="tx-mono tx-sm">WHERE referrer_url LIKE '%xyz.com'</text>
+        <text x="8" y="36" class="tx-sm tx-muted">(nothing on dt or country)</text>
+        <text x="8" y="64" class="tx-mono tx-sm">page_views/</text>
+        <text x="160" y="64" class="tx-mono tx-sm">country=</text>
+        <line x1="14" y1="70" x2="14" y2="172" class="st-muted"/>
+        <line x1="14" y1="88" x2="22" y2="88" class="st-muted"/>
+        <line x1="14" y1="116" x2="22" y2="116" class="st-muted"/>
+        <line x1="14" y1="172" x2="22" y2="172" class="st-muted"/>
+        <text x="26" y="92" class="tx-mono tx-sm">dt=2008-03-01/</text>
+        <rect x="160" y="76" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="76" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="91" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="91" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="26" y="120" class="tx-mono tx-sm">dt=2008-03-02/</text>
+        <rect x="160" y="104" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="104" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="119" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="119" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="26" y="148" class="tx-sm">… 28 more days, all read</text>
+        <text x="26" y="176" class="tx-mono tx-sm">dt=2008-03-31/</text>
+        <rect x="160" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="175" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="175" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="8" y="208" class="tx-sm">read: every directory, the whole table</text>
+        <text x="8" y="240" class="tx-hand">full scan</text>
+      </svg>
+      <p class="fig-label">Before: no condition on a partition column</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="With the condition dt = '2008-03-31': only the two directories of March 31st, USA and CA, are read; all other days are skipped before the job starts.">
+        <text x="8" y="18" class="tx-mono tx-sm">WHERE dt = '2008-03-31'</text>
+        <text x="8" y="36" class="tx-mono tx-sm">AND referrer_url LIKE '%xyz.com'</text>
+        <text x="8" y="64" class="tx-mono tx-sm">page_views/</text>
+        <text x="160" y="64" class="tx-mono tx-sm">country=</text>
+        <line x1="14" y1="70" x2="14" y2="172" class="st-muted"/>
+        <line x1="14" y1="88" x2="22" y2="88" class="st-muted"/>
+        <line x1="14" y1="116" x2="22" y2="116" class="st-muted"/>
+        <line x1="14" y1="172" x2="22" y2="172" class="st-muted"/>
+        <text x="26" y="92" class="tx-mono tx-sm tx-muted">dt=2008-03-01/</text>
+        <rect x="160" y="76" width="56" height="22" class="st-muted dash"/>
+        <rect x="226" y="76" width="56" height="22" class="st-muted dash"/>
+        <text x="188" y="91" class="tx-mono tx-sm tx-mid tx-muted">USA</text>
+        <text x="254" y="91" class="tx-mono tx-sm tx-mid tx-muted">CA</text>
+        <text x="26" y="120" class="tx-mono tx-sm tx-muted">dt=2008-03-02/</text>
+        <rect x="160" y="104" width="56" height="22" class="st-muted dash"/>
+        <rect x="226" y="104" width="56" height="22" class="st-muted dash"/>
+        <text x="188" y="119" class="tx-mono tx-sm tx-mid tx-muted">USA</text>
+        <text x="254" y="119" class="tx-mono tx-sm tx-mid tx-muted">CA</text>
+        <text x="26" y="148" class="tx-sm tx-muted">… 28 more days, skipped</text>
+        <text x="26" y="176" class="tx-mono tx-sm">dt=2008-03-31/</text>
+        <rect x="160" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="175" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="175" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="8" y="208" class="tx-sm">read: 2 directories, chosen before the job</text>
+        <text x="8" y="240" class="tx-hand">pruned</text>
+      </svg>
+      <p class="fig-label">After: a condition on dt</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Partition pruning on the table of p. 910, March 2008, two countries (orange: read by the query). Before: a condition on <code>referrer_url</code> alone cannot skip anything — that column lives inside the files — so every directory is read. After: the condition on <code>dt</code> is matched against the partitions in the Metastore before the job starts, and only the two directories of March 31st become its input; the LIKE is then checked inside them, row by row.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Partition pruning: a condition on a partition column chooses directories before any job runs; a condition on any other column filters rows inside the files that are read.</mark></p>
+
+  <div class="pitfall">
+    <p>"A partition works like an index." No: there is no row-level index at all. Pruning skips whole directories by the value in their name; inside the surviving directories every row is read. A query on <code>referrer_url</code> alone is a full scan, however selective it is.</p>
+  </div>
+
+  <h3>Joins and aggregation</h3>
+
+  <p>Page 912: "Count users who visited each page by gender". As printed:</p>
+
+<pre><code>-- p. 912 as printed (see the red pen)
+SELECT pv.page_url, u.gender, COUNT(DISTINCT u.id)
+FROM page_views pv JOIN user u ON (pv.userid = u.id)
+GROUP BY pv.page_url, u.gender
+WHERE pv.date = '2008-03-03';</code></pre>
+
+  <aside class="redpen" data-page="912">
+    <p class="claim">"GROUP BY pv.page_url, u.gender WHERE pv.date = '2008-03-03';"</p>
+    <p class="fix">WHERE comes before GROUP BY: <code>… ON (pv.userid = u.id) WHERE pv.dt = '2008-03-03' GROUP BY pv.page_url, u.gender;</code> — and, as on p. 911, the partition column is <code>dt</code>.</p>
+    <p class="because">In SQL, and in HiveQL, the clauses come in a fixed order — SELECT, FROM, JOIN … ON, WHERE, GROUP BY — because the WHERE filters rows before they are grouped; as printed, the query is rejected by the parser. The exam may be matched against the printed version; write the correct order yourself.</p>
+  </aside>
+
+  <aside class="margin-note">Today's Hive also reserves the words user and date: a table called user has to be written in backquotes (background). The slide's example, from 2008, predates that rule.</aside>
+
+<pre><code>-- p. 912 corrected: distinct users per page and gender
+SELECT pv.page_url, u.gender, COUNT(DISTINCT u.id)
+FROM page_views pv JOIN user u ON (pv.userid = u.id)
+WHERE pv.dt = '2008-03-03'
+GROUP BY pv.page_url, u.gender;</code></pre>
+
+  <figure class="tbl-fig" id="l32-tbl-output">
+    <figcaption>Table 2. The sample output of p. 912 (the header says <code>count(userid)</code>; the query counts <code>u.id</code>, the same value through the join).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>page_url</th><th>gender</th><th>count(userid)</th></tr></thead>
+        <tbody>
+          <tr><td>home.php</td><td>MALE</td><td class="num">12,141,412</td></tr>
+          <tr><td>home.php</td><td>FEMALE</td><td class="num">15,431,579</td></tr>
+          <tr><td>photo.php</td><td>MALE</td><td class="num">23,941,451</td></tr>
+          <tr><td>photo.php</td><td>FEMALE</td><td class="num">21,231,314</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p><code>COUNT(DISTINCT u.id)</code> counts users, not views: a user who opened home.php ten times counts once — and there are tens of millions of them per page in one day. The plan has Pig's shape: a shuffle for the join on <code>pv.userid = u.id</code>, another for the grouping on <code>(page_url, gender)</code>, and the jobs are cut at those shuffles. Pruning comes first: only the files of March 3rd enter the join.</p>
+
+  <p>The question of p. 900, asked in HiveQL over two tables <code>users(name, age)</code> and <code>pages(username, url)</code>, is one statement — switch the engine of the widget above to HiveQL and step through it:</p>
+
+<pre><code>-- p. 900 in HiveQL: top 5 pages of users aged 18-25
+SELECT p.url, COUNT(*) AS clicks
+FROM users u JOIN pages p ON (u.name = p.username)
+WHERE u.age &gt;= 18 AND u.age &lt;= 25
+GROUP BY p.url
+ORDER BY clicks DESC
+LIMIT 5;</code></pre>
+
+  <p>The same three shuffles — join, group, order — so the same three jobs, which Hive writes for you. Hive, like Pig, saves your time; the cluster still runs MapReduce.</p>
+</section>
+
+
+<section id="l32-impala">
+  <h2>Impala: SQL beside MapReduce, not on top of it</h2>
+
+  <p>Page 915: Impala is a "Massive parallel processing (MPP) database engine, developed by Cloudera", "Integrated into Hadoop stack on the same level as MapReduce, and not above it (as Hive and Pig)". The figure of that slide is the thesis of the whole section (Fig. 4).</p>
+
+  <figure class="fig fig--plain" id="l32-fig-stack">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="The layering of page 915: HDFS at the bottom; on it, Impala on the left and MapReduce on the right, side by side; Pig and Hive on top of MapReduce. A Hive query enters Hive and becomes MapReduce jobs, each writing its output to HDFS for the next one to read; an Impala query enters Impala and reads HDFS directly, keeping its rows in memory.">
+      <text x="105" y="24" class="tx-sm tx-mid">an Impala query</text>
+      <text x="475" y="24" class="tx-sm tx-mid">a Hive query</text>
+      <rect x="290" y="62" width="110" height="36" class="fi-paper"/>
+      <rect x="420" y="62" width="110" height="36" class="fi-paper"/>
+      <text x="345" y="85" class="tx-mid">Pig</text>
+      <text x="475" y="85" class="tx-mid">Hive</text>
+      <rect x="30" y="126" width="150" height="40" class="fi-paper sw-2"/>
+      <text x="105" y="151" class="tx-mid tx-bold">Impala</text>
+      <rect x="194" y="126" width="336" height="40" class="fi-paper"/>
+      <text x="300" y="151" class="tx-mid">MapReduce</text>
+      <rect x="30" y="204" width="500" height="40" class="fi-paper"/>
+      <text x="280" y="229" class="tx-mid">HDFS</text>
+      <line x1="475" y1="32" x2="475" y2="58" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="475" y1="98" x2="475" y2="122" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="430" y1="166" x2="430" y2="200" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="465" y1="204" x2="465" y2="170" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="500" y1="166" x2="500" y2="200" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="105" y1="32" x2="105" y2="122" class="st-s5 sw-3" marker-end="url(#arr-s5)"/>
+      <line x1="105" y1="166" x2="105" y2="200" class="st-s5 sw-3" marker-end="url(#arr-s5)"/>
+      <text x="30" y="272" class="tx-sm">read once, rows stay in memory</text>
+      <text x="530" y="272" class="tx-sm tx-end">each job writes to HDFS</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The layering of p. 915. Pig and Hive sit on top of MapReduce: a Hive query becomes MapReduce jobs, and each job writes its output to HDFS for the next one to read (teal: down, up, down). Impala sits beside MapReduce, directly on HDFS: its query reads the files and keeps its rows in memory to the end (magenta).</figcaption>
+  </figure>
+
+  <p>Why build it? Page 916 argues in six lines: "Data has a gravity"; "Today a lot of data live in HDFS"; "It is not practical to move big data"; "It is practical to bring engine to the data"; "In the same time – MapReduce is not must"; "Impala process data in Hadoop cluster without using MapReduce". Big data is too heavy to copy into a separate warehouse, so the engine moves onto the Hadoop machines — MapReduce's own "move the code, not the data" (<a href="l30.html#l30-cluster">lesson 30</a>). But nothing forces that engine to be MapReduce, which starts every job from scratch and writes every output to disk. Nor is Impala alone: "Several other modern Database engines also realized the opportunity to bypass MapReduce but work right with HDFS" (p. 917, with Greenplum and JethroData).</p>
+
+  <div class="def">
+    <p><dfn>MPP, massively parallel processing</dfn> — the slide prints "Massive". Every node runs a piece of every query at the same time, and the pieces stream rows to each other over the network, without writing intermediate results to disk. It is the architecture of parallel analytic databases.</p>
+  </div>
+
+  <h3>The architecture: every node plans, coordinates and executes</h3>
+
+  <p>Follow a query through p. 918 (Fig. 5). A client — any "SQL App", through ODBC, with "Common Hive SQL and interface" — sends it to one Impala node. That node's query planner reads the "Unified metadata": the Hive Metastore for the tables, the HDFS NameNode for where each block lives, the State Store for which nodes are alive. Its query coordinator cuts the plan into fragments and sends them to every node, "Fully MPP Distributed". Each node's query exec engine reads the blocks of its own DataNode — "Local Direct Reads" — or its HBase, and streams its rows back. No job is started, and nothing is written between the steps.</p>
+
+  <figure class="fig fig--plain" id="l32-fig-impala">
+    <svg class="dia" viewBox="0 0 560 360" role="img" aria-label="Impala's architecture: a SQL app through ODBC sends a query to one of three Impala nodes; that node's planner reads the unified metadata (Hive Metastore, HDFS NameNode, State Store). Every node has a query planner, a query coordinator and a query exec engine above its HDFS DataNode and HBase. The coordinator of the query sends fragments to the other nodes and receives their rows; each exec engine reads its local DataNode.">
+      <text x="20" y="16" class="tx-sm">Common Hive SQL and interface</text>
+      <rect x="20" y="26" width="130" height="30" class="fi-paper"/>
+      <rect x="20" y="62" width="130" height="30" class="fi-paper"/>
+      <text x="85" y="46" class="tx-sm tx-mid">SQL app</text>
+      <text x="85" y="82" class="tx-sm tx-mid">ODBC</text>
+      <text x="540" y="16" class="tx-sm tx-end">Unified metadata</text>
+      <rect x="380" y="26" width="160" height="26" class="fw-s3 st-s3"/>
+      <rect x="380" y="56" width="160" height="26" class="fi-paper st-s6 dash"/>
+      <rect x="380" y="86" width="160" height="26" class="fw-s3 st-s3"/>
+      <text x="460" y="44" class="tx-sm tx-mid">Hive Metastore</text>
+      <text x="460" y="74" class="tx-sm tx-mid">HDFS NameNode</text>
+      <text x="460" y="104" class="tx-sm tx-mid">State Store</text>
+
+      <line x1="150" y1="88" x2="246" y2="142" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="390" y1="114" x2="318" y2="142" class="sw-2" marker-end="url(#arr)"/>
+      <text x="168" y="126" class="tx-sm halo">query</text>
+
+      <rect x="194" y="142" width="172" height="146" rx="6" class="st-s6 dash sw-2"/>
+
+      <rect x="10" y="150" width="160" height="26" class="fi-paper"/>
+      <rect x="10" y="176" width="160" height="26" class="fi-paper"/>
+      <rect x="10" y="202" width="160" height="26" class="fi-paper"/>
+      <text x="90" y="168" class="tx-sm tx-mid">planner</text>
+      <text x="90" y="194" class="tx-sm tx-mid">coordinator</text>
+      <text x="90" y="220" class="tx-sm tx-mid">exec engine</text>
+      <rect x="10" y="252" width="84" height="28" class="fi-paper"/>
+      <rect x="100" y="252" width="70" height="28" class="fi-paper"/>
+      <text x="52" y="271" class="tx-sm tx-mid">HDFS DN</text>
+      <text x="135" y="271" class="tx-sm tx-mid">HBase</text>
+
+      <rect x="200" y="150" width="160" height="26" class="fi-paper"/>
+      <rect x="200" y="176" width="160" height="26" class="fi-paper"/>
+      <rect x="200" y="202" width="160" height="26" class="fi-paper"/>
+      <text x="280" y="168" class="tx-sm tx-mid">planner</text>
+      <text x="280" y="194" class="tx-sm tx-mid">coordinator</text>
+      <text x="280" y="220" class="tx-sm tx-mid">exec engine</text>
+      <rect x="200" y="252" width="84" height="28" class="fi-paper"/>
+      <rect x="290" y="252" width="70" height="28" class="fi-paper"/>
+      <text x="242" y="271" class="tx-sm tx-mid">HDFS DN</text>
+      <text x="325" y="271" class="tx-sm tx-mid">HBase</text>
+
+      <rect x="390" y="150" width="160" height="26" class="fi-paper"/>
+      <rect x="390" y="176" width="160" height="26" class="fi-paper"/>
+      <rect x="390" y="202" width="160" height="26" class="fi-paper"/>
+      <text x="470" y="168" class="tx-sm tx-mid">planner</text>
+      <text x="470" y="194" class="tx-sm tx-mid">coordinator</text>
+      <text x="470" y="220" class="tx-sm tx-mid">exec engine</text>
+      <rect x="390" y="252" width="84" height="28" class="fi-paper"/>
+      <rect x="480" y="252" width="70" height="28" class="fi-paper"/>
+      <text x="432" y="271" class="tx-sm tx-mid">HDFS DN</text>
+      <text x="515" y="271" class="tx-sm tx-mid">HBase</text>
+
+      <line x1="200" y1="184" x2="176" y2="184" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="170" y1="218" x2="194" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="360" y1="184" x2="384" y2="184" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="390" y1="218" x2="366" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="52" y1="250" x2="52" y2="232" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="242" y1="250" x2="242" y2="232" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="432" y1="250" x2="432" y2="232" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+
+      <text x="20" y="318" class="tx-hand">fully MPP distributed</text>
+      <text x="300" y="348" class="tx-hand">local direct reads</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> Impala's architecture (p. 918), redrawn; every node runs a Query Planner, a Query Coordinator and a Query Exec Engine. The query reaches one node (dashed ochre: the coordinator of this query), whose planner reads the Hive Metastore, the HDFS NameNode and the State Store. Its coordinator sends plan fragments to every node (ink arrows); each exec engine reads the blocks of its own DataNode (short blue arrows) and streams its rows back (blue).</figcaption>
+  </figure>
+
+  <h3>Same tables, faster reads</h3>
+
+  <p>Page 919: "Impala supports multiple formats. It is kind of schema on read"; "Impala shares metastore with Hive, which enables very simple adoption"; "Internally Impala have well defined way to add new formats". The table <code>page_views</code> that Hive created is the table Impala queries: same definition in the Metastore, same directories, same files. You adopt Impala by pointing it at the warehouse you already have — data gravity again, nothing moves.</p>
+
+  <p>Page 920 lists what makes it fast. Impala's "format adapters", called <mark class="key">scanners</mark>, "have predicate pushdown capability": the WHERE condition is handed to the code that reads the file, so a row that fails it is dropped during the read instead of being materialised and filtered later. It is an "Open source MPP engine" that "Runs hundreds of CPU cores in one query efficiently without expensive license" — and "Hive give us the same but not efficiently". There are scanners for the formats of p. 922 (Table 3).</p>
+
+  <figure class="tbl-fig" id="l32-tbl-formats">
+    <figcaption>Table 3. The scanners of p. 922 and how each format lays out a table (the layout column is background).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Format (p. 922)</th><th>Layout</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td>RCFile</td><td>columnar</td><td>Hive's record columnar file</td></tr>
+          <tr><td>Parquet (native dremel format)</td><td>columnar</td><td>an open format, not Dremel's own: it encodes nested data as Google's Dremel paper does; <a href="l40.html">lesson 40</a></td></tr>
+          <tr><td>CSV</td><td>row by row, text</td><td>the delimited text of p. 909</td></tr>
+          <tr><td>AVRO</td><td>row by row, binary</td><td>each file carries its schema</td></tr>
+          <tr><td>Sequence File</td><td>row by row, binary</td><td>Hadoop's key-value file of p. 910</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>With a columnar file, a scanner reads only the columns a query names — the column store of <a href="l20.html#l20-colstore">lesson 20</a>, and the precise sense in which HBase is <em>not</em> column-oriented. Partition pruning skips directories, the columnar layout skips columns, predicate pushdown drops rows while they are read: together they make an analytic query read and process a small part of the data.</p>
+
+  <h3>The price: one failure, one lost query</h3>
+
+  <p>Page 921 is the honest slide: "Hive is doing things Impala can not do yet, like joins between several big tables"; "Hive has convenient java UDF, while impala has not"; "Impala does not have inter-query fault tolerance"; "In the same time – MapReduce is not good framework for the database engine"; "Always faster then Hive at least 10 times"; "Impala in the cloud is not elastic".</p>
+
+  <aside class="redpen" data-page="921">
+    <p class="claim">"Impala does not have inter-query fault tolerance."</p>
+    <p class="fix">What Impala lacks is fault tolerance within a query (intra-query): if a node fails while a query runs, the whole query fails and must be run again. Between queries nothing is lost.</p>
+    <p class="because">MapReduce writes the output of every task to disk, so when a machine dies only its tasks are re-run elsewhere, and the job finishes. Impala's fragments hand rows to each other in memory: a dead node takes its part of the running query with it, and no saved state lets the others continue. "Inter-query" would mean between queries, where there is nothing to protect. The exam may be matched against the printed word: know it, and answer with the mechanism.</p>
+  </aside>
+
+  <p>The other points follow from the same design. MPP joins build their tables in memory, so in the slide's version two big tables could not be joined, while Hive's reduce-side join spills to disk and handles any size, slowly. Java UDFs existed only in Hive, and Impala's daemons live on the DataNodes, so it cannot grow and shrink with demand like a cloud service. These describe the early Impala of the slides, and "at least 10 times" is the slide's own claim against Hive on MapReduce: learn them as printed, as facts about that version.</p>
+
+  <p><b>Back to the puzzle.</b> Why keep an engine that is ten times slower? Because a long job must survive failures. A four-hour Hive job on hundreds of machines is likely to see some of them die, and MapReduce simply re-runs their tasks. An Impala query bets on being short enough to restart from scratch — a fine bet for a query of seconds, a ruinous one for a night of ETL. Hence the division of labour that follows from p. 921: Hive for long, heavy batch jobs and joins of big tables, Impala for interactive queries on the same tables, through the same Metastore. Speed was never the question; surviving failures, and tables too big for memory, was.</p>
+
+  <p class="memo"><mark class="key">Impala is faster because it skips MapReduce — no job start-up, rows streamed in memory — and for the same reason a node failure kills the whole query: Hive for long fault-tolerant jobs, Impala for interactive ones.</mark></p>
+
+  <div class="story" data-year="2008–2010">
+    <p>In January 2008 David DeWitt and Michael Stonebraker called MapReduce "A giant step backward in the programming paradigm for large-scale data intensive applications", "Missing most of the features that are routinely included in current DBMS". Two years later Stonebraker and six co-authors published "MapReduce and Parallel DBMSs: Friends or Foes?" and concluded that the two complement each other: MapReduce is closer to an ETL system than to a database. Hive and Impala, side by side on p. 921, are that truce.</p>
+  </div>
+</section>
+
+
+<section id="l32-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>The Hadoop ecosystem belongs to the theory part: open answers, multiple choice and true or false, where wrong answers may carry a penalty announced just before the exam. The last question is an exercise of ours on the ER diagram of a past paper.</p>
+
+  <div class="exam" data-kind="open" id="l32-exam-hbase">
+    <div class="exam-q" lang="en">
+      <p>Describe the data model of HBase, using the zoo example of the slides. How is a cell identified, how is a table stored, and what does "nulls are free" mean?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>HBase is modelled on Google's Bigtable: a key-valued row/column store on HDFS for billions of rows and millions of columns. A table is a sparse map in which each cell is addressed by its row key, its column — written family:qualifier — and a timestamp, and holds an untyped byte array. Column families are declared with the table (in the zoo example, animal: and repairs:), while qualifiers such as animal:type and animal:size can be added by any row. Every write creates a new version: enclosure1 has animal:type = lion at t1 and zebra at t2, and a read returns the newest version, zebra. Each column family is stored separately, as a list of (row, timestamp, column) → value entries: three in animal: and one in repairs: for the example. A cell that was never written has no entry at all, so it takes no space — that is "nulls are free"; space grows with the cells written, not with rows times columns. Access is only by key: get a cell or a row, or scan a range of row keys; there is no SQL and no join.</p></div>
+      <div class="exam-note"><p>A complete answer covers four things: the cell address (row key, family:qualifier, timestamp) with an untyped value; versions, newest returned; storage per family as (row, timestamp, column) → value entries; the absent entry as the meaning of "nulls are free". Use the zoo: it is the slides' own example. If you mention "column-oriented", add that it means column families, not a column store.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l32-exam-pig">
+    <div class="exam-q" lang="en">
+      <p>The Pig Latin script below finds the top 5 most visited pages by users aged 18–25. Into how many MapReduce jobs is it compiled, which statements belong to each job, and why that number?</p>
+<pre><code>Users = load 'users' as (name, age);
+Filtered = filter Users by age &gt;= 18 and age &lt;= 25;
+Pages = load 'pages' as (user, url);
+Joined = join Filtered by name, Pages by user;
+Grouped = group Joined by url;
+Summed = foreach Grouped generate group, COUNT(Joined) as clicks;
+Sorted = order Summed by clicks desc;
+Top5 = limit Sorted 5;
+store Top5 into 'top5sites';</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Three MapReduce jobs. A MapReduce job has at most one shuffle, so Pig starts a new job for every operator that needs tuples with equal keys brought together across the cluster: the join on name, the group on url and the order by clicks. Job 1 loads users and pages and filters the users by age in the map phase, shuffles both inputs on the name and joins them in the reduce phase. Job 2 reads the joined tuples, shuffles them on url, and counts each group in the reduce phase (COUNT can also run as a combiner). Job 3 shuffles the (url, clicks) pairs on clicks, so they arrive sorted; the reduce side keeps the first five and stores them. LOAD, FILTER, FOREACH … GENERATE and LIMIT need no shuffle of their own and ride along in the map or reduce phase of these jobs; the outputs of jobs 1 and 2 are written to HDFS and read by the next job.</p></div>
+      <div class="exam-note"><p>The number alone does not answer the "why": give the rule — one job per shuffle — and the statements assigned to jobs as on p. 904. The tempting wrong answers are nine (one per line) and one ("it is one script"). If you know that real Pig adds a small sampling job before the ORDER, say so after the three jobs of p. 904, never instead of them.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l32-exam-prune">
+    <div class="exam-q" lang="en">
+      <p>A Hive table <code>page_views</code> is <code>PARTITIONED BY (dt STRING, country STRING)</code> and holds 365 days of data for 4 countries, one partition per (dt, country) pair. How many partition directories does Hive read to answer the query below?</p>
+<pre><code>SELECT * FROM page_views
+WHERE dt = '2008-03-31' AND referrer_url LIKE '%xyz.com';</code></pre>
+    </div>
+    <ul class="options" lang="en">
+      <li>1 <span class="fb">That would need a condition on country too. With dt alone, every country of that day is read.</span></li>
+      <li data-correct>4 <span class="fb">dt = '2008-03-31' selects one day; country is unconstrained, so the 4 directories of that day are read, and the LIKE filters rows inside them.</span></li>
+      <li>124 <span class="fb">31 days × 4 countries: the whole of March — what the printed query of p. 911 selects, not this one.</span></li>
+      <li>1460 <span class="fb">The whole table: that happens only without the dt condition. The LIKE on referrer_url prunes nothing.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>4 directories out of 365 × 4 = 1460. Partition pruning matches the condition on the partition column dt against the partitions listed in the Metastore before the job starts, so only the directories dt=2008-03-31/country=… become input. The condition on referrer_url concerns a column inside the files: it is evaluated row by row in the mappers and does not reduce the data read.</p></div>
+      <div class="exam-note"><p>Two ideas in one question: a partition is a directory chosen by value before the job runs, and a condition on an ordinary column prunes nothing.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l32-exam-impala">
+    <div class="exam-q" lang="en">
+      <p>Impala and Hive can query the same tables. Explain why Impala answers interactive queries much faster than Hive, what it gives up in exchange, and when Hive remains the better choice.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Hive compiles a HiveQL query into MapReduce jobs: every job pays a start-up cost, and the output of every job is written to HDFS before the next one reads it. Impala is a massively parallel processing (MPP) engine integrated into the Hadoop stack on the same level as MapReduce, not above it: long-running daemons on the DataNodes plan the query, split it into fragments that run in parallel on every node, read the HDFS blocks locally and stream intermediate rows to each other in memory, and its scanners push predicates down into the read. It shares Hive's Metastore, so it uses the same tables and files without moving any data — the engine is brought to the data. The slides claim it is always at least 10 times faster than Hive. In exchange it has no fault tolerance within a query (the slide says "inter-query"): if a node fails, the whole query is aborted and must be restarted, whereas MapReduce re-runs only the failed tasks because their inputs and outputs are on disk. In the slides' version Impala also could not join several big tables, had no Java UDFs and was not elastic in the cloud. Hive therefore remains the choice for long batch jobs over very large tables, where a restart would be expensive, and Impala for short interactive queries.</p></div>
+      <div class="exam-note"><p>The core of the answer is the trade-off, not the speed: the mechanism (MPP daemons, no MapReduce, in-memory streaming, local reads, predicate pushdown), the price (a node failure kills the query — within a query, whatever the printed "inter-query" says) and the consequence (long jobs on Hive, interactive ones on Impala). The other points of p. 921 are dated: say "in the slides" when you use them.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l32-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Pig and Hive run their queries as MapReduce jobs, whereas Impala runs SQL without MapReduce. <span class="fb">True: Pig and Hive sit on top of MapReduce; Impala sits on the same level and processes data "without using MapReduce" (pp. 915–916).</span></li>
+      <li>HBase stores a NULL marker for every unwritten cell of a row. <span class="fb">False: an unwritten cell has no entry at all — "nulls are free" (pp. 893, 895).</span></li>
+      <li data-correct>Hive keeps the schemas of its tables in the Metastore and their data as files in HDFS directories. <span class="fb">True: "Maintains list of table schemas" (p. 906); warehouse directory, subdirectories and flat files (p. 909).</span></li>
+      <li>Tables created in Hive must be redefined in Impala before Impala can query them. <span class="fb">False: "Impala shares metastore with Hive, which enables very simple adoption" (p. 919).</span></li>
+      <li data-correct>A Hive bucket spreads the rows of a partition over a fixed number of files by hashing a column. <span class="fb">True: "Hash partitions within ranges (useful for sampling, join optimization)" (p. 908).</span></li>
+      <li>"Can call Hadoop Streaming scripts from HiveQL" means that Hive processes real-time data streams. <span class="fb">False: Hadoop Streaming runs mappers and reducers written in any language over standard input and output; stream processing is Storm.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: the first, the third and the fifth. HBase does not store anything for an unwritten cell; Impala shares the Hive Metastore, so Hive's tables are visible to it at once; Hadoop Streaming is a way of writing MapReduce code in any language, not stream processing.</p></div>
+      <div class="exam-note"><p>With a possible penalty, tick only what a slide supports. Each false statement swaps a word: NULL marker for no entry, redefine for share, streaming scripts for stream processing.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l32-exam-farm">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise of ours, on the ER diagram of the Exam of 12 Sep 2025</b> (tracking farmers and their sales at local markets): People (Personal ID, Name, Surname, Age, Address, State) buy Products (Product ID, Name, Quantity, Expiration Date) through the relationship Buy (Buy Date, Amount); Products are sold at Markets (Name, Location, Opening Time, Closing Time, Size) through the relationship Sell.</p>
+      <p>Suppose you record a large, continuously increasing number of purchases of products at the markets as files in HDFS, and analyse them with Hive, mostly one day at a time. (a) Write the Hive table for the purchases, with the attributes of the ER model you need, partitioned so that a query on one day reads only that day's data. (b) Write a HiveQL query that returns, for each market location, the number of distinct people who bought a product on 20/03/2025 and the total amount. (c) How many partition directories does your query read, and why?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE TABLE purchases(product_id STRING, product_name STRING,
+                       market_name STRING, market_location STRING,
+                       personal_id STRING, amount DOUBLE)
+COMMENT 'One row per purchase of a product at a market'
+PARTITIONED BY(buy_date STRING)
+STORED AS SEQUENCEFILE;</code></pre>
+<pre><code>SELECT market_location, COUNT(DISTINCT personal_id), SUM(amount)
+FROM purchases
+WHERE buy_date = '2025-03-20'
+GROUP BY market_location;</code></pre>
+        <p>(a) The partition column buy_date is declared in PARTITIONED BY and not in the column list: each day becomes a directory such as /user/hive/warehouse/purchases/buy_date=2025-03-20/. Dates are stored as yyyy-mm-dd strings, which sort in date order. (b) WHERE comes before GROUP BY; COUNT(DISTINCT personal_id) counts people, not purchases. (c) One directory: buy_date is a partition column, so the compiler matches the WHERE against the partitions listed in the Metastore before the job starts and reads only buy_date=2025-03-20; the GROUP BY then needs one shuffle, on market_location.</p>
+      </div>
+      <div class="exam-note"><p>The exercise is ours: Hive is not among the topics of the practical part (Neo4j, MongoDB, Elasticsearch, Redis, SparkQL), but the paper's own first exercise asks for a columnar design of the same sales. It checks what the theory part can ask about Hive: partition columns declared apart and turned into directories, the WHERE before the GROUP BY, and COUNT(DISTINCT …) counting people. Only attributes of the ER model are used, as the MongoDB exercise of the same paper demands ("Do not add variables besides the ones included in the ER model").</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l32-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">In the zoo table, <code>enclosure3</code> has only <code>animal:type</code> written. A put writes <code>animal:diet</code> = hay into <code>enclosure3</code>. What changes in storage?</p>
+    <ul class="options">
+      <li>The put is refused until the table is altered to declare <code>animal:diet</code> <span class="fb">Only column families are declared; qualifiers are free, as the widget's diet column showed.</span></li>
+      <li>A column <code>animal:diet</code> is added to all three rows, holding NULL where nothing was written <span class="fb">Columns are not slots: nothing is written for the other rows, and their <code>animal:diet</code> simply has no entry.</span></li>
+      <li data-correct>One entry, <code>(enclosure3, t, animal:diet)</code> → hay, is added to the list of the family <code>animal:</code> <span class="fb">One written cell, one entry, in its own family's list.</span></li>
+      <li>A new version of every cell of <code>enclosure3</code> is written, with the same timestamp <span class="fb">A put writes only the cells it names; the other cells keep their versions.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Any row can add any qualifier. Why does HBase keep column families at all?</p>
+    <ul class="options">
+      <li data-correct>They are the unit of storage: each family is kept apart, so reading <code>repairs:</code> never touches the entries of <code>animal:</code> <span class="fb">P. 895 stores the two families as separate lists; columns read together belong in one family.</span></li>
+      <li>They give each column a type <span class="fb">HBase is untyped: every value is a <code>byte[]</code> (p. 893).</span></li>
+      <li>Without families, empty cells would not be free <span class="fb">Empty cells are free because absent entries are not stored, in any family.</span></li>
+      <li>They replace the row key in lookups <span class="fb">Lookups go by row key (p. 897); the family only says which list to read.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A Pig script loads a log of visits, filters the visits of 2024, groups them by country, counts each group with <code>foreach … generate</code> and stores the result. By the one-job-per-shuffle rule of p. 904, into how many MapReduce jobs is it compiled?</p>
+    <ul class="options">
+      <li>5, one per statement <span class="fb">Statements are not jobs: load, filter, foreach and store run inside the map or reduce phase of a job.</span></li>
+      <li data-correct>1: only the group needs a shuffle <span class="fb">Load and filter on the map side, the shuffle on country, the count and the store on the reduce side.</span></li>
+      <li>2: one for the filter, one for the group <span class="fb">A filter looks at one tuple at a time: no shuffle, no job of its own.</span></li>
+      <li>0: Pig does not use MapReduce <span class="fb">Pig "Expresses sequences of MapReduce jobs" (p. 899).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text"><code>page_views</code> is partitioned by (dt, country), with 365 days and two countries, USA and CA. A query has <code>WHERE country = 'CA'</code> and nothing on <code>dt</code>. Which directories does Hive read?</p>
+    <ul class="options">
+      <li>Only the directory <code>country=CA</code> <span class="fb">There is no such directory at the top: the <code>country=…</code> directories sit inside each <code>dt=…</code> directory.</span></li>
+      <li>None can be skipped: country is not the first partition column <span class="fb">Any partition column can prune; the Metastore lists every (dt, country) pair.</span></li>
+      <li>All 730, because dt is not constrained <span class="fb">Pruning applies to each partition column: the 365 USA directories are skipped.</span></li>
+      <li data-correct>365: the <code>country=CA</code> directory inside every <code>dt</code> directory <span class="fb">Every day has its CA subdirectory; half of the table is skipped.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which are reasons why Impala answers a short query faster than Hive? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>No MapReduce job has to start: its daemons already run on every node <span class="fb">Impala "process data in Hadoop cluster without using MapReduce" (p. 916).</span></li>
+      <li>It stores the tables in its own, faster storage engine <span class="fb">No: it reads the same HDFS files as Hive, through the shared Metastore (p. 919).</span></li>
+      <li data-correct>Intermediate rows stream between nodes in memory instead of being written to HDFS between jobs <span class="fb">"Fully MPP Distributed" (p. 918); MapReduce writes every job's output to HDFS.</span></li>
+      <li data-correct>Its scanners push the WHERE conditions down into the reading of the files <span class="fb">"predicate pushdown capability" (p. 920): failing rows are dropped while reading.</span></li>
+      <li>It re-runs only the failed fragment when a node dies <span class="fb">That is MapReduce's strength; Impala has no fault tolerance within a query (p. 921).</span></li>
+    </ul>
+    <p class="q-fb">All three true reasons are one design: long-running processes that keep the data moving in memory. The same design is why a failure kills the query.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A nightly job joins three tables of several terabytes each and runs for four hours on a large cluster, where a machine fails every few hours. By the slides, Hive or Impala?</p>
+    <ul class="options">
+      <li>Impala, because it is always at least 10 times faster <span class="fb">A node failure would abort the whole query, and p. 921 lists joins between several big tables as something Impala could not do yet.</span></li>
+      <li>Either: they share the Metastore, so they behave the same <span class="fb">They share tables and files, not the way the query runs.</span></li>
+      <li data-correct>Hive: MapReduce re-runs failed tasks from data on disk, and it handles joins of big tables <span class="fb">Long, fault-tolerant batch work is Hive's niche: "Hive is doing things Impala can not do yet, like joins between several big tables" (p. 921).</span></li>
+      <li>Neither: only Pig can join three tables <span class="fb">Hive joins with SQL syntax (p. 912), any number of tables.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l32-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>HBase, modelled on Bigtable and built on HDFS, is a sparse map: a cell is addressed by (row key, family:qualifier, timestamp) and holds untyped bytes; families are declared, qualifiers are free, and a read returns the newest version.</li>
+    <li>Each column family is stored as its own list of (row, timestamp, column) → value entries, so an unwritten cell costs nothing — "nulls are free"; reads go by key only (a cell, a row, a scan of sorted keys), and "column-oriented" here means column families, not a column store.</li>
+    <li>Pig compiles a data flow of relations over nested bags into a sequence of MapReduce jobs, one per operator that needs a shuffle: JOIN, GROUP and ORDER make the three jobs of p. 904.</li>
+    <li>Hive puts SQL on Hadoop: the Driver compiles HiveQL into MapReduce jobs, the Metastore keeps schemas and partitions, and the data stay as flat files in HDFS — tables and partitions are directories, buckets are hash files, a SerDe applies the schema on read.</li>
+    <li>Partition pruning reads only the directories whose partition values satisfy the WHERE, chosen before any job starts; conditions on other columns filter rows inside the files. Correcting pp. 911–912: the partition column is dt, not date, and WHERE comes before GROUP BY.</li>
+    <li>Impala is an MPP SQL engine beside MapReduce: it shares the Hive Metastore and files, plans on any node, runs fragments on every node with local reads and in-memory streaming, and pushes predicates into its scanners — faster, but a node failure kills the whole query, so Hive keeps long batch jobs and Impala takes interactive ones.</li>
+  </ul>
+  <aside class="cheat" id="l32-cheat">
+    <dl>
+      <dt>HBase cell</dt><dd>(row key, family:qualifier, timestamp) → value (<code>byte[]</code>); newest version returned</dd>
+      <dt>HBase storage (p. 895)</dt><dd>one list per column family of (row, timestamp, column) → value; unwritten cell = no entry: "nulls are free"</dd>
+      <dt>HBase write (p. 896)</dt><dd><code>BatchUpdate update = new BatchUpdate(row); update.put(col, bytes); table.commit(update);</code></dd>
+      <dt>HBase reads (p. 897)</dt><dd><code>table.getRow(row).getColumn(col).getValue()</code> · <code>table.getRow(row)</code> · <code>table.getScanner(cols)</code></dd>
+      <dt>Pig Latin</dt><dd><code>load … as (…)</code> · <code>filter … by</code> · <code>join A by x, B by y</code> · <code>group … by</code> · <code>foreach … generate group, COUNT(bag)</code> · <code>order … by … desc</code> · <code>limit … n</code> · <code>store … into</code></dd>
+      <dt>Jobs of a script</dt><dd>one per shuffle operator (JOIN, GROUP, ORDER): 3 for the top-5 script (p. 904)</dd>
+      <dt>Hive</dt><dd>HiveQL + Metastore; Driver = compiler, optimizer, executor → MapReduce jobs; data = files under <code>/user/hive/warehouse</code></dd>
+      <dt>Hive table (p. 910)</dt><dd><code>CREATE TABLE t(…) PARTITIONED BY(dt STRING, country STRING) STORED AS SEQUENCEFILE;</code></dd>
+      <dt>Partition / bucket</dt><dd>directory per value, <code>…/page_views/dt=2008-06-08/country=USA</code> · file per hash: bucket = hash(col) mod N</dd>
+      <dt>Partition pruning</dt><dd><code>WHERE dt = '2008-03-31'</code> → only that day's directories, chosen before the job</dd>
+      <dt>Hive CLI (p. 913)</dt><dd><code>show tables;</code> · <code>describe t;</code> · <code>describe extended t;</code></dd>
+      <dt>Impala</dt><dd>MPP engine by Cloudera, beside MapReduce on HDFS; shares the Hive Metastore; planner + coordinator + exec engine on every node; local direct reads; scanners with predicate pushdown</dd>
+      <dt>Impala formats (p. 922)</dt><dd>RCFile, Parquet (columnar) · CSV, Avro, SequenceFile (row by row)</dd>
+      <dt>Hive or Impala</dt><dd>long, fault-tolerant batch jobs → Hive; interactive queries → Impala (no fault tolerance within a query)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l32-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://hbase.apache.org/book.html" target="_blank" rel="noopener">Apache HBase Reference Guide</a>
+      <span class="res-by">Apache HBase project</span>
+      <p class="res-why">Read the Data Model chapter next to section 1: its conceptual view and physical view are the pair of pictures of pp. 894–895, on a web table instead of a zoo. Its section on versions explains how many a family keeps.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://cwiki.apache.org/confluence/display/Hive/Tutorial" target="_blank" rel="noopener">Apache Hive Tutorial</a>
+      <span class="res-by">Apache Hive wiki</span>
+      <p class="res-why">The data units of p. 908 — tables, partitions, buckets — and the table of p. 910 (called <code>page_view</code> there) with its partition-based queries. Read it next to sections 3 and 4.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="http://infolab.stanford.edu/~olston/publications/sigmod08.pdf" target="_blank" rel="noopener">Pig Latin: A Not-So-Foreign Language for Data Processing</a>
+      <span class="res-by">Olston, Reed, Srivastava, Kumar, Tomkins · Yahoo! Research · SIGMOD 2008</span>
+      <p class="res-why">The paper behind p. 899. Section 3.1 defines the nested bags; section 3.5 shows that JOIN is a COGROUP followed by flattening; section 4.2 and its Figure 3 compile a script into MapReduce jobs — each (CO)GROUP opens a job, and an ORDER costs two.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper28.pdf" target="_blank" rel="noopener">Impala: A Modern, Open-Source SQL Engine for Hadoop</a>
+      <span class="res-by">Kornacker et al. · CIDR 2015</span>
+      <p class="res-why">The three daemons behind p. 918's figure (impalad on every DataNode, the statestore, the catalog service) and pipelined execution with exchange operators instead of MapReduce jobs. It also shows how later versions removed limits of p. 921: hash joins that spill to disk, UDFs in Java and C++.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf" target="_blank" rel="noopener">Bigtable: A Distributed Storage System for Structured Data</a>
+      <span class="res-by">Chang, Dean, Ghemawat et al. · OSDI 2006</span>
+      <p class="res-why">Section 2, two pages, is the origin of HBase's vocabulary: the sparse, sorted map indexed by row, column and timestamp, on a web-table example.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Everything in this lesson reads files that are already in HDFS, and already finished. Where do they come from — and what if the data never stops arriving, a stream of clicks or logs that has to be counted while it flows?</p>
+</aside>
+
+</main>
+</body>
+</html>

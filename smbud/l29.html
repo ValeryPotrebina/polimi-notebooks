@@ -1,0 +1,1189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Feature stores · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the joined rows under the two widgets, and the entity-key cells of the time-series table. Tokens only. */
+.l29-rows { margin: 0.75rem 1rem 0.5rem; }
+.l29-rows .tbl th, .l29-rows .tbl td { white-space: nowrap; }
+.l29-rows .tbl td.is-bad { color: var(--bad); font-weight: 600; }
+.l29-rows .tbl td.is-null { color: var(--ink-3); }
+.l29-ts td.l29-ek { box-shadow: inset 0 0 0 2px var(--s3); }
+.l29-ts th:nth-child(3), .l29-ts th:nth-child(4), .l29-ts td:nth-child(3), .l29-ts td:nth-child(4) { padding-left: 0.4rem; }
+.tbl tr.l29-role > th { font-weight: 500; color: var(--ink-3); font-size: var(--t-xs); border-bottom: 1px solid var(--line); }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l29">
+
+<header class="lesson-head">
+  <h1>Feature stores</h1>
+  <p class="lede">After this lesson you will explain why machine-learning teams keep their features in a store of their own — one definition, an offline store for training, an online store for serving — and build a training set that never looks into the future.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>In September 2017 Uber's engineering blog described Michelangelo, the platform behind the company's machine-learning models. One of its parts, a feature store, held about 10,000 features — the input columns of the models — computed every day, shared across teams by name and kept in two systems: a Hive/HDFS data lake for training and Cassandra for online predictions. The History slide of the lecture starts right there: "First Experience in Uber, with Michelangelo platform" (p. 739). Its timeline adds Airbnb, Gojek, Tecton, AWS, Databricks and Google by 2021.</p>
+  <p>Here is the puzzle. A feature such as "what this customer spent in the last 30 days" is one short query. Why did so many companies build a whole system — two stores, a catalog, monitoring — around numbers that one query computes?</p>
+  <p>Because a one-line feature can go wrong in two ways that no query will ever report: it gets computed twice, and it gets read at the wrong moment. By the end of the lesson you will name both, watch each one break a model in a widget, and know why Uber's "store" was not a new database at all.</p>
+</div>
+
+
+<section id="l29-loop">
+  <h2>Features and the MLOps loop</h2>
+
+  <p>Start with the usage example of p. 738, a credit-scoring application. To decide on a loan, a model reads a few numbers about each customer: "Customer demographics (age, income, etc.)", "Historical credit behavior (loan repayments, defaults)" and "Real-time transaction data (recent purchases, account balance changes)". Each of these numbers is a feature.</p>
+
+  <div class="def">
+    <p><dfn>Feature</dfn> — "the input variables or attributes that describe (data) objects used by machine learning models to make predictions, such as customer age, transaction history, or weather conditions" (p. 720).</p>
+    <p><dfn>Feature store</dfn> — "a centralized repository used to store, manage, and serve features for machine learning (ML) tasks". Its goal: "to streamline the process of creating, sharing, and using these features across various ML models" (p. 720).</p>
+  </div>
+
+  <p>In the notation of your statistics courses a feature is a column of the design matrix \(X\); a feature store keeps those columns — named, dated and shared — outside any single model.</p>
+
+  <p>The same slide says where the store belongs: "It's a key asset in ML-Ops". <mark class="key">MLOps</mark> (Machine Learning Operations) is "a set of practices and tools that aim to streamline the development, deployment, and maintenance of machine learning (ML) models in production environments"; it "extends the principles of DevOps (Development and Operations) to the ML domain" and "brings together data scientists, machine learning engineers, and operations teams" (p. 722). Page 723 draws it as a loop with no end.</p>
+
+  <figure class="fig fig--plain" id="l29-fig-loop">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="The MLOps loop of page 723 as two connected circles: on the left Develop, Data prep and EDA lead across to the right circle, where Review, Deploy, Inference and Monitor lead back to (Re)-Train on the left; the two stations that consume features, (Re)-Train and Inference, are highlighted">
+      <path d="M240.5 165.65 A75 75 0 0 1 132.5 204.95" class="hl"/>
+      <path d="M406.2 104.8 A75 75 0 0 1 379.7 203.6" class="hl"/>
+      <path d="M128.1 202.2 A75 75 0 0 1 106.4 100.3" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M109.3 95.9 A75 75 0 0 1 211.9 77.8" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M216.2 80.9 A75 75 0 0 1 240.5 114.3 L264 114.3" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M240.5 165.65 A75 75 0 0 1 132.5 204.95" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M269.5 114.35 A75 75 0 0 1 300.3 76.4" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M304.8 73.8 A75 75 0 0 1 403.6 100.3" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M406.2 104.8 A75 75 0 0 1 379.7 203.6" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M375.2 206.2 A75 75 0 0 1 269.5 165.65 L246 165.65" class="sw-2" marker-end="url(#arr)"/>
+      <text x="170" y="147" class="tx-lg tx-mid tx-muted">Dev</text>
+      <text x="340" y="147" class="tx-lg tx-mid tx-muted">Ops</text>
+      <text x="86" y="162" class="tx-end">Develop</text>
+      <text x="154" y="50" class="tx-mid">Data prep</text>
+      <text x="205" y="112" class="tx-mid">EDA</text>
+      <text x="312" y="112" class="tx-mid">Review</text>
+      <text x="364" y="50" class="tx-mid">Deploy</text>
+      <text x="422" y="167">Inference</text>
+      <text x="310" y="240" class="tx-mid">Monitor</text>
+      <text x="190" y="240" class="tx-mid">(Re)-Train</text>
+      <text x="255" y="284" class="tx-hand tx-mid">the same features, needed twice</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The loop of p. 723, redrawn as two joined circles — development on the left, operations on the right — with the slide's eight stations read as one cycle. Highlighted: the two stations that consume features, (Re)-Train and Inference.</figcaption>
+  </figure>
+
+  <aside class="margin-note">The slide validates "using a test dataset". In AN2DL terms model selection uses a validation set and the test set is kept for the final estimate; at the exam, quote the slide.</aside>
+
+  <p>Page 724 tells the same loop in five phases, each with what MLOps promises for it:</p>
+  <ol>
+    <li><b>Development</b> — experiments with "models, algorithms, and feature sets"; code, models and datasets are versioned.</li>
+    <li><b>Training and Validation</b> — the model is trained and "validated using a test dataset", in a way that "can be reproduced".</li>
+    <li><b>Deployment</b> — automated with CI/CD practices.</li>
+    <li><b>Monitoring</b> — "real-time insights into how the model is performing, and whether data or concept drift is affecting its accuracy".</li>
+    <li><b>Retraining</b> — "When the model's performance drops or when new data becomes available".</li>
+  </ol>
+
+  <p>Page 725, titled "ML-Ops – focus on data and features", draws the same lifecycle as four interlocking rings — Data, ML, Dev and Ops — and the first ring is pure data work: collect, curate, transform, validate. That ring is where a feature store works.</p>
+
+  <p>Fix the two drifts of phase 4 now; the slides use them without defining them. <mark class="key">Data drift</mark>: the distribution of the inputs changes — this year's applicants are younger. <mark class="key">Concept drift</mark>: the relation between inputs and target changes — the same spending pattern no longer means the same risk. In statistical terms \(P(X)\) moves, or \(P(Y \mid X)\) moves.</p>
+
+  <p>Pages 726–728 list eight components of MLOps: version control for models and data ("datasets, features, models, and hyperparameters"); CI/CD for ML; model training and retraining; monitoring and model performance tracking ("accuracy, precision, recall, and business-specific KPIs"); data and feature management; automation and orchestration ("Kubernetes, Airflow, or Kubeflow"); collaboration between teams; model governance and compliance. Page 729 adds five benefits: faster time to market, improved collaboration, increased model reliability, reusability "of code, pipelines, and features", better model governance.</p>
+
+  <p>The fifth component is the door to this lesson: "MLOps integrates with feature stores to ensure that the same data transformations applied during training are applied in production, avoiding issues like 'training-serving skew.'" (p. 727).</p>
+
+  <p class="memo"><mark class="key">MLOps is a loop, and the features are needed at two of its stations: training and inference.</mark></p>
+</section>
+
+
+<section id="l29-skew">
+  <h2>The biggest problem: one feature, computed twice</h2>
+
+  <p>Page 743 is titled "The biggest problem to face": "Features for a machine learning model are required in both the modelling and production (deployment) phases of the lifecycle. This implies duplication of code and risk of inconsistency".</p>
+
+  <p>Here is what that looks like. A data scientist writes <code>spend_l30d</code>, a customer's spending over the last 30 days, in a notebook: purchases minus refunds, computed over the history to build the training set. The model goes live, and an engineer rewrites the same feature inside the production service — another language, a deadline, and no refunds. On 14 June customer C2, who returned an item of 220.00 the day before, has 275.00 in the training data and 495.00 in production. Both programs run without a single error.</p>
+
+  <div class="def">
+    <p><dfn>Training-serving skew</dfn> — the situation "where a model performs poorly because the features used in production differ from the ones used during training" (p. 734). Page 743 calls it "online/offline skew".</p>
+  </div>
+
+  <figure class="fig fig--pair fig--plain" id="l29-fig-before-after">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="Before: the raw events feed two programs, a notebook that builds the training data and a service that feeds inference; for the same customer the training value is 275.00 and the served value 495.00">
+        <rect x="18" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="32" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="60" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <text x="45" y="142" class="tx-sm tx-mid">raw events</text>
+        <line x1="74" y1="106" x2="100" y2="58" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="122" x2="100" y2="170" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="104" y="30" width="88" height="34" class="fi-paper sw-2"/>
+        <text x="148" y="51" class="tx-sm tx-mid">notebook code</text>
+        <rect x="104" y="164" width="88" height="34" class="fi-paper sw-2"/>
+        <text x="148" y="185" class="tx-sm tx-mid">service code</text>
+        <line x1="192" y1="47" x2="214" y2="47" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="192" y1="181" x2="214" y2="181" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="218" y="30" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="51" class="tx-sm tx-mid">training</text>
+        <rect x="218" y="164" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="185" class="tx-sm tx-mid">inference</text>
+        <text x="255" y="86" class="tx-mono tx-mid">275.00</text>
+        <text x="255" y="154" class="tx-mono tx-mid">495.00</text>
+        <text x="255" y="124" class="tx-lg tx-mid tx-bad tx-bold">≠</text>
+        <text x="148" y="122" class="tx-hand tx-mid">two programs</text>
+      </svg>
+      <p class="fig-label">Before: two programs, two values</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="After: the raw events feed one feature store with one definition; training and inference both receive 275.00 for the same customer">
+        <rect x="18" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="32" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="60" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <text x="45" y="142" class="tx-sm tx-mid">raw events</text>
+        <line x1="74" y1="114" x2="96" y2="114" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="100" y="82" width="96" height="64" class="fi-paper sw-2"/>
+        <text x="148" y="108" class="tx-sm tx-mid tx-bold">feature store</text>
+        <text x="148" y="128" class="tx-sm tx-mid">one definition</text>
+        <line x1="196" y1="94" x2="216" y2="60" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="196" y1="134" x2="216" y2="168" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="218" y="30" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="51" class="tx-sm tx-mid">training</text>
+        <rect x="218" y="164" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="185" class="tx-sm tx-mid">inference</text>
+        <text x="255" y="86" class="tx-mono tx-mid">275.00</text>
+        <text x="255" y="154" class="tx-mono tx-mid">275.00</text>
+        <text x="255" y="124" class="tx-lg tx-mid tx-good tx-bold">=</text>
+        <text x="128" y="204" class="tx-hand tx-mid">same value</text>
+      </svg>
+      <p class="fig-label">After: one definition, one value</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> Customer C2 on 14 June, as in the widget of section 3. Left: the notebook subtracts the returned item, the service does not, and the model trained on 275.00 is fed 495.00. Right: the drawing of p. 742 — raw data into one feature store, out to "Features used for model training" and "Features used for model inference".</figcaption>
+  </figure>
+
+  <p>The fix is to stop having two programs. On p. 742 the feature store is "An interface between the raw data and the models. It takes raw data and then transforms it into features subsequently used for model training and inference", and it "ensures that the features used across both models (and possibly many models) are consistent". The same slide calls it "a centralised repository that stores curated features" and "a data management layer that allows data scientists, machine learning engineers, and data engineers to collaborate, share, and discover features".</p>
+
+  <div class="pitfall">
+    <p>"Skew is just another word for drift." No. Skew happens while the world stands still: one raw input, two computations. Drift is the world changing, with one computation. A feature store removes skew by construction; drift it can only detect, by monitoring the features (p. 736) — the cure for drift is retraining.</p>
+  </div>
+
+  <p>What a feature store "grants", in the words of p. 743: "Consistency between model training and inference leads to better model accuracy", "eliminating online/offline skew", "Share and reuse features across models and teams, ensuring faster model development", "Provide feature versioning, lineage, provenance, and regulatory compliance". Page 737 sums it up in four benefits: <b>Consistency</b> (the same transformations in training and production), <b>Efficiency</b> (no redundant feature engineering), <b>Scalability</b> (batch and real-time features at large scale) and <b>Version Control</b> (models trained on older versions of features "can still be reproduced").</p>
+
+  <div class="tip"><p>Two benefit lists sit a few pages apart and a closed question can mix them. MLOps (p. 729): faster time to market, improved collaboration, increased model reliability, reusability, better model governance. Feature store (p. 737): consistency, efficiency, scalability, version control.</p></div>
+
+  <p>Page 733 shows who talks to the store, and when. Data engineers, data scientists and ML engineers "Define and iterate on new features" and "Load feature data for training" and "for testing"; the prediction service in production receives the feature values computed for inference and writes back to the store ("Log served features, prediction, outcomes", "Track feature stats to identify issues"); the engineers read those back to "Monitor for drift &amp; quality issues". Every phase of the loop reads from the store or writes to it.</p>
+
+  <p>Is it always worth it? Feature stores "are a must-have when working on a project where the intention is to deploy models at scale and in production"; "However, if you are working within a small team and on a small project or a POC, you may not need it" (p. 744). A proof of concept has one model and no production: nothing is computed twice.</p>
+
+  <p class="memo"><mark class="key">A feature store replaces two programs that compute the same feature with one definition that feeds both training and serving.</mark></p>
+</section>
+
+
+<section id="l29-stores">
+  <h2>Two stores: the history for training, the latest value for serving</h2>
+
+  <p>One definition does not mean one database. Back to the credit score of p. 738: "For training, the offline store would provide historical data, while for real-time predictions, the online store would supply the latest transaction data." Two stores, because training and serving ask two different questions.</p>
+
+  <p>The <mark class="key">offline store</mark> "Contains batch features used for model training. These are typically updated at regular intervals (e.g., daily or weekly) and stored in large-scale data storage systems like Hadoop or cloud-based data lakes" (p. 735). It keeps "months' or years' worth of feature data", "often stored in data warehouses or data lakes like S3, BigQuery, Snowflake, Redshift" (p. 765). Its question is a scan: every customer's value on every day of the last two years. That is the workload of a warehouse (<a href="l23.html">lesson 23</a>).</p>
+
+  <p>The <mark class="key">online store</mark> "Contains real-time features used for serving live predictions. These features need to be served with low latency for real-time inference and are typically stored in low-latency databases like Redis" (p. 735). It persists "feature values for low-latency lookup during inference", and "They typically only store the latest feature values for each entity" (p. 765). Its question is a lookup: the current values of customer C2, now, in milliseconds — a <code>GET</code> on a key, exactly what Redis is built for (<a href="l17.html">lesson 17</a>).</p>
+
+  <p>Page 765 adds: "Online stores are usually eventually consistent." Why is that acceptable? The article the slides follow explains that most ML uses have no strict consistency requirement: a fraud check computed on a balance a few seconds old is still a sensible check, while a check that arrives after the payment has gone through is useless. Latency and availability win — the BASE side of the trade-off of <a href="l05.html">lesson 5</a>.</p>
+
+  <div class="pitfall">
+    <p>"Cassandra is a key-value store: p. 765 says so." Read the sentence again: "They are usually implemented with key-value stores like DynamoDB, Redis, or Cassandra" describes how an online store uses Cassandra — one lookup by partition key. As a family, the course files Cassandra under columnar databases: the exam-guideline deck lists "Key-value DB (Redis)" and "columnar DB (Cassandra)", and the course notes call it "a columnar database with some key-value features" (<a href="l20.html">lesson 20</a>). Asked for Cassandra's family, answer columnar.</p>
+  </div>
+
+  <h3>Serving: one API, two answers</h3>
+
+  <p>Reading from the two stores is the task the slides call Serving: "An easy and canonical way to access all features in a company consistently across all environments" (p. 764). Offline, "feature values are commonly accessed through notebook-friendly feature store SDKs"; online, "a feature store delivers a single vector of features at a time made up of the freshest feature values, through a high-performance API backed by a low-latency database". The figure of p. 764 asks for the same three features both ways (<code>l7d</code> and <code>l30d</code> mean "last 7 days" and "last 30 days"):</p>
+
+  <div class="tabs" id="l29-tabs-serving">
+    <div data-tab="Online: one vector">
+      <p>"Request feature vector for inference", answered through a REST API:</p>
+<pre><code>.get_feature_vector (
+    features=["item_clicks_l7d",
+              "item_price",
+              "user_spend_l30d"],
+    entities={"user_id":3,
+              "item_id":62}
+)</code></pre>
+      <p>The answer, "Feature Vector (latest values, low-latency)":</p>
+<pre><code>{
+  "item_clicks_l7d":6,
+  "item_price":"$25.12",
+  "user_spend_l30d":"$12.10"
+}</code></pre>
+    </div>
+    <div data-tab="Offline: a training dataframe">
+      <p>"Request training data", answered through the Python SDK:</p>
+<pre><code>.get_training_data (
+    features=["item_clicks_l7d",
+              "item_price",
+              "user_spend_l30d"],
+    entities=entities_df
+)</code></pre>
+      <p>The answer, "Training Dataframe (historical values)":</p>
+<pre><code>user_id  item_id  time   item_clicks_l7d  item_price  user_spend_l30d
+1        54       7485   6                $23.2       $0
+2        35       46854  5                $41.54      $8.41</code></pre>
+    </div>
+  </div>
+
+  <p>The same three names, two very different answers: one vector of the latest values for one key, or one row per (entity, time) with the values as they were then. That <code>time</code> column comes back in section 5.</p>
+
+  <div class="pitfall">
+    <p>"<code>get_feature_vector</code> is Feast's API." No: pp. 763–769 reproduce a general article on feature stores (the Tecton article of the resources below), and the method names of p. 764 belong to that article's illustration, not to Feast. Feast's real calls are the ones of p. 762, <code>get_historical_features</code> and <code>get_online_features</code> — quote those when a question names Feast.</p>
+  </div>
+
+  <figure class="tbl-fig" id="l29-tbl-usecases">
+    <figcaption>Three use cases and the Feast call for each (p. 762). Two of the three are offline: what matters is batch versus per-request, not training versus prediction.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Use case</th><th>Example</th><th>API</th></tr></thead>
+        <tbody>
+          <tr><td>Training data generation</td><td>Fetching user and item features for (user, item) pairs when training a production recommendation model</td><td><code>get_historical_features</code></td></tr>
+          <tr><td>Offline feature retrieval for batch predictions</td><td>Predicting user churn for all users on a daily basis</td><td><code>get_historical_features</code></td></tr>
+          <tr><td>Online feature retrieval for real-time model predictions</td><td>Fetching pre-computed features to predict whether a real-time credit card transaction is fraudulent</td><td><code>get_online_features</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>How do values reach the online store? Page 757, about Feast: "For offline use cases that only rely on batch data, Feast does not need to ingest data and can query your existing data", while "For online use cases, Feast supports ingesting features from batch sources to make them available online (through a process called <mark class="key">materialization</mark>), and pushing streaming features to make them available both offline / online". The offline store can be the warehouse you already have, queried in place; materialization copies the latest value of each key into the online store; a stream pushes to both.</p>
+
+  <p>The widget puts the two stores, and the two programs of section 2, side by side. Its one insight: <strong>skew is silent</strong> — it appears, hides and reappears with the data and the calendar, and only one shared definition removes it.</p>
+
+  <div class="widget" id="l29-w-stores">
+    <h3 class="widget-title">One feature, two stores: where the skew comes from</h3>
+    <p class="widget-intro">Four customers of a credit-scoring app, their purchases and refunds from 1 May to 30 June, and one feature: <code>spend_l30d</code>, purchases minus refunds over the last 30 days. The notebook computes it for the offline store (one row per customer per day); the online store holds one key per customer, the value served to the model on the lookup day. Choose who fills the online store and which mistakes the hand-written service makes. The data are invented for the widget; every value is computed from them.</p>
+    <ol class="tasks">
+      <li>Choose "a feature store". Before you look at the readouts: how many rows does the offline store hold on 30 June, and how many keys does the online store hold? Why so different?
+        <details class="answer"><summary>What you should see</summary>
+          <p>244 rows (4 customers × 61 days) against 4 keys. The offline store keeps "months' or years' worth of feature data for training purposes"; online stores "typically only store the latest feature values for each entity" (p. 765) — on 14 June it is still 4 keys, while the offline store has 180 rows. The model in production needs one key, now; training needs the whole history.</p></details>
+      </li>
+      <li>Choose "two programs" with only "forgets refunds" on, and move the day from 1 to 30 June. Predict when the skew counter first leaves zero, and for whom.
+        <details class="answer"><summary>What you should see</summary>
+          <p>On 13 June, for C2: 275.00 in the training rows, 495.00 served — C2 returned an item of 220.00 that day. From 16 June C1 joins (a refund of 12.00: 160.70 against 172.70). For twelve days the two programs agreed perfectly: a skew test run in early June would have passed.</p></details>
+      </li>
+      <li>Only "calendar month" on: on which day of June does the skew disappear? And what does the service send on 1 June?
+        <details class="answer"><summary>What you should see</summary>
+          <p>It disappears on 30 June, the one day when "this month" and "the last 30 days" are the same window. On 1 June the service sends 0.00 for C1, C2 and C3, who spent 215.50, 215.00 and 195.00 in the previous 30 days. The bug comes and goes with the calendar: 83 of the 120 lookups of June are wrong.</p></details>
+      </li>
+      <li>Turn on all three bugs (105 skewed lookups in June), then switch to "a feature store". What happens, and why can no toggle bring the skew back?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The counters drop to 0 of 4 and 0 of 120. There is no second program left for a bug to live in: the online store is filled by materializing the latest offline value of each key, so the value served on any day is the very number a training row of that day contains. That is the "Consistency" of p. 737 — the same feature transformations in training and production.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l29-w-stores', function (root, ui) {
+    /* day 1 = 1 May … day 31 = 31 May, day 32 = 1 June … day 61 = 30 June; a negative amount is a refund */
+    var EV = {
+      C1: [[3, 42.30], [10, 38.10], [17, 51.20], [24, 44.00], [31, 39.90], [38, 47.60], [45, 41.20], [47, -12.00], [52, 52.80], [59, 45.50]],
+      C2: [[20, 180.00], [28, 35.00], [36, 220.00], [41, 60.00], [44, -220.00], [55, 75.00]],
+      C3: [[27, 95.00], [29, 60.00], [30, 40.00], [58, 80.00], [60, 50.00]],
+      C4: [[49, 25.00], [56, 30.00]]
+    };
+    var CUST = ['C1', 'C2', 'C3', 'C4'], FILL = 160, NONE = { refunds: false, month: false, fill: false };
+    function r2(x) { return Math.round(x * 100) / 100; }
+    function spend(c, d, bug) {                        /* the feature on day d; bug = the service's mistakes */
+      var lo = bug.month ? (d <= 31 ? 0 : 31) : d - 30, s = 0, n = 0;
+      EV[c].forEach(function (e) {
+        if (e[0] > lo && e[0] <= d) { if (e[1] < 0 && bug.refunds) return; s += e[1]; n++; }
+      });
+      if (n === 0 && bug.fill) return FILL;
+      return r2(s);
+    }
+
+    var who = ui.select('who fills the online store', [
+      { value: 'two', label: 'two programs: notebook for training, service for serving' },
+      { value: 'fs', label: 'a feature store: one definition, materialized' }
+    ], null, 'two');
+    var tRef = ui.toggle('service bug: forgets refunds', true);
+    var tMon = ui.toggle('service bug: this calendar month, not the last 30 days', false);
+    var tFill = ui.toggle('service bug: an empty window becomes 160.00, not 0.00', false);
+    var day = ui.slider({ label: 'lookup day in June', min: 1, max: 30, step: 1, value: 14, format: function (v) { return v + ' June'; } });
+    var roOff = ui.readout('offline store'), roOn = ui.readout('online store');
+    var roToday = ui.readout('skewed values on the lookup day'), roMonth = ui.readout('skewed lookups in June');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'feature values moving', color: 's1', mark: 'line' },
+      { label: 'the registered definition', color: 's3', mark: 'area' },
+      { label: 'served value ≠ training value', color: 'bad', mark: 'square' }
+    ]);
+    var svg = ui.svg(560, 250, { label: 'The raw events feed either two programs, a notebook that fills the offline store and a service that fills the online store, or one registered definition whose values are materialized from the offline to the online store; the online store shows one key per customer with the value served on the lookup day, outlined in red when it differs from the training value' });
+    var rowsBox = Course.el('div', { 'class': 'l29-rows' });
+    ui.stage.appendChild(rowsBox);
+
+    function bug() { return { refunds: tRef.value, month: tMon.value, fill: tFill.value }; }
+    function state() {
+      var fs = who.value === 'fs', b = bug(), d = 31 + Math.round(day.value);
+      var rows = CUST.map(function (c) {
+        var off = spend(c, d, NONE), on = fs ? off : spend(c, d, b);
+        return { c: c, off: off, on: on, skew: Math.abs(off - on) > 0.005 };
+      });
+      var month = 0;
+      for (var j = 32; j <= 61; j++) CUST.forEach(function (c) {
+        var a = spend(c, j, NONE), v = fs ? a : spend(c, j, b);
+        if (Math.abs(a - v) > 0.005) month++;
+      });
+      return { fs: fs, d: d, rows: rows, today: rows.filter(function (r) { return r.skew; }).length, month: month };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function arrow(x1, y1, x2, y2) { S('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' }); }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      [18, 31.5, 45, 58.5, 72].forEach(function (x) { S('rect', { x: x, y: 112, width: 12, height: 20, 'class': 'fw-s1 st-s1' }); });
+      T(50, 152, 'raw events', 'tx-sm tx-mid');
+      /* the offline store: a table with a header row and the history below it */
+      for (var cx = 0; cx < 5; cx++) for (var ry = 0; ry < 4; ry++) {
+        S('rect', { x: 262 + 20 * cx, y: 24 + 12 * ry, width: 20, height: 12, 'class': ry === 0 ? 'fw-s3 st-s3' : 'fi-paper' });
+      }
+      T(312, 92, 'offline store', 'tx-sm tx-mid');
+      S('rect', { x: 440, y: 30, width: 110, height: 34, rx: 4, 'class': 'fi-paper' });
+      T(495, 52, 'training', 'tx-sm tx-mid');
+      arrow(364, 47, 436, 47);
+      /* the online store: one key-value pair per customer */
+      T(317, 140, 'online store', 'tx-sm tx-mid');
+      st.rows.forEach(function (r, i) {
+        var y = 150 + 22 * i;
+        S('rect', { x: 262, y: y, width: 38, height: 22, 'class': 'fw-s3 st-s3' });
+        S('rect', { x: 300, y: y, width: 72, height: 22, 'class': r.skew ? 'fi-paper st-bad sw-3' : 'fi-paper' });
+        T(281, y + 16, r.c, 'tx-mono tx-sm tx-mid');
+        T(336, y + 16, r.on.toFixed(2), 'tx-mono tx-sm tx-mid');
+      });
+      S('rect', { x: 440, y: 176, width: 110, height: 34, rx: 4, 'class': 'fi-paper' });
+      T(495, 198, 'serving', 'tx-sm tx-mid');
+      arrow(374, 194, 436, 194);
+      if (st.fs) {
+        S('rect', { x: 116, y: 100, width: 104, height: 40, 'class': 'fw-s3 st-s3 sw-2' });
+        T(168, 125, 'definition', 'tx-sm tx-mid');
+        arrow(88, 122, 112, 121);
+        arrow(220, 108, 258, 58);
+        S('path', { d: 'M366 64 C404 86 404 132 378 150', 'class': 'st-s1 sw-2 fi-none', 'marker-end': 'url(#arr-s1)' });
+        T(410, 112, 'materialize', 'tx-sm');
+      } else {
+        S('rect', { x: 116, y: 30, width: 104, height: 34, 'class': 'fi-paper sw-2' });
+        T(168, 52, 'notebook', 'tx-sm tx-mid');
+        S('rect', { x: 116, y: 176, width: 104, height: 34, 'class': 'fi-paper sw-2' });
+        T(168, 198, 'service', 'tx-sm tx-mid');
+        arrow(88, 116, 112, 54);
+        arrow(88, 128, 112, 186);
+        arrow(220, 47, 258, 47);
+        arrow(220, 193, 258, 193);
+      }
+    }
+    function table(st) {
+      rowsBox.textContent = '';
+      var head = Course.el('tr', null, ['customer', 'training row (offline)', 'served (online)', 'difference'].map(function (h) { return Course.el('th', { text: h }); }));
+      var body = Course.el('tbody');
+      st.rows.forEach(function (r) {
+        var diff = r2(r.on - r.off);
+        body.appendChild(Course.el('tr', null, [
+          Course.el('td', { text: r.c }),
+          Course.el('td', { 'class': 'n', text: r.off.toFixed(2) }),
+          Course.el('td', { 'class': 'n' + (r.skew ? ' is-bad' : ''), text: r.on.toFixed(2) }),
+          Course.el('td', { 'class': 'n' + (r.skew ? ' is-bad' : ''), text: r.skew ? (diff > 0 ? '+' : '−') + Math.abs(diff).toFixed(2) : '0' })
+        ]));
+      });
+      rowsBox.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, head), body])));
+    }
+    ui.onChange(function () {
+      var st = state();
+      draw(st); table(st);
+      roOff.set((4 * st.d) + ' rows: 4 customers × ' + st.d + ' days');
+      roOn.set('4 keys: the latest value of each');
+      roToday.set(st.today + ' of 4', st.today ? 'bad' : 'good');
+      roMonth.set(st.month + ' of 120', st.month ? 'bad' : 'good');
+      if (st.fs) note.set('One definition: the notebook\'s values are materialized into the online store, so the service\'s bugs have nothing to act on.');
+      else if (st.today) note.set('No error anywhere: both programs ran fine. The model was trained on the offline numbers and is now fed different ones.');
+      else if (st.month) note.set('The two programs agree on this day — but not on ' + st.month + ' lookups of June.');
+      else note.set('Two programs that agree — as long as nobody changes one of them.');
+    });
+  });
+  </script>
+
+  <p class="memo"><mark class="key">The offline store answers "what was the value then?" for training; the online store answers "what is the value now?" for one key, in milliseconds.</mark></p>
+</section>
+
+
+<section id="l29-tasks">
+  <h2>Inside the box: five tasks</h2>
+
+  <p>Page 763 opens the box (Fig. 3). Data enter from a stream source and a batch source and leave towards model serving and model training. Three tasks sit on the data path — transform, storage, serving, with an on-demand transform inside serving — and two span all of them: operational monitoring above, the registry below. The slides number them 1 Serving, 2 Storage, 3 Transform, 4 Monitoring, 5 Registry; you have met the first two.</p>
+
+  <figure class="fig fig--plain" id="l29-fig-tasks">
+    <svg class="dia" viewBox="0 0 560 304" role="img" aria-label="The feature store of page 763 with the detail of page 766: a stream source feeds a stream transform and a batch source a batch transform; both transforms fill both parts of the storage, an online and an offline store; the online store feeds model serving through an on-demand transform in the serving panel, the offline store feeds model training; operational monitoring spans the top and the registry the bottom">
+      <text x="46" y="108" class="tx-sm tx-mid tx-muted">sources</text>
+      <rect x="14" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="28" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="42" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="56" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="70" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <text x="48" y="168" class="tx-sm tx-mid">stream</text>
+      <path d="M20 184 v26 a27 5 0 0 0 54 0 v-26" class="fi-paper"/>
+      <ellipse cx="47" cy="184" rx="27" ry="5" class="fi-paper"/>
+      <text x="47" y="236" class="tx-sm tx-mid">batch</text>
+      <rect x="96" y="14" width="368" height="280" rx="6" class="sw-2"/>
+      <text x="280" y="34" class="tx-mid tx-bold">Feature Store</text>
+      <rect x="104" y="44" width="352" height="28" class="fw-ink"/>
+      <text x="280" y="63" class="tx-sm tx-mid">Operational monitoring</text>
+      <rect x="104" y="80" width="112" height="156" class="fi-paper"/>
+      <rect x="224" y="80" width="112" height="156" class="fi-paper"/>
+      <rect x="344" y="80" width="112" height="156" class="fi-paper"/>
+      <text x="160" y="100" class="tx-sm tx-mid tx-bold">Transform</text>
+      <text x="280" y="100" class="tx-sm tx-mid tx-bold">Storage</text>
+      <text x="400" y="100" class="tx-sm tx-mid tx-bold">Serving</text>
+      <rect x="112" y="124" width="80" height="28" class="fw-s5 st-s5 sw-2"/>
+      <text x="152" y="143" class="tx-sm tx-mid">stream</text>
+      <rect x="112" y="178" width="80" height="28" class="fw-s4 st-s4 sw-2"/>
+      <text x="152" y="197" class="tx-sm tx-mid">batch</text>
+      <path d="M240 122 v32 a40 6 0 0 0 80 0 v-32" class="fi-paper"/>
+      <ellipse cx="280" cy="122" rx="40" ry="6" class="fi-paper"/>
+      <text x="280" y="146" class="tx-sm tx-mid">online</text>
+      <path d="M240 176 v32 a40 6 0 0 0 80 0 v-32" class="fi-paper"/>
+      <ellipse cx="280" cy="176" rx="40" ry="6" class="fi-paper"/>
+      <text x="280" y="200" class="tx-sm tx-mid">offline</text>
+      <rect x="352" y="122" width="96" height="32" class="fw-s2 st-s2 sw-2"/>
+      <text x="400" y="143" class="tx-sm tx-mid">on-demand</text>
+      <rect x="104" y="244" width="352" height="40" class="fw-s3 st-s3"/>
+      <text x="280" y="269" class="tx-sm tx-mid tx-bold">Registry</text>
+      <rect x="476" y="116" width="80" height="44" rx="4" class="fi-paper"/>
+      <text x="516" y="134" class="tx-sm tx-mid">model</text>
+      <text x="516" y="152" class="tx-sm tx-mid">serving</text>
+      <rect x="476" y="170" width="80" height="44" rx="4" class="fi-paper"/>
+      <text x="516" y="188" class="tx-sm tx-mid">model</text>
+      <text x="516" y="206" class="tx-sm tx-mid">training</text>
+      <line x1="84" y1="138" x2="108" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="76" y1="194" x2="108" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <path d="M192 138 H204 M192 192 H204 M204 138 V192" class="st-s1 sw-2 fi-none"/>
+      <line x1="204" y1="138" x2="236" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="204" y1="192" x2="236" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="320" y1="138" x2="348" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="448" y1="138" x2="472" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="320" y1="192" x2="472" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The five tasks of p. 763, with the transforms of p. 766 inside. A stream transform (magenta) and a batch transform (teal) both feed both stores — streaming features are pushed to both, batch values are materialized into the online store (p. 757); the online store reaches model serving through serving, where an on-demand transform (orange) adds what only the request knows; the offline store feeds model training. Operational monitoring and the registry span everything.</figcaption>
+  </figure>
+
+  <h3>Transform: where feature engineering runs</h3>
+
+  <aside class="margin-note">Most feature engineering is plain data code: sums over windows, encodings. Machine learning enters at the advanced end, like the embeddings of lessons 27 and 28, which are features too.</aside>
+
+  <p>Page 741 defines what the transform task runs. Feature engineering: "DEF: a machine learning approach that extracts features from a raw dataset, resulting in new features". It "ranges from basic transformations such as aggregations to more advanced feature transformations such as word embeddings produced by machine learning algorithms", and its goal is "to essentially create a better dataset to improve the performance of machine learning algorithms". Page 734 names the everyday steps: "aggregations, normalization, one-hot encoding".</p>
+
+  <p>The jobs "are executed on data processing engines (e.g. Spark or Pandas) to which the feature store is connected" (p. 766): the store orchestrates them, it does not replace Spark (<a href="l38.html">lesson 38</a>). Page 767 sorts them into three kinds, by when their input exists:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-transforms">
+    <figcaption>The three transform types of p. 767. The slide prints the fourth header as "Common input data source"; read it as "Example" (see the red pen below).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Feature type</th><th>Definition</th><th>Common input data source</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td>Batch Transform</td><td>Transformations that are applied only to data at rest</td><td>Data warehouse, data lake, database</td><td>User country, product category</td></tr>
+          <tr><td>Streaming Transform</td><td>Transformations that are applied to streaming sources</td><td>Kafka, Kinesis, PubSub</td><td># of clicks per vertical per user in last 30 minutes, # of views per listing in past hour</td></tr>
+          <tr><td>On-demand transform</td><td>Transformations that are used to produce features based on data that is only available at the time of the prediction. These features cannot be pre-computed.</td><td>User-facing application</td><td>Is the user currently in a supported location? Similarity score between listing and search query</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="767">
+    <p class="claim">"Common input data source" (printed as the header of both the third and the fourth column)</p>
+    <p class="fix">The fourth column holds examples of features, not data sources: its header should read "Example".</p>
+    <p class="because">The cells settle it: "User country, product category" or "Is the user currently in a supported location?" are features, while the sources — "Data warehouse, data lake, database", "Kafka, Kinesis, PubSub", "User-facing application" — are in the third column. The article the slide reproduces heads the column "Example". The exam may be matched against the table as printed, duplicated header included: know that the sources are the third column and the examples the fourth.</p>
+  </aside>
+
+  <p>The vector served on p. 766 mixes all three, colour-coded on the slide: <code>"item_clicks_last_5_mins":6</code> comes from a stream transform, <code>"user_spend_last_30_days":"$1.10"</code> from a batch transform, and <code>"user_current_location":"US_NY"</code> from an on-demand transform fed with the request's application data, <code>{user_ip: "x.x.x.x"}</code>. Why can't the third be precomputed? Its input — where the user is right now — exists only when the request arrives.</p>
+
+  <h3>Monitoring and the registry</h3>
+
+  <p>Monitoring (p. 768) tracks "operational metrics relating to core functionality": for storage "availability, capacity, utilization, staleness", for serving "throughput, latency, error rates". Keep it apart from the key component "Monitoring and Validation" (p. 736), which checks the feature values themselves so that "data drifts or anomalies are detected early". One watches the machine, the other the data.</p>
+
+  <p>The <mark class="key">registry</mark> "is a central interface for user interactions with the feature store. Teams use the registry as a common catalog to explore, develop, collaborate on, and publish new definitions. The registry allows for important metadata to be attached to feature definitions" (p. 769). It holds definitions, not values. It is what makes reuse real: the "catalog or search functionality" of p. 736 lets the next data scientist find <code>spend_l30d</code> instead of writing it a third time.</p>
+
+  <p>Pages 734–736 list eight "Key Components". Each lives in one of the five tasks (the mapping is ours):</p>
+
+  <figure class="tbl-fig" id="l29-tbl-components">
+    <figcaption>The eight key components of pp. 734–736 and the task of p. 763 that carries each.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Key component</th><th>In the slide's words</th><th>Task</th></tr></thead>
+        <tbody>
+          <tr><td>1 Feature Storage</td><td>"historical features (used for training models) and real-time features (used for serving live predictions)"</td><td>Storage</td></tr>
+          <tr><td>2 Feature Engineering Pipeline</td><td>"aggregations, normalization, one-hot encoding"</td><td>Transform</td></tr>
+          <tr><td>3 Feature Versioning</td><td>"critical in avoiding 'training-serving skew'"</td><td>Registry</td></tr>
+          <tr><td>4 Online and Offline Stores</td><td>batch features for training; real-time features "with low latency"</td><td>Storage</td></tr>
+          <tr><td>5 Feature Serving</td><td>"training environments (batch mode) and production environments (real-time)"</td><td>Serving</td></tr>
+          <tr><td>6 Data Governance &amp; Access Control</td><td>"who can create, access, or update certain features"</td><td>Registry</td></tr>
+          <tr><td>7 Feature Discoverability and Reusability</td><td>"a catalog or search functionality"</td><td>Registry</td></tr>
+          <tr><td>8 Monitoring and Validation</td><td>"data drifts or anomalies are detected early"</td><td>Monitoring</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">Three tasks on the data path — transform, storage, serving — and two over all of them: monitoring and the registry.</mark></p>
+</section>
+
+
+<section id="l29-feast">
+  <h2>Feast: entities, feature views and the point-in-time join</h2>
+
+  <p>The deck ends with one technology in detail: Feast, "Feature Store for Machine Learning", "Type: Open-source" (p. 746). It was born at the ride-hailing company Gojek with Google Cloud and announced in January 2019 (Google Cloud blog) — the "Go-jek 2019" dot of p. 739. Its objects form a small tree (Fig. 4).</p>
+
+  <figure class="fig fig--plain" id="l29-fig-feast">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Feast's objects as on page 756: a Project contains Feature Views; each Feature View binds Features, an Entity and a Data Source; these definitions live in the registry, while the Data Source only points to raw data that stays in the user's own table, for example in BigQuery">
+      <rect x="10" y="10" width="414" height="282" rx="6" class="st-s3 dash"/>
+      <text x="24" y="34" class="tx-sm">registry: the definitions</text>
+      <rect x="30" y="50" width="120" height="34" class="fi-paper sw-2"/>
+      <text x="90" y="72" class="tx-mid">Project</text>
+      <path d="M60 84 V129 H86" marker-end="url(#arr)"/>
+      <rect x="98" y="104" width="150" height="34" class="fi-paper"/>
+      <rect x="94" y="108" width="150" height="34" class="fi-paper"/>
+      <rect x="90" y="112" width="150" height="34" class="fi-paper sw-2"/>
+      <text x="165" y="134" class="tx-mid">Feature View</text>
+      <text x="258" y="134" class="tx-mono tx-sm">driver_stats</text>
+      <path d="M120 146 V261"/>
+      <path d="M120 173 H192" marker-end="url(#arr)"/>
+      <path d="M120 217 H192" marker-end="url(#arr)"/>
+      <path d="M120 261 H192" marker-end="url(#arr)"/>
+      <rect x="204" y="150" width="120" height="30" class="fi-paper"/>
+      <rect x="200" y="154" width="120" height="30" class="fi-paper"/>
+      <rect x="196" y="158" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="256" y="178" class="tx-mid">Feature</text>
+      <rect x="196" y="202" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="256" y="222" class="tx-mid">Entity</text>
+      <rect x="196" y="246" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="256" y="266" class="tx-mid">Data Source</text>
+      <text x="334" y="178" class="tx-mono tx-sm">rating</text>
+      <text x="326" y="222" class="tx-mono tx-sm">driver_id</text>
+      <line x1="316" y1="261" x2="444" y2="261" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <rect x="450" y="236" width="28" height="16" class="fw-s3 st-s3"/>
+      <rect x="478" y="236" width="28" height="16" class="fw-s3 st-s3"/>
+      <rect x="506" y="236" width="28" height="16" class="fw-s3 st-s3"/>
+      <rect x="450" y="252" width="28" height="16" class="fi-paper"/>
+      <rect x="478" y="252" width="28" height="16" class="fi-paper"/>
+      <rect x="506" y="252" width="28" height="16" class="fi-paper"/>
+      <rect x="450" y="268" width="28" height="16" class="fi-paper"/>
+      <rect x="478" y="268" width="28" height="16" class="fi-paper"/>
+      <rect x="506" y="268" width="28" height="16" class="fi-paper"/>
+      <text x="492" y="224" class="tx-sm tx-mid">BigQuery table</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The project structure of p. 756: a project holds feature views, and each feature view binds its features, its entity and its data source. All of these are definitions kept in the registry (dashed); the data source only points to raw data that stays where you keep it (p. 759). The names <code>driver_stats</code>, <code>rating</code> and <code>driver_id</code> are the example of the next table.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn>Project</dfn> — "Projects provide complete isolation of feature stores at the infrastructure level. This is accomplished through resource namespacing" (p. 757).</p>
+    <p><dfn>Entity</dfn> — "a collection of semantically related features. Users define entities to map to the domain of their use case" (p. 758): a driver, a customer.</p>
+    <p><dfn>Feature view</dfn> — "a collection of features" (p. 758), bound to its entities and to one data source.</p>
+    <p><dfn>Data source</dfn> — "raw underlying data that users own (e.g. in a table in BigQuery). Feast does not manage any of the raw underlying data" (p. 759).</p>
+    <p><dfn>Registry</dfn> — "Feast uses a registry to store all applied Feast objects (e.g. Feature views, entities, etc). The registry exposes methods to apply, list, retrieve and delete these objects" (p. 759).</p>
+  </div>
+
+  <p>A feature view maps to "0 or more entities" (p. 758): zero for a global feature ("num_daily_global_transactions"), one for a user feature ("user_age or last_5_bought_items"), several — "aka a composite key" — for a feature of a pair ("num_user_purchases_in_merchant_category", a user and a merchant category). "A collection of entities for a feature view is called an <mark class="key">entity key</mark>", and "Entities should be reused across feature views", so that features about the same thing are found, and joined, on the same key.</p>
+
+  <p>Then the sentence the rest of this section unpacks: "Feast uses a time-series data model to represent data. This data model is used to interpret feature data in data sources in order to build training datasets or materialize features into an online store" (p. 759). Pages 760–761 show what its rows look like:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-timeseries">
+    <figcaption>The time-series data model of pp. 760–761. Every row has a timestamp; each column is an entity or a feature, each cell an entity value or a feature value. The outlined pair is the entity key of row 1. (Page 760 is the same table without <code>customer_id</code>.)</figcaption>
+    <div class="scroll-x">
+      <table class="tbl l29-ts">
+        <thead>
+          <tr><th>row</th><th>timestamp</th><th>customer_id</th><th>driver_id</th><th>trips_today</th><th>rating</th></tr>
+          <tr class="l29-role"><th></th><th>timestamp</th><th>entity</th><th>entity</th><th>feature</th><th>feature</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="n">1</td><td>5/22/2021 0:00:00</td><td class="l29-ek">customer_A</td><td class="l29-ek">driver_1001</td><td class="n">5</td><td class="n">4.8</td></tr>
+          <tr><td class="n">2</td><td>5/22/2021 0:00:00</td><td>customer_B</td><td>driver_1002</td><td class="n">0</td><td class="n">4.2</td></tr>
+          <tr><td class="n">3</td><td>5/22/2021 0:00:00</td><td>customer_C</td><td>driver_1003</td><td class="n">8</td><td class="n">4.5</td></tr>
+          <tr><td class="n">4</td><td>5/22/2021 0:00:00</td><td>customer_D</td><td>driver_1004</td><td class="n">3</td><td class="n">4.2</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The slides use "entity key" in two senses: the set of entities of a feature view (p. 758), and the pair of values that identifies one row, (customer_A, driver_1001) in the red frame of p. 761. Both are Feast's usage. In Feast's Python SDK the driver view of p. 760 is declared like this (adapted from the Feast documentation; not on the slides):</p>
+
+<pre><code># a feature view: two features of the entity "driver",
+# read from a BigQuery table
+from datetime import timedelta
+from feast import BigQuerySource, Entity, FeatureView, Field
+from feast.types import Float32, Int64
+
+driver = Entity(name="driver", join_keys=["driver_id"])
+
+driver_stats = FeatureView(
+    name="driver_stats",
+    entities=[driver],
+    ttl=timedelta(days=1),
+    schema=[
+        Field(name="trips_today", dtype=Int64),
+        Field(name="rating", dtype=Float32),
+    ],
+    source=BigQuerySource(table="my-project.rides.driver_stats"),
+)</code></pre>
+
+  <h3>Why the timestamp matters: the point-in-time join</h3>
+
+  <p>Why insist on time? Build a training set for "will this trip end in a complaint?". The labels arrive as rows — driver, time of the trip, complaint yes or no — called the entity dataframe. To each row you must attach the driver's rating. A plain join on <code>driver_id</code> with today's table gives every row today's rating, including ratings computed after the trip, perhaps because of that very complaint. The model trains on information it will never have in production: <mark class="key">data leakage</mark>. Its symptom is an offline score far better than anything production delivers.</p>
+
+  <p>Feast's documentation names the cure — the slides do not: "Feast performs a point-in-time join (also called a 'last known good value' temporal join): for each entity row, it retrieves the latest feature values with a timestamp at or before the entity row's event_timestamp." Without that rule, "features generated after the prediction time could leak into training data — effectively letting the model 'see the future'". In symbols:</p>
+
+  <div class="formula">
+    \[ \tau^{*} = \max\,\{\, \tau_i : \tau_i \le t \,\} \]
+    \[ \text{joined value} = v(k, \tau^{*}) \]
+    \[ \text{null if}\ \ t - \tau^{*} \gt \text{ttl} \]
+    <dl class="legend">
+      <dt>\(k,\ t\)</dt><dd>the entity key and the timestamp of one training row</dd>
+      <dt>\(\tau_i\)</dt><dd>the timestamps of the feature rows with the same key \(k\)</dd>
+      <dt>\(v(k, \tau)\)</dt><dd>the feature value of the row with key \(k\) and timestamp \(\tau\)</dd>
+      <dt>ttl</dt><dd>time to live of the feature view: how old a value may be and still count</dd>
+    </dl>
+  </div>
+
+  <ol class="steps" id="l29-steps-pit">
+    <li><p>Take one row of the entity dataframe: key <code>driver_1001</code>, timestamp 5/22 10:00.</p></li>
+    <li><p>Keep the feature rows with the same key: 4.6 (5/20), 4.7 (5/21), 4.8 (5/22), 4.9 (5/23), 4.9 (5/24), all at 0:00.</p></li>
+    <li><p>Drop every row dated after 10:00 on 5/22: the two values 4.9 did not exist yet when the trip took place.</p></li>
+    <li><p>Take the latest of what remains: \(\tau^{*}\) = 5/22 0:00, value 4.8 — the rating p. 760 prints for that day.</p></li>
+    <li><p>Check its age against the ttl: 10 hours, inside a ttl of one day, so 4.8 is joined. Older than the ttl, the feature would be null — and null too if no rating were dated at or before 10:00.</p></li>
+  </ol>
+
+  <p>The same rule explains the online store: materialization is the point-in-time join evaluated at "now" for every key — "the latest feature values for each entity" (p. 765). The widget builds the training set both ways. Its one insight: <strong>a training row may only see the past of its own timestamp</strong>, and a plain join quietly hands it the future.</p>
+
+  <div class="widget" id="l29-w-pit">
+    <h3 class="widget-title">Join the labels to the feature history</h3>
+    <p class="widget-intro">Three drivers and their daily rating (dots, values above them; 5/22 is the day of p. 760). Six labelled trips (crosses): did the trip end in a complaint? Each curved arrow shows which rating the join attaches to a trip, and the value it attaches is written under the trip. The table below is the training set. Ratings other than those of 5/22 and the trips are invented for the widget.</p>
+    <ol class="tasks">
+      <li>With the naive join, predict how many of the six trips get a rating from their own future. Which trip, if any, is safe?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Five of six. The naive join takes today's table, one value per driver — the ratings of 5/24 — and only the trip of driver_1003 on 5/25 at 20:00 happens after that update. A plain join is right only for rows newer than the last feature update, which in a training set is almost never.</p></details>
+      </li>
+      <li>Switch to the point-in-time join. What does driver_1001's trip of 5/22 at 10:00 get, and why not 4.9?
+        <details class="answer"><summary>What you should see</summary>
+          <p>4.8, dated 5/22 0:00: the latest value at or before 10:00. The 4.9 values are dated 5/23 and 5/24 — they did not exist at 10:00 on 5/22. Leaks drop from 5 to 0.</p></details>
+      </li>
+      <li>Look at the only complaint, driver_1002 on 5/22 at 20:00, in both modes. Which rating does each join give it, and why is the naive one dangerous?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Naive: 3.8, computed on 5/24, after the complaint and possibly because of it. Point-in-time: 4.2, the rating the driver had when the trip began. A model trained on the 3.8 learns that low ratings come with complaints from numbers the complaint itself pushed down — and in production it only ever sees the rating before the trip. The offline score looks great; the live one does not.</p></details>
+      </li>
+      <li>Point-in-time, set the ttl to 24 hours, then to 12. Which rows turn null each time?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At 24 hours only the trip of 5/25 at 20:00: its latest rating is 44 hours old. At 12 hours five of six are null; only the trip of 5/22 at 10:00 keeps its value (10 hours old). A ttl trades coverage for freshness: an old value is not silently passed off as current.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l29-w-pit', function (root, ui) {
+    var DAYS = ['5/20', '5/21', '5/22', '5/23', '5/24', '5/25', '5/26'];
+    var NAMES = ['driver_1001', 'driver_1002', 'driver_1003'];
+    /* daily ratings at 0:00 from 5/20 to 5/24; the 5/22 column is the table of p. 760 */
+    var VALS = [[4.6, 4.7, 4.8, 4.9, 4.9], [4.6, 4.5, 4.2, 3.9, 3.8], [4.4, 4.5, 4.5, 4.6, 4.6]];
+    /* the entity dataframe: driver, hour since 5/20 0:00, complaint */
+    var TRIPS = [{ d: 0, h: 38, y: 'no' }, { d: 0, h: 58, y: 'no' }, { d: 1, h: 16, y: 'no' },
+                 { d: 1, h: 68, y: 'yes' }, { d: 2, h: 85, y: 'no' }, { d: 2, h: 140, y: 'no' }];
+    var X0 = 110, X1 = 540, LANE = [62, 142, 222];
+    function X(h) { return X0 + (X1 - X0) * h / 144; }
+    function when(h) { return DAYS[Math.floor(h / 24)] + ' ' + (h % 24) + ':00'; }
+    function rows(d) { return VALS[d].map(function (v, k) { return { h: 24 * k, v: v }; }); }
+
+    var mode = ui.select('join', [
+      { value: 'naive', label: 'naive: today\'s value of each driver_id' },
+      { value: 'pit', label: 'point-in-time: the latest value at or before the trip' }
+    ], null, 'naive');
+    var ttl = ui.slider({ label: 'ttl of the feature view', min: 6, max: 72, step: 6, value: 72, format: function (v) { return v + ' h'; } });
+    var roLeak = ui.readout('trips joined with a rating from their future'), roNull = ui.readout('trips left null by the ttl');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'rating (feature row)', color: 's1', mark: 'dot' },
+      { label: 'labelled trip', color: 's2', mark: 'cross' },
+      { label: 'join', color: 's2', mark: 'line' },
+      { label: 'join into the future', color: 'bad', mark: 'line' },
+      { label: 'look-back window (ttl)', color: 's2', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 296, { label: 'A timeline from 5/20 to 5/26 with one lane per driver: the daily ratings as dots, the six labelled trips as crosses, and for each trip an arrow to the rating the join attaches; arrows that point forward in time are drawn in red' });
+    var rowsBox = Course.el('div', { 'class': 'l29-rows' });
+    ui.stage.appendChild(rowsBox);
+
+    function join(t) {
+      var fr = rows(t.d);
+      if (mode.value === 'naive') { var last = fr[fr.length - 1]; return { f: last, leak: last.h > t.h, nul: false }; }
+      var best = null;
+      fr.forEach(function (f) { if (f.h <= t.h && (!best || f.h > best.h)) best = f; });
+      if (!best) return { f: null, leak: false, nul: true };
+      return { f: best, leak: false, nul: t.h - best.h > ttl.value };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function draw(js) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var pit = mode.value === 'pit';
+      T(96, 24, 'driver_id', 'tx-sm tx-end');
+      T(548, 24, 'today', 'tx-sm tx-end');
+      DAYS.forEach(function (s, k) {
+        S('line', { x1: X(24 * k), y1: 36, x2: X(24 * k), y2: 262, 'class': 'st-grid sw-1' });
+        T(X(24 * k), 286, s, 'tx-sm tx-mid');
+      });
+      S('line', { x1: X1, y1: 36, x2: X1, y2: 262, 'class': 'st-muted dash' });
+      LANE.forEach(function (y, d) {
+        S('line', { x1: X0, y1: y, x2: X1, y2: y, 'class': 'st-line' });
+        T(96, y + 5, NAMES[d].slice(7), 'tx-mono tx-sm tx-end');
+      });
+      if (pit) TRIPS.forEach(function (t) {
+        var y = LANE[t.d], a = Math.max(0, t.h - ttl.value);
+        S('rect', { x: X(a), y: y - 8, width: X(t.h) - X(a), height: 16, 'class': 'fw-s2 st-none' });
+      });
+      TRIPS.forEach(function (t, i) {
+        var j = js[i], y = LANE[t.d], xt = X(t.h);
+        if (!j.f) return;
+        var xf = X(j.f.h), cls = j.leak ? 'st-bad sw-2' : (j.nul ? 'st-muted dash' : 'st-s2 sw-2');
+        var mk = j.leak ? 'url(#arr-bad)' : (j.nul ? 'url(#arr-muted)' : 'url(#arr-s2)');
+        S('path', { d: 'M' + xt + ' ' + (y + 6) + ' Q' + ((xt + xf) / 2) + ' ' + (y + 30) + ' ' + xf + ' ' + (y + 10), 'class': cls + ' fi-none', 'marker-end': mk });
+      });
+      VALS.forEach(function (row, d) {
+        row.forEach(function (v, k) {
+          S('circle', { cx: X(24 * k), cy: LANE[d], r: 6, 'class': 'fi-s1 st-paper sw-2' });
+          S('rect', { x: X(24 * k) - 4, y: LANE[d] - 28, width: 8, height: 20, 'class': 'fi-paper st-none' });
+          T(X(24 * k), LANE[d] - 12, v.toFixed(1), 'tx-mono tx-sm tx-mid halo');
+        });
+      });
+      TRIPS.forEach(function (t, i) {
+        var j = js[i], y = LANE[t.d], x = X(t.h);
+        S('path', { d: 'M' + (x - 6) + ' ' + (y - 6) + ' L' + (x + 6) + ' ' + (y + 6) + ' M' + (x - 6) + ' ' + (y + 6) + ' L' + (x + 6) + ' ' + (y - 6), 'class': 'st-s2 sw-3' });
+        T(x, y + 44, j.nul ? 'null' : j.f.v.toFixed(1), 'tx-mono tx-sm tx-mid halo' + (j.leak ? ' tx-bad tx-bold' : (j.nul ? ' tx-muted' : ' tx-bold')));
+      });
+    }
+    function table(js) {
+      rowsBox.textContent = '';
+      var head = Course.el('tr', null, ['#', 'driver_id', 'event_timestamp', 'complaint', 'rating', 'dated'].map(function (h) { return Course.el('th', { text: h }); }));
+      var body = Course.el('tbody');
+      TRIPS.forEach(function (t, i) {
+        var j = js[i], age = j.f ? t.h - j.f.h : 0;
+        var dated = !j.f ? 'none' : when(j.f.h) + (j.leak ? ' · future' : (j.nul ? ' · ' + age + ' h old > ttl' : ''));
+        body.appendChild(Course.el('tr', null, [
+          Course.el('td', { 'class': 'n', text: String(i + 1) }),
+          Course.el('td', { text: NAMES[t.d] }),
+          Course.el('td', { text: when(t.h) }),
+          Course.el('td', { text: t.y }),
+          Course.el('td', { 'class': 'n' + (j.leak ? ' is-bad' : (j.nul ? ' is-null' : '')), text: j.nul ? 'null' : j.f.v.toFixed(1) }),
+          Course.el('td', { 'class': j.leak ? 'is-bad' : (j.nul ? 'is-null' : ''), text: dated })
+        ]));
+      });
+      rowsBox.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, head), body])));
+    }
+    ui.onChange(function () {
+      var js = TRIPS.map(join);
+      var leaks = js.filter(function (j) { return j.leak; }).length, nulls = js.filter(function (j) { return j.nul; }).length;
+      draw(js); table(js);
+      roLeak.set(leaks + ' of 6', leaks ? 'bad' : 'good');
+      roNull.set(nulls + ' of 6');
+      note.set(mode.value === 'naive'
+        ? 'Naive: one row per driver, the latest. The ttl plays no part here.'
+        : 'Point-in-time: each trip looks back from its own timestamp, at most ' + ttl.value + ' hours.');
+    });
+  });
+  </script>
+
+  <p>In Feast the whole join is one call, and the online lookup another (Feast documentation; <code>store</code> is the <code>FeatureStore</code> of your project):</p>
+
+<pre><code># the training set: one row per labelled trip,
+# each row joined point-in-time
+import pandas as pd
+
+entity_df = pd.DataFrame({
+    "driver_id": ["driver_1001", "driver_1002"],
+    "event_timestamp": pd.to_datetime(
+        ["2021-05-22 10:00", "2021-05-22 20:00"]),
+    "complaint": [0, 1],
+})
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:rating", "driver_stats:trips_today"],
+).to_df()</code></pre>
+
+<pre><code># one vector of the latest values for one key, for a prediction now
+features = store.get_online_features(
+    features=["driver_stats:rating", "driver_stats:trips_today"],
+    entity_rows=[{"driver_id": "driver_1001"}],
+).to_dict()</code></pre>
+
+  <p class="memo"><mark class="key">A training row may only see feature values dated at or before its own timestamp; the online store is the same join, taken at "now".</mark></p>
+</section>
+
+
+<section id="l29-landscape">
+  <h2>Nine products, one history, five dimensions</h2>
+
+  <p>Page 739 says where it all began: "First Experience in Uber, with Michelangelo platform." Fig. 5 redraws its timeline.</p>
+
+  <figure class="fig fig--plain" id="l29-fig-history">
+    <svg class="dia" viewBox="0 0 560 330" role="img" aria-label="The timeline of page 739, top to bottom: 2017 Uber with Michelangelo; 2018 Airbnb; Hopsworks; 2019 Go-jek, where Feast was born; 2020 Kaskada; Tecton; DoorDash and Abacus.AI; Iguazio and AWS SageMaker; 2021 Splice Machine and Molecula; Databricks, Google and Alteryx; Iterative.AI">
+      <line x1="110" y1="14" x2="110" y2="318" class="st-muted" marker-end="url(#arr-muted)"/>
+      <circle cx="110" cy="30" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="57" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="84" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="111" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="138" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="165" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="192" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="219" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="246" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="273" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="300" r="6" class="fi-muted st-paper sw-2"/>
+      <text x="94" y="35" class="tx-mono tx-sm tx-end">2017</text>
+      <text x="94" y="62" class="tx-mono tx-sm tx-end">2018</text>
+      <text x="94" y="116" class="tx-mono tx-sm tx-end">2019</text>
+      <text x="94" y="143" class="tx-mono tx-sm tx-end">2020</text>
+      <text x="94" y="251" class="tx-mono tx-sm tx-end">2021</text>
+      <text x="126" y="35" class="tx-sm">Uber · Michelangelo</text>
+      <text x="126" y="62" class="tx-sm">Airbnb</text>
+      <text x="126" y="89" class="tx-sm">Hopsworks</text>
+      <text x="126" y="116" class="tx-sm">Go-jek</text>
+      <text x="126" y="143" class="tx-sm">Kaskada</text>
+      <text x="126" y="170" class="tx-sm">Tecton</text>
+      <text x="126" y="197" class="tx-sm">DoorDash · Abacus.AI</text>
+      <text x="126" y="224" class="tx-sm">Iguazio · AWS SageMaker</text>
+      <text x="126" y="251" class="tx-sm">Splice Machine · Molecula</text>
+      <text x="126" y="278" class="tx-sm">Databricks · Google · Alteryx</text>
+      <text x="126" y="305" class="tx-sm">Iterative.AI</text>
+      <text x="340" y="38" class="tx-hand">the first one</text>
+      <text x="228" y="119" class="tx-hand">Feast is born here</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> The timeline of p. 739, one dot per row, with the years where the slide writes them. The slide spells Hopsworks "Hopworks". The note on Go-jek is ours: Feast was open-sourced by Gojek with Google Cloud in January 2019.</figcaption>
+  </figure>
+
+  <p>Pages 746–754 review nine products in one template, "Type" plus "Key Characteristics". Most traits repeat on every slide ("Online and Offline Stores", versioning, "real-time and batch"); what tells them apart is the type and one or two traits:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-products">
+    <figcaption>The nine feature stores of pp. 746–754, with the type as printed. Three open-source, one commercial, five proprietary. Tecton was acquired by Databricks in August 2025; at the exam, give the slide's type.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>System</th><th>Type</th><th>What sets it apart on its slide</th></tr></thead>
+        <tbody>
+          <tr><td>1 Feast (p. 746)</td><td>Open-source</td><td>cloud-agnostic or on-premise; "Simple Design: Focuses on feature serving"; "Good for Startups/SMEs"</td></tr>
+          <tr><td>2 Hopsworks (p. 747)</td><td>Open-source (with enterprise version)</td><td>Spark, TensorFlow, Kubernetes; stores "backed by distributed systems like Apache Hive and MySQL"; RBAC and GDPR</td></tr>
+          <tr><td>3 Tecton (p. 748)</td><td>Commercial</td><td>"Built specifically for real-time machine learning"; automated batch and streaming pipelines; drift monitoring</td></tr>
+          <tr><td>4 AWS SageMaker Feature Store (p. 749)</td><td>Proprietary (part of AWS SageMaker)</td><td>S3, Redshift, Glue; IAM for access control</td></tr>
+          <tr><td>5 Databricks Feature Store (p. 750)</td><td>Proprietary (part of Databricks)</td><td>"Unified with Delta Lake"; feature lineage; native Spark</td></tr>
+          <tr><td>6 Google Vertex AI Feature Store (p. 751)</td><td>Proprietary (part of Google Cloud)</td><td>fully managed; BigQuery, Dataflow; drift and anomaly monitoring</td></tr>
+          <tr><td>7 Azure ML Feature Store (p. 752)</td><td>Proprietary (part of Microsoft Azure)</td><td>Data Lake, Azure Synapse; Azure Active Directory</td></tr>
+          <tr><td>8 Scribble Data Enrich (p. 753)</td><td>Proprietary</td><td>customizable enrichment pipelines; cloud-agnostic; "SME Focus"</td></tr>
+          <tr><td>9 Featureform (p. 754)</td><td>Open-source</td><td>"Declarative Feature Definitions"; multi-cloud; "Lightweight Design"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The course covers every family of systems "along 5 dimensions" (intro deck, slide 6). The feature-store slides do not fill them in; here is the profile their pages imply (ours):</p>
+
+  <figure class="tbl-fig" id="l29-tbl-dims">
+    <figcaption>A feature store along the five dimensions of the course.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Dimension</th><th>Feature store</th></tr></thead>
+        <tbody>
+          <tr><td>(1) data model</td><td>an entity-keyed time series: rows of entity key, timestamp and feature values, grouped into feature views and described in a registry (pp. 758–761)</td></tr>
+          <tr><td>(2) (declarative vs. imperative) query languages</td><td>declarative feature definitions (Feast's Python objects; Featureform's "Declarative Feature Definitions"), read through two SDK calls, <code>get_historical_features</code> and <code>get_online_features</code> (p. 762): lookups by key and point-in-time joins, no general query language</td></tr>
+          <tr><td>(3) data distribution</td><td>the offline store on a distributed warehouse or lake (S3, BigQuery, Snowflake, Redshift, Hadoop), the online store on a distributed key-value store (Redis, DynamoDB); materialization and push move data between them (pp. 735, 757, 765)</td></tr>
+          <tr><td>(4) non-functional aspects</td><td>low latency and freshness online, volume and history offline; online stores usually eventually consistent; operational metrics for storage and serving (pp. 765, 768)</td></tr>
+          <tr><td>(5) architectural solutions</td><td>five tasks: transform (batch, streaming, on-demand), storage (offline and online), serving, monitoring, registry (p. 763)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>So where does a feature store sit among the systems of this course? Above them:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-compare">
+    <figcaption>A feature store is a layer over systems you already know, not a new storage engine.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>System</th><th>What it holds</th><th>How you read it</th><th>Its place in a feature store</th></tr></thead>
+        <tbody>
+          <tr><td>Data warehouse or lake (<a href="l23.html">lesson 23</a>)</td><td>historical tables</td><td>scans and aggregations over years</td><td>the offline store</td></tr>
+          <tr><td>Key-value store such as Redis (<a href="l17.html">lesson 17</a>)</td><td>one value per key</td><td>a <code>GET</code> by key, in milliseconds</td><td>the online store</td></tr>
+          <tr><td>Vector database (<a href="l27.html">lessons 27</a>–<a href="l28.html">28</a>)</td><td>embeddings and an index over them</td><td>nearest neighbours by similarity</td><td>an embedding can be a feature, but the store looks it up by entity key, not by similarity</td></tr>
+          <tr><td>Stream processing (<a href="l33.html">lesson 33</a>)</td><td>events as they arrive</td><td>continuous transforms</td><td>the source of streaming features, pushed to both stores</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Back to Uber. Michelangelo's shared features lived in HDFS/Hive for training and in Cassandra for online predictions, and the transformations each model applied to them were written in a small language whose "expressions are part of the model configuration and the same expressions are applied at training time and at prediction time" (Uber Engineering blog, 2017). One definition, so a feature is not computed twice; two stores, one for the history and one for the latest values, read by key. The second danger of the hook, reading a value at the wrong moment, is what the timestamps of the time-series model and the point-in-time join are for. That is why the "store" was never a new database: it is a layer of definitions over a data lake and a low-latency store. The deck's last sentence says the same: "a feature store acts as the backbone of the feature lifecycle in machine learning systems, enabling teams to efficiently manage and serve high-quality features across different stages of the ML pipeline, from model development to deployment" (p. 771).</p>
+
+  <p class="memo"><mark class="key">A feature store is a layer — a registry of definitions over a warehouse for the history and a key-value store for the latest values — not a new kind of database.</mark></p>
+</section>
+
+
+<section id="l29-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Feature stores have appeared in no past paper, and the practical part of 2026/27 covers Neo4j, MongoDB, Elasticsearch, Redis and SparkQL: this lesson belongs to the theory part. Its questions come in the forms the readme of the past papers names — open-ended, multiple-choice, true or false — and wrong answers may carry a penalty, announced just before the exam.</p>
+
+  <div class="exam" data-kind="open" id="l29-exam-skew">
+    <div class="exam-q" lang="en">
+      <p>Define training-serving skew as presented in the lecture. Explain why it arises in machine-learning systems, how a feature store prevents it, and how it differs from data drift.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Training-serving skew, also called online/offline skew, is the situation in which a model performs poorly because the features used in production differ from the ones used during training. It arises because features are required both in the modelling phase and in the production (deployment) phase of the lifecycle: when each phase has its own feature code, the code is duplicated and the two implementations can silently diverge, for example in the time window, in the handling of refunds or in the default for missing values. A feature store prevents it by keeping one registered and versioned definition per feature and one transformation pipeline, whose results are stored in an offline store, which provides historical values for training, and in an online store, which provides the latest values with low latency for inference, both accessed through one serving API. In this way the same feature transformations are applied in training and in production. Data drift is different: the distribution of the input data changes over time while the computation stays the same; a feature store can detect drift by monitoring the features, but the remedy is retraining.</p></div>
+      <div class="exam-note"><p>A complete answer has three parts: the definition in the slide's words (p. 734, with the synonym of p. 743), the cause — two code paths for one feature (p. 743) — and the mechanism: one definition, two stores. The contrast with drift shows understanding rather than memory.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-online">
+    <div class="exam-q" lang="en">
+      <p>In a feature store, which component typically stores only the latest feature values for each entity and is usually eventually consistent?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>The offline store <span class="fb">It keeps "months' or years' worth of feature data for training purposes" (p. 765): the history, not only the latest values.</span></li>
+      <li>The registry <span class="fb">The registry holds definitions and their metadata (p. 769), not feature values.</span></li>
+      <li data-correct>The online store <span class="fb">"They typically only store the latest feature values for each entity" and "Online stores are usually eventually consistent" (p. 765).</span></li>
+      <li>The data source <span class="fb">In Feast it is the raw data the users own; "Feast does not manage any of the raw underlying data" (p. 759).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The online store. It persists the latest feature value of each entity for low-latency lookups during inference, usually in a key-value store such as Redis or DynamoDB, and it is usually eventually consistent. The offline store keeps months or years of history for training.</p></div>
+      <div class="exam-note"><p>Every distractor is another component of the same architecture; the two properties in the question are the ones p. 765 gives the online store.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: in Feast, for offline use cases that rely only on batch data, the data must first be ingested into the feature store.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">The slide says the opposite: "Feast does not need to ingest data and can query your existing data" (p. 757).</span></li>
+      <li data-correct>False <span class="fb">Ingestion is for online use cases: materialization from batch sources and pushing of streaming features (p. 757).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. For offline use cases that rely only on batch data, Feast does not need to ingest data and queries the existing data in place. Data are ingested only for online use cases: batch features are materialized into the online store, and streaming features are pushed to make them available both offline and online.</p></div>
+      <div class="exam-note"><p>A true/false item is easy to build by flipping one slide sentence. With a possible penalty for wrong answers, answer only what the sentence of p. 757 supports.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l29-exam-feast">
+    <div class="exam-q" lang="en">
+      <p>In Feast, what are an entity, a feature view and an entity key? Give an example of a feature view with zero entities, one with one entity and one with several entities, and explain why Feast uses a time-series data model.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>An entity is a collection of semantically related features, defined by the users to map to the domain of their use case, for example a driver or a customer. A feature view is a collection of features, bound to its entities and to a data source; it maps to zero or more entities. A collection of entities for a feature view is called an entity key; in the data, the entity key of a row is the tuple of its entity values, for example (customer_A, driver_1001). Zero entities: a global feature such as num_daily_global_transactions. One entity: a user feature such as user_age or last_5_bought_items. Several entities, a composite key: num_user_purchases_in_merchant_category, for a user and a merchant category. Feast uses a time-series data model, in which every row carries a timestamp, the entity values and the feature values, in order to build training datasets and to materialize features into an online store: the timestamps let a training row receive the latest feature values at or before its own time, without values from the future, and they tell materialization which value is the latest.</p></div>
+      <div class="exam-note"><p>The definitions are p. 758 almost word for word, the examples too; the composite key is the part that is easiest to forget. The last sentence goes beyond the slides (point-in-time correctness is in the Feast documentation): it shows why p. 759 insists on time.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-ondemand">
+    <div class="exam-q" lang="en">
+      <p>Which of the following features can only be produced by an on-demand transformation? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>User country <span class="fb">Data at rest: a batch transform (p. 767).</span></li>
+      <li>Number of views per listing in the past hour <span class="fb">Computed continuously from a stream (Kafka, Kinesis, PubSub): a streaming transform.</span></li>
+      <li data-correct>Whether the user is currently in a supported location <span class="fb">It depends on "data that is only available at the time of the prediction" — where the user is now (p. 767).</span></li>
+      <li data-correct>The similarity score between a listing and the search query <span class="fb">The query exists only when the request arrives: "These features cannot be pre-computed" (p. 767).</span></li>
+      <li>Product category <span class="fb">A property of data at rest: a batch transform.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The third and the fourth. On-demand transformations produce features from data that is only available at the time of the prediction, coming from the user-facing application, so they cannot be pre-computed. User country and product category come from batch transformations of data at rest; views per listing in the past hour come from a streaming transformation.</p></div>
+      <div class="exam-note"><p>The examples are p. 767's own, so a question can use them verbatim. The test to apply: does the input exist before the request arrives? If it does, the feature can be precomputed.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l29-exam-farm">
+    <div class="exam-q" lang="en">
+      <p>Consider the ER scenario of the exam of 12 Sep 2025, tracking farmers and their sales at local markets: People (Personal ID, Name, Surname, Age, Address, State) Buy Products (Product ID, Name, Quantity, Expiration Date), with a Buy Date and an Amount; Products are sold at Markets (Name, Location, Opening Time, Closing Time, Size).</p>
+      <p>A cooperative wants two models: (a) every night, predict for each product the amount that will be bought the next day; (b) at the moment a person pays, decide whether the purchase is fraudulent. Using a feature store, propose for each model its entity key and features of the three transformation types where they fit, say which store serves each prediction, and which Feast retrieval method is used for training and for prediction.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) Entity Product, entity key Product ID. Batch features computed from the history of Buy: the total Amount bought in the last 7 days, the number of days to the Expiration Date. Training: get_historical_features with an entity dataframe of (Product ID, date) rows labelled with the amount of the next day, so that each row is joined with the feature values at or before its date. The nightly prediction for all products is a batch prediction: it also uses get_historical_features on the offline store; no low latency is needed.</p>
+        <p>(b) Entity Person, entity key Personal ID. Batch feature: Age. Streaming feature: the number of purchases of this person in the last 10 minutes, computed from the stream of Buy events and pushed to both stores. On-demand feature: whether the market of the payment is open at the time of the payment, computed at request time from the request data and the market's Opening Time and Closing Time; it cannot be precomputed. Training: get_historical_features on past purchases labelled fraudulent or not. Prediction: get_online_features for the Personal ID, served by the online store with the latest values and low latency, plus the on-demand transformation at request time.</p>
+      </div>
+      <div class="exam-note"><p>Ours, not a past-paper exercise: the scenario is borrowed to practise the vocabulary in context. The trap is (a): a nightly prediction is offline, exactly as "Predicting user churn for all users on a daily basis" on p. 762, so it uses get_historical_features, not the online store.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-products">
+    <div class="exam-q" lang="en">
+      <p>According to the lecture, which of these feature stores are open-source? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Feast <span class="fb">"Type: Open-source" (p. 746).</span></li>
+      <li>Tecton <span class="fb">"Type: Commercial" (p. 748).</span></li>
+      <li data-correct>Hopsworks <span class="fb">"Type: Open-source (with enterprise version)" (p. 747).</span></li>
+      <li>AWS SageMaker Feature Store <span class="fb">"Proprietary (part of AWS SageMaker)" (p. 749).</span></li>
+      <li data-correct>Featureform <span class="fb">"Type: Open-source" (p. 754).</span></li>
+      <li>Databricks Feature Store <span class="fb">"Proprietary (part of Databricks)" (p. 750).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Feast, Hopsworks and Featureform. Tecton is commercial; AWS SageMaker, Databricks, Google Vertex AI and Azure ML feature stores are proprietary parts of their platforms, and Scribble Data Enrich is proprietary too.</p></div>
+      <div class="exam-note"><p>Pure recall of pp. 746–754: three open-source, one commercial, five proprietary. Hopsworks is the one to hesitate on — the slide types it as open-source with an enterprise version.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l29-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A fraud model scores very well on its offline test set and clearly worse in production from its first day. Nothing in the world has changed. What is the most likely cause?</p>
+    <ul class="options">
+      <li>Concept drift <span class="fb">Drift needs time and a changing world; this gap is there from day one.</span></li>
+      <li>The online store is only eventually consistent <span class="fb">Values a few seconds old explain small differences on a few requests, not a gap from the first day on.</span></li>
+      <li data-correct>The features reach the model in production through different code, or the training set leaked future values <span class="fb">Training-serving skew (p. 734) and leakage both make offline scores promise what production cannot deliver — check both.</span></li>
+      <li>The registry is missing <span class="fb">A missing catalog hurts reuse and discovery, not the values a deployed model receives.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">driver_1001 has ratings 4.6 (5/20 0:00), 4.7 (5/21 0:00), 4.8 (5/22 0:00) and 4.9 (5/23 0:00). A training row is dated 5/22 10:00. Which rating does a point-in-time join attach?</p>
+    <ul class="options">
+      <li>4.9 <span class="fb">Dated 5/23: at 10:00 on 5/22 it did not exist yet. That is the naive join's leak.</span></li>
+      <li data-correct>4.8 <span class="fb">The latest value at or before 5/22 10:00 — the rating p. 760 prints for 5/22.</span></li>
+      <li>4.75, the average of the two values around 10:00 <span class="fb">A point-in-time join picks one dated value; it does not interpolate.</span></li>
+      <li>4.7 <span class="fb">Before 10:00, but not the latest: 4.8, dated 5/22 0:00, is later and still in the past.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about the offline store are true? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>It keeps months or years of feature values, for training <span class="fb">"months' or years' worth of feature data for training purposes" (p. 765).</span></li>
+      <li>It answers one lookup by key in milliseconds during inference <span class="fb">That is the online store: "low-latency lookup during inference" (p. 765).</span></li>
+      <li data-correct>It is often a data warehouse or data lake such as S3, BigQuery, Snowflake or Redshift <span class="fb">The list of p. 765.</span></li>
+      <li>In Feast, batch data must be ingested into it before it can be queried <span class="fb">"Feast does not need to ingest data and can query your existing data" (p. 757).</span></li>
+      <li data-correct>It is typically refreshed at regular intervals, such as daily or weekly <span class="fb">"updated at regular intervals (e.g., daily or weekly)" (p. 735).</span></li>
+    </ul>
+    <p class="q-fb">History and scans offline, the latest value and lookups online: the two stores answer two different questions.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can an online store afford to be only eventually consistent?</p>
+    <ul class="options">
+      <li>Because every value is also kept in the offline store <span class="fb">A copy elsewhere does not make a stale value fresh; the question is whether staleness matters.</span></li>
+      <li>Because it stores no history, so there is nothing to keep consistent <span class="fb">It stores the latest value of every key, and its replicas can still disagree for a moment.</span></li>
+      <li>Because a single client reads it <span class="fb">Every prediction service reads it, often from many machines at once.</span></li>
+      <li data-correct>Because a prediction made on a value a few seconds old is still useful, while a slow answer is not <span class="fb">Latency and availability matter more than strict consistency for most ML uses — the BASE side of lesson 5.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A Feast feature view computes <code>num_user_purchases_in_merchant_category</code>. What is its entity key?</p>
+    <ul class="options">
+      <li data-correct>The pair (user, merchant category): a composite key <span class="fb">"multiple entities, aka a composite key" (p. 758).</span></li>
+      <li>None: it is a global feature <span class="fb">Global features such as num_daily_global_transactions have zero entities; this one depends on who buys and where.</span></li>
+      <li>The user alone <span class="fb">A user feature like user_age has one entity; this one also depends on the merchant category.</span></li>
+      <li>The timestamp <span class="fb">Every row has one, but the timestamp is not part of the entity key.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">What does materialization do in Feast?</p>
+    <ul class="options">
+      <li>It computes on-demand features when a request arrives <span class="fb">That is the on-demand transform, inside serving (p. 763).</span></li>
+      <li>It pushes streaming features to both stores <span class="fb">That is pushing, the other half of p. 757.</span></li>
+      <li data-correct>It copies the latest feature values from batch sources into the online store <span class="fb">"ingesting features from batch sources to make them available online (through a process called materialization)" (p. 757).</span></li>
+      <li>It stores the feature definitions in the registry <span class="fb">Definitions are applied to the registry (p. 759); materialization moves values, not definitions.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A data scientist is about to write <code>spend_l30d</code> from scratch, although a colleague wrote it last year. Which task of the feature store should have stopped her?</p>
+    <ul class="options">
+      <li>Monitoring <span class="fb">Operational monitoring watches availability, latency and the like (p. 768), not who writes what.</span></li>
+      <li data-correct>The registry <span class="fb">"a common catalog to explore, develop, collaborate on, and publish new definitions" (p. 769) — the discoverability of p. 736.</span></li>
+      <li>Storage <span class="fb">Storage holds the values; finding a definition is the catalog's job.</span></li>
+      <li>The on-demand transform <span class="fb">It computes request-time features; it has nothing to do with reuse.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l29-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A feature is an input variable of a model; a feature store is "a centralized repository used to store, manage, and serve features for machine learning (ML) tasks" (p. 720) and "a key asset in ML-Ops", the practices that run the loop of development, training and validation, deployment, monitoring and retraining.</li>
+    <li>The biggest problem (p. 743): features are needed both in modelling and in production, so two programs compute them and drift apart — training-serving skew, or online/offline skew. A feature store replaces them with one definition. Skew is not drift: drift is the world changing.</li>
+    <li>The offline store keeps months or years of history in warehouses and lakes, refreshed daily or weekly, for training; the online store keeps only the latest value of each entity in a low-latency key-value store, usually eventually consistent, for inference. Materialization fills the online store; streams push to both.</li>
+    <li>Inside the box (p. 763): 1 Serving, 2 Storage, 3 Transform (batch, streaming, on-demand), 4 Monitoring (operational metrics), 5 Registry (the catalog of definitions).</li>
+    <li>Feast: projects, feature views, features, entities, entity keys (composite when several), data sources it does not manage, a registry, a time-series data model; <code>get_historical_features</code> for training and batch predictions, <code>get_online_features</code> for real-time predictions.</li>
+    <li>Point-in-time correctness: each training row is joined with the latest feature value at or before its own timestamp, null beyond the ttl; a plain join leaks the future and inflates offline scores.</li>
+    <li>Nine products (pp. 746–754): open-source Feast, Hopsworks and Featureform, commercial Tecton, five proprietary. A feature store is a layer over storage you already have — a warehouse or lake for the history, a low-latency store for the latest values; the first was Uber's Michelangelo in 2017 (p. 739).</li>
+  </ul>
+  <aside class="cheat" id="l29-cheat">
+    <dl>
+      <dt>Feature (p. 720)</dt><dd>an input variable or attribute that describes a data object, used by a model to predict</dd>
+      <dt>Feature store (p. 720)</dt><dd>centralized repository to store, manage and serve features for ML; "a key asset in ML-Ops"</dd>
+      <dt>MLOps (p. 722)</dt><dd>practices and tools for developing, deploying and maintaining ML models in production; DevOps for ML</dd>
+      <dt>MLOps lifecycle (p. 724)</dt><dd>development → training and validation → deployment → monitoring → retraining</dd>
+      <dt>Training-serving skew (p. 734)</dt><dd>a model performs poorly because production features differ from training features; "online/offline skew" (p. 743)</dd>
+      <dt>Data drift / concept drift</dt><dd>\(P(X)\) changes / \(P(Y \mid X)\) changes — the world, not the code</dd>
+      <dt>Offline store (pp. 735, 765)</dt><dd>history, months or years; warehouses and lakes (S3, BigQuery, Snowflake, Redshift, Hadoop); for training</dd>
+      <dt>Online store (pp. 735, 765)</dt><dd>latest value per entity; low latency; key-value (Redis, DynamoDB); eventually consistent; for inference</dd>
+      <dt>Materialization / push (p. 757)</dt><dd>batch sources → online store / streaming features → both stores; offline batch use: no ingestion</dd>
+      <dt>Five tasks (p. 763)</dt><dd>1 Serving · 2 Storage · 3 Transform · 4 Monitoring · 5 Registry</dd>
+      <dt>Transforms (p. 767)</dt><dd>batch: data at rest · streaming: Kafka, Kinesis, PubSub · on-demand: request-time data, cannot be precomputed</dd>
+      <dt>Monitoring (p. 768)</dt><dd>storage: availability, capacity, utilization, staleness · serving: throughput, latency, error rates</dd>
+      <dt>Registry (p. 769)</dt><dd>common catalog of feature definitions and their metadata</dd>
+      <dt>Feast objects (pp. 756–759)</dt><dd>project (namespace) → feature views → features, entity, data source; entity key = the entities of a view (composite if several)</dd>
+      <dt>Feast retrieval (p. 762)</dt><dd><code>get_historical_features</code>: training data, batch predictions · <code>get_online_features</code>: real-time predictions</dd>
+      <dt>Point-in-time join</dt><dd>\(\tau^{*} = \max\{\tau_i \le t\}\); null if \(t - \tau^{*} \gt\) ttl</dd>
+      <dt>When needed (p. 744)</dt><dd>models at scale and in production; not for a small team, small project or POC</dd>
+      <dt>Products (pp. 746–754)</dt><dd>open-source: Feast, Hopsworks, Featureform · commercial: Tecton · proprietary: SageMaker, Databricks, Vertex AI, Azure ML, Scribble Data</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l29-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.uber.com/blog/michelangelo-machine-learning-platform/" target="_blank" rel="noopener">Meet Michelangelo: Uber's Machine Learning Platform</a>
+      <span class="res-by">Jeremy Hermann and Mike Del Balso, Uber Engineering, 2017</span>
+      <p class="res-why">The first public feature store, the "First Experience in Uber" of p. 739: about 10,000 shared features, kept in HDFS/Hive for training and in Cassandra for online predictions, with transformation expressions applied the same way at training and at prediction time.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" target="_blank" rel="noopener">Point-in-time joins</a>
+      <span class="res-by">Feast documentation</span>
+      <p class="res-why">The timeline picture behind section 5 and its widget: each row of the entity dataframe looks back, within the ttl, for the latest feature value.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.databricks.com/glossary/what-is-a-feature-store" target="_blank" rel="noopener">What is a Feature Store?</a>
+      <span class="res-by">Tecton article, now hosted by Databricks</span>
+      <p class="res-why">The source of pp. 763–769: serving, storage, transform, monitoring and registry in the authors' own words, with the reasons behind the online store's eventual consistency.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://developers.google.com/machine-learning/guides/rules-of-ml" target="_blank" rel="noopener">Rules of Machine Learning</a>
+      <span class="res-by">Martin Zinkevich, Google</span>
+      <p class="res-why">The section on training-serving skew: re-use code between training and serving, beware of joining tables that change, measure the skew — the practices a feature store builds in.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://eugeneyan.com/writing/feature-stores/" target="_blank" rel="noopener">Feature Stores: A Hierarchy of Needs</a>
+      <span class="res-by">Eugene Yan</span>
+      <p class="res-why">The key components of pp. 734–737 as a ladder — access, serving, integrity, convenience, autopilot — with real feature stores compared, and the same caveat as p. 744.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>A feature store hands its transformations to an engine such as Spark (p. 766). But how do you run one computation over a thousand machines in the first place?</p>
+</aside>
+
+</main>
+</body>
+</html>

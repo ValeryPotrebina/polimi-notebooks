@@ -1,0 +1,1219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Inside an Elasticsearch index — and the rest of ELK · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the JSON response that the mapping widget prints above its tasks (no component covers it) */
+.widget > pre.l25-resp { margin: 0; border-radius: 0; border-width: 1px 0 0; }
+/* page-local: code in the drawings shows => as typed, not as the font's arrow ligature */
+main svg .tx-mono { font-variant-ligatures: none; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l25">
+
+<header class="lesson-head">
+  <h1>Inside an Elasticsearch index — and the rest of ELK</h1>
+  <p class="lede">After this lesson you will say what survives when a node of an Elasticsearch cluster fails, write the complete mapping of an index from an ER entity as the exam asks for it, predict which terms an analyzer makes of a text, and name what Beats, Logstash and Kibana do around the index.</p>
+</header>
+
+<div class="hook" data-label="A puzzle from pp. 597–598">
+  <p>Page 597 sends one request to an index of New York restaurant inspections: <code>GET /nyc-restaurants/_search</code> with a <code>match</code> on <code>"BORO": "Queens"</code>. The first hit is NEW YORK SHAKE &amp; BURGER, borough Queens, with <code>"_score" : 1.4879451</code>.</p>
+  <p>Page 598 sends the same request with one letter changed, <code>"BORO": "queens"</code>, and gets <code>"hits" : [ ]</code>: not a single document, <code>"max_score" : null</code>. Same index, same field, same borough — and <code>match</code> is the query that is supposed to be lenient with text.</p>
+  <p>Nothing is wrong with the data, and the query is not to blame: the outcome was decided before anybody typed a query. Keep both responses in mind. By the end of the lesson you will know what decided them, and why the person who set it up may still have made the right choice.</p>
+</div>
+
+
+<section id="l25-elk">
+  <h2>Who does what: the ELK stack</h2>
+
+  <p>Page 569 stacks four programs as coloured bars: <mark class="key">Kibana</mark>, "Visualize and Manage"; <mark class="key">Elasticsearch</mark>, "Store, Search and Analyze"; <mark class="key">Logstash</mark> + <mark class="key">Beats</mark>, "Ingest". The initials of the first three name the <mark class="key">ELK stack</mark>; p. 571 calls it the Elastic Stack.</p>
+
+  <p>Page 570 shows who talks to whom (Fig. 1). Beats are small programs on the machines where data is produced, each collecting one kind of data and shipping it, through their shared library libbeat, straight into Elasticsearch or to Logstash, which parses and enriches it first. Kibana reads what Elasticsearch holds and draws it.</p>
+
+  <figure class="fig fig--plain" id="l25-fig-elk">
+    <svg class="dia" viewBox="0 0 560 248" role="img" aria-label="Six Beats ship through libbeat either directly into Elasticsearch or into Logstash, which parses and enhances the events and sends them on to Elasticsearch; Kibana visualizes what Elasticsearch stores">
+      <line x1="156" y1="72" x2="294" y2="64" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="156" y1="188" x2="294" y2="188" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="370" y1="164" x2="370" y2="92" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="444" y1="64" x2="464" y2="64" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="10" y="20" width="124" height="200" class="fi-paper sw-2"/>
+      <rect x="140" y="20" width="14" height="200" class="fi-soft"/>
+      <rect x="298" y="40" width="144" height="48" class="fi-paper sw-2"/>
+      <rect x="468" y="40" width="82" height="48" class="fi-paper sw-2"/>
+      <rect x="298" y="166" width="144" height="48" class="fi-paper sw-2"/>
+      <text x="72" y="44" class="tx-mid tx-bold">Beats</text>
+      <text x="72" y="76" class="tx-mid tx-sm">Filebeat</text>
+      <text x="72" y="100" class="tx-mid tx-sm">Metricbeat</text>
+      <text x="72" y="124" class="tx-mid tx-sm">Packetbeat</text>
+      <text x="72" y="148" class="tx-mid tx-sm">Heartbeat</text>
+      <text x="72" y="172" class="tx-mid tx-sm">Auditbeat</text>
+      <text x="72" y="196" class="tx-mid tx-sm">Winlogbeat</text>
+      <text x="147" y="240" class="tx-mid tx-sm">libbeat</text>
+      <text x="370" y="70" class="tx-mid tx-bold">Elasticsearch</text>
+      <text x="509" y="70" class="tx-mid tx-bold">Kibana</text>
+      <text x="370" y="196" class="tx-mid tx-bold">Logstash</text>
+      <text x="226" y="54" class="tx-mid tx-sm halo">direct</text>
+      <text x="382" y="134" class="tx-sm">parse &amp; enhance</text>
+      <text x="455" y="26" class="tx-mid tx-sm">visualize</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The interactions of p. 570, redrawn: through libbeat the Beats ship either directly into Elasticsearch or into Logstash, which sends the data on after "Parse &amp; Enhance"; Kibana's arrow is "Visualize". Blue arrows are data on the move.</figcaption>
+  </figure>
+
+  <p>The arrows carry a design decision: in this picture no data is born in Elasticsearch. It arrives from elsewhere — a web server's log, a database's rows — and is indexed to be searched, while the system it came from keeps the original. That is why two of the four programs exist only to bring data in.</p>
+
+  <p>Elasticsearch itself is the "Core of the Elastic Stack", a "Search &amp; Analytic engine" with four properties (p. 571, again on p. 575):</p>
+  <ul>
+    <li>"Based on Apache Lucene which enables full-text search": every text and keyword field ends up as terms in an inverted index, term → documents (<a href="l24.html">lesson 24</a>); the mapping and the analyzers decide which terms. (Numbers and dates get their own structures for range queries — background.)</li>
+    <li>"Distributed": an index is cut into shards on several machines, with copies.</li>
+    <li>"RESTful": you talk to it with HTTP requests carrying JSON.</li>
+    <li>"Near real-time: the time for a document to be searchable after indexing is very short" — short, not zero: by default new documents become searchable about once a second (background).</li>
+  </ul>
+
+</section>
+
+
+<section id="l25-shards">
+  <h2>Documents, indices, shards and replicas</h2>
+
+  <p>Start from one record: six fields of the inspection that p. 590 fetches from the index <code>nyc-restaurants</code>.</p>
+
+<pre><code>{
+  "DBA" : "BENTO HOUSE",
+  "BORO" : "Queens",
+  "CUISINE DESCRIPTION" : "Chinese",
+  "INSPECTION DATE" : "02/17/2021",
+  "ZIPCODE" : 11354,
+  "VIOLATION CODE" : "22G"
+}</code></pre>
+
+  <p>That is a <mark class="key">document</mark>: "Elasticsearch stores data structures in JSON documents" (p. 576), JSON objects like MongoDB's (<a href="l13.html">lesson 13</a>), nesting included. "When stored, new documents are indexed and made fully searchable", and they "can be accessed from any ES node when in a cluster".</p>
+
+  <p>The documents of one kind form an <mark class="key">index</mark>: a "Data organization mechanism", "Partitioned in shards", whose structure is defined "via mappings"; and "Elasticsearch is based on the concept of Inverted Index" (p. 577). Page 586 lines the words up with the relational ones:</p>
+
+  <figure class="tbl-fig" id="l25-tbl-rdbms">
+    <figcaption>Relational words and Elasticsearch words (p. 586), with the restaurant index as the example.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>RDBMS</th><th>Elasticsearch</th><th>In the restaurant index</th></tr></thead>
+        <tbody>
+          <tr><td>Table</td><td>Index</td><td><code>nyc-restaurants</code></td></tr>
+          <tr><td>Row</td><td>Document</td><td>one inspection, such as BENTO HOUSE</td></tr>
+          <tr><td>Column</td><td>Field</td><td><code>BORO</code>, <code>DBA</code>, <code>ZIPCODE</code></td></tr>
+          <tr><td>Schema</td><td>Mapping</td><td>what <code>GET /nyc-restaurants/_mapping</code> returns</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The analogy holds for words, not mechanisms: a document nests, an index is cut into pieces, and "index" means the whole collection, not SQL's helper structure on a column.</p>
+
+  <h3>Shards and replicas</h3>
+
+  <p>An index is split into <mark class="key">primary shards</mark> — "Each document in an index belongs to one Primary Shard" (p. 1621) — spread over the <mark class="key">nodes</mark> of a cluster: the partitioning of <a href="l03.html">lesson 3</a>. A <mark class="key">replica</mark> is a copy of a primary shard, with one condition: "Replicas: copies of shards stored on a different node" (p. 578). The same slide gives the traffic rules:</p>
+  <ul>
+    <li>"Write operation → Primary → Replica (to copy)": the primary writes the document, then copies it to every replica.</li>
+    <li>"Read operation → Routed to primary or replica": any copy may answer.</li>
+  </ul>
+
+  <p>Why one writer? If every copy accepted writes, copies could disagree; one primary per shard orders the writes and the replicas follow. Reads change nothing, so any copy will do — more replicas, more reads at once. But every write is done once per copy, so replicas never speed up writing. Per index this is two numbers, <code>number_of_shards</code> and <code>number_of_replicas</code> (per primary), plus a name and a location per node (p. 579).</p>
+
+  <p>Page 579 draws the result, and is easy to misread: its five boxes labelled "Node" cannot be one cluster — a primary cannot exist twice. Read them as one index, three primaries with one replica each, laid out on two different clusters (Fig. 2), with \(3 \times (1 + 1) = 6\) copies in each. In general \(P\) primaries with \(R\) replicas make \(P\,(1 + R)\) shard copies.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l25-fig-clusters">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 206" role="img" aria-label="Two nodes: Node 1 holds the primaries P1, P2, P3, Node 2 holds the replicas R1, R2, R3">
+        <rect x="58" y="12" width="44" height="28" class="fi-paper"/>
+        <line x1="66" y1="20" x2="94" y2="20" class="st-muted"/><line x1="66" y1="26" x2="94" y2="26" class="st-muted"/><line x1="66" y1="32" x2="94" y2="32" class="st-muted"/>
+        <rect x="198" y="12" width="44" height="28" class="fi-paper"/>
+        <line x1="206" y1="20" x2="234" y2="20" class="st-muted"/><line x1="206" y1="26" x2="234" y2="26" class="st-muted"/><line x1="206" y1="32" x2="234" y2="32" class="st-muted"/>
+        <rect x="30" y="68" width="100" height="128" class="st-line"/>
+        <rect x="170" y="68" width="100" height="128" class="st-line"/>
+        <rect x="58" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="58" y="120" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="58" y="158" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="198" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+        <rect x="198" y="120" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+        <rect x="198" y="158" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+        <text x="80" y="58" class="tx-mid tx-sm">Node 1</text>
+        <text x="220" y="58" class="tx-mid tx-sm">Node 2</text>
+        <text x="84" y="96" class="tx-mono tx-sm">P1</text>
+        <text x="84" y="134" class="tx-mono tx-sm">P2</text>
+        <text x="84" y="172" class="tx-mono tx-sm">P3</text>
+        <text x="224" y="96" class="tx-mono tx-sm">R1</text>
+        <text x="224" y="134" class="tx-mono tx-sm">R2</text>
+        <text x="224" y="172" class="tx-mono tx-sm">R3</text>
+      </svg>
+      <p class="fig-label">Two nodes: the top row of p. 579</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 206" role="img" aria-label="Three nodes: Node 1 holds P2 and P3, Node 2 holds R1 and R2, Node 3 holds P1 and R3">
+        <rect x="28" y="12" width="44" height="28" class="fi-paper"/>
+        <line x1="36" y1="20" x2="64" y2="20" class="st-muted"/><line x1="36" y1="26" x2="64" y2="26" class="st-muted"/><line x1="36" y1="32" x2="64" y2="32" class="st-muted"/>
+        <rect x="128" y="12" width="44" height="28" class="fi-paper"/>
+        <line x1="136" y1="20" x2="164" y2="20" class="st-muted"/><line x1="136" y1="26" x2="164" y2="26" class="st-muted"/><line x1="136" y1="32" x2="164" y2="32" class="st-muted"/>
+        <rect x="228" y="12" width="44" height="28" class="fi-paper"/>
+        <line x1="236" y1="20" x2="264" y2="20" class="st-muted"/><line x1="236" y1="26" x2="264" y2="26" class="st-muted"/><line x1="236" y1="32" x2="264" y2="32" class="st-muted"/>
+        <rect x="8" y="68" width="84" height="128" class="st-line"/>
+        <rect x="108" y="68" width="84" height="128" class="st-line"/>
+        <rect x="208" y="68" width="84" height="128" class="st-line"/>
+        <rect x="28" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="28" y="120" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="128" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+        <rect x="128" y="120" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+        <rect x="228" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="228" y="120" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+        <text x="50" y="58" class="tx-mid tx-sm">Node 1</text>
+        <text x="150" y="58" class="tx-mid tx-sm">Node 2</text>
+        <text x="250" y="58" class="tx-mid tx-sm">Node 3</text>
+        <text x="54" y="96" class="tx-mono tx-sm">P2</text>
+        <text x="54" y="134" class="tx-mono tx-sm">P3</text>
+        <text x="154" y="96" class="tx-mono tx-sm">R1</text>
+        <text x="154" y="134" class="tx-mono tx-sm">R2</text>
+        <text x="254" y="96" class="tx-mono tx-sm">P1</text>
+        <text x="254" y="134" class="tx-mono tx-sm">R3</text>
+      </svg>
+      <p class="fig-label">Three nodes: the bottom row of p. 579</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> The five "Node" boxes of p. 579, read as two separate clusters holding the same index — 3 primaries (solid) with 1 replica each (dashed), 6 shard copies in both. In both layouts no replica shares a node with its primary, so either cluster survives the loss of any one node.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="578">
+    <p class="claim">"Shards: distribute operations to … Increase resistance to faults (e.g. crashes when an indices get too big)"</p>
+    <p class="fix">Splitting an index into primary shards spreads its size and its work, so no node has to hold the whole index: that prevents the slide's example, a node overwhelmed by an index too big for it, and gives the next bullet's "Improve performance". It does not let the index survive the failure of a node: with <code>"number_of_replicas": 0</code> a failed node takes its shards, part of the index, with it. That resistance comes from replicas on other nodes.</p>
+    <p class="because">Check it in the widget below: replicas at 0, fail a node, and its shard is lost. The session repeats the list (p. 1621) but counts replicas as one of "two types of shards" — read that way, it is the replica shards that resist the failure. The exam may be matched against the printed wording: know it as printed, and in an open answer credit the replicas.</p>
+  </aside>
+
+  <div class="widget" id="l25-w-shards">
+    <h3 class="widget-title">Shards and replicas: what survives a failure</h3>
+    <p class="widget-intro">An index with some primary shards (P, solid) and replicas (R, dashed) on the nodes of a cluster. The widget places each replica on a different node from its primary, as Elasticsearch does; a copy with no possible node waits under "unassigned". Choose a node that fails, and step through a write and two reads of a document of shard 1. The widget shows the moment right after the failure; after a short delay Elasticsearch rebuilds missing replicas on the surviving nodes when there is room (background).</p>
+    <ol class="tasks">
+      <li>Set the index of p. 579: 3 primaries, 1 replica, 2 nodes. Predict the number of shard copies, then predict what is still served when Node 1 fails.
+        <details class="answer"><summary>What you should see</summary>
+          <p>\(3 \times (1 + 1) = 6\) copies, all placed. The layout is not the slide's top row — the widget spreads the primaries — but it obeys the same rule. When Node 1 fails, R1 and R3 on Node 2 are promoted to primaries: every shard is still served. The health turns yellow, because the lost replicas have no third node to be rebuilt on.</p></details>
+      </li>
+      <li>Now 3 nodes, 3 primaries and replicas at 0. Before failing Node 2, say what part of the index survives.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Shard 2 lived only on Node 2: it is lost, and the health is red. A third of the index is gone even though the data was "distributed". This is the one insight of the widget: <em>shards spread the index, only replicas let it survive a failure</em>. Put the replicas back to 1 and fail Node 2 again: R2 on Node 3 becomes the primary and nothing is lost.</p></details>
+      </li>
+      <li>One node, one replica. Where do the replicas go? Then add a second node.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Nowhere: all three replicas are unassigned, because a replica may not sit on the node of its primary, and there is no other node. With two nodes every replica finds a place. In general an index with R replicas needs at least R + 1 nodes to place them all.</p></details>
+      </li>
+      <li>Step through the write and the reads with the default index. Then fail the node that holds P1 and step again: which copy receives the write now, and how many copies of shard 1 remain?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The write goes to the primary, which copies it to the replica; a read can be answered by either copy. After the failure the promoted replica takes the write, and shard 1 exists once — one more failure and it is gone, which is why the health is yellow, not green, until Elasticsearch rebuilds a replica of shard 1 on Node 3.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l25-w-shards', function (root, ui) {
+    var W = 560, H = 356;
+    var sN = ui.slider({ label: 'nodes in the cluster', min: 1, max: 5, step: 1, value: 3 });
+    var sP = ui.slider({ label: 'primary shards · <code>number_of_shards</code>', min: 1, max: 5, step: 1, value: 3 });
+    var sR = ui.slider({ label: 'replicas of each primary · <code>number_of_replicas</code>', min: 0, max: 2, step: 1, value: 1 });
+    var selF = ui.select('a node fails', [
+      { value: '0', label: 'none' }, { value: '1', label: 'Node 1' }, { value: '2', label: 'Node 2' },
+      { value: '3', label: 'Node 3' }, { value: '4', label: 'Node 4' }, { value: '5', label: 'Node 5' }], null, '0');
+    var stepper = ui.stepper({ steps: [
+      'Follow one document of shard 1: press Next.',
+      'Write, step 1: the request goes to the primary of shard 1.',
+      'Write, step 2: the primary copies the document to every replica of shard 1.',
+      'Read: the primary of shard 1 can answer…',
+      '…and so can a replica of shard 1.'], play: 1400 });
+    var svgEl = ui.svg(W, H, { label: 'The nodes of the cluster with the primary and replica shards placed on them, the copies that have no node, and the path of a write and of a read of shard 1' });
+    var roCopies = ui.readout('shard copies (computed)');
+    var roFail = ui.readout('after the failure');
+    var roProm = ui.readout('promoted to primary');
+    var roHealth = ui.readout('health, in Elasticsearch’s colours');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'primary shard', color: 's1', mark: 'square' },
+      { label: 'replica: dashed outline', color: 's1', mark: 'dash' },
+      { label: 'request (reply dashed)', color: 's2', mark: 'line' },
+      { label: 'primary copies to a replica', color: 's1', mark: 'line' },
+      { label: 'copy on the failed node', color: 'bad', mark: 'cross' },
+      { label: 'the step now', color: 'ink', mark: 'hl' }
+    ]);
+
+    /* the layout: primary of shard s on node (s-1) mod N, its j-th replica on node (s-1+j) mod N (j < N), else unassigned */
+    function state() {
+      var N = Math.round(sN.value), P = Math.round(sP.value), R = Math.round(sR.value);
+      var sel = parseInt(selF.value, 10), f = sel - 1, outside = sel > N;
+      if (outside) f = -1;
+      var copies = [], s, j;
+      for (s = 1; s <= P; s++) copies.push({ s: s, j: 0, node: (s - 1) % N });
+      for (j = 1; j <= R; j++) for (s = 1; s <= P; s++) copies.push({ s: s, j: j, node: j < N ? (s - 1 + j) % N : -1 });
+      copies.forEach(function (c) { c.dead = c.node >= 0 && c.node === f; c.role = c.j === 0 ? 'P' : 'R'; c.promoted = false; });
+      var lost = [], promoted = [];
+      for (s = 1; s <= P; s++) {
+        var mine = copies.filter(function (c) { return c.s === s; });
+        var alive = mine.filter(function (c) { return c.node >= 0 && !c.dead; });
+        if (!alive.length) { lost.push(s); continue; }
+        if (mine[0].dead) { alive[0].promoted = true; alive[0].role = 'P'; promoted.push(alive[0]); }
+      }
+      var placed = copies.filter(function (c) { return c.node >= 0; }).length;
+      var dead = copies.filter(function (c) { return c.dead; }).length;
+      var one = copies.filter(function (c) { return c.s === 1 && c.node >= 0 && !c.dead; });
+      var prim = one.filter(function (c) { return c.role === 'P'; })[0] || null;
+      var reps = one.filter(function (c) { return c.role === 'R'; });
+      return { N: N, P: P, R: R, sel: sel, f: f, outside: outside, copies: copies, lost: lost, promoted: promoted,
+               placed: placed, dead: dead, prim: prim, reps: reps };
+    }
+    function cx(i, N) { return W * (i + 0.5) / N; }
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function T(x, y, str, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: str }); }
+    function list(a) { return a.length === 1 ? String(a[0]) : a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1]; }
+    function slot(st, c) {                 /* x, y of the square of copy c in its node's tray */
+      var here = st.copies.filter(function (d) { return d.node === c.node; });
+      here.sort(function (a, b) { return a.j - b.j || a.s - b.s; });
+      var k = here.indexOf(c);
+      return { x: cx(c.node, st.N) - 24, y: 122 + k * 30 };
+    }
+
+    function draw(st) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var k = stepper.index, i, c;
+      /* the path of the current step, drawn first so that the boxes cover the arrow ends */
+      var hot = [];
+      if (st.prim && k >= 1) {
+        var px = cx(st.prim.node, st.N);
+        if (k === 1) { S('line', { x1: 280, y1: 30, x2: px, y2: 50, 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' }); hot.push(st.prim); }
+        if (k === 2) {
+          hot.push(st.prim);
+          st.reps.forEach(function (r) {
+            var rx = cx(r.node, st.N);
+            S('path', { d: 'M' + px + ',50 Q' + ((px + rx) / 2) + ',24 ' + rx + ',50', 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' });
+            hot.push(r);
+          });
+        }
+        var target = k === 3 ? st.prim : (k === 4 ? (st.reps[0] || null) : null);
+        if (target) {
+          var tx = cx(target.node, st.N);
+          S('line', { x1: 276, y1: 30, x2: tx - 6, y2: 50, 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+          S('line', { x1: tx + 6, y1: 50, x2: 284, y2: 30, 'class': 'st-s2 sw-2 dash', 'marker-end': 'url(#arr-s2)' });
+          hot.push(target);
+        }
+      }
+      /* client */
+      S('rect', { x: 262, y: 6, width: 36, height: 24, rx: 6, 'class': 'fi-paper' });
+      T(306, 23, 'client', 'tx-sm');
+      /* nodes */
+      var tw = Math.min(104, W / st.N - 10);
+      for (i = 0; i < st.N; i++) {
+        var x = cx(i, st.N), down = i === st.f;
+        S('rect', { x: x - tw / 2, y: 110, width: tw, height: 166, 'class': down ? 'st-muted dash' : 'st-line' });
+        S('rect', { x: x - 22, y: 52, width: 44, height: 28, 'class': down ? 'fi-paper st-muted' : 'fi-paper' });
+        [60, 66, 72].forEach(function (yy) { S('line', { x1: x - 14, y1: yy, x2: x + 14, y2: yy, 'class': 'st-muted' }); });
+        T(x, 100, 'Node ' + (i + 1), 'tx-sm tx-mid' + (down ? ' tx-muted' : ''));
+        if (down) {
+          S('line', { x1: x - 26, y1: 46, x2: x + 26, y2: 86, 'class': 'st-bad sw-3' });
+          S('line', { x1: x + 26, y1: 46, x2: x - 26, y2: 86, 'class': 'st-bad sw-3' });
+        }
+      }
+      /* placed copies */
+      st.copies.forEach(function (c) {
+        if (c.node < 0) return;
+        var p = slot(st, c);
+        if (hot.indexOf(c) >= 0) S('rect', { x: p.x - 3, y: p.y - 3, width: 24, height: 24, 'class': 'hl' });
+        S('rect', { x: p.x, y: p.y, width: 18, height: 18, 'class': 'fw-s1 st-s1 sw-2' + (c.role === 'R' ? ' dash' : '') });
+        T(p.x + 30, p.y + 14, c.role + c.s + (c.promoted ? '↑' : ''), 'tx-mono tx-sm' + (c.dead ? ' tx-muted' : ''));
+        if (c.dead) {
+          S('line', { x1: p.x - 3, y1: p.y - 3, x2: p.x + 21, y2: p.y + 21, 'class': 'st-bad sw-2' });
+          S('line', { x1: p.x + 21, y1: p.y - 3, x2: p.x - 3, y2: p.y + 21, 'class': 'st-bad sw-2' });
+        }
+      });
+      /* copies without a node */
+      var un = st.copies.filter(function (c) { return c.node < 0; });
+      T(14, 314, un.length ? 'unassigned' : 'unassigned: none', 'tx-sm tx-muted');
+      un.forEach(function (c, n) {
+        var ux = 118 + (n % 8) * 54, uy = 298 + Math.floor(n / 8) * 30;
+        S('rect', { x: ux, y: uy, width: 18, height: 18, 'class': 'st-muted dash' });
+        T(ux + 24, uy + 14, 'R' + c.s, 'tx-mono tx-sm tx-muted');
+      });
+    }
+
+    ui.onChange(function () {
+      var st = state(), total = st.P * (1 + st.R), un = total - st.placed, k = stepper.index;
+      roCopies.set(st.P + ' × (1 + ' + st.R + ') = ' + total + ' · ' + (un ? st.placed + ' placed, ' + un + ' unassigned' : 'all placed'));
+      if (st.sel === 0) roFail.set('no node has failed');
+      else if (st.outside) roFail.set('there is no Node ' + st.sel + ' with ' + st.N + (st.N === 1 ? ' node' : ' nodes'));
+      else if (st.lost.length) roFail.set('Node ' + st.sel + ' down · ' + (st.lost.length === st.P ? 'the whole index is lost' : (st.lost.length === 1 ? 'shard ' : 'shards ') + list(st.lost) + ' lost'), 'bad');
+      else roFail.set('Node ' + st.sel + ' down · every shard still served', 'good');
+      roProm.set(st.promoted.length ? st.promoted.map(function (c) { return 'R' + c.s + ' on Node ' + (c.node + 1); }).join(', ') : 'none');
+      if (st.lost.length) roHealth.set('red · a shard has no copy', 'bad');
+      else if (un || st.dead) roHealth.set('yellow · replicas missing', 'key');
+      else roHealth.set('green · every copy placed', 'good');
+
+      var one = st.prim ? 'Node ' + (st.prim.node + 1) : '';
+      var msg;
+      if (!st.prim) msg = 'Shard 1 has no copy left: a write or a read of its documents fails.';
+      else if (k === 0) msg = 'Every document belongs to one primary shard (p. 1621). Press Next to follow a document of shard 1.';
+      else if (k === 1) msg = 'The write goes to the primary of shard 1, on ' + one + (st.prim.promoted ? ' — a replica promoted after the failure.' : '.');
+      else if (k === 2) msg = st.reps.length ? 'The primary copies the document to ' + (st.reps.length === 1 ? 'its replica on Node ' : 'its replicas on Nodes ') + list(st.reps.map(function (r) { return r.node + 1; })) + '. The write is done once per copy, so replicas never speed up writing.'
+        : 'Shard 1 has no replica now: the document exists once, on ' + one + '. One more failure and it is gone.';
+      else if (k === 3) msg = 'A read is answered by the primary, on ' + one + '.';
+      else msg = st.reps.length ? 'A read can just as well be answered by the replica on Node ' + (st.reps[0].node + 1) + ': every replica adds capacity for reads.'
+        : 'No replica of shard 1: every read of its documents lands on ' + one + '.';
+      note.set(msg);
+      draw(st);
+    });
+  });
+  </script>
+
+  <p>Shards are not free: "The more shards you have, the more the management overheads", and "The larger the shard size, the more it takes to move them (if needed)" (p. 1622). The number of primaries is fixed when the index is created; the number of replicas can change at any time (background).</p>
+</section>
+
+
+<section id="l25-rest">
+  <h2>Talking to Elasticsearch: one REST request at a time</h2>
+
+  <p>"Interactions with Elasticsearch happen through requests to REST endpoints", and "Actions depend on HTTP verbs" (p. 582): <code>GET</code> to read, <code>POST</code> and <code>PUT</code> "often used to create new documents, indices, etc.", and <code>DELETE</code>. You send them from a command line, from Postman, or from the "Developer Tools built in Kibana", the console of the exercise sessions. A request is a verb, an endpoint and, often, a JSON body. The shortest creates an index (p. 587):</p>
+
+<pre><code># create an empty index
+PUT /my_index</code></pre>
+
+  <p>The answer, <code>"acknowledged" : true</code>, says that the index exists. Now add a document (p. 584):</p>
+
+<pre><code># add a document; Elasticsearch picks its _id
+POST /my_index/_doc
+{
+  "author":"Andrea",
+  "title":"Set up Elasticsearch and Kibana in 15 minutes!",
+  "date":"Tue, 23 Feb 2021 11:40:00 +0000",
+  "categories": ["elasticsearch","tutorial",
+                 "data science","bigdata"],
+  "lang":"en-US"
+}</code></pre>
+
+  <p>Read it aloud: verb <code>POST</code>; endpoint <code>/my_index/_doc</code>, the documents of <code>my_index</code>; body, the document. No identifier is given, so "Elasticsearch takes care of creating and assigning IDs to documents" (p. 583): the answer carries <code>"_id": "jYpU_XQBkGeBYJKltRh8"</code> and <code>"result": "created"</code> (p. 585). With <code>PUT</code> you choose the identifier:</p>
+
+<pre><code># create or replace document my_id
+PUT /my_index/_doc/my_id
+{
+  "author":"Andrea",
+  "lang":"en-US"
+}</code></pre>
+
+  <p>Hence the slide's warning (p. 583): "POST doesn't require the ID of the resource → duplicates", "PUT requires the ID of the resource → create or update the same one". Send the <code>POST</code> twice and the post is stored twice, under two ids; send the <code>PUT</code> twice and one document has <code>_version</code> 2. A <code>PUT</code> to a known address is idempotent; a <code>POST</code> to a collection is not.</p>
+
+  <p>A <code>GET</code> on a document's address reads it back (p. 590):</p>
+
+<pre><code># one document by its _id
+GET /nyc-restaurants/_doc/pZpozncBDaS7kSRanan2</code></pre>
+
+  <p>The answer wraps the document in metadata — <code>_index</code>, <code>_id</code>, <code>_version</code>, <code>_seq_no</code>, <code>_primary_term</code>, <code>"found" : true</code> — and returns under <code>_source</code> the JSON exactly as it was sent. Searches look in the inverted index; <code>_source</code> is what they hand back. The last verb removes:</p>
+
+<pre><code># delete one document; DELETE /my_index drops the whole index
+DELETE /my_index/_doc/my_id</code></pre>
+
+</section>
+
+
+<section id="l25-mapping">
+  <h2>The mapping: what each field becomes</h2>
+
+  <p>Ask the restaurant index for its structure:</p>
+
+<pre><code># the mapping this index is using
+GET /nyc-restaurants/_mapping</code></pre>
+
+  <aside class="margin-note">The _meta line of p. 581 names the tool that wrote this mapping: Kibana's file uploader ("ml-file-data-visualizer"), which proposes a type for every column of the uploaded file. BORO came out a keyword (p. 598).</aside>
+
+  <p>Nobody typed the answer of p. 581, yet every field has a type: <code>"@timestamp" : { "type" : "date" }</code>, <code>"ACTION" : { "type" : "text" }</code>, <code>"BBL" : { "type" : "long" }</code>… "Is Elasticsearch really schemaless?" the slide asks, with an arrow labelled "Proof" to this answer. No: "Elasticsearch tries to guess the structure of the documents" — <mark class="key">dynamic mapping</mark> — when it first meets a field, and keeps the guess.</p>
+
+  <p>A <mark class="key">mapping</mark> is the schema of an index: with it "you can tell Elasticsearch the types of your documents' fields", "Decide which fields are searchable" and "Enable full-text search, time and geo-based queries" (p. 580). The type decides how a value is indexed, so it decides which questions can be asked of it. Page 589 teaches four types; the session's table adds more (p. 1635):</p>
+
+  <figure class="tbl-fig" id="l25-tbl-types">
+    <figcaption>The field types in the slides' words (pp. 589, 1635), with fields of the restaurant index that would take them.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Type</th><th>The slide says</th><th>Restaurant fields</th></tr></thead>
+        <tbody>
+          <tr><td><code>text</code></td><td>"used for full-text search. With analyzer you can specify how the field is pre-processed."</td><td><code>DBA</code>, <code>VIOLATION DESCRIPTION</code></td></tr>
+          <tr><td><code>keyword</code></td><td>"used for structured content such as email, tags, postcode etc…"</td><td><code>BORO</code>, <code>CUISINE DESCRIPTION</code>, <code>ZIPCODE</code></td></tr>
+          <tr><td><code>date</code></td><td>"used for dates you can specify the format."</td><td><code>INSPECTION DATE</code>, with <code>"format": "MM/dd/yyyy"</code></td></tr>
+          <tr><td><code>long</code></td><td>"used for 64-bit integers."</td><td><code>BBL</code>, as mapped on p. 581</td></tr>
+          <tr><td><code>double</code>, <code>boolean</code>, <code>binary</code>, <code>object</code>, <code>geo_point</code></td><td>the session's table (p. 1635): a 64-bit floating-point number, "Either true or false", a Base64-encoded binary value, "A JSON object", "Latitude and longitude points"</td><td><code>Latitude</code>, <code>location</code></td></tr>
+          <tr><td><code>integer</code></td><td>not in either table, but used by the session's own mapping (p. 1663): a 32-bit integer</td><td><code>SCORE</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The hard choice is <code>text</code> against <code>keyword</code>. A <mark class="key">text</mark> field is cut into words by an analyzer and searched word by word; a <mark class="key">keyword</mark> field is one exact value, matched whole, counted and sorted. Decide by the question: "violations that mention mice" wants words, so text; "only Queens" and "how many per cuisine" want whole values, so keyword. Mind the slide's own list: a postcode is keyword even when it arrives as a number, like <code>"ZIPCODE" : 11354</code> — you match postcodes, you never add them.</p>
+
+  <p>The guess is "risky (e.g. dates could be parsed as strings)" (p. 581): <code>"02/22/2021"</code> is not a date format Elasticsearch recognises by default, so it becomes a string — a <code>text</code> field with a <code>keyword</code> sub-field (background) — and sorting by it compares characters, not days.</p>
+
+  <h3>What may change once documents are in</h3>
+
+  <aside class="redpen" data-page="580">
+    <p class="claim">"Be careful as you CANNOT change the mapping on an existing index that already has documents!"</p>
+    <p class="fix">You cannot change the type — or most settings — of a field that already exists: for that you create a new index with the right mapping and copy the documents into it, a reindex. New fields can be added at any time, with <code>PUT /my_index/_mapping</code>.</p>
+    <p class="because">The deck adds a field this way on p. 588, the session on p. 1632, and the session gives the rule for the rest: to update the mapping of a field "it is necessary to create a new index and reindex the data" (p. 1633). A type cannot change because the field's terms were indexed for the old type. The exam may be matched against the printed sentence: know it, and write the precise version in an open answer.</p>
+  </aside>
+
+  <p>Adding a field (p. 588):</p>
+
+<pre><code># add a text field to the mapping
+PUT /my_index/_mapping
+{
+  "properties": {
+    "field_name": {
+      "type": "text"
+    }
+  }
+}</code></pre>
+
+  <h3>The exam's question: the complete mapping of the index</h3>
+
+  <p>Safer than any guess is a mapping written before the first document. The session shows the full form, settings and mapping side by side (p. 1663, "Define the full mapping describing a Person with 10 shards and 3 replicas"):</p>
+
+<pre><code># an index with settings and mapping
+PUT /people
+{
+  "settings": {
+    "number_of_shards": 10,
+    "number_of_replicas": 3
+  },
+  "mappings": {
+    "properties": {
+      "personal_id": { "type": "keyword" },
+      "name": { "type": "text" },
+      "surname": { "type": "text" },
+      "birth date": { "type": "date", "format": "yyyy-MM-dd" },
+      "address": { "type": "text" },
+      "eye_color": { "type": "keyword" },
+      "height": { "type": "integer" }
+    }
+  }
+}</code></pre>
+
+  <p>Read it from the outside in: <code>PUT /people</code> creates the index; <code>settings</code> gives it 10 primaries with 3 replicas each; <code>mappings</code> → <code>properties</code> holds one entry per field with its <code>type</code> and, for a date, its <code>format</code>. Seven of the nine past papers open their Elasticsearch exercise with this request, for 1 point: "Provide the complete mapping of the index for the considered entity (i.e., field name, field type, the structure of the mapping, etc.)" — the three 2024 papers word it without "for the considered entity". <code>mappings</code> is the answer; <code>settings</code> may be added.</p>
+
+  <p>Solved on the paper of 30 May 2025 (its header prints "June 30, 2025"), exercise 3. The ER scenario tracks puzzles' production and sales; the entity is Puzzle — Puzzle ID, Name, Collection Name (e.g., Museum Collection), Number of Pieces, Width, Height, Description — and "All sizes are in cm". The next sub-question (2 points) asks for "the total number of puzzles for each collection name". "Consider the Puzzle entity. Provide the complete mapping of the index for the considered entity (…) (1 PT)". List every attribute, inherited ones included (Puzzle has no ISA parent), and type each by the question it will answer:</p>
+
+  <figure class="tbl-fig" id="l25-tbl-puzzle">
+    <figcaption>From the attributes of Puzzle to the fields of the mapping. Field names in lower case with underscores, like the session's <code>personal_id</code>.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Attribute</th><th>Field</th><th>Type</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Puzzle ID</td><td><code>puzzle_id</code></td><td><code>keyword</code></td><td>an identifier, matched whole</td></tr>
+          <tr><td>Name</td><td><code>name</code></td><td><code>text</code></td><td>searched by its words</td></tr>
+          <tr class="is-key"><td>Collection Name</td><td><code>collection_name</code></td><td><code>keyword</code></td><td>counted per value by the next question: "term aggregations only work on keywords" (p. 1658)</td></tr>
+          <tr><td>Number of Pieces</td><td><code>number_of_pieces</code></td><td><code>integer</code></td><td>a count</td></tr>
+          <tr><td>Width, Height</td><td><code>width</code>, <code>height</code></td><td><code>double</code></td><td>centimetres, may have decimals</td></tr>
+          <tr><td>Description</td><td><code>description</code></td><td><code>text</code></td><td>free text</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+<pre><code># the answer: mappings → properties
+PUT /puzzles
+{
+  "mappings": {
+    "properties": {
+      "puzzle_id": { "type": "keyword" },
+      "name": { "type": "text" },
+      "collection_name": { "type": "keyword" },
+      "number_of_pieces": { "type": "integer" },
+      "width": { "type": "double" },
+      "height": { "type": "double" },
+      "description": { "type": "text" }
+    }
+  }
+}</code></pre>
+
+  <p class="memo"><mark class="key">Choose each field's type by the question that will be asked of it: words → text, whole values to match or count → keyword, numbers and dates → their own types.</mark></p>
+</section>
+
+
+<section id="l25-analyzers">
+  <h2>Analyzers: how a text becomes terms</h2>
+
+  <p>A <code>text</code> field is "pre-processed" by an <mark class="key">analyzer</mark> (p. 589), the program that turns a string into the terms of the inverted index. You can run one on any text (p. 594):</p>
+
+<pre><code># the terms of a text
+POST /_analyze
+{
+  "analyzer": "standard",
+  "text": "The 2 QUICK Brown-Foxes jumped over the lazy dog's bone."
+}</code></pre>
+
+  <p>The answer lists tokens with their offsets and positions; the slide shows the first, <code>"token" : "the"</code> at position 0. The table runs the same sentence through every analyzer of pp. 591–593:</p>
+
+  <figure class="tbl-fig wide" id="l25-tbl-analyzers">
+    <figcaption>The sentence of p. 594 through the built-in analyzers. The slide prints only the first token, <code>the</code>; the rows are computed from each analyzer's definition (Elasticsearch documentation). A middle dot separates the terms.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Analyzer</th><th>Terms</th></tr></thead>
+        <tbody>
+          <tr><td>standard</td><td><code>the&nbsp;· 2&nbsp;· quick&nbsp;· brown&nbsp;· foxes&nbsp;· jumped&nbsp;· over&nbsp;· the&nbsp;· lazy&nbsp;· dog's&nbsp;· bone</code></td></tr>
+          <tr><td>simple</td><td><code>the&nbsp;· quick&nbsp;· brown&nbsp;· foxes&nbsp;· jumped&nbsp;· over&nbsp;· the&nbsp;· lazy&nbsp;· dog&nbsp;· s&nbsp;· bone</code></td></tr>
+          <tr><td>whitespace</td><td><code>The&nbsp;· 2&nbsp;· QUICK&nbsp;· <span class="nw">Brown-Foxes</span>&nbsp;· jumped&nbsp;· over&nbsp;· the&nbsp;· lazy&nbsp;· dog's&nbsp;· bone.</code></td></tr>
+          <tr><td>stop</td><td><code>quick&nbsp;· brown&nbsp;· foxes&nbsp;· jumped&nbsp;· over&nbsp;· lazy&nbsp;· dog&nbsp;· s&nbsp;· bone</code></td></tr>
+          <tr><td>keyword</td><td><code>The 2 QUICK Brown-Foxes jumped over the lazy dog's bone.</code></td></tr>
+          <tr><td>pattern</td><td><code>the&nbsp;· 2&nbsp;· quick&nbsp;· brown&nbsp;· foxes&nbsp;· jumped&nbsp;· over&nbsp;· the&nbsp;· lazy&nbsp;· dog&nbsp;· s&nbsp;· bone</code></td></tr>
+          <tr><td>english (a language analyzer)</td><td><code>2&nbsp;· quick&nbsp;· brown&nbsp;· fox&nbsp;· jump&nbsp;· over&nbsp;· lazi&nbsp;· dog&nbsp;· bone</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Check the slide's definitions against the rows. The standard analyzer "divides text into terms on word boundaries, as defined by the Unicode Text Segmentation algorithm. It removes most punctuation, lowercases terms, and supports removing stop words" (p. 592). The simple analyzer cuts "whenever it encounters a character which is not a letter" and "lowercases all terms": the 2 vanishes, "dog's" falls apart. The whitespace analyzer "does not lowercase terms": QUICK and <span class="nw">Brown-Foxes</span> survive. The stop analyzer "is like the simple analyzer, but also supports removal of stop words"; the keyword analyzer, a "noop", "outputs the exact same text as a single term"; the pattern analyzer splits "according to a custom regexp pattern" (p. 593) — the pattern marks the separators, by default every run of non-word characters, <code>\W+</code>, and the terms are lower-cased (background). A language analyzer "removes stopwords of a given language" and performs "stemming" (p. 591): <code>english</code> makes foxes fox and lazy lazi — a stem need not be a word, only shared by related words.</p>
+
+  <div class="pitfall">
+    <p>"The standard analyzer removes stop words." It "supports removing stop words" (p. 592) if you configure it to; by default it removes none — the first token on p. 594 is "the".</p>
+  </div>
+
+  <p>The analyzer runs twice: on every document when it is indexed, and on the query text of a <code>match</code>. Both sides must end with the same terms, or "<span class="nw">Brown-Foxes</span>" never meets "brown" — AN2DL's training–serving skew, where preprocessing that differs at serving time feeds the model inputs it never learned.</p>
+
+  <p>And a <code>keyword</code> field? "Borough (BORO) was mapped as a keyword. A keyword does not have any analyser!" (p. 598). Its value enters the index whole, as written, and so does the query text. The widget replays the hook on three documents from the slides.</p>
+
+  <div class="widget" id="l25-w-mapping">
+    <h3 class="widget-title">"Queens" or "queens": the mapping decides</h3>
+    <p class="widget-intro">Three restaurant documents from the slides, indexed with the mapping you choose for <code>BORO</code>. Top: the query text goes through the field's analyzer and becomes query terms (orange). Middle: the terms of <code>BORO</code> in the inverted index (violet) and their postings, the documents that contain them. A query term finds documents only if the index holds exactly that term. Under the readouts, the response as Elasticsearch would print it.</p>
+    <ol class="tasks">
+      <li>Keep <code>BORO</code> as keyword and query "Queens", then "queens". Predict the number of hits before you switch.
+        <details class="answer"><summary>What you should see</summary>
+          <p>2 hits, then 0 — the response of p. 598, <code>"max_score" : null</code>, <code>"hits" : [ ]</code>. Without an analyzer the query term is "queens", and the index only knows "Queens": there is no posting list to follow.</p></details>
+      </li>
+      <li>Switch to text with the standard analyzer. Predict "queens" and "QUEENS".
+        <details class="answer"><summary>What you should see</summary>
+          <p>2 hits each. The analyzer lower-cased the stored values when the documents were indexed and lower-cases the query now: both sides meet at the term "queens".</p></details>
+      </li>
+      <li>Text again, but with the whitespace analyzer. Predict "queens".
+        <details class="answer"><summary>What you should see</summary>
+          <p>0 hits: the whitespace analyzer "does not lowercase terms" (p. 592), so the index holds "Queens". Case disappears not because a field is text, but because its analyzer lower-cases.</p></details>
+      </li>
+      <li>The one insight: <em>a match compares terms after the field's analyzer</em>. Query "Queens County" — predict keyword, then standard.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Keyword: 0 hits, because the whole string is one term and "Queens County" is not "Queens". Standard: 2 hits, because the text becomes two terms, "queens" and "county", and a <code>match</code> needs any one of them; "county" simply finds nothing.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l25-w-mapping', function (root, ui) {
+    var W = 560, H = 304;
+    var DOCS = [
+      { id: '1', dba: 'NEW YORK SHAKE & BURGER', boro: 'Queens', x: 25 },
+      { id: '2', dba: 'BENTO HOUSE', boro: 'Queens', x: 205 },
+      { id: '3', dba: 'U LIKE CHINESE TAKE OUT', boro: 'Manhattan', x: 385 }
+    ];
+    var selMap = ui.select('mapping of <code>BORO</code>', [
+      { value: 'keyword', label: 'keyword: no analyzer' },
+      { value: 'standard', label: 'text: standard analyzer' },
+      { value: 'whitespace', label: 'text: whitespace analyzer' }], null, 'keyword');
+    var selQ = ui.select('query text of the <code>match</code>', [
+      { value: 'Queens', label: '"Queens"' }, { value: 'queens', label: '"queens"' },
+      { value: 'QUEENS', label: '"QUEENS"' }, { value: 'Queens County', label: '"Queens County"' }], null, 'Queens');
+    var svgEl = ui.svg(W, H, { label: 'The query text, the analyzer and the query terms; the terms of BORO in the inverted index with arrows to the documents that contain them; the three documents, with the hits outlined' });
+    var code = Course.el('code');
+    root.insertBefore(Course.el('pre', { 'class': 'l25-resp' }, [code]), root.querySelector('.tasks'));   /* under the readouts, above "Try it" */
+    var roQ = ui.readout('query terms after analysis');
+    var roI = ui.readout('terms of BORO in the index');
+    var roH = ui.readout('hits.total.value', { digits: 0 });
+    ui.note('The documents are doc 1 NEW YORK SHAKE &amp; BURGER (p. 597), doc 2 BENTO HOUSE (p. 590) and doc 3 U LIKE CHINESE TAKE OUT (p. 596). The scores in the response are computed for this three-document index with Elasticsearch’s default formula; the full index of the slides gave 1.4879451 to the same match.');
+    ui.legend([
+      { label: 'query, query terms, hits', color: 's2', mark: 'line' },
+      { label: 'inverted index and postings', color: 's3', mark: 'area' },
+      { label: 'the matching term', color: 'ink', mark: 'hl' }
+    ]);
+
+    function analyze(mode, text) {
+      if (mode === 'keyword') return [text];
+      if (mode === 'whitespace') return text.split(/\s+/).filter(function (t) { return t; });
+      return text.split(/[^A-Za-z0-9]+/).filter(function (t) { return t; }).map(function (t) { return t.toLowerCase(); });
+    }
+    function width(s) { return Math.max(56, Math.round(s.length * 10.6 + 18)); }
+    function state() {
+      var mode = selMap.value, q = selQ.value, index = [];
+      DOCS.forEach(function (d) {
+        analyze(mode, d.boro).forEach(function (t) {
+          var e = index.filter(function (x) { return x.term === t; })[0];
+          if (!e) { e = { term: t, ids: [] }; index.push(e); }
+          if (e.ids.indexOf(d.id) < 0) e.ids.push(d.id);
+        });
+      });
+      index.forEach(function (e) { e.cx = e.ids.indexOf('3') >= 0 ? 460 : 280; });
+      var qterms = analyze(mode, q), hits = [];
+      DOCS.forEach(function (d) {
+        var score = 0, hit = false;
+        qterms.forEach(function (t) {
+          var e = index.filter(function (x) { return x.term === t; })[0];
+          /* BM25 with one occurrence in a one-term field: the term adds its idf */
+          if (e && e.ids.indexOf(d.id) >= 0) { hit = true; score += Math.log(1 + (DOCS.length - e.ids.length + 0.5) / (e.ids.length + 0.5)); }
+        });
+        if (hit) hits.push({ d: d, score: score });
+      });
+      hits.sort(function (a, b) { return b.score - a.score || (a.d.id < b.d.id ? -1 : 1); });
+      return { mode: mode, q: q, index: index, qterms: qterms, hits: hits };
+    }
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function T(x, y, str, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: str }); }
+
+    function draw(st) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var isHit = {};
+      st.hits.forEach(function (h) { isHit[h.d.id] = true; });
+      /* the inverted index region */
+      S('rect', { x: 10, y: 84, width: 540, height: 88, 'class': 'fw-s3 st-s3' });
+      T(22, 106, 'inverted index of BORO', 'tx-sm');
+      /* query terms and their lookup */
+      var qx = 306, matched = [];
+      st.qterms.forEach(function (t) {
+        var w = width(t), mid = qx + w / 2;
+        var e = st.index.filter(function (x) { return x.term === t; })[0];
+        if (e) {
+          S('line', { x1: mid, y1: 58, x2: e.cx, y2: 118, 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+          matched.push(e);
+        } else {
+          S('line', { x1: mid, y1: 58, x2: mid, y2: 90, 'class': 'st-s2 sw-2 dash' });
+          S('line', { x1: mid - 7, y1: 91, x2: mid + 7, y2: 105, 'class': 'st-bad sw-2' });
+          S('line', { x1: mid + 7, y1: 91, x2: mid - 7, y2: 105, 'class': 'st-bad sw-2' });
+          if (mid > 400) T(mid - 14, 104, 'no such term', 'tx-sm tx-end');      /* keep the label inside the drawing */
+          else T(mid + 14, 104, 'no such term', 'tx-sm');
+        }
+        S('rect', { x: qx, y: 26, width: w, height: 32, 'class': 'fi-paper st-s2 sw-2' });
+        T(mid, 47, t, 'tx-mono tx-mid');
+        qx += w + 10;
+      });
+      /* the query box and the analyzer */
+      S('rect', { x: 14, y: 24, width: 168, height: 34, 'class': 'fi-paper st-s2 sw-2 dash' });
+      T(24, 46, '"' + st.q + '"', 'tx-mono');
+      T(14, 15, 'match on BORO', 'tx-sm tx-muted');
+      S('line', { x1: 190, y1: 41, x2: 294, y2: 41, 'marker-end': 'url(#arr)' });
+      T(242, 31, st.mode === 'keyword' ? 'no analyzer' : st.mode, 'tx-sm tx-mid halo');
+      /* index terms and postings */
+      st.index.forEach(function (e) {
+        var w = width(e.term);
+        e.ids.forEach(function (id) {
+          var d = DOCS.filter(function (x) { return x.id === id; })[0];
+          S('line', { x1: e.cx, y1: 150, x2: d.x + 75, y2: 200, 'class': 'st-s3', 'marker-end': 'url(#arr-s3)' });
+        });
+        if (matched.indexOf(e) >= 0) S('rect', { x: e.cx - w / 2 - 4, y: 118, width: w + 8, height: 34, 'class': 'hl' });
+        S('rect', { x: e.cx - w / 2, y: 122, width: w, height: 26, 'class': 'fi-paper' });
+        T(e.cx, 140, e.term, 'tx-mono tx-mid');
+      });
+      /* the documents */
+      DOCS.forEach(function (d) {
+        if (isHit[d.id]) S('rect', { x: d.x - 6, y: 200, width: 162, height: 82, 'class': 'st-s2 sw-2 dash' });
+        S('rect', { x: d.x, y: 206, width: 150, height: 70, 'class': 'fi-paper sw-2' });
+        T(d.x + 8, 228, '{', 'tx-mono tx-lg');
+        T(d.x + 26, 230, 'BORO:', 'tx-mono tx-sm');
+        T(d.x + 26, 250, '"' + d.boro + '"', 'tx-mono tx-sm');
+        T(d.x + 142, 272, '}', 'tx-mono tx-lg tx-end');
+        T(d.x + 75, 298, 'doc ' + d.id, 'tx-sm tx-mid');
+      });
+    }
+    function response(st) {          /* the "hits" part of the answer, laid out like pp. 597-598 */
+      var n = st.hits.length, out = '"hits" : {\n  "total" : {\n    "value" : ' + n + ',\n    "relation" : "eq"\n  },\n';
+      if (!n) return out + '  "max_score" : null,\n  "hits" : [ ]\n}';
+      function f(v) { return String(Number(v.toPrecision(8))); }
+      out += '  "max_score" : ' + f(st.hits[0].score) + ',\n  "hits" : [\n';
+      out += st.hits.map(function (h) {
+        return '    { "_id" : "' + h.d.id + '",\n      "_score" : ' + f(h.score) + ',\n      "_source" : {\n        "DBA" : "' + h.d.dba + '",\n        "BORO" : "' + h.d.boro + '" } }';
+      }).join(',\n');
+      return out + '\n  ]\n}';
+    }
+
+    ui.onChange(function () {
+      var st = state();
+      roQ.set('[ ' + st.qterms.map(function (t) { return '"' + t + '"'; }).join(', ') + ' ]');
+      roI.set(st.index.map(function (e) { return e.term + ' → ' + e.ids.join(', '); }).join(' · '));
+      roH.set(st.hits.length);
+      code.textContent = response(st);
+      draw(st);
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l25-logstash">
+  <h2>The rest of ELK: Beats, Logstash and Kibana</h2>
+
+  <p>Ingestion takes two programs because it has two jobs: "Beats focus on data collection and shipping", "Logstash focuses on processing and data normalization" (p. 617). <mark class="key">Beats</mark>, a "Platform for data shippers" — Filebeat, Metricbeat, Packetbeat, Heartbeat — "Collect and ship logs and metrics from hosts or containers" (p. 616), light enough for every machine. <mark class="key">Logstash</mark>, the "Streaming ETL engine of the ELK stack", does the heavy work once, centrally: "centralized data collection, processing and enrichment on the fly", "Data agnostic", with a "Wide range of integrations and processors" and "Ready-to-use monitoring and administrative panes built in Kibana" (p. 615). ETL is the warehouse word of <a href="l23.html">lesson 23</a>; streaming means event by event.</p>
+
+  <aside class="margin-note">The slides print "Pool-based": read pull-based. A JDBC input polls a database on a schedule; Beats, TCP, UDP and HTTP inputs wait for data pushed to them.</aside>
+
+  <p>Logstash also takes data without Beats, "Via TCP, UDP, HTTP protocols" or "Pool-based inputs like JDBC" that fetch it (p. 617), and emits it "to Elasticsearch, to other data stores or via TCP, UDP and HTTP protocols" (p. 619); in between, filters "structure, normalize and enrich data" (p. 618) — the three columns of p. 620.</p>
+
+  <h3>Events and the pipeline</h3>
+
+  <aside class="margin-note">The slide prints the timestamp 2021-16-02T01-01-01: there is no month 16. Below, the intended 16 February 2021, as Logstash writes it.</aside>
+
+  <p>What flows is an <mark class="key">event</mark>: the "Primary unit of data in Logstash", "Similar to JSON documents", which "Flow through pipelines" (p. 623). The slide prints one as Logstash's debug output shows it, with <code>=&gt;</code> where JSON has a colon:</p>
+
+<pre><code>{
+  "@timestamp" => 2021-02-16T01:01:01.000Z,
+  "message" => "hello",
+  "other_field" => {
+    "nested_field" => 5678
+  }
+}</code></pre>
+
+  <p>The <mark class="key">pipeline</mark>, the "Logical flow of data" (p. 624, Fig. 3), "Supports multiple inputs", has a "Single queue to buffer data", "Either in-memory or persistent", and "Workers ensure server-side scalability".</p>
+
+  <figure class="fig fig--plain" id="l25-fig-pipeline">
+    <svg class="dia" viewBox="0 0 560 192" role="img" aria-label="Input feeds one queue, in memory or on disk; several workers each take events from the queue and run the filter stage and then the output stage">
+      <line x1="100" y1="87" x2="126" y2="87" marker-end="url(#arr)"/>
+      <line x1="240" y1="87" x2="270" y2="87" marker-end="url(#arr)"/>
+      <rect x="290" y="56" width="250" height="96" class="fi-paper st-muted"/>
+      <rect x="282" y="48" width="250" height="96" class="fi-paper st-muted"/>
+      <rect x="274" y="40" width="250" height="96" class="fi-paper sw-2"/>
+      <line x1="388" y1="91" x2="408" y2="91" marker-end="url(#arr)"/>
+      <rect x="10" y="70" width="90" height="34" class="fi-paper sw-2"/>
+      <rect x="130" y="66" width="110" height="42" class="fi-paper sw-2"/>
+      <rect x="142" y="77" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="156" y="77" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="170" y="77" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="184" y="77" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="198" y="77" width="12" height="20"/>
+      <rect x="212" y="77" width="12" height="20"/>
+      <rect x="292" y="74" width="96" height="34" class="fi-paper sw-2"/>
+      <rect x="412" y="74" width="96" height="34" class="fi-paper sw-2"/>
+      <text x="55" y="92" class="tx-mid tx-mono">Input</text>
+      <text x="185" y="56" class="tx-mid tx-mono">Queue</text>
+      <text x="185" y="132" class="tx-mid tx-sm">memory or disk</text>
+      <text x="399" y="62" class="tx-mid tx-mono">Worker</text>
+      <text x="340" y="96" class="tx-mid tx-mono">Filter</text>
+      <text x="460" y="96" class="tx-mid tx-mono">Output</text>
+      <text x="410" y="180" class="tx-mid tx-sm">several workers run at once</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The pipeline of p. 624, redrawn. Every input writes events (blue cells) into one queue, kept in memory or persisted on disk; each worker takes a batch from the queue and runs the filters, then the outputs, on it. The stack of boxes stands for several workers running at the same time.</figcaption>
+  </figure>
+
+  <p>Why a queue? Inputs and filters run at different speeds: bursts wait in the queue, and a slow Elasticsearch fills it until the inputs wait, without dropping events. Why workers? Parsing and enriching are expensive, so several threads do it at once, each on its own batch — scaling inside one server (background).</p>
+
+  <h3>Codecs and filters</h3>
+
+  <p>A <mark class="key">codec</mark> changes "the data representation of an event" — "Serialization and de-serialization" — "as part of an input or output" (p. 625):</p>
+
+<pre><code># parse the JSON lines of file.log
+input{
+  file {
+    path => "file.log"
+    codec => json
+  }
+}</code></pre>
+
+<pre><code># pretty-print events on the console
+output{
+  stdout {
+    codec => rubydebug
+  }
+}</code></pre>
+
+  <p>They are the slide's "Parse JSON data in file.log" (a real <code>file</code> input wants an absolute path, like <code>/var/log/file.log</code>) and "Format console output with Ruby Amazing Print", the <code>=&gt;</code> form above. A codec works at the edges, on bytes; a filter in the middle, on fields (pp. 626–627):</p>
+
+  <figure class="tbl-fig" id="l25-tbl-filters">
+    <figcaption>Logstash filters in the slides' words (pp. 626–627), each with one typical use.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Filter</th><th>The slide says</th><th>For example</th></tr></thead>
+        <tbody>
+          <tr><td><code>mutate</code></td><td>"field manipulation filter": "Convert types", "Add, rename, replace, copy fields", "Upper and lowercase transformations", "Join arrays", "Split field into arrays"</td><td>turn the string "200" into the number 200; remove a sensitive field — the "Exclude sensitive fields" of p. 618</td></tr>
+          <tr><td><code>split</code></td><td>"divide a single event into multiple events"</td><td>one event per item of a list</td></tr>
+          <tr><td><code>drop</code></td><td>"delete an event"</td><td>throw away debug lines</td></tr>
+          <tr><td><code>geoip</code>, <code>dns</code></td><td>"enrich IP addresses"</td><td>the city of an address; its host name</td></tr>
+          <tr><td><code>useragent</code></td><td>"record information like browser type from web logs"</td><td>browser and system of each visitor</td></tr>
+          <tr><td><code>translate</code></td><td>"use local data to translate parts of the events"</td><td>an error code → its description</td></tr>
+          <tr><td><code>elasticsearch</code></td><td>"query Elasticsearch"</td><td>copy fields from an earlier event</td></tr>
+          <tr><td><code>jdbc</code></td><td>"query databases that support Java"</td><td>look up a customer in any database with a JDBC driver — JDBC is the Java API Logstash speaks, the database need not "support Java"; the filters are named <code>jdbc_streaming</code> and <code>jdbc_static</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>One filter almost every pipeline uses is missing: <code>grok</code>, which cuts an unstructured line into named fields with patterns (background) — the "structure" of p. 620, which <code>geoip</code> needs before it can enrich (Fig. 4).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l25-fig-event">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 218" role="img" aria-label="Before: an event whose only field is a message string holding a whole web server log line">
+        <rect x="10" y="40" width="280" height="80" class="fi-paper sw-2"/>
+        <text x="18" y="62" class="tx-mono tx-lg">{</text>
+        <text x="30" y="80" class="tx-mono tx-sm">"message" =&gt;</text>
+        <text x="44" y="98" class="tx-mono tx-sm">"83.149.9.216 GET / 200"</text>
+        <text x="282" y="114" class="tx-mono tx-lg tx-end">}</text>
+        <text x="40" y="168" class="tx-hand">one string, no fields</text>
+      </svg>
+      <p class="fig-label">Before: as Filebeat ships it</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 218" role="img" aria-label="After: the event has the fields clientip, verb, request and response, and a geoip object with the city Moscow and the country Russia">
+        <rect x="10" y="6" width="280" height="206" class="fi-paper sw-2"/>
+        <path d="M226,32 h4 v72 h-4" class="st-muted"/>
+        <path d="M226,106 h4 v54 h-4" class="st-muted"/>
+        <text x="18" y="26" class="tx-mono tx-lg">{</text>
+        <text x="30" y="44" class="tx-mono tx-sm">"clientip" =&gt; "83.149.9.216",</text>
+        <text x="30" y="62" class="tx-mono tx-sm">"verb" =&gt; "GET",</text>
+        <text x="30" y="80" class="tx-mono tx-sm">"request" =&gt; "/",</text>
+        <text x="30" y="98" class="tx-mono tx-sm">"response" =&gt; "200",</text>
+        <text x="30" y="116" class="tx-mono tx-sm">"geoip" =&gt; {</text>
+        <text x="42" y="134" class="tx-mono tx-sm">"city_name" =&gt; "Moscow",</text>
+        <text x="42" y="152" class="tx-mono tx-sm">"country_name" =&gt; "Russia"</text>
+        <text x="30" y="170" class="tx-mono tx-sm">}</text>
+        <text x="282" y="206" class="tx-mono tx-lg tx-end">}</text>
+        <text x="238" y="74" class="tx-hand">grok</text>
+        <text x="236" y="140" class="tx-hand">geoip</text>
+      </svg>
+      <p class="fig-label">After the filters: grok, then geoip</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> One event before and after the filter stage, printed in the <code>=&gt;</code> notation of p. 623 (the original message and <code>@timestamp</code> are left out). Before, the whole web-server line is one string. After, <code>grok</code> has cut it into fields and <code>geoip</code> (p. 627) has added where the address is — the address and its city are the example of Elastic's Logstash tutorial. Only now can Elasticsearch count requests per country, and Kibana put them on a map.</figcaption>
+  </figure>
+
+  <p>The slide's own pipeline is the smallest complete one (p. 628):</p>
+
+<pre><code># Beats in, Elasticsearch out
+input {
+  beats { port => 5043 }
+}
+filter {
+  mutate { lowercase => ["message"] }
+}
+output {
+  elasticsearch {}
+}</code></pre>
+
+  <p>The slide reads it: "Receive data from a host that uses Beats" (port 5043; a Beat sends to 5044 unless told otherwise — background), "Process that input via a filter" (lower-case <code>message</code>), "Output directly to Elasticsearch". Type straight quotes, not the slide's curly ones.</p>
+
+  <h3>Delivery: at least once, and the dead letter queue</h3>
+
+  <p>Page 629 promises "“At Least Once” message delivery": "In most conditions messages are delivered exactly once", but "Unclean shutdowns could lead to duplicates". With the persistent queue, an event leaves the queue only after the outputs accept it; if Logstash dies in between, the event is processed again at restart — twice in Elasticsearch, never zero times.</p>
+
+  <aside class="redpen" data-page="629">
+    <p class="claim">"“At Least Once” message delivery"</p>
+    <p class="fix">At least once holds only with the persistent queue, on disk. With the default in-memory queue, the events in flight are lost in a crash.</p>
+    <p class="because">The guarantee needs a queue that survives the restart, and RAM does not (Elastic's documentation, background); p. 624 itself offers both queues, "Either in-memory or persistent". The exam may be matched against the printed bullet: know it, with its condition.</p>
+  </aside>
+
+  <p>Some events can never be delivered: Elasticsearch rejects them, typically when a field contradicts the mapping. Retrying forever blocks the pipeline; dropping them breaks the at-least-once promise. The slide squeezes this into "Due to “at least once” policy these are undeliverable": the refusal makes them undeliverable, the policy forbids dropping them. The <mark class="key">dead letter queue</mark> (DLQ) sets them aside on disk for later inspection: it "Avoids losing those events and halting the pipeline, freeing processing resources for subsequent events" (p. 629). It is off by default, and only the Elasticsearch output writes to it (background).</p>
+
+  <p>Modules, finally — "Provided by Logstash and Beats", "Available only for specific data types" — package the whole chain: "Automated parsing and enrichment in Logstash", "Custom schema in Elasticsearch", "Default dashboards in Kibana" (p. 621).</p>
+
+  <h3>Kibana: every panel is a question to Elasticsearch</h3>
+
+  <p><mark class="key">Kibana</mark> "is an open source data visualization dashboard for Elasticsearch" that "provides visualization capabilities on top of the content indexed on an Elasticsearch cluster" (p. 631): it shows what an index holds, nothing else. With it "you can aggregate, organize, filter and represent data" (p. 632) in dashboards of "basic representations, location-based analyses, time series, machine learning and graphs/networks" (p. 633), some paid.</p>
+
+  <p>A first dashboard (p. 635) is an editor with four labelled zones: "Dashboard Management", "Time and Fields Filters", "Tools to create a new Graph" and the space where "The Graphs you will create will be displayed". Its "Create Panel" (p. 636) offers Lens, Maps, "Aggregation based" charts, TSVB, a "Custom visualization" in Vega, Text and Controls: "easy to learn … but really hard to master" (p. 637).</p>
+
+  <figure class="tbl-fig" id="l25-tbl-kibana">
+    <figcaption>What Elasticsearch computes behind each kind of panel on the slides (background: Kibana writes the request for you). Aggregations are the subject of <a href="l26.html">lesson 26</a>.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Panel</th><th>Elasticsearch computes</th><th>Field it needs</th></tr></thead>
+        <tbody>
+          <tr><td>the gauge "CPU usage 36.43%" (p. 632)</td><td>one number from many documents, such as an average</td><td>a number</td></tr>
+          <tr><td>the time series of p. 632</td><td>one number per time interval</td><td>a <code>date</code>, usually <code>@timestamp</code></td></tr>
+          <tr><td>a pie such as "TOP SOURCES" (p. 633)</td><td>one bucket per value, with its count</td><td><code>keyword</code></td></tr>
+          <tr><td>the "MAP" of p. 633</td><td>counts per region of the map</td><td>a location: <code>geo_point</code> coordinates, or a country code as <code>keyword</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Back to Queens</h3>
+
+  <p>The hook resolves. <code>BORO</code> is a <code>keyword</code>, so "Queens" entered the index as one term, capital Q included. The query "Queens" became the same term; "queens" became a term with no posting list, hence <code>"hits" : [ ]</code>. A <code>text</code> field with the standard analyzer would have lower-cased both sides and found both.</p>
+
+  <p>Was keyword a mistake? No. A borough is a category to filter and count by, and "term aggregations only work on keywords" (p. 1658): the Kibana pie of inspections per borough needs this very mapping. Exactness costs spelling the value as stored. To have both, map <code>text</code> with a <code>keyword</code> sub-field, as dynamic mapping does, and query <code>BORO</code> for words, <code>BORO.keyword</code> for exact values. The mapping did not fail: it answered the question it was built for.</p>
+</section>
+
+
+<section id="l25-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Two practical sub-questions from past papers — the 1-point mapping that opens the Elasticsearch exercise — and five theory questions in the form of the theory part: open answers of a few sentences, and closed questions where a wrong answer may cost points.</p>
+
+  <div class="exam" data-kind="open" data-points="1" id="l25-exam-pilot">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 11 Feb 2025, Elasticsearch exercise, first sub-question.</b> ER scenario: a data structure for tracking Formula 1 races. Person (Personal_ID, Name, Surname, Birth_Date, Gender) has the children Spectator, Team Owner and Team Member, (T, E); Team Member has the children Engineer, Mechanic and Pilot, (P, E). Pilot - (...), Championships_Won, Career (Textual). The second sub-question will ask for male pilots who won at least 10 championships and whose career must include the words "Champion" and "Car".</p>
+      <p>Consider the Pilot entity. Provide the complete mapping of the index for the considered entity (i.e., field name, field type, the structure of the mapping, etc.) (1 PT)</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>PUT /pilots
+{
+  "mappings": {
+    "properties": {
+      "personal_id": { "type": "keyword" },
+      "name": { "type": "text" },
+      "surname": { "type": "text" },
+      "birth_date": { "type": "date", "format": "yyyy-MM-dd" },
+      "gender": { "type": "keyword" },
+      "championships_won": { "type": "integer" },
+      "career": { "type": "text" }
+    }
+  }
+}</code></pre>
+        <p>A pilot is a person and a team member, so its documents carry the inherited attributes as well. The identifier and the gender are keywords (exact match), names and career are full text, the number of championships is an integer and the birth date a date with its format.</p>
+      </div>
+      <div class="exam-note"><p>The paper prints "Career (Textual), Career (Textual)" — one field is enough. The question tests the structure <code>mappings</code> → <code>properties</code> → one entry per attribute, and types that fit the queries that follow: "male" is an exact value of <code>gender</code>, "at least 10" a range on an integer, "Champion" and "Car" words in a text field. Forgetting the inherited attributes leaves the next query without a <code>gender</code> to filter on. That query is solved in <a href="l26.html#l26-sentences">lesson 26</a>.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="1" id="l25-exam-farmer">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 12 Sep 2025, exercise 3, first sub-question.</b> ER scenario: a data structure for tracking farmers and their sales at local markets. People (Personal ID, Name, Surname, Age, Address, State) has the child Farmer, (P, O), with the attributes Biography and Experienced (Yes/No). Farmer (1, 2) — Work — (1, N) Farm; Farmer (1, N) — Cultivate — (1, N) Crop.</p>
+      <p>Consider the Farmer entity. Provide the complete mapping of the index for the considered entity (i.e., field name, field type, the structure of the mapping, etc.) (1 PT)</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>PUT /farmers
+{
+  "mappings": {
+    "properties": {
+      "personal_id": { "type": "keyword" },
+      "name": { "type": "text" },
+      "surname": { "type": "text" },
+      "age": { "type": "integer" },
+      "address": { "type": "text" },
+      "state": { "type": "keyword" },
+      "biography": { "type": "text" },
+      "experienced": { "type": "boolean" }
+    }
+  }
+}</code></pre>
+        <p>The farmer inherits the six attributes of People. Experienced (Yes/No) is a boolean, the age an integer, the state a keyword because it is a category; the biography is full text.</p>
+      </div>
+      <div class="exam-note"><p>The next sub-question of the paper (solved in <a href="l26.html#l26-exam-farmer">lesson 26</a>) searches the biography for "cactus" and "aloe" and asks for farmers whose name is "Bill", so <code>biography</code> must be <code>text</code> and the inherited <code>name</code> must be present. A Yes/No attribute is the classic place to show that you know <code>boolean</code>.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l25-exam-queens">
+    <div class="exam-q" lang="en">
+      <p>An index of restaurant inspections answers the request below with <code>"hits" : [ ]</code>, although many of its documents contain <code>"BORO" : "Queens"</code>. Which explanation is correct?</p>
+<pre><code>GET /nyc-restaurants/_search
+{ "query": { "match": { "BORO": "queens" } } }</code></pre>
+    </div>
+    <ul class="options" lang="en">
+      <li>A match query is always case-sensitive. <span class="fb">On a text field with the standard analyzer both sides are lower-cased, and "queens" finds "Queens".</span></li>
+      <li>The index has a single shard, so only part of the documents is searched. <span class="fb">A search reaches every shard of the index; with one shard, that shard holds every document.</span></li>
+      <li>A match query cannot be used on fields that hold strings. <span class="fb">The same match with "Queens" returns hits (p. 597).</span></li>
+      <li data-correct>BORO is mapped as keyword, which has no analyzer, so the query term "queens" must equal the stored term "Queens" exactly. <span class="fb">The words of p. 598: "Borough (BORO) was mapped as a keyword. A keyword does not have any analyser!"</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>BORO is mapped as keyword. A keyword field has no analyzer: the stored value "Queens" is indexed as one exact term, and the query text "queens" is also used as one exact term. The two terms differ in case, so no document matches. With a text field and the standard analyzer, both would be lower-cased and the query would match.</p></div>
+      <div class="exam-note"><p>A closed question built on pp. 597–598. Wrong ticks may be penalised: the tempting wrong answer is the first, which holds only for keyword fields and for analyzers that do not lower-case.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l25-exam-shards">
+    <div class="exam-q" lang="en">
+      <p>Explain the difference between primary shards and replica shards in Elasticsearch. How are write and read operations routed, and which of the two makes an index resistant to the failure of a node?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>An index is partitioned into primary shards: each document belongs to exactly one primary shard, and the shards are distributed over the nodes of the cluster, so the data and the work are spread over several machines. A replica shard is a copy of a primary shard, always stored on a different node from its primary. A write operation is performed on the primary shard and then copied to its replicas, so all copies stay identical; a read operation can be routed to the primary or to any replica, so replicas also increase the capacity to serve reads. Resistance to faults comes from the replicas: when a node fails, a replica of each primary that was on it is promoted to primary and no data is lost, while without replicas the shards of the failed node are lost. Both numbers are set per index with number_of_shards and number_of_replicas.</p></div>
+      <div class="exam-note"><p>The slides (p. 578) list resistance to faults under shards; the session (p. 1621) repeats it and counts replicas as one of "two types of shards". An answer that names the mechanism — a copy on another node — is right under every reading and shows that you know why.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l25-exam-retype">
+    <div class="exam-q" lang="en">
+      <p>True or false: once an index contains documents, the type of one of its existing fields can be changed in place with <code>PUT /index_name/_mapping</code>.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">The terms of that field were indexed for the old type. PUT /index_name/_mapping can add new fields, but not retype an existing one.</span></li>
+      <li data-correct>False <span class="fb">To change the type you create a new index with the new mapping and reindex the documents into it.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. The mapping of an existing field cannot be changed once documents are indexed: to change its type, create a new index with the correct mapping and reindex the data. PUT /index_name/_mapping can add new fields, but it cannot retype an existing one.</p></div>
+      <div class="exam-note"><p>The statement is false both by the slide's printed sentence (p. 580) and by the precise rule — safe either way. Had it read "No field can be added to an index that has documents", the slide's wording and the facts would part ways (p. 588 adds one).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l25-exam-post">
+    <div class="exam-q" lang="en">
+      <p>Which request lets Elasticsearch generate the identifier of the new document, so that sending it twice stores two documents?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li><code>PUT /blog/_doc/1</code> <span class="fb">It creates or replaces the document with id 1: sent twice, the index still holds one document, with _version 2.</span></li>
+      <li><code>GET /blog/_doc/1</code> <span class="fb">GET reads a document; it stores nothing.</span></li>
+      <li data-correct><code>POST /blog/_doc</code> <span class="fb">"POST doesn't require the ID of the resource → duplicates" (p. 583): each call gets a new generated _id.</span></li>
+      <li><code>PUT /blog</code> <span class="fb">It creates the index blog, not a document.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>POST /blog/_doc. Without an id, Elasticsearch creates and assigns one, so repeating the request creates a duplicate. PUT /blog/_doc/1 requires the id and creates or updates that same document.</p></div>
+      <div class="exam-note"><p>The pair POST /index/_doc against PUT /index/_doc/id is the whole of p. 583; the other two options test whether you can read a verb and an endpoint.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l25-exam-logstash">
+    <div class="exam-q" lang="en">
+      <p>Describe the logical flow of data inside a Logstash pipeline. What are the queue and the workers for, and which delivery guarantee does Logstash offer?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>A Logstash pipeline receives events from one or more inputs, for example Beats, TCP, UDP or HTTP listeners, or a JDBC input that polls a database. All inputs write into a single queue that buffers the events, either in memory or persistently on disk; the queue decouples the inputs from the processing and absorbs bursts. Worker threads take batches of events from the queue and run them through the filters, which structure, transform, normalize and enrich the events (for example mutate or geoip), and then through the outputs, for example Elasticsearch. Several workers run in parallel, which gives server-side scalability. Codecs attached to inputs and outputs deserialize and serialize the data. Logstash offers at-least-once delivery: in most conditions an event is delivered exactly once, but after an unclean shutdown it may be delivered twice; this requires the persistent queue. Events that cannot be processed go to the dead letter queue, so that they are not lost and the pipeline does not halt.</p></div>
+      <div class="exam-note"><p>The figure of p. 624 is the skeleton: Input → Queue → Worker (Filter → Output). Naming the two kinds of queue and the condition of at least once shows that you know why the guarantee holds, not only its name.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l25-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">An index is created with <code>"number_of_shards": 2</code> and <code>"number_of_replicas": 2</code>. How many shard copies does it have, and how many nodes does it need so that every copy is placed?</p>
+    <ul class="options">
+      <li>4 copies, 2 nodes <span class="fb">2 replicas per primary: each shard has 3 copies, not 2.</span></li>
+      <li data-correct>6 copies, at least 3 nodes <span class="fb">\(2 \times (1 + 2) = 6\); the 3 copies of a shard must sit on 3 different nodes.</span></li>
+      <li>6 copies, 2 nodes <span class="fb">With 2 nodes one of the three copies of each shard would have to share a node with another copy — not allowed, so it stays unassigned.</span></li>
+      <li>2 copies, 1 node <span class="fb">That counts only the primaries; replicas are copies too, and they can never sit on their primary's node.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">You write the mapping of the restaurant index. Which fields should be <code>keyword</code>? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct><code>BORO</code>, e.g. "Queens" <span class="fb">A category to filter and count by, matched whole.</span></li>
+      <li><code>VIOLATION DESCRIPTION</code>, a sentence <span class="fb">Sentences are searched by their words: text.</span></li>
+      <li data-correct><code>CUISINE DESCRIPTION</code>, e.g. "Chinese" <span class="fb">Despite its name it holds a category: "how many per cuisine" needs keyword.</span></li>
+      <li data-correct><code>ZIPCODE</code>, e.g. 11354 <span class="fb">"Keyword is used for structured content such as email, tags, postcode" (p. 589) — even when the value looks like a number.</span></li>
+      <li><code>INSPECTION DATE</code>, e.g. "02/17/2021" <span class="fb">A date, with a format such as "MM/dd/yyyy", so that ranges compare days.</span></li>
+    </ul>
+    <p class="q-fb">Decide by the question that will be asked of the field: words → text, whole values → keyword.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">You send <code>POST /blog/_doc</code> with the same body three times. What does the index contain?</p>
+    <ul class="options">
+      <li>One document with <code>_version</code> 3 <span class="fb">That is what three PUTs to the same id would give.</span></li>
+      <li>One document; the second and third requests fail <span class="fb">Nothing fails: POST simply creates a new document each time.</span></li>
+      <li data-correct>Three identical documents with three different generated ids <span class="fb">"POST doesn't require the ID of the resource → duplicates" (p. 583).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Dynamic mapping meets the field <code>"RECORD DATE" : "02/22/2021"</code> for the first time. What does it most likely make of it?</p>
+    <ul class="options">
+      <li data-correct>A text field with a keyword sub-field — a string, not a date <span class="fb">The value is not in a date format recognised by default; the slide's warning: "dates could be parsed as strings" (p. 581).</span></li>
+      <li>A date with the format MM/dd/yyyy <span class="fb">Dynamic mapping does not invent formats; it only recognises a few standard ones.</span></li>
+      <li>A long, after removing the slashes <span class="fb">The value is a string; it is never turned into a number.</span></li>
+      <li>Nothing: the document is rejected until you write a mapping <span class="fb">Dynamic mapping exists precisely so that unknown fields are accepted.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Which analyzer keeps "<span class="nw">Brown-Foxes</span>" as one term but still cuts "The 2 QUICK <span class="nw">Brown-Foxes</span>" into several terms?</p>
+    <ul class="options">
+      <li>standard <span class="fb">It splits on the hyphen: brown, foxes.</span></li>
+      <li>simple <span class="fb">The hyphen is not a letter, so it splits there too — and it drops the 2.</span></li>
+      <li>keyword <span class="fb">It keeps the hyphen, but makes the whole input a single term.</span></li>
+      <li data-correct>whitespace <span class="fb">It cuts only at spaces: The, 2, QUICK, Brown-Foxes — and does not lower-case.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In a Logstash pipeline, where do the filters run?</p>
+    <ul class="options">
+      <li>In the input threads, before the events enter the queue <span class="fb">Inputs only produce events and write them into the queue.</span></li>
+      <li data-correct>Inside the worker threads, on batches taken from the queue, before the outputs <span class="fb">Input → Queue → Worker (Filter → Output), p. 624.</span></li>
+      <li>Inside Elasticsearch, when the document is indexed <span class="fb">Logstash finishes its filters before the output sends anything to Elasticsearch.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A Kibana pie chart shows the number of inspections per borough. Where are those numbers computed?</p>
+    <ul class="options">
+      <li data-correct>In Elasticsearch, as an aggregation over the keyword field BORO <span class="fb">Kibana "provides visualization capabilities on top of the content indexed on an Elasticsearch cluster" (p. 631); it asks, Elasticsearch counts.</span></li>
+      <li>In Kibana, which reads all the documents and counts them <span class="fb">Kibana sends a request and draws the answer; it does not scan the index itself.</span></li>
+      <li>In Logstash, when the events are ingested <span class="fb">Logstash can add fields to each event, but it does not keep counts over the index.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l25-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>ELK: Beats and Logstash ingest, Elasticsearch stores, searches and analyzes, Kibana visualizes and manages (p. 569). Beats ship through libbeat either straight into Elasticsearch or through Logstash, which parses and enhances first (p. 570).</li>
+    <li>A document is a JSON object; an index is the collection of documents of one kind, with a mapping, partitioned in shards — table, row, column and schema in relational words (pp. 576–577, 586).</li>
+    <li>Each document belongs to one primary shard; replicas are copies on other nodes. Writes go to the primary, then to the replicas; reads go to either (p. 578). An index has \(P\,(1 + R)\) shard copies, and only replicas let it survive a node failure.</li>
+    <li>REST: <code>PUT /index</code> creates an index, <code>POST /index/_doc</code> adds a document with a generated id, <code>PUT /index/_doc/id</code> creates or replaces that one, <code>GET /index/_doc/id</code> returns it with its <code>_source</code> (pp. 582–590).</li>
+    <li>The mapping types the fields: text is analyzed and searched by words, keyword is one exact value, date takes a format, long and the other numbers hold numbers (p. 589). Dynamic mapping guesses once and keeps the guess; fields can be added later, a type changes only through a new index and a reindex (pp. 580–581, 588). The exam asks for <code>PUT /index</code> with <code>mappings</code> → <code>properties</code>.</li>
+    <li>An analyzer turns text into terms at index time and at query time — standard, simple, whitespace, stop, keyword, pattern, language (pp. 591–594). A keyword field has none, so "queens" does not find "Queens" (p. 598).</li>
+    <li>Logstash runs input → queue (memory or persistent) → workers (filter → output), with codecs at the edges, filters such as mutate, split, drop, geoip and translate, at-least-once delivery with a persistent queue, and a dead letter queue (pp. 615–629). Kibana draws what Elasticsearch computes (pp. 631–637).</li>
+  </ul>
+  <aside class="cheat" id="l25-cheat">
+    <dl>
+      <dt>ELK roles</dt><dd>Beats, Logstash: ingest · Elasticsearch: store, search, analyze · Kibana: visualize, manage (p. 569)</dd>
+      <dt>Index · document · field · mapping</dt><dd>table · row · column · schema (p. 586)</dd>
+      <dt>Shard copies</dt><dd>\(P\,(1 + R)\): <code>number_of_shards</code> × (1 + <code>number_of_replicas</code>); a replica never on its primary's node</dd>
+      <dt>Write · read</dt><dd>primary, then replicas · primary or any replica (p. 578)</dd>
+      <dt><code>PUT /my_index</code></dt><dd>create an index (p. 587)</dd>
+      <dt><code>POST /my_index/_doc</code></dt><dd>add a document, generated <code>_id</code>; repeated → duplicates (p. 583)</dd>
+      <dt><code>PUT /my_index/_doc/id</code></dt><dd>create or replace the document <code>id</code> (p. 583)</dd>
+      <dt><code>GET /my_index/_doc/id</code></dt><dd>one document: metadata + <code>_source</code> (p. 590)</dd>
+      <dt><code>GET /my_index/_mapping</code></dt><dd>the mapping in use, guessed or written (p. 581)</dd>
+      <dt><code>PUT /my_index/_mapping</code></dt><dd>add fields; an existing field's type never changes → new index + reindex (p. 588)</dd>
+      <dt>Exam mapping</dt><dd><code>PUT /idx { "settings": {…}, "mappings": { "properties": { "f": { "type": "keyword" } } } }</code> (p. 1663)</dd>
+      <dt>text · keyword</dt><dd>analyzed, searched by words · one exact term: filter, count, sort</dd>
+      <dt>date · long</dt><dd><code>"format": "yyyy-MM-dd"</code> · 64-bit integer (p. 589); also double, boolean, binary, object, geo_point (p. 1635) and integer (p. 1663)</dd>
+      <dt><code>POST /_analyze</code></dt><dd><code>{ "analyzer": "standard", "text": "…" }</code> → tokens with offsets and positions (p. 594)</dd>
+      <dt>Analyzers</dt><dd>standard, simple, whitespace, stop, keyword ("noop"), pattern, language (pp. 591–593)</dd>
+      <dt>Logstash pipeline</dt><dd>Input → Queue (memory or persistent) → Worker (Filter → Output) (p. 624)</dd>
+      <dt>Codec</dt><dd>(de)serialization inside an input or output: <code>json</code>, <code>rubydebug</code> (p. 625)</dd>
+      <dt>Filters</dt><dd><code>mutate</code>, <code>split</code>, <code>drop</code>; enrichment <code>geoip</code>, <code>dns</code>, <code>useragent</code>, <code>translate</code>, <code>elasticsearch</code>, <code>jdbc</code> (pp. 626–627)</dd>
+      <dt>Delivery</dt><dd>at least once (persistent queue); unprocessable events → dead letter queue (p. 629)</dd>
+      <dt>Kibana</dt><dd>dashboards on top of an Elasticsearch index; panels: Lens, Maps, Aggregation based, TSVB, Custom visualization (Vega) (pp. 631–636)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l25-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.elastic.co/docs/get-started/the-stack" target="_blank" rel="noopener">The Elastic Stack</a>
+      <span class="res-by">Elastic documentation</span>
+      <p class="res-why">One page on who does what — Elasticsearch, Kibana, Beats, Logstash — and on Elastic Agent, which today does much of the job the slides give to Beats.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=MN5-AD5I8mI" target="_blank" rel="noopener">Elasticsearch Mapping - S1E19</a>
+      <span class="res-by">Official Elastic Community</span><span class="res-dur">10:46</span>
+      <p class="res-why">Dynamic against explicit mapping, text against keyword, and why a field's type cannot change without a reindex — the mapping section in ten minutes, in the console syntax of the slides.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.elastic.co/blog/strings-are-dead-long-live-strings" target="_blank" rel="noopener">Strings are dead, long live strings!</a>
+      <span class="res-by">Elastic blog</span>
+      <p class="res-why">Why one string type was split into text and keyword, and the text field with a keyword sub-field that dynamic mapping creates — the way out of the Queens dilemma.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.elastic.co/docs/deploy-manage/distributed-architecture/clusters-nodes-shards" target="_blank" rel="noopener">Clusters, nodes, and shards</a>
+      <span class="res-by">Elastic documentation</span>
+      <p class="res-why">Primaries and replicas in the vendor's words: a shard is a self-contained Lucene index, the number of primaries is fixed at creation, replicas can change at any time.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.elastic.co/docs/reference/logstash/execution-model" target="_blank" rel="noopener">Execution model</a>
+      <span class="res-by">Logstash documentation</span>
+      <p class="res-why">The pipeline of p. 624 in prose: one thread per input, the central queue in memory or on disk, workers that run filters and outputs on batches.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You can now build an index and say what every field turns into. Next you put questions to it — match against term, filter against query — and see why adding an "OR" clause can leave the number of hits unchanged while changing who comes first.</p>
+</aside>
+
+</main>
+</body>
+</html>

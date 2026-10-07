@@ -1,0 +1,1280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spark SQL, Catalyst and the columnar file formats · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l40">
+
+<header class="lesson-head">
+  <h1>Spark SQL, Catalyst and the columnar file formats</h1>
+  <p class="lede">After this lesson you will follow a DataFrame query through Catalyst's four phases, say which bytes of a Parquet file it reads and why, and explain where Spark SQL's speed comes from.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>In the paper behind the chart of p. 1287, two Spark programs compute the same thing: the average of one column for every value of another, over a billion pairs of numbers, on the same five worker machines. Both are written in Python. One hands its work to <code>map</code> and <code>reduceByKey</code> as lambdas; the other is a single line, <code>df.groupBy("a").avg("b")</code>. On the chart the lambdas need about 180 seconds and the one-liner about 15: twelve times less.</p>
+  <p>Same language, same data, same cluster. What does Spark know about the one-liner that it cannot know about the lambdas? By the end of the lesson you will have three answers, and one of them is not in Spark at all but in the file on disk.</p>
+</div>
+
+<section id="l40-more">
+  <h2>Spark SQL is about more than SQL</h2>
+
+  <p>The title slide says it in five words: Spark SQL "is about more than SQL" (p. 1262). Page 1263 gives the reasons. Big-data work must "perform ETL to and from various (semi- or unstructured) data sources" and "perform advanced analytics (e.g. machine learning, graph processing) that are hard to express in relational systems". The answer: "a DataFrame API that can perform relational operations on both external data sources and Spark's built-in RDDs", plus "a highly extensible optimizer, Catalyst".</p>
+
+  <p>Page 1264 turns this into three promises of <mark class="key">declarative</mark> big-data processing: <b>write less code</b>, <b>read less data</b>, <b>let the optimizer do the hard work</b>. You state <em>what</em> you want; Spark decides <em>how</em>. This lesson follows the data: your code, the optimizer, the file.</p>
+
+  <h3>Write less code: one average, four dialects</h3>
+
+  <aside class="margin-note">On p. 1265 the Hadoop mapper writes every value under the key 1: it averages the whole file, the Spark lines per key.</aside>
+
+  <p>Page 1265 computes an average in about thirty lines of Hadoop Java and five of Spark; p. 1266 writes the average age per name in four dialects: RDDs, SQL, Pig and the DataFrame. Take <code>people(name, age)</code>: Ann 30, Bob 20, Ann 40, Cid 10. (The slides' <code>sqlCtx</code> is today's session object <code>spark</code>.)</p>
+
+<pre><code>from pyspark.sql import functions as F
+# one row per name: Ann 35.0, Bob 20.0, Cid 10.0
+spark.table("people").groupBy("name").agg(F.avg("age")).show()</code></pre>
+
+  <aside class="redpen" data-page="1266">
+    <p class="claim">Using DataFrames: <code>sqlCtx.table("people") \ .groupBy("name") \ .agg("name", avg("age")) \ .collect()</code></p>
+    <p class="fix">Pass only the aggregate: <code>.groupBy("name").agg(F.avg("age"))</code>. The grouping column comes back by itself.</p>
+    <p class="because"><code>agg</code> takes column expressions, not a column name in front of them: on PySpark 4.2 the slide's line stops with <code>AssertionError: all exprs should be Column</code>, while the corrected one returns name and avg(age). The exam may quote the printed line: recognise it, and write the corrected form in a SparkQL answer.</p>
+  </aside>
+
+  <p>The RDD version of p. 1266 carries the average's ingredients by hand:</p>
+
+<pre><code># the same averages with RDDs: carry (sum, count) pairs yourself
+(sc.textFile("people.tsv")
+   .map(lambda line: line.split("\t"))
+   .map(lambda x: (x[0], [int(x[1]), 1]))
+   .reduceByKey(lambda x, y: [x[0] + y[0], x[1] + y[1]])
+   .map(lambda x: [x[0], x[1][0] / x[1][1]])
+   .collect())</code></pre>
+
+  <aside class="margin-note">Averages do not merge: the average of 10 and 20 is 15, of 15 and 60 it is 37.5, but of 10, 20 and 60 it is 30.</aside>
+
+  <p>Why <code>[int(x[1]), 1]</code>? <code>reduceByKey</code> combines partial results in any order, on any machine, like the combiner of <a href="l30.html">lesson 30</a>. Averages cannot be combined; (sum, count) pairs can, and the last <code>map</code> divides:</p>
+  \[ \begin{aligned} &amp;(s_1, c_1) \oplus (s_2, c_2) \\ &amp;\quad = (s_1 + s_2,\ c_1 + c_2) \end{aligned} \]
+  <p>The DataFrame just says <code>avg</code>, and Spark supplies this machinery. (The slide's <code>sc.textFile(...).split("\t")</code> would fail: an RDD has no <code>split</code>, so each line is split inside a <code>map</code>.)</p>
+
+  <h3>One engine, two front ends</h3>
+
+  <p>Spark SQL is "part of the core distribution since Spark 1.0" and "runs SQL / HiveQL queries, optionally alongside or replacing existing Hive deployments" (p. 1270). Page 1272 shows where it sits.</p>
+
+  <figure class="fig fig--plain" id="l40-fig-interface">
+    <svg class="dia" viewBox="0 0 560 310" role="img" aria-label="Three layers. On top, JDBC, the console and user programs in Java, Scala and Python send their queries into Spark SQL, which holds the DataFrame API and the Catalyst optimizer. Spark SQL runs on Spark and its resilient distributed datasets. A dashed arrow shows that user programs can also call Spark directly.">
+      <line x1="75" y1="74" x2="75" y2="113" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="210" y1="74" x2="210" y2="113" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="350" y1="74" x2="350" y2="121" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="505" y1="74" x2="505" y2="219" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+      <line x1="240" y1="204" x2="240" y2="219" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="20" y="14" width="110" height="60" rx="4" class="fi-paper sw-2"/>
+      <rect x="150" y="14" width="120" height="60" rx="4" class="fi-paper sw-2"/>
+      <rect x="290" y="14" width="250" height="60" rx="4" class="fi-paper sw-2"/>
+      <text x="75" y="50" class="tx-mid">JDBC</text>
+      <text x="210" y="50" class="tx-mid">Console</text>
+      <text x="415" y="40" class="tx-mid">User programs</text>
+      <text x="415" y="63" class="tx-mid tx-sm">Java, Scala, Python</text>
+      <rect x="20" y="116" width="440" height="88" rx="4" class="fi-paper sw-2"/>
+      <text x="34" y="146" class="tx-bold">Spark SQL</text>
+      <rect x="240" y="124" width="206" height="32" rx="4" class="fi-paper"/>
+      <text x="343" y="146" class="tx-mid">DataFrame API</text>
+      <rect x="34" y="164" width="412" height="32" rx="4" class="fi-paper"/>
+      <text x="240" y="186" class="tx-mid">Catalyst optimizer</text>
+      <rect x="20" y="222" width="520" height="78" rx="4" class="fi-paper sw-2"/>
+      <text x="34" y="248" class="tx-bold">Spark</text>
+      <rect x="34" y="258" width="492" height="32" rx="4" class="fw-s1 st-s1"/>
+      <text x="280" y="280" class="tx-mid">Resilient Distributed Datasets</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The programming interface of p. 1272. JDBC clients, the console and user programs send their queries (orange) to Spark SQL, where SQL strings and DataFrame calls reach the same Catalyst optimizer; what comes out runs on Spark's RDDs. The dashed arrow: a program may still call RDDs directly.</figcaption>
+  </figure>
+
+  <p>The slide presents Spark SQL as "Originally called Shark" with three limitations (p. 1271): it "can only be used to query external data in Hive catalog → limited data sources", "can only be invoked via SQL string from Spark → error prone", and its "Hive optimizer tailored for MapReduce → difficult to extend". Read backwards, they are Spark SQL's design: any source and native RDDs, a DataFrame API, a new optimizer.</p>
+
+  <div class="pitfall">
+    <p>"Spark SQL can only query Hive tables." That was Shark's limitation. Strictly, Shark was the predecessor project, Hive running on Spark, stopped in July 2014 in favour of Spark SQL (background).</p>
+  </div>
+
+  <h3>What a program has that an SQL string has not</h3>
+
+  <p>Page 1273 lists the "Advantages over Relational Query Languages": "Holistic optimization across functions composed in different languages", "Control structures (e.g. if, for)" and "Logical plan analyzed eagerly → identify code errors associated with data schema issues on the fly". Execution is lazy, analysis is eager: on a table <code>sales(region, amount)</code> the line <code>sales.select("col")</code> fails at once, before any data is read, with <code>... `col` cannot be resolved. Did you mean one of the following? [`amount`, `region`]</code> (Spark 4.2, executed).</p>
+
+  <p>Spark SQL also queries your own objects (p. 1274): it can "infer column names and types directly from data objects (via reflection in Java and Scala and data sampling in Python, which is dynamically typed)", reads them "in-place", and lets you "combine RDDs with external structured data", with "hot columns cached in memory".</p>
+
+  <p>Inside a full programming language a <mark class="key">user-defined function</mark> (UDF) needs no packaging: Spark SQL "allows inline registration of UDFs", whereas Pig "requires the UDF to be written in a Java package", and a registered UDF is "available to other interfaces" (p. 1275) — the slide registers a trained model as <code>predict</code> and calls <code>SELECT predict(age, weight) FROM users</code>. Page 1269 adds composition: <code>add_demographics</code> takes a DataFrame and returns one. Runnable, with the caller of p. 1281:</p>
+
+<pre><code>from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+
+zipToCity = F.udf(lambda z: "Melbourne" if z.startswith("3")
+                            else "Other", StringType())
+
+def add_demographics(events):
+    u = spark.table("users")
+    return (events.join(u, events.user_id == u.user_id)
+                  .withColumn("city", zipToCity(u.zip)))
+
+# the timestamps of the events of users living in Melbourne
+events = add_demographics(spark.read.parquet("/data/events"))
+training_data = (events.where(events.city == "Melbourne")
+                       .select(events.timestamp)
+                       .collect())</code></pre>
+
+  <aside class="redpen" data-page="1269">
+    <p class="claim"><code>events \ .join(u, events.user_id == u.user_id) \ .withColumn("city", zipToCity(df.zip))</code> — "Takes and returns a DataFrame"</p>
+    <p class="fix">Take the zip code from the users table, <code>zipToCity(u.zip)</code>, and <code>return</code> the chain.</p>
+    <p class="because"><code>df</code> is defined nowhere, so Python stops with a <code>NameError</code>; and a function without <code>return</code> gives back <code>None</code>, not the DataFrame the brace promises. Page 1281 repeats the lines, and the exam may quote them as printed: know both versions.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">Spark SQL is one structured API and one optimizer behind both SQL strings and DataFrame code, executed as RDD operations.</mark></p>
+</section>
+
+<section id="l40-catalyst">
+  <h2>Let the optimizer do the hard work: Catalyst</h2>
+
+  <p>A lambda is a black box: Spark can call it but cannot look inside. A DataFrame query is kept as a <mark class="key">tree</mark> of node objects. The expression <code>x + (1 + 2)</code> is <code>Add(Attribute(x), Add(Literal(1), Literal(2)))</code>, and a <mark class="key">rule</mark> is a function that finds a pattern in the tree and replaces it (p. 1276):</p>
+
+<pre><code>tree.transform {
+  case Add(Literal(c1), Literal(c2)) => Literal(c1+c2)
+}</code></pre>
+
+  <figure class="fig fig--pair fig--plain" id="l40-fig-fold">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 226" role="img" aria-label="Before: the tree of x plus (1 plus 2). The root Add has the children Attribute(x) and a second Add, whose children are Literal(1) and Literal(2). The second Add with its two literals is highlighted: it matches the rule.">
+        <rect x="124" y="78" width="172" height="118" rx="10" class="fw-key st-none"/>
+        <line x1="150" y1="44" x2="60" y2="88"/>
+        <line x1="150" y1="44" x2="215" y2="88"/>
+        <line x1="215" y1="116" x2="170" y2="156"/>
+        <line x1="215" y1="116" x2="256" y2="156"/>
+        <rect x="115" y="16" width="70" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="150" y="35" class="tx-mid">Add</text>
+        <rect x="10" y="88" width="100" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="60" y="107" class="tx-mid tx-mono">Attribute(x)</text>
+        <rect x="185" y="88" width="60" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="215" y="107" class="tx-mid">Add</text>
+        <rect x="130" y="156" width="80" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="170" y="175" class="tx-mid tx-mono">Literal(1)</text>
+        <rect x="216" y="156" width="80" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="256" y="175" class="tx-mid tx-mono">Literal(2)</text>
+        <text x="150" y="218" class="tx-mid tx-mono">x + (1 + 2)</text>
+      </svg>
+      <p class="fig-label">Before: the rule matches the highlighted subtree</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 226" role="img" aria-label="After: the tree of x plus 3. The root Add has the children Attribute(x) and Literal(3); Literal(3) is highlighted as the node that replaced the matched subtree.">
+        <rect x="182" y="104" width="96" height="40" rx="10" class="fw-key st-none"/>
+        <line x1="150" y1="58" x2="70" y2="110"/>
+        <line x1="150" y1="58" x2="230" y2="110"/>
+        <rect x="115" y="30" width="70" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="150" y="49" class="tx-mid">Add</text>
+        <rect x="20" y="110" width="100" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="70" y="129" class="tx-mid tx-mono">Attribute(x)</text>
+        <rect x="190" y="110" width="80" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="230" y="129" class="tx-mid tx-mono">Literal(3)</text>
+        <text x="236" y="178" class="tx-mid tx-hand">folded once</text>
+        <text x="150" y="218" class="tx-mid tx-mono">x + 3</text>
+      </svg>
+      <p class="fig-label">After: one literal, computed before any row is read</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> Constant folding as a Catalyst rule (p. 1276). <code>case Add(Literal(c1), Literal(c2))</code> matches the highlighted subtree and replaces it with <code>Literal(3)</code>; the branch with <code>Attribute(x)</code> does not match and is left alone.</figcaption>
+  </figure>
+
+  <p>Rules (p. 1277) are "pattern matching functions that transform subtrees into specific structures", and partial functions: they "skip over subtrees that do not match → no need to modify existing rules when adding new types of operators" — which is why Catalyst is extensible. One <code>transform</code> may hold several patterns; rules come in <em>batches</em> and "may take multiple batches to reach a fixed point", where no rule changes the tree any more (one rewrite can enable the next); and "transform can contain arbitrary Scala code".</p>
+
+  <h3>Four phases, from query to RDDs</h3>
+
+  <p>Page 1278 is the map of the optimizer, and its caption is the fact to remember: "DataFrames and SQL share the same optimization/execution pipeline".</p>
+
+  <figure class="fig fig--plain" id="l40-fig-pipeline">
+    <svg class="dia" viewBox="0 0 560 600" role="img" aria-label="The Catalyst pipeline from top to bottom. An SQL AST or a DataFrame becomes an unresolved logical plan; analysis, helped by the catalog, makes it a logical plan; logical optimization makes it an optimized logical plan; physical planning produces several physical plans; a cost model selects one; code generation turns the selected physical plan into RDDs.">
+      <line x1="100" y1="44" x2="161" y2="68" marker-end="url(#arr)"/>
+      <line x1="240" y1="44" x2="179" y2="68" marker-end="url(#arr)"/>
+      <line x1="170" y1="104" x2="170" y2="160" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="150" y1="133" x2="166" y2="133" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="170" y1="196" x2="170" y2="252" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="170" y1="288" x2="170" y2="344" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="170" y1="392" x2="170" y2="412" marker-end="url(#arr)"/>
+      <line x1="170" y1="444" x2="170" y2="464" marker-end="url(#arr)"/>
+      <line x1="170" y1="500" x2="170" y2="556" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="40" y="10" width="120" height="34" rx="4" class="fi-paper"/>
+      <text x="100" y="33" class="tx-mid">SQL AST</text>
+      <rect x="180" y="10" width="120" height="34" rx="4" class="fi-paper"/>
+      <text x="240" y="33" class="tx-mid">DataFrame</text>
+      <text x="318" y="34" class="tx-hand">one pipeline for both</text>
+      <rect x="30" y="70" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="93" class="tx-mid">Unresolved logical plan</text>
+      <rect x="40" y="117" width="110" height="32" rx="4" class="fw-s3 st-s3"/>
+      <text x="95" y="139" class="tx-mid">Catalog</text>
+      <text x="184" y="127" class="tx-bold">Analysis</text>
+      <text x="184" y="147" class="tx-sm">names → columns, types</text>
+      <rect x="30" y="162" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="185" class="tx-mid">Logical plan</text>
+      <text x="184" y="219" class="tx-bold">Logical optimization</text>
+      <text x="184" y="239" class="tx-sm">rules · 800LOC</text>
+      <rect x="30" y="254" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="277" class="tx-mid">Optimized logical plan</text>
+      <text x="184" y="311" class="tx-bold">Physical planning</text>
+      <text x="184" y="331" class="tx-sm">one or more plans</text>
+      <rect x="42" y="356" width="280" height="34" rx="10" class="fi-paper"/>
+      <rect x="36" y="351" width="280" height="34" rx="10" class="fi-paper"/>
+      <rect x="30" y="346" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="369" class="tx-mid">Physical plans</text>
+      <rect x="110" y="414" width="120" height="30" rx="4" class="fi-paper sw-2"/>
+      <text x="170" y="434" class="tx-mid">Cost model</text>
+      <text x="246" y="434" class="tx-sm">the only cost-based step</text>
+      <rect x="30" y="466" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="489" class="tx-mid">Selected physical plan</text>
+      <text x="184" y="523" class="tx-bold">Code generation</text>
+      <text x="184" y="543" class="tx-sm">quasiquotes → bytecode</text>
+      <rect x="110" y="558" width="120" height="32" rx="4" class="fw-s1 st-s1 sw-2"/>
+      <text x="170" y="580" class="tx-mid">RDDs</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The pipeline of p. 1278, drawn top to bottom. SQL strings and DataFrame calls enter the same way; only physical planning consults a cost model, the other phases apply rules.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn>Unresolved attribute</dfn> — an attribute whose "type is not known or it's not matched to an input table" (p. 1279).</p>
+  </div>
+
+  <aside class="margin-note">Spark prints a quote ' in front of every name it has not resolved yet.</aside>
+
+  <p><b>Analysis</b> (p. 1279) turns the unresolved logical plan into a logical plan. For <code>SELECT col FROM sales</code> it must "look up relations by name from the catalog", "map named attributes to the input provided given operator's children", give a "UID for references to the same value" and "propagate and coerce types through expressions (e.g. 1 + col)". Spark lets you watch: for <code>SELECT amount + 1 FROM sales</code> the parsed plan holds <code>'amount</code> and <code>'UnresolvedRelation [sales]</code>, the analysed plan <code>amount#32 + cast(1 as double)</code> — a column with a unique id, and a literal cast to its type.</p>
+
+  <p><b>Logical optimization</b> (p. 1280) "applies standard rule-based optimization (constant folding, predicate-pushdown, projection pruning, null propagation, boolean expression simplification, etc)", all in "800LOC". <mark class="key">Predicate pushdown</mark> moves a filter as close to the data as possible; <mark class="key">projection pruning</mark> keeps only the columns used further up. Page 1282 spells out one such rule: "Find filters on top of projections", "Check that the filter can be evaluated without the result of the project", "If so, switch the operators".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l40-fig-pushdown">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 300" role="img" aria-label="Original plan, read from the bottom: People, then Project id and name, then Filter id = 1, then Project name. One million rows reach the filter; one row leaves it.">
+        <line x1="130" y1="82" x2="130" y2="59" marker-end="url(#arr)"/>
+        <line x1="130" y1="150" x2="130" y2="127" marker-end="url(#arr)"/>
+        <line x1="130" y1="218" x2="130" y2="195" marker-end="url(#arr)"/>
+        <rect x="55" y="14" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="31" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="49" class="tx-mid tx-mono">name</text>
+        <rect x="55" y="82" width="150" height="42" rx="12" class="fw-s2 st-s2 sw-2"/>
+        <text x="130" y="99" class="tx-mid tx-bold">Filter</text>
+        <text x="130" y="117" class="tx-mid tx-mono">id = 1</text>
+        <rect x="55" y="150" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="167" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="185" class="tx-mid tx-mono">id, name</text>
+        <rect x="55" y="218" width="150" height="32" rx="12" class="fw-s1 st-s1 sw-2"/>
+        <text x="130" y="239" class="tx-mid">People</text>
+        <text x="140" y="75" class="tx-sm tx-muted">1 row</text>
+        <text x="140" y="143" class="tx-sm tx-muted">1,000,000</text>
+        <text x="140" y="211" class="tx-sm tx-muted">1,000,000</text>
+        <text x="130" y="284" class="tx-mid tx-hand">filters late</text>
+      </svg>
+      <p class="fig-label">Original plan</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 300" role="img" aria-label="Filter push-down, read from the bottom: People, then Filter id = 1, then Project id and name, then Project name. One million rows reach the filter; both projections handle one row.">
+        <line x1="130" y1="82" x2="130" y2="59" marker-end="url(#arr)"/>
+        <line x1="130" y1="150" x2="130" y2="127" marker-end="url(#arr)"/>
+        <line x1="130" y1="218" x2="130" y2="195" marker-end="url(#arr)"/>
+        <rect x="55" y="14" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="31" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="49" class="tx-mid tx-mono">name</text>
+        <rect x="55" y="82" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="99" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="117" class="tx-mid tx-mono">id, name</text>
+        <rect x="55" y="150" width="150" height="42" rx="12" class="fw-s2 st-s2 sw-2"/>
+        <text x="130" y="167" class="tx-mid tx-bold">Filter</text>
+        <text x="130" y="185" class="tx-mid tx-mono">id = 1</text>
+        <rect x="55" y="218" width="150" height="32" rx="12" class="fw-s1 st-s1 sw-2"/>
+        <text x="130" y="239" class="tx-mid">People</text>
+        <text x="140" y="75" class="tx-sm tx-muted">1 row</text>
+        <text x="140" y="143" class="tx-sm tx-muted">1 row</text>
+        <text x="140" y="211" class="tx-sm tx-muted">1,000,000</text>
+        <text x="130" y="284" class="tx-mid tx-hand">filters first</text>
+      </svg>
+      <p class="fig-label">Filter push-down</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> The example transformation of p. 1282, read from the bottom up. The filter needs only <code>id</code>, which People already has, so it may swap places with the projection. Row counts are illustrative (a People table of 1,000,000 rows, one of them with id = 1): after the swap the projection handles 1 row instead of 1,000,000.</figcaption>
+  </figure>
+
+  <p>Spark 4.2 goes further: its optimised plan drops the inner projection and turns the filter into <code>isnotnull(id) AND (id = 1)</code> (executed).</p>
+
+  <p>Page 1281 runs the slide's example through three plans (the widget replays them): the caller's <code>where</code> sits on top of the join written inside <code>add_demographics</code>, and Catalyst moves it down anyway — the "holistic optimization across functions" of p. 1273.</p>
+
+  <div class="widget" id="l40-w-plan">
+    <h3 class="widget-title">Catalyst at work: four plans of one query</h3>
+    <p class="widget-intro">The query of p. 1281 ("after the join, on users.city") with one change: <code>users</code> stores the city itself, so no UDF is needed (with the slide's Python UDF, Spark moves the filter below the join but cannot push it into the scan). Both tables are Parquet files: <code>events(user_id, timestamp, kind)</code> and <code>users(user_id, zip, city)</code>. Choose how the filter is written, then step from the unresolved plan to the physical plan. The plans are simplified from what Spark 4.2 prints for this query. Illustrative sizes for the row readout: 1,000,000 events, 10,000 users; the 400 users in Melbourne have 40,000 events; 250,000 events are clicks.</p>
+    <ol class="tasks">
+      <li>Keep "after the join" and step to the analysed plan. Before you press Next again: where will the Filter end up, and how many rows will the join produce?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Below the join, directly above the users relation (with a new Project above it that keeps only <code>user_id</code>): <code>city</code> is a users column, so Catalyst tests it before joining. The join now builds 40,000 rows instead of 1,000,000. This is the insight of the widget: the optimizer moves the filter towards the data, whatever order you wrote it in.</p></details>
+      </li>
+      <li>Switch to "before the join" and compare its optimised and physical plans with those of "after the join".
+        <details class="answer"><summary>What you should see</summary>
+          <p>They are identical, node for node. The two queries still differ in the unresolved and analysed plans; from the optimised plan on, Catalyst has made them the same. Write the filter wherever it reads best.</p></details>
+      </li>
+      <li>Choose "after the join, on events.kind" and step to the physical plan. Which side receives the filter, and how many columns of <code>users</code> are read?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The events side: <code>kind</code> is an events column. The users scan reads only <code>user_id</code>, 1 of 3 columns, because nothing above the join needs <code>zip</code> or <code>city</code>. Projection pruning works per table and per query.</p></details>
+      </li>
+      <li>In the physical plan the filter has been pushed into the Parquet scan, yet a Filter node is still drawn above the scan. Why both?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The scan uses the pushed filter to skip whole row groups whose statistics rule it out (next section); the rows of the row groups it does read are then checked one by one. Pushed filters are a help to the source, not a promise.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l40-w-plan', function (root, ui) {
+    var variant = ui.select('the filter, as you write it', [
+      { value: 'A', label: 'after the join, on users.city' },
+      { value: 'B', label: 'before the join, on users.city' },
+      { value: 'C', label: 'after the join, on events.kind' }
+    ], null, 'A');
+    var stepper = ui.stepper({ steps: [
+      "1 · Unresolved logical plan: the query as written. Names marked with ' are not yet bound to a table. Spark prints this as the parsed plan of an SQL string; DataFrame calls are analysed at once (p. 1273).",
+      "2 · Analysis: the catalog says which columns events and users have; every attribute gets a type and a unique id such as #38. For the city filter written after the join, this is the \"Logical Plan\" of p. 1281.",
+      "3 · Logical optimization: the filter is pushed below the join, to the table whose column it tests, and new Projects keep only the columns used above them (the pruned ones are struck through). P. 1281 draws this stage as its \"Physical Plan\": the filter below the join, on the users side.",
+      "4 · Physical planning: real operators. The Parquet scans read only the needed columns and receive the filter: the \"Physical Plan with Predicate Pushdown and Column Pruning\" of p. 1281, with its two \"optimized\" scans. A broadcast hash join is chosen because users is small."
+    ] });
+    var roWhere = ui.readout('where the filter runs');
+    var roCols = ui.readout('columns read');
+    var roRows = ui.readout('rows the join produces (computed on the illustrative sizes)');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'the filter', color: 's2', mark: 'area' },
+      { label: 'a table: relation or file scan', color: 's1', mark: 'area' },
+      { label: 'moved by the optimizer', color: 'key', mark: 'area' },
+      { label: 'column dropped by pruning (struck through)', color: 'muted', mark: 'line' }
+    ]);
+    var svg = ui.svg(560, 440, { label: 'The plan of the chosen query as an indented tree, root at the top: Project, Join and Filter nodes above the two tables events and users. The tree changes as you step from the unresolved plan to the physical plan.' });
+
+    var EV1 = '[user_id#37, timestamp#38, kind#39]', US1 = '[user_id#40, zip#41, city#42]';
+    var PLANS = {
+      '0A': [[0, "'Project", "['timestamp]"], [1, "'Filter", "('city = Melbourne)", 'f'], [2, "'Join Inner", "('user_id = 'user_id)"],
+             [3, "'UnresolvedRelation", '[events]', 's'], [3, "'UnresolvedRelation", '[users]', 's']],
+      '0B': [[0, "'Project", "['timestamp]"], [1, "'Join Inner", "('user_id = 'user_id)"], [2, "'UnresolvedRelation", '[events]', 's'],
+             [2, "'Filter", "('city = Melbourne)", 'f'], [3, "'UnresolvedRelation", '[users]', 's']],
+      '0C': [[0, "'Project", "['timestamp]"], [1, "'Filter", "('kind = click)", 'f'], [2, "'Join Inner", "('user_id = 'user_id)"],
+             [3, "'UnresolvedRelation", '[events]', 's'], [3, "'UnresolvedRelation", '[users]', 's']],
+      '1A': [[0, 'Project', '[timestamp#38]'], [1, 'Filter', '(city#42 = Melbourne)', 'f'], [2, 'Join Inner', '(user_id#37 = user_id#40)'],
+             [3, 'Relation events (parquet)', EV1, 's'], [3, 'Relation users (parquet)', US1, 's']],
+      '1B': [[0, 'Project', '[timestamp#38]'], [1, 'Join Inner', '(user_id#37 = user_id#40)'], [2, 'Relation events (parquet)', EV1, 's'],
+             [2, 'Filter', '(city#42 = Melbourne)', 'f'], [3, 'Relation users (parquet)', US1, 's']],
+      '1C': [[0, 'Project', '[timestamp#38]'], [1, 'Filter', '(kind#39 = click)', 'f'], [2, 'Join Inner', '(user_id#37 = user_id#40)'],
+             [3, 'Relation events (parquet)', EV1, 's'], [3, 'Relation users (parquet)', US1, 's']],
+      '2A': [[0, 'Project', '[timestamp#38]'], [1, 'Join Inner', '(user_id#37 = user_id#40)'], [2, 'Project', '[user_id#37, timestamp#38]'],
+             [3, 'Relation events (parquet)', '[user_id#37, timestamp#38, ~kind#39~]', 's'], [2, 'Project', '[user_id#40]'],
+             [3, 'Filter', '(city#42 = Melbourne)', 'f', null, true], [4, 'Relation users (parquet)', '[user_id#40, ~zip#41~, city#42]', 's']],
+      '2C': [[0, 'Project', '[timestamp#38]'], [1, 'Join Inner', '(user_id#37 = user_id#40)'], [2, 'Project', '[user_id#37, timestamp#38]'],
+             [3, 'Filter', '(kind#39 = click)', 'f', null, true], [4, 'Relation events (parquet)', EV1, 's'], [2, 'Project', '[user_id#40]'],
+             [3, 'Relation users (parquet)', '[user_id#40, ~zip#41, city#42~]', 's']],
+      '3A': [[0, 'Project', '[timestamp]'], [1, 'BroadcastHashJoin', 'user_id = user_id, users broadcast'],
+             [2, 'FileScan parquet [events]', 'reads: user_id, timestamp', 's', 'skips: kind'], [2, 'Project', '[user_id]'],
+             [3, 'Filter', '(city = Melbourne), row by row', 'f', null, true], [4, 'FileScan parquet [users]', 'reads: user_id, city', 's', 'pushed: city = Melbourne']],
+      '3C': [[0, 'Project', '[timestamp]'], [1, 'BroadcastHashJoin', 'user_id = user_id, users broadcast'], [2, 'Project', '[user_id, timestamp]'],
+             [3, 'Filter', '(kind = click), row by row', 'f', null, true], [4, 'FileScan parquet [events]', 'reads: user_id, timestamp, kind', 's', 'pushed: kind = click'],
+             [2, 'FileScan parquet [users]', 'reads: user_id', 's', 'skips: zip, city']]
+    };
+    function planOf(v, k) {
+      if (k >= 2 && v === 'B') {                       // optimised B = optimised A, but nothing was moved
+        return PLANS[k + 'A'].map(function (n) { return n.length > 5 ? n.slice(0, 5) : n; });
+      }
+      return PLANS[k + v] || PLANS[k + 'A'];
+    }
+    var CODE = {
+      A: 'events.join(users, events.user_id == users.user_id).where(users.city == "Melbourne").select(events.timestamp)',
+      B: 'melb = users.where(users.city == "Melbourne") ; events.join(melb, events.user_id == melb.user_id).select(events.timestamp)',
+      C: 'events.join(users, events.user_id == users.user_id).where(events.kind == "click").select(events.timestamp)'
+    };
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    function draw(list, k) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var y = 8, nodes = [];
+      list.forEach(function (n) {
+        var h = n[4] ? 70 : 52, x = 12 + n[0] * 26;
+        nodes.push({ d: n[0], x: x, y: y, h: h, n: n });
+        y += h + 10;
+      });
+      nodes.forEach(function (c, i) {
+        if (!c.d) return;
+        var j = i - 1;
+        while (j > 0 && nodes[j].d !== c.d - 1) j--;
+        var p = nodes[j], xl = p.x + 13, ym = c.y + c.h / 2;
+        S('path', { d: 'M' + xl + ' ' + (p.y + p.h) + ' V' + ym + ' H' + c.x, 'class': 'st-muted sw-2' });
+      });
+      nodes.forEach(function (c) {
+        var kind = c.n[3], cls = kind === 'f' ? 'fw-s2 st-s2 sw-2' : kind === 's' ? 'fw-s1 st-s1' : 'fi-paper';
+        if (c.n[5]) S('rect', { x: c.x - 5, y: c.y - 5, width: 558 - c.x, height: c.h + 10, rx: 10, 'class': 'fw-key st-none' });
+        S('rect', { x: c.x, y: c.y, width: 548 - c.x, height: c.h, rx: 6, 'class': cls + (k === 0 ? ' dash' : '') });
+        T(c.x + 12, c.y + 21, c.n[1], 'tx-bold');
+        var t = S('text', { x: c.x + 12, y: c.y + 41, 'class': 'tx-mono tx-sm' });
+        String(c.n[2]).split('~').forEach(function (seg, i) {        // ~…~ marks a column that projection pruning drops
+          if (seg) Course.svg('tspan', i % 2 ? { 'class': 'tx-muted', 'text-decoration': 'line-through', text: seg } : { text: seg }, t);
+        });
+        if (c.n[4]) T(c.x + 12, c.y + 60, c.n[4], 'tx-mono tx-sm');
+      });
+    }
+    function info(v, k) {
+      var opt = k >= 2, onEvents = v === 'C';
+      var where = !opt ? (v === 'B' ? 'below the join, on users (as written)' : 'above the join (as written)')
+        : k === 2 ? (onEvents ? 'below the join, right above events' : 'below the join, right above users')
+        : (onEvents ? 'pushed into the events scan, then row by row' : 'pushed into the users scan, then row by row');
+      var cols = k === 0 ? 'not known yet: names only'
+        : k === 1 ? 'events 3 of 3 · users 3 of 3'
+        : onEvents ? 'events 3 of 3 · users 1 of 3 (user_id)' : 'events 2 of 3 (no kind) · users 2 of 3 (no zip)';
+      var rows = (!opt && v !== 'B') ? '1,000,000; the filter keeps ' + (onEvents ? '250,000' : '40,000') + ' afterwards'
+        : (onEvents ? '250,000' : '40,000');
+      return { where: where, cols: cols, rows: rows };
+    }
+    ui.onChange(function () {
+      var v = variant.value || 'A', k = stepper.index;
+      draw(planOf(v, k), k);
+      var s = info(v, k);
+      roWhere.set(s.where);
+      roCols.set(s.cols);
+      roRows.set(s.rows);
+      note.set('Your code: <code>' + CODE[v] + '</code>' + (k >= 2 ? ' Spark also adds <code>isnotnull(user_id)</code> tests on both sides (a NULL key never joins); they are left out of the picture.' : ''));
+    });
+  });
+  </script>
+
+  <p><b>Physical planning</b> turns the optimised plan into one or more physical plans of real operators, and a <mark class="key">cost model</mark> selects one (p. 1278). In the Spark SQL paper it chose only the join algorithm — a broadcast join for a small table, as in the widget (background). The scans belong to <em>data sources</em>: "Spark's Data Source API allows optimizations like column pruning and filter pushdown into custom data sources" (p. 1268) — p. 1280's projection pruning and predicate pushdown. A source implements <code>buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row]</code> (p. 1267): its two parameters are the two pushdowns. And since "DataFrame execution is done with Spark RDDs", custom code can drop to them: <code>queryResult.rdd.mapPartitions { … }</code>.</p>
+
+  <p><b>Code generation</b> (p. 1283) "relies on Scala's quasiquotes": Catalyst "transforms a SQL tree into an abstract syntax tree (AST) for Scala code". The slide's generator is one pattern match:</p>
+
+<pre><code>def compile(node: Node): AST = node match {
+  case Literal(value) => q"$value"
+  case Attribute(name) => q"row.get($name)"
+  case Add(left, right) =>
+    q"${compile(left)} + ${compile(right)}"
+}</code></pre>
+
+  <p>Each <code>q"…"</code> is a code template. The tree of Fig. 2 becomes the line <code>row.get("x") + 3</code>, compiled once instead of walked for every row: for x+x+x a billion times, about 36 s interpreted against about 9 s generated, close to hand-written code (read off the chart), from a generator of "700LOC".</p>
+
+  <p class="memo"><mark class="key">You say what; Catalyst decides how — it rewrites a tree with rules, chooses operators by cost and compiles the result.</mark></p>
+</section>
+
+<section id="l40-files">
+  <h2>Files that know their own shape: Avro and Parquet</h2>
+
+  <p>Catalyst hands a scan <code>requiredColumns</code> and <code>filters</code>; what the scan does with them depends on the file. Page 1242 lists the "Available File Formats": text and CSV, JSON, SequenceFile ("binary key/value pair format"), Avro, Parquet, ORC ("optimized row columnar format") and "Data Frames". Three families hide in it: text (readable, slow to parse, no schema), binary <em>rows</em> (SequenceFile, Avro) and binary <em>columns</em> (Parquet, ORC).</p>
+
+  <aside class="redpen" data-page="1242">
+    <p class="claim">Available File Formats: "-Avro -Parquet -Data Frames -ORC"</p>
+    <p class="fix">A DataFrame is not a file format but Spark's in-memory table, "a distributed collection of rows organized into named columns" (p. 1246), which files are read into and written from.</p>
+    <p class="because">No file on disk is "a DataFrame": <code>df.write.parquet(path)</code> writes Parquet. A closed question may be matched against the printed list, so know both: the slide lists it, the concept says no.</p>
+  </aside>
+
+  <h3>Avro: rows, with the schema inside</h3>
+
+  <p><mark class="key">Avro</mark> (p. 1243) is a "language neutral data serialization system": "write a file in python and read it in C". The schema is "language independent", "usually written in JSON", the data "encoded in binary format". It "supports schema evolution" — "producers and consumers at different versions of schema" — and "supports compression and are splittable". The tweets schema of p. 1244, repaired:</p>
+
+<pre><code>{
+  "type": "record",
+  "name": "tweets",
+  "doc": "schema for storing tweets",
+  "fields": [
+    { "name": "username",  "type": "string" },
+    { "name": "tweet",     "type": "string" },
+    { "name": "timestamp", "type": "long" }
+  ]
+}</code></pre>
+
+  <aside class="redpen" data-page="1244">
+    <p class="claim"><code>"name" : "username", "type" : "string", }, { …</code> and <code>"doc:" : “schema for storing tweets"</code></p>
+    <p class="fix">No comma before a closing brace, straight quotes only, and the attribute is <code>"doc"</code> — the schema above.</p>
+    <p class="because">JSON forbids a trailing comma, so a parser rejects the printed schema at its first field (checked with Python's <code>json</code>); <code>"doc:"</code> would be another, unknown attribute. The exam may show the schema as printed: take its structure from the slide, its punctuation from here.</p>
+  </aside>
+
+  <p>An Avro file (p. 1244) is a header — metadata holding the JSON schema, and a <mark class="key">sync marker</mark> — then blocks: auxiliary data (record count and size), the serialized objects, and the same marker. That marker makes the file splittable: a task that starts mid-file, at an HDFS split, skips to the next marker and is aligned on a block. The schema is written once, so records carry no field names.</p>
+
+  <h3>Parquet: columns inside row groups</h3>
+
+  <p>"Apache Parquet is a columnar storage format available to any project in the Hadoop/Spark ecosystem, regardless of the choice of data processing framework, data model or programming language" (p. 1250). Page 1254 draws the difference on a table X, Y, Z: a row format stores x1 y1 z1 x2 y2 z2 …, a columnar format stores x1 … x5, then y1 … y5, then z1 … z5, each column as one "encoded chunk" — the column store of <a href="l20.html#l20-colstore">lesson 20</a>, as a file.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l40-fig-files">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 340" role="img" aria-label="An Avro file: a header with metadata holding the JSON schema and a sync marker, then blocks, each with auxiliary data (count and size), the serialized records r1 r2 r3, and a sync marker. A split that starts inside block 2 skips forward to its sync marker.">
+        <rect x="10" y="10" width="280" height="66" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="28" class="tx-sm tx-bold">header</text>
+        <rect x="20" y="36" width="170" height="30" class="fw-s3 st-s3"/>
+        <text x="105" y="55" class="tx-mid tx-sm">metadata: schema (JSON)</text>
+        <rect x="196" y="36" width="84" height="30" class="fw-s3 st-s3"/>
+        <text x="238" y="55" class="tx-mid tx-sm">sync marker</text>
+        <rect x="10" y="88" width="280" height="66" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="106" class="tx-sm tx-bold">block 1</text>
+        <rect x="20" y="114" width="72" height="30" class="fi-paper"/>
+        <text x="56" y="133" class="tx-mid tx-sm">aux. data</text>
+        <rect x="98" y="114" width="108" height="30" class="fw-s1 st-s1"/>
+        <text x="152" y="133" class="tx-mid tx-mono">r1 r2 r3 …</text>
+        <rect x="212" y="114" width="68" height="30" class="fw-s3 st-s3"/>
+        <text x="246" y="133" class="tx-mid tx-sm">sync</text>
+        <rect x="10" y="166" width="280" height="66" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="184" class="tx-sm tx-bold">block 2</text>
+        <rect x="20" y="192" width="72" height="30" class="fi-paper"/>
+        <text x="56" y="211" class="tx-mid tx-sm">aux. data</text>
+        <rect x="98" y="192" width="108" height="30" class="fw-s1 st-s1"/>
+        <text x="152" y="211" class="tx-mid tx-mono">r4 r5 r6 …</text>
+        <rect x="212" y="192" width="68" height="30" class="fw-s3 st-s3"/>
+        <text x="246" y="211" class="tx-mid tx-sm">sync</text>
+        <line x1="108" y1="160" x2="108" y2="246" class="st-s2 sw-2 dash"/>
+        <line x1="108" y1="246" x2="240" y2="246" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="150" y="276" class="tx-mid tx-hand">split: skip to sync</text>
+        <text x="150" y="304" class="tx-mid tx-sm">… block N</text>
+        <text x="150" y="328" class="tx-mid tx-mono tx-sm">r = (username, tweet, timestamp)</text>
+      </svg>
+      <p class="fig-label">Avro: whole records, one after another</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 340" role="img" aria-label="A Parquet file: the magic number PAR1, row group 0 with three column chunks username, tweet and timestamp divided into pages, row group 1, then a footer with the schema, the offsets, sizes, encodings and codecs of every column chunk and min and max statistics, the footer length and PAR1 again. An arrow from the footer points at a column chunk.">
+        <rect x="10" y="10" width="56" height="22" class="fi-paper"/>
+        <text x="38" y="26" class="tx-mid tx-mono tx-sm">PAR1</text>
+        <rect x="10" y="40" width="270" height="96" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="57" class="tx-sm tx-bold">row group 0</text>
+        <rect x="18" y="64" width="78" height="64" class="fw-s1 st-s1"/>
+        <text x="57" y="78" class="tx-mid tx-sm">username</text>
+        <line x1="18" y1="96" x2="96" y2="96" class="st-s1 sw-1"/>
+        <line x1="18" y1="112" x2="96" y2="112" class="st-s1 sw-1"/>
+        <rect x="102" y="64" width="98" height="64" class="fw-s1 st-s1"/>
+        <text x="151" y="78" class="tx-mid tx-sm">tweet</text>
+        <line x1="102" y1="88" x2="200" y2="88" class="st-s1 sw-1"/>
+        <line x1="102" y1="101" x2="200" y2="101" class="st-s1 sw-1"/>
+        <line x1="102" y1="114" x2="200" y2="114" class="st-s1 sw-1"/>
+        <rect x="206" y="64" width="66" height="64" class="fw-s1 st-s1"/>
+        <text x="239" y="78" class="tx-mid tx-sm">timestamp</text>
+        <line x1="206" y1="96" x2="272" y2="96" class="st-s1 sw-1"/>
+        <line x1="206" y1="112" x2="272" y2="112" class="st-s1 sw-1"/>
+        <rect x="10" y="144" width="270" height="56" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="161" class="tx-sm tx-bold">row group 1</text>
+        <rect x="18" y="168" width="78" height="24" class="fw-s1 st-s1"/>
+        <rect x="102" y="168" width="98" height="24" class="fw-s1 st-s1"/>
+        <rect x="206" y="168" width="66" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="208" width="270" height="94" rx="4" class="fw-s3 st-s3"/>
+        <text x="20" y="225" class="tx-sm tx-bold">footer</text>
+        <text x="20" y="242" class="tx-sm">schema</text>
+        <text x="20" y="258" class="tx-sm">per row group, per column chunk:</text>
+        <text x="20" y="274" class="tx-sm">offset, size, encodings, codec,</text>
+        <text x="20" y="290" class="tx-sm">min / max statistics</text>
+        <path d="M282 252 C 297 220, 297 140, 276 104" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+        <rect x="10" y="310" width="120" height="22" class="fi-paper"/>
+        <text x="70" y="326" class="tx-mid tx-sm">footer length</text>
+        <rect x="138" y="310" width="56" height="22" class="fi-paper"/>
+        <text x="166" y="326" class="tx-mid tx-mono tx-sm">PAR1</text>
+      </svg>
+      <p class="fig-label">Parquet: column chunks inside row groups</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> Two files for the tweets of p. 1244. Left, the Avro layout of p. 1244: whole records in blocks, each block closed by the sync marker that a reader starting mid-file (orange) skips to. Right, the Parquet layout of pp. 1245 and 1252: row groups of column chunks, each chunk cut into pages (thin lines), and a footer that points (violet) at every chunk.</figcaption>
+  </figure>
+
+  <p>The units nest (pp. 1245, 1251). A <mark class="key">row group</mark> is "a group of rows in columnar format": the "max size buffered in memory while writing", "one (or more) per split while reading", "roughly: 50MB &lt; row group &lt; 1 GB". A <mark class="key">column chunk</mark> is "the data for one column in a row group" and "can be read independently". A <mark class="key">page</mark> is the "unit of access in a column chunk", "big enough for compression to be efficient", "roughly: 8KB &lt; page &lt; 1MB". The <mark class="key">footer</mark> (p. 1252) "contains column chunks offset and schema": per column chunk its type, encodings, codec, number of values, offsets and sizes. It comes last, so the writer can stream row groups out and append the index at the end; a reader reads it first and jumps to the chunks it needs.</p>
+
+  <figure class="tbl-fig" id="l40-tbl-config">
+    <figcaption>"Configurable parquet parameters" (p. 1245), as printed. They are the defaults of the Hadoop Parquet library; Spark itself writes Parquet with Snappy compression unless told otherwise (background).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Property name</th><th>Default value</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td><code>parquet.block.size</code></td><td class="num">128 MB</td><td>The size in bytes of a block (row group).</td></tr>
+          <tr><td><code>parquet.page.size</code></td><td class="num">1MB</td><td>The size in bytes of a page.</td></tr>
+          <tr><td><code>parquet.dictionary.page.size</code></td><td class="num">1MB</td><td>The maximum allowed size in bytes of a dictionary before falling back to plain encoding for a page.</td></tr>
+          <tr><td><code>parquet.enable.dictionary</code></td><td>true</td><td>Whether to use dictionary encoding.</td></tr>
+          <tr><td><code>parquet.compression</code></td><td>UNCOMPRESSED</td><td>The type of compression: UNCOMPRESSED, SNAPPY, GZIP &amp; LZO</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Mind the word <em>block</em>: p. 1245 calls a row group a block; p. 1260 means the HDFS block of <a href="l31.html#l31-hdfs">lesson 31</a>. No row group straddles two HDFS blocks — the slide packs two into one and pads the rest — so a task reads its row group from one machine.</p>
+
+  <div class="pitfall">
+    <p>"Columnar means the whole file is one column after another." Not in Parquet: the file is a sequence of row groups, and only <em>inside</em> a row group are the columns contiguous, so every record can be rebuilt from one row group.</p>
+  </div>
+
+  <p class="memo"><mark class="key">Avro writes whole records one after another with the schema in its header; Parquet writes each column of a row group together and indexes the file in its footer.</mark></p>
+</section>
+
+<section id="l40-skip">
+  <h2>Read less data: inside a Parquet file</h2>
+
+  <p>Page 1257 lists three ways to "Read Less Data". <b>Columnar organization</b>: "Encoding: make the data smaller" and "Column projection: read only the columns you need". <b>Row group filtering</b>: "Use footer stats to eliminate row groups" and "Use dictionary pages to eliminate row groups". <b>Page filtering</b>: "Use page stats to eliminate pages". Page 1255 calls the first moves <em>projection push down</em> (read only the requested columns) and <em>predicate push down</em> (use statistics, such as each chunk's minimum and maximum, to skip what cannot match): together you "read only the data you need". The layout also "minimizes CPU cache misses": a column's values lie side by side, so the processor fetches only useful ones.</p>
+
+  <p>The dictionary of a column chunk (p. 1261) "is a compact list of all the values": "Search term missing? Skip the row group" — "like a bloom filter without false positives". Minimum and maximum rule a value out only when it lies outside their range; inside it they say "maybe". A dictionary answers exactly.</p>
+
+  <div class="widget" id="l40-w-rowgroups">
+    <h3 class="widget-title">One file written twice: what a query reads</h3>
+    <p class="widget-intro">Twelve tweets with the schema of p. 1244, in time order. Above, an Avro file: four records per block, each closed by a sync marker (violet). Below, a Parquet file: three row groups of four rows, each made of three column chunks; the narrow violet cell is the dictionary page of the username chunk. Sizes in the picture: a username 8 bytes, a tweet 120, a timestamp 8 — 1,632 bytes in all. Headers, markers, dictionaries and the footer are left out of the counts.</p>
+    <ol class="tasks">
+      <li>Keep the first query with row-group filtering off. Predict the share of the 1,632 bytes that Avro reads and the share that Parquet reads. Then switch on the footer statistics.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Avro reads 100 %: to find the timestamps it must read every record whole. Parquet reads 192 bytes (11.8 %), the username and timestamp chunks of every row group; the big tweet column is never touched. With statistics, 64 bytes (3.9 %): row group 1 ends at 09:14 and row group 3 starts at 09:47, so neither is opened. The two savings multiply: 11.8 % of the bytes of each row group, times 1 of 3 row groups, is 3.9 %. That is the insight of the widget: Parquet skips whole column chunks and whole row groups, Avro can skip neither.</p></details>
+      </li>
+      <li>Choose "text of the tweets by eva" with the footer statistics on. Predict which row groups min/max can skip. Then add the dictionary pages.
+        <details class="answer"><summary>What you should see</summary>
+          <p>None: in every row group the usernames run from ada to ugo or to eva, and eva lies inside each range, so min/max can only answer "maybe" — 1,536 bytes. The dictionaries are exact: row groups 1 and 3 contain only ada, bob and ugo, so both are skipped and 512 bytes remain. "Like a bloom filter without false positives" (p. 1261).</p></details>
+      </li>
+      <li>Choose "every field of every tweet". Compare the two files.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Both read all 1,632 bytes: with no filter and every column needed, the columnar layout saves nothing, and Parquet must even stitch each record back together from three chunks. A row format suits writing and reading whole records; a columnar format suits analytics over a few columns.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l40-w-rowgroups', function (root, ui) {
+    var ROWS = [['bob', '09:00'], ['ada', '09:04'], ['ugo', '09:09'], ['bob', '09:14'],
+                ['eva', '09:21'], ['bob', '09:27'], ['eva', '09:33'], ['ada', '09:38'],
+                ['ugo', '09:47'], ['ada', '09:52'], ['bob', '09:58'], ['ugo', '10:05']];
+    var SIZE = { u: 8, w: 120, t: 8 }, TOTAL = 12 * 136;
+    var Q = {
+      time: { label: 'usernames of tweets 09:25–09:40', cols: { u: 1, t: 1 }, on: 't',
+              hit: function (r) { return r[1] >= '09:25' && r[1] <= '09:40'; } },
+      eva: { label: 'text of the tweets by eva', cols: { u: 1, w: 1 }, on: 'u',
+             hit: function (r) { return r[0] === 'eva'; } },
+      all: { label: 'every field of every tweet', cols: { u: 1, w: 1, t: 1 }, on: null, hit: null }
+    };
+    var qSel = ui.select('query', ['time', 'eva', 'all'].map(function (k) { return { value: k, label: Q[k].label }; }), null, 'time');
+    var fSel = ui.select('row-group filtering in Parquet', [
+      { value: 'off', label: 'off: open every row group' },
+      { value: 'stats', label: 'footer min/max statistics' },
+      { value: 'dict', label: 'statistics + dictionary pages' }
+    ], null, 'off');
+    var roA = ui.readout('Avro reads (computed)'), roP = ui.readout('Parquet reads (computed)');
+    var roG = ui.readout('Parquet row groups opened'), roC = ui.readout('column chunks read per opened row group');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'bytes read from disk', color: 's1', mark: 'area' },
+      { label: 'bytes skipped', color: 'muted', mark: 'dash' },
+      { label: 'rows the query returns', color: 's2', mark: 'line' },
+      { label: 'sync markers, dictionaries, footer', color: 's3', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 418, { label: 'The same twelve tweets stored as an Avro file, three blocks of four whole records, and as a Parquet file, three row groups of three column chunks, with the footer statistics below. Cells that the chosen query reads are filled, skipped cells are dashed, the rows it returns are underlined.' });
+
+    var G = [0, 1, 2].map(function (g) {
+      var rs = ROWS.slice(g * 4, g * 4 + 4);
+      var us = rs.map(function (r) { return r[0]; }).sort(), ts = rs.map(function (r) { return r[1]; }).sort();
+      var dict = us.filter(function (u, i) { return us.indexOf(u) === i; });
+      return { umin: us[0], umax: us[3], tmin: ts[0], tmax: ts[3], dict: dict };
+    });
+    function decide(g, q, mode) {
+      if (!q.on || mode === 'off') return { read: true, why: '' };
+      if (q.on === 't') {
+        if (g.tmax < '09:25') return { read: false, why: 'its latest tweet is ' + g.tmax + ' (max)' };
+        if (g.tmin > '09:40') return { read: false, why: 'its first tweet is ' + g.tmin + ' (min)' };
+        return { read: true, why: '' };
+      }
+      if ('eva' < g.umin || 'eva' > g.umax) return { read: false, why: 'eva is outside ' + g.umin + '–' + g.umax };
+      if (mode === 'dict' && g.dict.indexOf('eva') < 0) return { read: false, why: 'eva is not in its dictionary' };
+      return { read: true, why: '' };
+    }
+    function state() {
+      var q = Q[qSel.value] || Q.time, mode = fSel.value || 'off';
+      var dec = G.map(function (g) { return decide(g, q, mode); });
+      var per = 0, nc = 0;
+      Object.keys(q.cols).forEach(function (c) { per += SIZE[c]; nc++; });
+      var opened = dec.filter(function (d) { return d.read; }).length;
+      return { q: q, mode: mode, dec: dec, opened: opened, bytes: opened * 4 * per, nc: nc };
+    }
+    function n(x) { return String(x).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    function cell(x, y, w, read) { S('rect', { x: x, y: y, width: w, height: 24, 'class': read ? 'fw-s1 st-s1' : 'fi-paper st-muted dash' }); }
+    function mark(x, y, w) { S('line', { x1: x + 3, y1: y + 29, x2: x + w - 3, y2: y + 29, 'class': 'st-s2 sw-3' }); }
+    function footerLine(i, q, mode) {
+      var g = G[i], head = 'RG ' + (i + 1) + ' · ';
+      if (q.on === 't') return head + 'time min ' + g.tmin + ' · max ' + g.tmax;
+      if (q.on === 'u') return head + (mode === 'dict' ? 'dictionary: ' + g.dict.join(', ') : 'user min ' + g.umin + ' · max ' + g.umax);
+      return head + 'offsets and sizes of 3 column chunks';
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var q = st.q, b, r, g, row, x, y;
+      T(10, 16, 'Avro: one record after another', 'tx-sm tx-bold');
+      T(94, 40, 'u', 'tx-mid tx-mono tx-sm');
+      T(134, 40, 'tweet', 'tx-mid tx-mono tx-sm');
+      T(174, 40, 't', 'tx-mid tx-mono tx-sm');
+      for (b = 0; b < 3; b++) {
+        y = 48 + b * 34;
+        T(10, y + 17, 'block ' + (b + 1), 'tx-sm');
+        for (r = 0; r < 4; r++) {
+          row = ROWS[b * 4 + r]; x = 84 + r * 100;
+          cell(x, y, 20, true); cell(x + 20, y, 60, true); cell(x + 80, y, 20, true);
+          if (q.hit && q.hit(row)) mark(x, y, 100);
+        }
+        S('rect', { x: 486, y: y, width: 12, height: 24, 'class': 'fw-s3 st-s3' });
+      }
+      T(10, 170, 'Parquet: row groups made of column chunks', 'tx-sm tx-bold');
+      T(129, 194, 'username', 'tx-mid tx-mono tx-sm');
+      T(298, 194, 'tweet', 'tx-mid tx-mono tx-sm');
+      T(462, 194, 'timestamp', 'tx-mid tx-mono tx-sm');
+      var dictUsed = st.mode === 'dict' && q.on === 'u';
+      for (g = 0; g < 3; g++) {
+        y = 202 + g * 34;
+        var d = st.dec[g];
+        T(10, y + 17, 'RG ' + (g + 1), 'tx-sm');
+        S('rect', { x: 84, y: y, width: 10, height: 24, 'class': 'fw-s3 st-s3' + (dictUsed ? ' sw-3' : '') });
+        for (r = 0; r < 4; r++) {
+          row = ROWS[g * 4 + r];
+          var xu = 94 + r * 20, xw = 178 + r * 60, xt = 422 + r * 20, hit = d.read && q.hit && q.hit(row);
+          cell(xu, y, 20, d.read && !!q.cols.u);
+          cell(xw, y, 60, d.read && !!q.cols.w);
+          cell(xt, y, 20, d.read && !!q.cols.t);
+          if (hit) {
+            if (q.cols.u) mark(xu, y, 20);
+            if (q.cols.w) mark(xw, y, 60);
+            if (q.cols.t) mark(xt, y, 20);
+          }
+        }
+        T(512, y + 17, d.read ? 'read' : 'skip', d.read ? 'tx-sm' : 'tx-sm tx-muted');
+      }
+      S('rect', { x: 10, y: 312, width: 540, height: 98, rx: 4, 'class': 'fw-s3 st-s3' });
+      T(20, 332, 'footer' + ((st.mode === 'off' && q.on) ? ' (filtering off: not consulted)' : ''), 'tx-sm tx-bold');
+      for (g = 0; g < 3; g++) T(20, 356 + g * 22, footerLine(g, q, st.mode), 'tx-mono tx-sm');
+    }
+    ui.onChange(function () {
+      var st = state();
+      draw(st);
+      roA.set(n(TOTAL) + ' of ' + n(TOTAL) + ' bytes: every record, whole');
+      roP.set(n(st.bytes) + ' of ' + n(TOTAL) + ' bytes (' + Course.fmt(100 * st.bytes / TOTAL, 1) + ' %)');
+      roG.set(st.opened + ' of 3');
+      roC.set(st.nc + ' of 3');
+      var why = [];
+      st.dec.forEach(function (d, i) { if (!d.read) why.push('RG ' + (i + 1) + ' skipped: ' + d.why); });
+      var txt;
+      if (!st.q.on) txt = 'No filter and every column needed: Parquet reads every chunk of every row group.';
+      else if (st.mode === 'off') txt = 'Parquet opens every row group but reads only the column chunks of the query.';
+      else if (why.length) txt = why.join(' · ') + '.';
+      else txt = 'The statistics cannot rule out any row group: eva lies inside the username range of each one.';
+      note.set(txt);
+    });
+  });
+  </script>
+
+  <h3>Encodings: make the data smaller</h3>
+
+  <p>Before any compressor runs, Parquet encodes each column with a trick that fits its content (pp. 1256, 1258; the examples are ours).</p>
+
+  <figure class="tbl-fig" id="l40-tbl-enc">
+    <figcaption>The encodings of pp. 1256 and 1258.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Encoding</th><th>Stores</th><th>Good for (slide)</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td>Delta</td><td>the first value, then the differences</td><td>timestamps: subsequent values are close</td><td class="num">1000, 1003, 1004, 1009 → 1000, +3, +1, +5</td></tr>
+          <tr><td>Prefix</td><td>the length of the prefix shared with the previous string, then the rest</td><td>"delta encoding for strings"</td><td><code>Milano</code>, <code>Milazzo</code> → <code>Milano</code>, (4, <code>zzo</code>)</td></tr>
+          <tr><td>Dictionary</td><td>each distinct value once, then small integer keys</td><td>"small set of values, e.g post code, ip addresses"</td><td>Como, Lecco, Como, Como → [Como, Lecco] + keys 0 1 0 0</td></tr>
+          <tr><td>Run length (RLE)</td><td>a value and the length of its run</td><td>"repeating data"; definition levels of sparse columns</td><td class="num">0 0 0 0 0 0 1 → (0, 6) (1, 1)</td></tr>
+          <tr><td>Bit packing</td><td>small integers in the fewest bits</td><td>"repetition level, definition levels and dictionary keys"</td><td>keys 0–3 in 2 bits each instead of 32</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Of the "heavyweight algorithms (gzip, lzo, snappy)" of p. 1258 only gzip is really heavy: Snappy and LZO trade compression for speed (background).</aside>
+
+  <p>Dictionary encoding is "useful for columns with few ( &lt; 50,000 ) distinct values" and "when applicable, compresses better and faster than heavyweight algorithms". Bit packing stores small integers "in the minimum bits required": a value whose maximum is \(m\) needs \(\lceil \log_2(m+1) \rceil\) bits, so 16 bits cover any key below 65,536. Parquet 2.0 (p. 1259) adds "more encodings: compact storage without heavyweight compression" (delta encodings "for integers, strings and sorted dictionaries"), "statistics: to be used by query planners and predicate pushdown" and a "new page format: to facilitate skipping ahead at a more granular level".</p>
+
+  <div class="pitfall">
+    <p>"Dictionary encoding always pays." Only for few distinct values: beyond 1 MB of dictionary (<code>parquet.dictionary.page.size</code>, p. 1245) the writer falls back to plain encoding, and the chunk has no complete dictionary left to skip with.</p>
+  </div>
+
+  <h3>Nested records in flat columns</h3>
+
+  <p>Parquet's "key strength is to store nested data in truly columnar format using definition and repetition levels" (p. 1254). The technique comes from Google's Dremel; p. 1253 applies it to a schema with an optional group and two repeated fields.</p>
+
+  <figure class="fig fig--plain" id="l40-fig-levels">
+    <svg class="dia" viewBox="0 0 560 322" role="img" aria-label="The schema Document with the required field DocId and the optional group Links, which holds the repeated fields Backward and Forward. Under each leaf, its maximum levels and the values of the slide's record: DocId 20 with R 0 and D 0; Backward 10 with R 0 and D 2 and 30 with R 1 and D 2; Forward 80 with R 0 and D 2.">
+      <line x1="280" y1="40" x2="100" y2="92"/>
+      <line x1="320" y1="40" x2="410" y2="92"/>
+      <line x1="395" y1="122" x2="300" y2="176"/>
+      <line x1="425" y1="122" x2="480" y2="176"/>
+      <rect x="250" y="10" width="100" height="30" rx="8" class="fi-paper sw-2"/>
+      <text x="300" y="31" class="tx-mid">Document</text>
+      <text x="168" y="64" class="tx-mid tx-sm tx-muted halo">required</text>
+      <text x="400" y="64" class="tx-mid tx-sm tx-muted halo">optional</text>
+      <rect x="50" y="92" width="100" height="30" rx="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="100" y="113" class="tx-mid">DocId</text>
+      <rect x="360" y="92" width="100" height="30" rx="8" class="fi-paper sw-2"/>
+      <text x="410" y="113" class="tx-mid">Links</text>
+      <text x="318" y="152" class="tx-mid tx-sm tx-muted halo">repeated</text>
+      <text x="482" y="152" class="tx-mid tx-sm tx-muted halo">repeated</text>
+      <rect x="240" y="176" width="120" height="30" rx="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="300" y="197" class="tx-mid">Backward</text>
+      <rect x="420" y="176" width="120" height="30" rx="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="480" y="197" class="tx-mid">Forward</text>
+      <text x="100" y="146" class="tx-mid tx-mono tx-sm">max R 0 · D 0</text>
+      <circle cx="80" cy="172" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="80" y="177" class="tx-mid tx-mono tx-sm">20</text>
+      <text x="102" y="177" class="tx-mono tx-sm">R0 D0</text>
+      <text x="300" y="230" class="tx-mid tx-mono tx-sm">max R 1 · D 2</text>
+      <circle cx="280" cy="256" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="280" y="261" class="tx-mid tx-mono tx-sm">10</text>
+      <text x="302" y="261" class="tx-mono tx-sm">R0 D2</text>
+      <circle cx="280" cy="292" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="280" y="297" class="tx-mid tx-mono tx-sm">30</text>
+      <text x="302" y="297" class="tx-mono tx-sm">R1 D2</text>
+      <text x="480" y="230" class="tx-mid tx-mono tx-sm">max R 1 · D 2</text>
+      <circle cx="460" cy="256" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="460" y="261" class="tx-mid tx-mono tx-sm">80</text>
+      <text x="482" y="261" class="tx-mono tx-sm">R0 D2</text>
+      <text x="20" y="266" class="tx-hand">one column per leaf</text>
+    </svg>
+    <figcaption><b>Fig. 6.</b> The schema and the record of p. 1253 in one picture. Every leaf (blue) becomes a column; under it, its maximum levels and the record's values with their repetition level R and definition level D. Optional and repeated fields count towards D, only repeated ones towards R.</figcaption>
+  </figure>
+
+  <p>Next to each stored value Parquet writes two small integers. The <mark class="key">definition level</mark> D says how many of the optional or repeated fields on the value's path are actually present; the <mark class="key">repetition level</mark> R says at which repeated field the value continues a list, 0 meaning that a new record starts. The slide's record, shredded step by step:</p>
+
+  <ol class="steps" id="l40-steps-shred">
+    <li><p>Read the columns off the schema, one per leaf: <code>DocId</code>, <code>Links.Backward</code>, <code>Links.Forward</code>. The groups <code>Document</code> and <code>Links</code> store nothing themselves.</p></li>
+    <li><p>Count, on each path, the fields that may be missing:</p>
+      \[ D_{\max} = \#\ \text{optional or repeated fields} \]
+      <p>DocId is required: 0. Links is optional and Backward repeated: 2; Forward too. A value must say how deep its path is defined.</p></li>
+    <li><p>Count only the repeated fields:</p>
+      \[ R_{\max} = \#\ \text{repeated fields} \]
+      <p>0 for DocId, 1 for each list: with one repeated field on the path, R is 0 or 1.</p></li>
+    <li><p>Shred <code>DocId: 20</code>: a required value at the start of a record gives (20, R 0, D 0).</p></li>
+    <li><p>Shred <code>Backward: 10, 30</code>. The first value starts the record's list (R 0) with Links and Backward present (D 2): (10, 0, 2). The second continues the list at Backward, the first repeated field: (30, 1, 2).</p></li>
+    <li><p>Shred <code>Forward: 80</code>, the record's first Forward: (80, 0, 2). These are the four rows of p. 1253; with maxima 1 and 2, bit packing stores R in 1 bit and D in 2.</p></li>
+    <li><p>Not on the slide, same rules: a record without Links stores NULL in both Links columns with R 0, D 0 — the path stops before Links. R = 0 tells the assembler a new record begins, so it rebuilds the record exactly.</p></li>
+  </ol>
+
+  <p class="memo"><mark class="key">Parquet skips at three levels — column chunks, row groups, pages — and turns nesting into two tiny integers per value.</mark></p>
+</section>
+
+<section id="l40-beyond">
+  <h2>Beyond queries: extensions, JSON, pipelines, speed</h2>
+
+  <p>Two "Extensions" complete the design (p. 1284). A new data source "must implement a createRelation function that takes a set of key-value params and returns a BaseRelation object" — "E.g. CSV, Avro, Parquet, JDBC". A <mark class="key">user-defined type</mark> (UDT) maps "user-defined types to structures composed of Catalyst's built-in types": <code>PointUDT</code> stores a Point as a struct of two doubles, x and y, with <code>serialize</code> and <code>deserialize</code>. Catalyst never needs to understand a Point, only the struct.</p>
+
+  <h3>Schema inference for JSON</h3>
+
+  <p>JSON carries no schema, yet Spark SQL "automatically infers schema from a set of records, in one pass or sample" (p. 1285). Each record yields "a tree of STRUCT types"; each field gets "the most appropriate type … based on all data observed in that column"; the per-record schemas are merged "in one reduce operation" — possible because merging schemas is associative, like the (sum, count) pairs. The slide's three tweets:</p>
+
+  <figure class="tbl-fig" id="l40-tbl-json">
+    <figcaption>The three records of p. 1285 and the schema the slide prints for them.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Field</th><th>Record 1</th><th>Record 2</th><th>Record 3</th><th>Inferred (p. 1285)</th></tr></thead>
+        <tbody>
+          <tr><td><code>text</code></td><td>a string</td><td>a string</td><td>a string</td><td><code>STRING NOT NULL</code></td></tr>
+          <tr><td><code>tags</code></td><td><code>["#Spark"]</code></td><td><code>[]</code></td><td><code>["#tweet", "#location"]</code></td><td><code>ARRAY&lt;STRING NOT NULL&gt; NOT NULL</code></td></tr>
+          <tr class="is-key"><td><code>loc.lat</code></td><td class="num">45.1</td><td class="num">39</td><td>no <code>loc</code></td><td><code>FLOAT NOT NULL</code> inside <code>loc</code></td></tr>
+          <tr class="is-key"><td><code>loc.long</code></td><td class="num">90</td><td class="num">88.5</td><td>no <code>loc</code></td><td><code>FLOAT NOT NULL</code> inside <code>loc</code></td></tr>
+          <tr><td><code>loc</code></td><td>present</td><td>present</td><td>missing</td><td><code>STRUCT&lt;lat …, long …&gt;</code>, nullable</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>An integer in one record and a fraction in another make FLOAT, the most specific type holding both; <code>loc</code> is missing from record 3, so it gets no NOT NULL. Spark 4.2 reads the same records as <code>struct&lt;lat: double, long: double&gt;</code>, every field nullable (executed): the slide's reasoning, newer type names. "Same trick for Python typing" is the data sampling of p. 1274, and all of it is the schema-on-read of <a href="l04.html#l04-shift">lesson 4</a>.</p>
+
+  <h3>ML pipelines speak DataFrame</h3>
+
+  <p>Page 1286, repeated on p. 1288, chains three stages of Spark's machine-learning library, MLlib (quotes straightened):</p>
+
+<pre><code>from pyspark.ml import Pipeline
+from pyspark.ml.feature import Tokenizer, HashingTF
+from pyspark.ml.classification import LogisticRegression
+
+tokenizer = Tokenizer(inputCol="text", outputCol="words")
+hashingTF = HashingTF(inputCol="words", outputCol="features")
+lr = LogisticRegression(maxIter=10, regParam=0.01)
+pipeline = Pipeline(stages=[tokenizer, hashingTF, lr])
+# df: a "text" and a "label" column; returns a PipelineModel
+model = pipeline.fit(df)</code></pre>
+
+  <figure class="fig fig--plain" id="l40-fig-mllib">
+    <svg class="dia" viewBox="0 0 560 430" role="img" aria-label="The pipeline from top to bottom: dataset ds0, tokenizer, ds1, hashingTF, ds2, lr.model, ds3. To the left of each dataset, the column it adds. lr sits outside on the right: it is fitted on ds2 and produces lr.model. A dotted box called Pipeline Model encloses tokenizer, ds1, hashingTF, ds2 and lr.model.">
+      <rect x="24" y="68" width="300" height="300" rx="8" class="st-muted sw-2 dots"/>
+      <text x="336" y="88" class="tx-sm tx-muted">Pipeline Model</text>
+      <line x1="200" y1="52" x2="200" y2="76" marker-end="url(#arr)"/>
+      <line x1="200" y1="110" x2="200" y2="128" marker-end="url(#arr)"/>
+      <line x1="200" y1="172" x2="200" y2="196" marker-end="url(#arr)"/>
+      <line x1="200" y1="230" x2="200" y2="248" marker-end="url(#arr)"/>
+      <line x1="200" y1="292" x2="200" y2="316" marker-end="url(#arr)"/>
+      <line x1="200" y1="350" x2="200" y2="374" marker-end="url(#arr)"/>
+      <path d="M232 266 L 370 266" class="sw-2 dash" marker-end="url(#arr)"/>
+      <path d="M430 284 C 430 330, 330 334, 264 334" class="sw-2 dash" marker-end="url(#arr)"/>
+      <path d="M168 14 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="14" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="42" class="tx-mid">ds0</text>
+      <text x="156" y="38" class="tx-end tx-mono tx-sm">text, label</text>
+      <rect x="140" y="78" width="120" height="32" rx="4" class="fi-paper sw-2"/>
+      <text x="200" y="100" class="tx-mid tx-mono">tokenizer</text>
+      <path d="M168 136 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="136" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="164" class="tx-mid">ds1</text>
+      <text x="156" y="160" class="tx-end tx-mono tx-sm">+ words</text>
+      <rect x="140" y="198" width="120" height="32" rx="4" class="fi-paper sw-2"/>
+      <text x="200" y="220" class="tx-mid tx-mono">hashingTF</text>
+      <path d="M168 256 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="256" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="284" class="tx-mid">ds2</text>
+      <text x="156" y="280" class="tx-end tx-mono tx-sm">+ features</text>
+      <rect x="374" y="250" width="112" height="32" rx="4" class="fi-paper sw-2 dash"/>
+      <text x="430" y="272" class="tx-mid tx-mono">lr</text>
+      <text x="300" y="256" class="tx-mid tx-sm halo">fit</text>
+      <text x="380" y="314" class="tx-sm halo">produces</text>
+      <rect x="140" y="318" width="120" height="32" rx="4" class="fi-paper sw-2"/>
+      <text x="200" y="340" class="tx-mid tx-mono">lr.model</text>
+      <path d="M168 382 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="382" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="410" class="tx-mid">ds3</text>
+      <text x="156" y="406" class="tx-end tx-mono tx-sm">+ prediction</text>
+    </svg>
+    <figcaption><b>Fig. 7.</b> The pipeline of p. 1286, drawn top to bottom. Every stage returns its input DataFrame with one more column (left; executed, ds3 actually gains rawPrediction, probability and prediction). The estimator <code>lr</code> is fitted on ds2 and produces <code>lr.model</code>; the fitted Pipeline Model (dotted) holds only transformers.</figcaption>
+  </figure>
+
+  <p><code>tokenizer</code> and <code>hashingTF</code> only transform; <code>lr</code> is an estimator, whose <code>fit</code> on ds2 produces the transformer <code>lr.model</code>. That is why <code>lr</code> sits outside the dotted "Pipeline Model" box and <code>lr.model</code> inside (executed). If you have used scikit-learn pipelines, <code>fit</code> and <code>transform</code> mean the same here.</p>
+
+  <h3>The twelve times, explained</h3>
+
+  <p>Page 1287 measures the promises (Fig. 8).</p>
+
+  <figure class="fig fig--plain" id="l40-fig-perf">
+    <svg class="dia" viewBox="0 0 560 282" role="img" aria-label="Two bar charts. Above, an aggregation: Python API about 180 seconds, Scala API about 28, DataFrame about 15. Below, a filter followed by a word count: SQL plus Spark about 565 plus 325 seconds, one DataFrame job about 405.">
+      <text x="10" y="16" class="tx-sm tx-bold">An aggregation (left chart), seconds</text>
+      <rect x="132" y="28" width="360" height="22" class="fw-s4 st-s4 sw-2"/>
+      <rect x="132" y="58" width="56" height="22" class="fw-s4 st-s4 sw-2"/>
+      <rect x="132" y="88" width="30" height="22" class="fw-s5 st-s5 sw-2"/>
+      <text x="124" y="44" class="tx-end">Python API</text>
+      <text x="124" y="74" class="tx-end">Scala API</text>
+      <text x="124" y="104" class="tx-end">DataFrame</text>
+      <text x="484" y="44" class="tx-end tx-sm">≈ 180</text>
+      <text x="196" y="74" class="tx-sm">≈ 28</text>
+      <text x="170" y="104" class="tx-sm">≈ 15</text>
+      <text x="232" y="106" class="tx-hand">12 times less</text>
+      <line x1="132" y1="120" x2="532" y2="120" class="st-muted"/>
+      <text x="132" y="140" class="tx-mid tx-sm tx-muted">0</text>
+      <text x="232" y="140" class="tx-mid tx-sm tx-muted">50</text>
+      <text x="332" y="140" class="tx-mid tx-sm tx-muted">100</text>
+      <text x="432" y="140" class="tx-mid tx-sm tx-muted">150</text>
+      <text x="532" y="140" class="tx-mid tx-sm tx-muted">200</text>
+      <text x="10" y="176" class="tx-sm tx-bold">Filter, then word count (right chart), seconds</text>
+      <rect x="132" y="188" width="226" height="22" class="fw-s4 st-s4 sw-2"/>
+      <rect x="358" y="188" width="130" height="22" class="fw-s4 st-s4 sw-2 dash"/>
+      <rect x="132" y="218" width="162" height="22" class="fw-s5 st-s5 sw-2"/>
+      <text x="124" y="204" class="tx-end">SQL + Spark</text>
+      <text x="124" y="234" class="tx-end">DataFrame</text>
+      <text x="245" y="204" class="tx-mid tx-sm">filter ≈ 565</text>
+      <text x="423" y="204" class="tx-mid tx-sm">count ≈ 325</text>
+      <text x="302" y="234" class="tx-sm">≈ 405</text>
+      <text x="368" y="238" class="tx-hand">2 times less</text>
+      <line x1="132" y1="250" x2="532" y2="250" class="st-muted"/>
+      <text x="132" y="270" class="tx-mid tx-sm tx-muted">0</text>
+      <text x="212" y="270" class="tx-mid tx-sm tx-muted">200</text>
+      <text x="292" y="270" class="tx-mid tx-sm tx-muted">400</text>
+      <text x="372" y="270" class="tx-mid tx-sm tx-muted">600</text>
+      <text x="452" y="270" class="tx-mid tx-sm tx-muted">800</text>
+      <text x="532" y="270" class="tx-mid tx-sm tx-muted">1000</text>
+    </svg>
+    <figcaption><b>Fig. 8.</b> The two charts of p. 1287 (Figures 9 and 10 of the Spark SQL paper), redrawn. The slide prints no numbers: every value is read off its bars. Teal: hand-written RDD code, or an SQL query followed by a separate Spark job (solid: filter, dashed: word count); magenta: the DataFrame.</figcaption>
+  </figure>
+
+  <p>Back to the opening puzzle. Lambdas are black boxes that Spark can only call, row by row, in a Python process; the one-liner is a tree it can read, and that gives three answers. Catalyst can rewrite it. Only the plan is built in Python and the work runs as JVM bytecode: the paper credits this for the 12×, and code generation, which "avoids expensive allocation of key-value pairs", for the 2× over Scala. And the plan names its columns and filters, so the data source can be asked for less: with Parquet, only the needed column chunks and row groups leave the disk — the answer in the file. The right chart adds that one DataFrame job beats an SQL query plus a separate Spark job by about 2×: nothing is saved to HDFS in between (paper).</p>
+
+  <p class="memo"><mark class="key">The DataFrame wins because Spark sees the whole plan: it can rewrite it, compile it and ask the file for less.</mark></p>
+</section>
+
+<section id="l40-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <p>Catalyst, the design of Spark SQL and the file formats are theory: open, multiple-choice and true-or-false questions in 10–15 minutes, where wrong answers may carry a penalty. The practical part's SparkQL exercise wants PySpark DataFrame code ("you are not allowed to use SQL syntax", paper of 30 January 2026); the last question is one in the wording of the past papers, and <a href="l39.html">lesson 39</a> solves the papers' own.</p>
+
+  <div class="exam" data-kind="open" id="l40-exam-phases">
+    <div class="exam-q" lang="en">
+      <p>Describe the phases of query optimization in Spark SQL's Catalyst, from a query written as SQL or with the DataFrame API to the RDDs that execute it. Which phase uses a cost model, and for what?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>An SQL string (parsed into an AST) and a DataFrame both produce an unresolved logical plan: the same pipeline serves both. Analysis resolves it with the catalog — it looks up relations by name, maps named attributes to the inputs of each operator, gives each attribute a unique id and propagates and coerces types — and yields a logical plan. Logical optimization applies rule-based rewrites such as constant folding, predicate pushdown, projection pruning, null propagation and boolean expression simplification, producing an optimized logical plan. Physical planning generates one or more physical plans made of Spark operators, and a cost model selects one (for example the join algorithm: a broadcast join for a small table). Code generation finally compiles the selected plan, using Scala quasiquotes, into code that runs as RDD operations. Only physical planning is cost-based; the other phases apply rules.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer gives the four phases in order, what goes in and comes out of each, the catalog in analysis and the cost model only in physical planning. Name a few rules of logical optimization too: they are the easiest part to leave out.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-unresolved">
+    <div class="exam-q" lang="en">
+      <p>What is an unresolved attribute in Spark SQL? Using the query <code>SELECT col FROM sales</code>, explain what the analyzer does, and what happens when <code>sales</code> has no column <code>col</code>.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>An attribute is unresolved if its type is not known or it is not matched to an input table. After parsing, <code>col</code> is only a name and <code>sales</code> an unresolved relation. The analyzer looks up <code>sales</code> by name in the catalog, matches <code>col</code> to one of its columns, gives it a unique id so that every reference to the same value is recognised, and propagates and coerces types through expressions (in <code>1 + col</code> the literal is cast to the type of <code>col</code>). If <code>sales</code> has no column <code>col</code>, analysis fails at once with an error, before any data is read: the logical plan is analyzed eagerly, even though the query is executed lazily.</p>
+      </div>
+      <div class="exam-note"><p>The core is the definition in the slide's words and the catalog lookup. "Eager analysis, lazy execution" shows that you understand why the error comes early.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l40-exam-rules">
+    <div class="exam-q" lang="en">
+      <p>Which of the following are rule-based optimizations of Catalyst's logical optimization phase, as listed in the lecture? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Constant folding <span class="fb">Listed on p. 1280; the rule of p. 1276 turns x + (1 + 2) into x + 3.</span></li>
+      <li data-correct>Predicate pushdown <span class="fb">Listed on p. 1280: a filter moves towards the data, below projections and joins.</span></li>
+      <li data-correct>Projection pruning <span class="fb">Listed on p. 1280: only the columns used above are kept.</span></li>
+      <li>Choosing a broadcast join because a table is small <span class="fb">That choice belongs to physical planning, where the cost model selects among physical plans.</span></li>
+      <li data-correct>Null propagation <span class="fb">Listed on p. 1280 among the standard rules.</span></li>
+      <li>Generating Java bytecode with quasiquotes <span class="fb">That is the last phase, code generation (p. 1283), not logical optimization.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Constant folding, predicate pushdown, projection pruning and null propagation (with boolean expression simplification, the list of p. 1280). The join algorithm is chosen in physical planning by the cost model; bytecode is produced by code generation.</p></div>
+      <div class="exam-note"><p>The distractors are real Catalyst work, done in another phase. Wrong answers may carry a penalty, so the phase of each optimization is what to know for sure.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l40-exam-lazy">
+    <div class="exam-q" lang="en">
+      <p>True or false: because DataFrames are evaluated lazily, a reference to a column that does not exist is reported only when an action such as <code>show()</code> or <code>collect()</code> runs.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Execution is lazy, but the logical plan is analyzed eagerly (p. 1273): a wrong column name fails when the line is written.</span></li>
+      <li data-correct>False <span class="fb">"Logical plan analyzed eagerly → identify code errors associated with data schema issues on the fly" (p. 1273).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. Spark SQL analyzes the logical plan eagerly: column names and types are checked against the catalog as soon as the DataFrame operation is defined, while the data is processed only when an action runs.</p></div>
+      <div class="exam-note"><p>The trap is to stretch "lazy" from execution to analysis. Analysis needs only metadata, so it is cheap to do at once.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-parquet">
+    <div class="exam-q" lang="en">
+      <p>Describe the internal structure of a Parquet file and explain how it lets a query that needs two columns and a filter read less data than a row-oriented format such as Avro.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A Parquet file is a sequence of row groups followed by a footer, with the magic number PAR1 at both ends. A row group holds a set of rows in columnar format (parquet.block.size, 128 MB by default) and never straddles two HDFS blocks; inside it each column is stored contiguously as a column chunk, and each column chunk is divided into pages, the unit of access, encoding and compression (1 MB by default). The footer stores the schema and, for every row group and column chunk, its offset, size, encodings, codec and statistics such as min and max. A reader reads the footer first. With projection pushdown it reads only the column chunks of the two requested columns. With predicate pushdown it uses the footer statistics and the dictionary pages to skip row groups that cannot contain matching rows, and page statistics to skip pages. Avro stores whole records one after another, so the same query must read every byte of every record.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer has the hierarchy (row group, column chunk, page), the footer's content and both kinds of pushdown, each tied to the structure that makes it possible.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-levels">
+    <div class="exam-q" lang="en">
+      <p>Consider the Parquet schema <code>message Document { required int64 DocId; optional group Links { repeated int64 Backward; repeated int64 Forward; } }</code>.</p>
+      <p>(a) Give the maximum repetition and definition levels of each column. (b) Shred the record <code>DocId: 10, Links { Forward: 20, Forward: 40, Forward: 60 }</code>, which has no Backward value, into (value, R, D) triples.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) DocId: max R 0, max D 0 (required, nothing optional or repeated on its path). Links.Backward and Links.Forward: max R 1 (one repeated field on the path), max D 2 (Links is optional, the field itself repeated).</p>
+        <p>(b) DocId: (10, 0, 0). Links.Backward: (NULL, 0, 1) — Links is present but Backward is not, so one of the two fields of the path is defined; R 0 because the value belongs to a new record. Links.Forward: (20, 0, 2), (40, 1, 2), (60, 1, 2) — the first value starts the record's list, the next two repeat at level 1, and both Links and Forward are defined.</p>
+      </div>
+      <div class="exam-note"><p>The slide's record (p. 1253) has a Backward list; this one does not, and the NULL with D = 1 is the point of the exercise. Max D counts optional and repeated fields, max R only repeated ones.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-spark">
+    <div class="exam-q" lang="en">
+      <p>Consider the following ER scenario: a city app tracks its Users (User_ID, Name, Age, City) and the Events they generate (Event_ID, Timestamp, Kind). Each user generates zero or more events (0,N); each event is generated by exactly one user (1,1). Consider the following Users and Events tables.</p>
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th>User_ID</th><th>Name</th><th>Age</th><th>City</th></tr></thead>
+          <tbody>
+            <tr><td>U1</td><td>Ada</td><td class="num">31</td><td>Melbourne</td></tr>
+            <tr><td>U2</td><td>Bob</td><td class="num">24</td><td>Sydney</td></tr>
+            <tr><td>…</td><td>…</td><td>…</td><td>…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th>Event_ID</th><th>User_ID</th><th>Timestamp</th><th>Kind</th></tr></thead>
+          <tbody>
+            <tr><td>E1</td><td>U1</td><td>2026-03-01 09:12</td><td>click</td></tr>
+            <tr><td>E2</td><td>U2</td><td>2026-03-01 09:15</td><td>view</td></tr>
+            <tr><td>…</td><td>…</td><td>…</td><td>…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>(a) Write a SparkQL query to compute the average age of the users of each city.</p>
+      <p>(b) Write a SparkQL query to return the timestamps of the "click" events generated by users living in Melbourne.</p>
+      <p>(c) Write a SparkQL query to compute the total number of events for each city, returning only the cities whose total is greater than 2.</p>
+      <p>Note that you are not allowed to use SQL syntax. Use PySpark instead.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.appName("SMBUD").getOrCreate()
+# users and events: DataFrames with the columns of the two tables
+
+# (a) average age per city
+users.groupBy("City").agg(F.avg("Age").alias("Avg_Age")).show()
+
+# (b) timestamps of the clicks of users living in Melbourne
+(events.join(users, "User_ID")
+       .filter((F.col("City") == "Melbourne")
+               &amp; (F.col("Kind") == "click"))
+       .select("Timestamp")
+       .show())
+
+# (c) events per city, only cities above 2 (the HAVING)
+(events.join(users, "User_ID")
+       .groupBy("City")
+       .agg(F.count("Event_ID").alias("N_Events"))
+       .filter(F.col("N_Events") &gt; 2)
+       .show())</code></pre>
+        <p>Executed on four users (U1 Ada 31 and U3 Eva 27 in Melbourne, U2 Bob 24 in Sydney, U4 Ugo 45 in Perth) and seven events (E1 U1 click 2026-03-01 09:12, E2 U2 view, E3 U1 purchase, E4 U3 click 2026-03-02 18:05, E5 U2 click, E6 U3 view, E7 U4 click): (a) Melbourne 29.0, Perth 45.0, Sydney 24.0; (b) 2026-03-01 09:12 and 2026-03-02 18:05; (c) Melbourne 4.</p>
+      </div>
+      <div class="exam-note"><p>What to get right: the join on the key column's name, <code>join(users, "User_ID")</code>, which keeps one <code>User_ID</code> column; each comparison in parentheses combined with <code>&amp;</code>, <code>groupBy</code> with <code>agg</code>, and the HAVING as a <code>filter</code> on the aggregate's alias. In (b) it does not matter whether you filter before or after the join: Catalyst pushes both conditions below it, as the widget of this lesson shows.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l40-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">You move <code>.where(users.city == "Melbourne")</code> from after the join to before it. What happens to the optimised plan?</p>
+    <ul class="options">
+      <li data-correct>Nothing: it is the same plan <span class="fb">Catalyst pushes the filter below the join either way; the widget showed identical optimised and physical plans.</span></li>
+      <li>It gets faster, because the filter now runs first <span class="fb">It runs first in both cases: predicate pushdown already moved it there.</span></li>
+      <li>It gets slower, because the join loses rows it needs <span class="fb">The filter removes only rows that the query would drop anyway; the result is the same.</span></li>
+      <li>It fails, because <code>users</code> has no timestamp <span class="fb">The timestamp comes from <code>events</code>; filtering <code>users</code> first is perfectly valid.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A Parquet file has 10 equally large columns in 8 row groups. A query needs 2 columns, and the footer statistics prove that only 2 row groups can hold matching rows. Roughly what share of the file is read?</p>
+    <ul class="options">
+      <li data-correct>5 % <span class="fb">The two skips multiply: 2/10 of the columns times 2/8 of the row groups is 1/20.</span></li>
+      <li>20 % <span class="fb">That counts only the column projection and forgets the skipped row groups.</span></li>
+      <li>25 % <span class="fb">That counts only the row groups and forgets that 8 of the 10 columns are not read.</span></li>
+      <li>45 % <span class="fb">The two savings do not add up; they multiply.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can Spark not move the filter of <code>rdd.map(f).filter(g)</code> below the <code>map</code>, as Catalyst does with a DataFrame?</p>
+    <ul class="options">
+      <li data-correct>f and g are opaque functions: Spark cannot see which fields they read or write <span class="fb">Pushdown needs to know that the filter does not depend on what the map computes; a lambda does not tell.</span></li>
+      <li>Because RDDs are immutable <span class="fb">DataFrames are immutable too, and Catalyst rewrites their plans all the time.</span></li>
+      <li>Because RDD operations are evaluated eagerly <span class="fb">RDD transformations are lazy as well; laziness is not the obstacle.</span></li>
+      <li>Because Catalyst works only on Scala code <span class="fb">Catalyst optimizes Python DataFrame code too; only the plan is built in Python.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about the footer of a Parquet file are true?</p>
+    <ul class="options">
+      <li data-correct>It is written after all the row groups <span class="fb">The writer streams the row groups out and appends the footer last, in one pass.</span></li>
+      <li data-correct>It holds the schema and, for each column chunk, its offset and statistics <span class="fb">"A footer contains column chunks offset and schema" (p. 1252); the statistics are the "footer stats" of p. 1257.</span></li>
+      <li data-correct>A reader reads it before any column chunk <span class="fb">It needs the offsets to jump to the chunks, and the statistics to skip row groups.</span></li>
+      <li>It keeps a copy of the first row group for quick previews <span class="fb">The footer holds metadata only, no data.</span></li>
+      <li>It sits at the end because HDFS cannot read files from the start <span class="fb">HDFS reads from any offset; the reason is single-pass writing.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Same schema as p. 1253. A record has <code>DocId: 7</code> and no Links at all. What does the column <code>Links.Backward</code> store for it?</p>
+    <ul class="options">
+      <li data-correct>NULL with R = 0 and D = 0 <span class="fb">Nothing on the path is defined, so D = 0; the value belongs to a new record, so R = 0.</span></li>
+      <li>Nothing at all <span class="fb">Then a reader could not tell where one record ends in this column: every record leaves a trace in every column.</span></li>
+      <li>NULL with R = 0 and D = 1 <span class="fb">D = 1 would mean that Links is present and only Backward is missing.</span></li>
+      <li>NULL with R = 1 and D = 2 <span class="fb">D = 2 means a real Backward value, and R = 1 a continued list: neither is the case.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A column chunk of <code>city</code> has the dictionary {Como, Lecco, Milano}; its statistics are min Como, max Milano. Which filter lets the reader skip the row group thanks to the dictionary, although min/max alone would not?</p>
+    <ul class="options">
+      <li data-correct><code>city == "Lodi"</code> <span class="fb">Lodi lies between Como and Milano, so min/max says "maybe"; the dictionary says it is not there.</span></li>
+      <li><code>city == "Monza"</code> <span class="fb">Monza comes after Milano: min/max alone already skips the row group.</span></li>
+      <li><code>city == "Lecco"</code> <span class="fb">Lecco is in the dictionary: the row group must be read.</span></li>
+      <li><code>city &gt; "Bari"</code> <span class="fb">Every value of the chunk is after Bari: nothing can be skipped.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">In the MLlib pipeline of p. 1286, which objects end up inside the fitted PipelineModel?</p>
+    <ul class="options">
+      <li data-correct><code>tokenizer</code> <span class="fb">A transformer: it is used as it is.</span></li>
+      <li data-correct><code>hashingTF</code> <span class="fb">A transformer too.</span></li>
+      <li data-correct><code>lr.model</code> <span class="fb">The transformer that <code>lr.fit</code> produced on ds2.</span></li>
+      <li><code>lr</code> <span class="fb">The estimator is used once, by fit; that is why the slide draws it outside the dotted box.</span></li>
+      <li><code>ds0</code> <span class="fb">The input data is not a stage of the model.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l40-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Spark SQL "is about more than SQL": one DataFrame API and one optimizer, Catalyst, behind SQL strings and DataFrame code alike, executed on RDDs; it removed Shark's limits (Hive catalog only, SQL strings only, a MapReduce-era optimizer).</li>
+    <li>Declarative code is shorter and checkable: <code>agg(F.avg("age"))</code> instead of hand-carried (sum, count) pairs, and eager analysis reports a wrong column before any data moves.</li>
+    <li>Catalyst rewrites trees with pattern-matching rules to a fixed point, in four phases: analysis with the catalog, rule-based logical optimization, physical planning with a cost model, code generation with quasiquotes.</li>
+    <li>Predicate pushdown and projection pruning move filters towards the data and drop unused columns, down into a data source's <code>buildScan(requiredColumns, filters)</code>.</li>
+    <li>Avro stores whole records with the JSON schema in the header and sync markers for splitting; Parquet stores column chunks inside row groups, indexes them in the footer, and reads only the columns, row groups and pages a query needs.</li>
+    <li>Encodings (delta, prefix, dictionary, RLE, bit packing) shrink columns, and definition and repetition levels store nested data as flat columns.</li>
+    <li>Extensions, JSON schema inference by one reduce and MLlib pipelines all build on the DataFrame; on p. 1287 a DataFrame aggregation runs about 12 times faster than Python RDD code.</li>
+  </ul>
+  <aside class="cheat" id="l40-cheat">
+    <dl>
+      <dt>Spark SQL's promises</dt><dd>write less code · read less data · let the optimizer do the hard work (p. 1264)</dd>
+      <dt>Average per group</dt><dd><code>df.groupBy("name").agg(F.avg("age"))</code></dd>
+      <dt>Average with RDDs</dt><dd>carry (sum, count) pairs: \((s_1, c_1) \oplus (s_2, c_2)\) adds both parts</dd>
+      <dt>Catalyst phases</dt><dd>analysis (catalog) → logical optimization (rules) → physical planning (cost model) → code generation (quasiquotes)</dd>
+      <dt>Unresolved attribute</dt><dd>type not known, or not matched to an input table</dd>
+      <dt>Constant folding</dt><dd><code>case Add(Literal(c1), Literal(c2)) => Literal(c1+c2)</code></dd>
+      <dt>Predicate pushdown</dt><dd>move a filter towards the data: below projections and joins, into the scan</dd>
+      <dt>Projection pruning</dt><dd>read and carry only the columns used above</dd>
+      <dt>Data source scan</dt><dd><code>buildScan(requiredColumns, filters): RDD[Row]</code></dd>
+      <dt>Avro</dt><dd>row-oriented binary; JSON schema in the header; sync markers make it splittable; schema evolution</dd>
+      <dt>Parquet units</dt><dd>file ⊃ row group (128 MB) ⊃ column chunk ⊃ page (1 MB); footer: schema, offsets, statistics</dd>
+      <dt>Bytes read</dt><dd>\(\approx \frac{c'}{c} \cdot \frac{g'}{g}\) of the file (columns and row groups read)</dd>
+      <dt>Max levels</dt><dd>D: optional or repeated fields on the path; R: repeated fields only</dd>
+      <dt>Bits for a level of maximum m</dt><dd>\(\lceil \log_2(m+1) \rceil\)</dd>
+      <dt>Encodings</dt><dd>delta (timestamps), prefix (strings), dictionary (&lt; 50,000 values), RLE + bit packing (levels, keys)</dd>
+      <dt>JSON inference</dt><dd>most specific common type per field; schemas merged in one reduce</dd>
+      <dt>MLlib</dt><dd>transformer: <code>transform</code>; estimator: <code>fit</code> → model; <code>Pipeline.fit</code> → PipelineModel</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l40-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.databricks.com/blog/2015/04/13/deep-dive-into-spark-sqls-catalyst-optimizer.html" target="_blank" rel="noopener">Deep Dive into Spark SQL's Catalyst Optimizer</a>
+      <span class="res-by">Armbrust, Huai, Lian, Xin, Zaharia · Databricks blog, 2015</span>
+      <p class="res-why">The friendly version of the slides' Catalyst pages, with the same x + (1 + 2) tree and the same four phases. Read it next to the second section.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://parquet.apache.org/docs/file-format/" target="_blank" rel="noopener">Parquet documentation: File Format</a>
+      <span class="res-by">Apache Parquet</span>
+      <p class="res-why">The canonical layout picture — PAR1, row groups, column chunks, pages, footer — that p. 1252 copies. Its "Nested Encoding" page defines the two levels in one paragraph each.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://parquet-viewer.xiangpeng.systems/" target="_blank" rel="noopener">Parquet Viewer</a>
+      <span class="res-by">Xiangpeng Hao</span>
+      <p class="res-why">Drop any .parquet file into the browser and see its real row groups, column chunks, encodings and min/max statistics: the widget of this lesson on a file of your own.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf" target="_blank" rel="noopener">Spark SQL: Relational Data Processing in Spark</a>
+      <span class="res-by">Armbrust et al. · SIGMOD 2015</span>
+      <p class="res-why">The paper behind pp. 1262–1287: sections 3 and 4 for the API and Catalyst, section 6.2–6.3 for the two charts of the opening puzzle.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://arrow.apache.org/blog/2022/12/26/querying-parquet-with-millisecond-latency/" target="_blank" rel="noopener">Querying Parquet with Millisecond Latency</a>
+      <span class="res-by">Raphael Taylor-Davies, Andrew Lamb · Apache Arrow blog, 2022</span>
+      <p class="res-why">The three pruning levels of p. 1257 — column chunks, row groups with footer statistics, pages with the page index — explained precisely, with ASCII diagrams.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Here the lecture decks end: p. 1289 points to spark.apache.org, and p. 1290 says "Thanks". What stays is a habit for every system of this course: before you write a query, ask what the engine can see of it — a plan it can rewrite, a schema it can check, a file it can skip.</p>
+  <a class="bridge-link" href="index.html">Back to the course map</a>
+</aside>
+
+</main>
+</body>
+</html>

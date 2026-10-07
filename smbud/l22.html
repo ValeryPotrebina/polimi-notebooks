@@ -1,0 +1,1374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Inside Cassandra: ring, gossip, replicas, quorums; HBase · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l22">
+
+<header class="lesson-head">
+  <h1>Inside Cassandra: ring, gossip, replicas, quorums; HBase</h1>
+  <p class="lede">After this lesson you will trace a key from its hash to the nodes that hold its copies, follow a write and a read inside a Cassandra node, tell which consistency levels guarantee a fresh read, and say what HBase does differently.</p>
+</header>
+
+<div class="hook" data-label="Two puzzles">
+  <p>The slide "Vs. SQL" (p. 459) prints four numbers, measured "On &gt; 50 GB data". MySQL: writes 300 ms, reads 350 ms on average — about the same. Cassandra: writes 0.12 ms, reads 15 ms. Cassandra writes 125 times faster than it reads. What did it give up to make writing so cheap?</p>
+  <p>The second puzzle comes from the company that built Cassandra. In November 2010 Facebook chose HBase, not Cassandra, for its new Messages system: "We found Cassandra's eventual consistency model to be a difficult pattern to reconcile for our new Messages infrastructure" (Facebook Engineering). Yet HBase writes with the same machinery — a log, a table in memory, sorted files on disk. Where does the different consistency come from?</p>
+  <p>Keep both questions. Section 3 answers the first, section 5 the second.</p>
+</div>
+
+
+<section id="l22-ring">
+  <h2>Where a key lives: the hash ring</h2>
+
+  <p>Take the paper of 12 Sep 2025: its farmers' sales, "large-scale, continuously increasing", go to Cassandra, to be queried "by market location or product name". Partition them by market location: every Milano sale lands in the partition 'Milano'. Eight machines hold them as equals: "NO MASTER", "NO SLAVE", "PEER TO PEER" (p. 440). So who answers p. 439, "How do you decide which server(s) a key-value resides on?"</p>
+
+  <p>Every node, alone, with the same arithmetic. The <mark class="key">partitioner</mark> turns the key into a number, its <mark class="key">token</mark>: "system will use MD5(key) to distribute data across nodes" (p. 457). Tokens lie on a circle; each node owns one token, and a key belongs to the first node clockwise from its own token. The <mark class="key">replication factor</mark> N counts the copies, and the Simple Strategy places the other N − 1 by "Clockwise placement to the next node(s)" (p. 442). A client may send a request to any node, which becomes that request's <mark class="key">coordinator</mark> (p. 443).</p>
+
+  <p>Why a circle, and not the hash modulo the number of nodes? With modulo 8, a ninth machine changes the remainder of almost every key: nearly all the data moves. On the ring a new node takes one arc from one neighbour. That is <mark class="key">consistent hashing</mark> (background: the slides draw the ring without naming it).</p>
+
+  <div class="widget" id="l22-w-ring">
+    <h3 class="widget-title">The ring: who owns a key, and what moves when a node joins</h3>
+    <p class="widget-intro">Twelve market locations are hashed onto a ring of tokens 0–99, read clockwise from the top. Nodes join in the order A1, B1, A2, B2, A3, B3, A4, B4; a node's letter is its rack. Pick a key: the nodes holding its copies are filled, and the arc walks clockwise from the key to them. Keys that changed node at the last change of the ring are highlighted.</p>
+    <ol class="tasks">
+      <li>Keep N = 1 and 3 nodes. Predict how many of the 12 keys change node when a fourth node joins. Then move "nodes in the ring" to 4, and compare with the readout "same change with hash mod n".
+        <details class="answer"><summary>What you should see</summary>
+          <p>Four keys — Varese, Como, Cremona, Mantova — and all four come from A1. B2 (token 81) lands on the arc A1 owned, from A2's token 56 round to A1's 6, and takes the part up to 81. With hash mod n, 11 of the 12 keys would change node. That is the insight of the widget: a joining node takes one arc from one neighbour, and nothing else moves.</p></details>
+      </li>
+      <li>Go to 8 nodes, then back to 7. Which keys move now, and where to?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Removing B4 (token 93) moves only its own key, Padova (87), to B4's clockwise neighbour A1. Leaving is the same move backwards: the next node clockwise inherits the arc.</p></details>
+      </li>
+      <li>Set 8 nodes, N = 3 and the key Varese. Which racks hold its three copies? Predict what the Network Topology Strategy changes, then switch it on.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Varese (token 62) belongs to B3; the Simple Strategy adds the next two nodes clockwise, B2 and B4 — all three in rack B, so one rack failure loses the key. With the toggle on, two racks must share three copies: the walk keeps B3 and the first repeat it meets, B2, then skips B4 and continues to A1, the first node of rack A. A rack failure now leaves at least one copy.</p></details>
+      </li>
+      <li>Set 3 nodes and N = 3. How much of the data does each node hold? Why does p. 458 ask for "&gt;= three servers"?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Every node holds every key: three copies need three different machines. With more nodes, each holds about 3/n of the keys — the reason a ring scales out.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l22-w-ring', function (root, ui) {
+    function fnv(s) { var h = 0x811c9dc5; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; }
+    function fmix(h) { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16; return h >>> 0; }
+    var KEYS = ['Milano', 'Treviso', 'Ravenna', 'Monza', 'Novara', 'Lodi', 'Varese', 'Como', 'Cremona', 'Mantova', 'Padova', 'Rimini'].map(function (name) {
+      var h = fmix(fnv(name));
+      return { name: name, h: h, t: Math.floor(h / 4294967296 * 100) };     // token 0..99
+    });
+    /* the order in which the nodes join; the letter is the rack */
+    var JOIN = [{ id: 'A1', t: 6 }, { id: 'B1', t: 31 }, { id: 'A2', t: 56 }, { id: 'B2', t: 81 },
+                { id: 'A3', t: 19 }, { id: 'B3', t: 68 }, { id: 'A4', t: 43 }, { id: 'B4', t: 93 }];
+    function ring(n) { return JOIN.slice(0, n).sort(function (a, b) { return a.t - b.t; }); }
+    function ownerAt(r, t) { for (var i = 0; i < r.length; i++) if (r[i].t >= t) return i; return 0; }
+    function copies(r, t, N, nts) {
+      var start = ownerAt(r, t), want = Math.min(N, r.length), out = [], i, x;
+      if (!nts) { for (i = 0; i < want; i++) out.push(r[(start + i) % r.length]); return out; }
+      /* Network Topology Strategy inside one datacenter: a rack without a copy first; when there are fewer racks
+         than copies, the first nodes met in an already used rack fill the difference */
+      var racks = {}, seen = {}, nr = 0;
+      r.forEach(function (nd) { if (!racks[nd.id[0]]) { racks[nd.id[0]] = true; nr++; } });
+      var repeats = N - nr;
+      for (i = 0; i < r.length && out.length < want; i++) {
+        x = r[(start + i) % r.length];
+        if (!seen[x.id[0]]) { seen[x.id[0]] = true; out.push(x); }
+        else if (repeats > 0) { repeats--; out.push(x); }
+      }
+      return out;
+    }
+
+    var sNodes = ui.slider({ label: 'nodes in the ring', min: 3, max: 8, step: 1, value: 3 });
+    var sN = ui.slider({ label: 'replication factor N', min: 1, max: 3, step: 1, value: 1 });
+    var selKey = ui.select('key (market location)', KEYS.map(function (k) { return k.name; }), null, 'Milano');
+    var tNTS = ui.toggle('Network Topology Strategy: a new rack first', false);
+    var roTok = ui.readout('key → token');
+    var roCop = ui.readout('copies, owner first');
+    var roRack = ui.readout('if one rack fails');
+    var roMove = ui.readout('last change of the ring');
+    var roMod = ui.readout('same change with hash mod n');
+    ui.note('Tokens run from 0 to 99 here, a stand-in for the 128-bit MD5 tokens of the slide. The hash is computed; the node tokens and the market names are chosen for the demo, not taken from the slides.');
+    ui.legend([
+      { label: 'key, hashed onto the ring', color: 's3', mark: 'dot' },
+      { label: 'node with the first copy (owner)', color: 's1', mark: 'square' },
+      { label: 'node with another copy', color: 's1', mark: 'area' },
+      { label: 'clockwise walk to the copies', color: 's1', mark: 'line' },
+      { label: 'key moved by the last change', color: 'ink', mark: 'hl' }
+    ]);
+
+    var CX = 280, CY = 196, R = 136;
+    var svgEl = ui.svg(560, 392, { label: 'A ring of tokens from 0 to 99 with the nodes as squares and the keys as dots; the nodes holding the chosen key are filled and joined to it by a clockwise arc' });
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function P(t, r) { var a = 2 * Math.PI * t / 100; return { x: CX + r * Math.sin(a), y: CY - r * Math.cos(a) }; }
+    function f1(v) { return v.toFixed(1); }
+
+    function draw(st) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      S('circle', { cx: CX, cy: CY, r: R, 'class': 'st-muted dash' });
+      var z0 = P(0, R - 8), z1 = P(0, R + 8), zl = P(0, R - 24);
+      S('line', { x1: f1(z0.x), y1: f1(z0.y), x2: f1(z1.x), y2: f1(z1.y), 'class': 'st-muted' });
+      S('text', { x: f1(zl.x), y: f1(zl.y + 4), 'class': 'tx-sm tx-mid tx-muted', text: '0' });
+      /* the clockwise walk from the key to its last copy */
+      var tk = st.key.t, last = st.cps[st.cps.length - 1].t, span = (last - tk + 100) % 100, RA = 158;
+      var a0 = P(tk, RA), a1 = P(last, RA), c0 = P(tk, R + 6);
+      S('line', { x1: f1(c0.x), y1: f1(c0.y), x2: f1(a0.x), y2: f1(a0.y), 'class': 'st-s1 sw-2' });
+      S('path', { d: 'M' + f1(a0.x) + ',' + f1(a0.y) + ' A' + RA + ',' + RA + ' 0 ' + (span > 50 ? 1 : 0) + ',1 ' + f1(a1.x) + ',' + f1(a1.y), 'class': 'st-s1 sw-3', 'marker-end': 'url(#arr-s1)' });
+      st.moved.forEach(function (k) { var p = P(k.t, R); S('circle', { cx: f1(p.x), cy: f1(p.y), r: 9, 'class': 'hl' }); });
+      st.ring.forEach(function (nd) {
+        var p = P(nd.t, R), idx = st.cps.indexOf(nd);
+        S('rect', { x: f1(p.x - 7), y: f1(p.y - 7), width: 14, height: 14, 'class': idx === 0 ? 'fi-s1 st-s1 sw-2' : idx > 0 ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        var l = P(nd.t, 184);
+        S('text', { x: f1(l.x), y: f1(l.y + 5), 'class': 'tx-sm tx-mid', text: nd.id });
+      });
+      KEYS.forEach(function (k) {
+        var p = P(k.t, R), sel = k === st.key;
+        S('circle', { cx: f1(p.x), cy: f1(p.y), r: sel ? 7 : 5, 'class': sel ? 'fi-s3 sw-2' : 'fi-s3 st-paper sw-1' });
+      });
+      S('text', { x: CX, y: CY - 2, 'class': 'tx-lg tx-mid', text: st.key.name });
+      S('text', { x: CX, y: CY + 22, 'class': 'tx-mono tx-sm tx-mid tx-muted', text: 'token ' + st.key.t });
+    }
+
+    var cur = sNodes.value, prev = sNodes.value;
+    ui.onChange(function () {
+      if (sNodes.value !== cur) { prev = cur; cur = sNodes.value; }
+      var r = ring(cur), key = KEYS.filter(function (k) { return k.name === selKey.value; })[0] || KEYS[0];
+      var cps = copies(r, key.t, sN.value, tNTS.value);
+      var moved = [], movedMod = [];
+      if (prev !== cur) {
+        var a = ring(prev);
+        moved = KEYS.filter(function (k) { return a[ownerAt(a, k.t)].id !== r[ownerAt(r, k.t)].id; });
+        movedMod = KEYS.filter(function (k) { return JOIN[k.h % prev].id !== JOIN[k.h % cur].id; });
+      }
+      roTok.set(key.name + ' → ' + key.t);
+      roCop.set(cps.map(function (nd) { return nd.id; }).join(', '));
+      var byRack = {}, worst = 0, wr = '';
+      cps.forEach(function (nd) { byRack[nd.id[0]] = (byRack[nd.id[0]] || 0) + 1; });
+      Object.keys(byRack).forEach(function (k) { if (byRack[k] > worst) { worst = byRack[k]; wr = k; } });
+      if (cps.length === 1) roRack.set('one copy only: losing rack ' + wr + ' loses the key', 'bad');
+      else if (worst === cps.length) roRack.set('all ' + cps.length + ' copies are in rack ' + wr + ': one rack failure loses the key', 'bad');
+      else roRack.set('at most ' + worst + ' of ' + cps.length + ' copies lost (rack ' + wr + '): a copy survives', 'good');
+      if (prev === cur) { roMove.set('move the slider "nodes in the ring"'); roMod.set('—'); }
+      else {
+        var added = cur > prev, diff = added ? JOIN.slice(prev, cur) : JOIN.slice(cur, prev);
+        roMove.set((added ? 'added ' : 'removed ') + diff.map(function (nd) { return nd.id; }).join(', ') + ': ' + moved.length + ' of 12 keys changed node' +
+          (moved.length ? ' (' + moved.map(function (k) { return k.name; }).join(', ') + ')' : ''));
+        roMod.set(movedMod.length + ' of 12 keys would change node');
+      }
+      draw({ ring: r, key: key, cps: cps, moved: moved });
+    });
+  });
+  </script>
+
+  <h3>Two partitioners</h3>
+  <aside class="margin-note">The slide's "Random Preserving" preserves nothing: the class was RandomPartitioner. Today's default hash is Murmur3 (background).</aside>
+  <p>The "partitioner smack-down" (p. 457) sets the two side by side (Table 1). Keeping keys in order lets the order-preserving one scan a range of keys, at the price of the "'scrabble' distribution": real keys are as uneven as Scrabble letters, and the node owning the M's gets far more rows than the one owning the X's. The hash is the default (background): Cassandra gives up range scans over partition keys and keeps order inside a partition instead, with the clustering key of <a href="l21.html">lesson 21</a>.</p>
+
+  <figure class="tbl-fig" id="l22-tbl-part">
+    <figcaption>Table 1. The "partitioner smack-down" of p. 457, in the slide's words. CF is the slides' column family, a table.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Random (hash)</th><th>Order preserving</th></tr></thead>
+        <tbody>
+          <tr><td>token</td><td>"system will use MD5(key) to distribute data across nodes"</td><td>"key distribution determined by token"; "can specify the token for this node to use"</td></tr>
+          <tr><td>row order</td><td>hash order</td><td>"lexicographical ordering"</td></tr>
+          <tr><td>range of keys</td><td>not scannable</td><td>"required for range queries": "scan over rows like cursor in index"</td></tr>
+          <tr class="is-key"><td>load</td><td>"even distribution of keys from one CF across ranges/nodes"</td><td>"'scrabble' distribution": hot spots</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Where the copies go</h3>
+  <p>"data replication" (p. 456) needs a "configurable replication factor" and a "replica placement strategy". The slide strikes out the old, more telling names: rack unaware → Simple Strategy; rack aware → Old Network Topology Strategy (since removed, background); data center shard → Network Topology Strategy. The Simple Strategy serves a "Single datacenter" (p. 442) and ignores racks. The <mark class="key">Network Topology Strategy</mark> serves "Multiple datacenters", "Supporting local queries": a replication factor per datacenter, and inside each one the walk skips nodes of a rack that already holds a copy (Fig. 1).</p>
+
+  <aside class="margin-note">On p. 444 both racks of data center 2 are labelled Rack 1. The lower box is a second rack: that is why R4 goes there.</aside>
+  <figure class="fig fig--pair fig--plain" id="l22-fig-nts">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 222" role="img" aria-label="Simple Strategy with four copies on the ring of page 444: nodes 2, 8, 3 and 9, so rack 1 of each data center holds two copies">
+        <text x="77" y="16" class="tx-sm tx-mid tx-bold">data center 1</text>
+        <text x="223" y="16" class="tx-sm tx-mid tx-bold">data center 2</text>
+        <rect x="8" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="154" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="14" y="32" width="126" height="84" class="st-line"/>
+        <rect x="14" y="124" width="126" height="84" class="st-line"/>
+        <rect x="160" y="32" width="126" height="84" class="st-line"/>
+        <rect x="160" y="124" width="126" height="84" class="st-line"/>
+        <text x="20" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="20" y="138" class="tx-sm tx-muted">rack 2</text>
+        <text x="166" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="166" y="138" class="tx-sm tx-muted">rack 2</text>
+        <rect x="20" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="60" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="100" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="20" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="60" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="100" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="166" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="206" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="246" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="166" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="206" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="246" y="148" width="34" height="26" class="fi-paper"/>
+        <text x="37" y="74" class="tx-mono tx-mid">1</text>
+        <text x="77" y="74" class="tx-mono tx-mid">2</text>
+        <text x="117" y="74" class="tx-mono tx-mid">3</text>
+        <text x="37" y="166" class="tx-mono tx-mid">4</text>
+        <text x="77" y="166" class="tx-mono tx-mid">5</text>
+        <text x="117" y="166" class="tx-mono tx-mid">6</text>
+        <text x="183" y="74" class="tx-mono tx-mid">7</text>
+        <text x="223" y="74" class="tx-mono tx-mid">8</text>
+        <text x="263" y="74" class="tx-mono tx-mid">9</text>
+        <text x="183" y="166" class="tx-mono tx-mid">10</text>
+        <text x="223" y="166" class="tx-mono tx-mid">11</text>
+        <text x="263" y="166" class="tx-mono tx-mid">12</text>
+        <text x="77" y="100" class="tx-sm tx-mid tx-bold">R1</text>
+        <text x="117" y="100" class="tx-sm tx-mid tx-bold">R3</text>
+        <text x="223" y="100" class="tx-sm tx-mid tx-bold">R2</text>
+        <text x="263" y="100" class="tx-sm tx-mid tx-bold">R4</text>
+      </svg>
+      <p class="fig-label">Simple Strategy, N = 4 (computed)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 222" role="img" aria-label="Network Topology Strategy with two copies per data center on the same ring: nodes 2, 4, 8 and 10, one copy in every rack, as on page 444">
+        <text x="77" y="16" class="tx-sm tx-mid tx-bold">data center 1</text>
+        <text x="223" y="16" class="tx-sm tx-mid tx-bold">data center 2</text>
+        <rect x="8" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="154" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="14" y="32" width="126" height="84" class="st-line"/>
+        <rect x="14" y="124" width="126" height="84" class="st-line"/>
+        <rect x="160" y="32" width="126" height="84" class="st-line"/>
+        <rect x="160" y="124" width="126" height="84" class="st-line"/>
+        <text x="20" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="20" y="138" class="tx-sm tx-muted">rack 2</text>
+        <text x="166" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="166" y="138" class="tx-sm tx-muted">rack 2</text>
+        <rect x="20" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="60" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="100" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="20" y="148" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="60" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="100" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="166" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="206" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="246" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="166" y="148" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="206" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="246" y="148" width="34" height="26" class="fi-paper"/>
+        <text x="37" y="74" class="tx-mono tx-mid">1</text>
+        <text x="77" y="74" class="tx-mono tx-mid">2</text>
+        <text x="117" y="74" class="tx-mono tx-mid">3</text>
+        <text x="37" y="166" class="tx-mono tx-mid">4</text>
+        <text x="77" y="166" class="tx-mono tx-mid">5</text>
+        <text x="117" y="166" class="tx-mono tx-mid">6</text>
+        <text x="183" y="74" class="tx-mono tx-mid">7</text>
+        <text x="223" y="74" class="tx-mono tx-mid">8</text>
+        <text x="263" y="74" class="tx-mono tx-mid">9</text>
+        <text x="183" y="166" class="tx-mono tx-mid">10</text>
+        <text x="223" y="166" class="tx-mono tx-mid">11</text>
+        <text x="263" y="166" class="tx-mono tx-mid">12</text>
+        <text x="77" y="100" class="tx-sm tx-mid tx-bold">R1</text>
+        <text x="37" y="192" class="tx-sm tx-mid tx-bold">R2</text>
+        <text x="223" y="100" class="tx-sm tx-mid tx-bold">R3</text>
+        <text x="183" y="192" class="tx-sm tx-mid tx-bold">R4</text>
+      </svg>
+      <p class="fig-label">Network Topology Strategy, 2 + 2 (p. 444)</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> The ring of p. 444 runs clockwise 1, 7, 2, 8, 3, 9, 4, 10, 5, 11, 6, 12, and the key's token falls just before node 2. The Simple Strategy takes the next four nodes, 2, 8, 3, 9: both copies of each data center share rack 1. The Network Topology Strategy, two copies per data center, skips 3 and 9 and gives the slide's R1–R4 on 2, 4, 8, 10 — one per rack.</figcaption>
+  </figure>
+
+  <p>A Cassandra script starts by creating the keyspace, as in the exercise session (p. 1553):</p>
+  <pre><code>-- three copies of every row
+CREATE KEYSPACE population
+  WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3};</code></pre>
+  <p>Per datacenter, in the syntax of the Cassandra documentation (not on the slides), for Fig. 1:</p>
+  <pre><code>-- two copies in each datacenter
+CREATE KEYSPACE population
+  WITH replication = {
+    'class':
+      'NetworkTopologyStrategy',
+    'DC1': 2, 'DC2': 2};</code></pre>
+
+  <p class="memo"><mark class="key">The hash picks the first node clockwise; the strategy picks the other N − 1: the next nodes, or the next racks of each datacenter.</mark></p>
+</section>
+
+
+<section id="l22-gossip">
+  <h2>Nobody in charge: gossip and failure detection</h2>
+
+  <p>Node B3 reboots at night. With no master, nobody keeps the list of who is alive: each node keeps its own and corrects it by talking to the others. Page 440 draws a rumour — "I'm online!" — travelling from node to node as "gossip".</p>
+
+  <p>The "Gossip protocol" (p. 441) runs in rounds. "Each node picks its discussants (up to 3)", however large the cluster, and each conversation is a three-message handshake (Fig. 2). Afterwards both know the union of what they knew, so views "converge": the slide's <mark class="key">anti-entropy</mark>, entropy being the disorder of nodes that disagree. Few partners per round mean "Always a constant amount of network traffic (except for gossip storms)", when many nodes change state at once.</p>
+
+  <figure class="fig fig--plain" id="l22-fig-handshake">
+    <svg class="dia" viewBox="0 0 560 330" role="img" aria-label="Node X gossips with node Y in three messages: a SYN with the versions X knows, an ACK with what X lacks and what Y needs, an ACK2 with what Y asked for">
+      <rect x="36" y="14" width="44" height="28" class="fi-paper sw-2"/>
+      <line x1="44" y1="22" x2="72" y2="22" class="st-muted"/>
+      <line x1="44" y1="28" x2="72" y2="28" class="st-muted"/>
+      <line x1="44" y1="34" x2="72" y2="34" class="st-muted"/>
+      <rect x="480" y="14" width="44" height="28" class="fi-paper sw-2"/>
+      <line x1="488" y1="22" x2="516" y2="22" class="st-muted"/>
+      <line x1="488" y1="28" x2="516" y2="28" class="st-muted"/>
+      <line x1="488" y1="34" x2="516" y2="34" class="st-muted"/>
+      <text x="58" y="62" class="tx-sm tx-mid">node X</text>
+      <text x="502" y="62" class="tx-sm tx-mid">node Y</text>
+      <line x1="58" y1="72" x2="58" y2="320" class="st-muted dash"/>
+      <line x1="502" y1="72" x2="502" y2="320" class="st-muted dash"/>
+      <line x1="62" y1="112" x2="494" y2="112" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="498" y1="200" x2="66" y2="200" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="62" y1="288" x2="494" y2="288" class="sw-2" marker-end="url(#arr)"/>
+      <text x="280" y="96" class="tx-mono tx-mid halo">1. GossipDigestSynMessage</text>
+      <text x="280" y="184" class="tx-mono tx-mid halo">2. GossipDigestAckMessage</text>
+      <text x="280" y="272" class="tx-mono tx-mid halo">3. GossipDigestAck2Message</text>
+      <text x="280" y="140" class="tx-sm tx-mid tx-muted">here are the versions I know</text>
+      <text x="280" y="228" class="tx-sm tx-mid tx-muted">this is what you lack; send me what I lack</text>
+      <text x="280" y="316" class="tx-sm tx-mid tx-muted">here is what you asked for</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> One round of gossip between two nodes, with the message names of p. 441. What each message carries — versions, then the missing parts — is background from Cassandra's implementation.</figcaption>
+  </figure>
+
+  <div class="pitfall"><p>"Up to 3" discussants and "three messages for each round" are two different threes: partners per round, messages per conversation. And gossip carries node state — heartbeats, tokens, versions — never rows: writes go from the coordinator to the replicas (p. 445).</p></div>
+
+  <h3>The membership list</h3>
+  <p>"Cluster Membership" (p. 451): each node keeps one row per node — Address, Heartbeat Counter, Time (local) — and raises only its own counter. "Nodes periodically gossip their membership list"; "On receipt, the local membership list is updated": per address the larger counter wins, stamped with the receiver's own clock, since the clocks are "asynchronous". Fig. 3 replays the slide.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l22-fig-members">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="Before: node 1 sends its membership list to node 2, whose own list has smaller counters for nodes 1 and 3">
+        <text x="65" y="18" class="tx-sm tx-mid tx-bold">node 1 sends</text>
+        <text x="235" y="18" class="tx-sm tx-mid tx-bold">node 2 has</text>
+        <rect x="8" y="28" width="114" height="20" class="fw-s3 st-none"/>
+        <rect x="8" y="28" width="114" height="116"/>
+        <line x1="38" y1="28" x2="38" y2="144" class="st-muted"/>
+        <line x1="92" y1="28" x2="92" y2="144" class="st-muted"/>
+        <line x1="8" y1="48" x2="122" y2="48" class="st-muted"/>
+        <line x1="8" y1="72" x2="122" y2="72" class="st-muted"/>
+        <line x1="8" y1="96" x2="122" y2="96" class="st-muted"/>
+        <line x1="8" y1="120" x2="122" y2="120" class="st-muted"/>
+        <text x="23" y="42" class="tx-sm tx-mid">node</text>
+        <text x="65" y="42" class="tx-sm tx-mid">counter</text>
+        <text x="107" y="42" class="tx-sm tx-mid">time</text>
+        <text x="23" y="64" class="tx-mono tx-sm tx-mid">1</text><text x="65" y="64" class="tx-mono tx-sm tx-mid">10120</text><text x="107" y="64" class="tx-mono tx-sm tx-mid">66</text>
+        <text x="23" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="65" y="88" class="tx-mono tx-sm tx-mid">10103</text><text x="107" y="88" class="tx-mono tx-sm tx-mid">62</text>
+        <text x="23" y="112" class="tx-mono tx-sm tx-mid">3</text><text x="65" y="112" class="tx-mono tx-sm tx-mid">10098</text><text x="107" y="112" class="tx-mono tx-sm tx-mid">63</text>
+        <text x="23" y="136" class="tx-mono tx-sm tx-mid">4</text><text x="65" y="136" class="tx-mono tx-sm tx-mid">10111</text><text x="107" y="136" class="tx-mono tx-sm tx-mid">65</text>
+        <rect x="178" y="28" width="114" height="20" class="fw-s3 st-none"/>
+        <rect x="178" y="28" width="114" height="116"/>
+        <line x1="208" y1="28" x2="208" y2="144" class="st-muted"/>
+        <line x1="262" y1="28" x2="262" y2="144" class="st-muted"/>
+        <line x1="178" y1="48" x2="292" y2="48" class="st-muted"/>
+        <line x1="178" y1="72" x2="292" y2="72" class="st-muted"/>
+        <line x1="178" y1="96" x2="292" y2="96" class="st-muted"/>
+        <line x1="178" y1="120" x2="292" y2="120" class="st-muted"/>
+        <text x="193" y="42" class="tx-sm tx-mid">node</text>
+        <text x="235" y="42" class="tx-sm tx-mid">counter</text>
+        <text x="277" y="42" class="tx-sm tx-mid">time</text>
+        <text x="193" y="64" class="tx-mono tx-sm tx-mid">1</text><text x="235" y="64" class="tx-mono tx-sm tx-mid">10118</text><text x="277" y="64" class="tx-mono tx-sm tx-mid">64</text>
+        <text x="193" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="235" y="88" class="tx-mono tx-sm tx-mid">10110</text><text x="277" y="88" class="tx-mono tx-sm tx-mid">64</text>
+        <text x="193" y="112" class="tx-mono tx-sm tx-mid">3</text><text x="235" y="112" class="tx-mono tx-sm tx-mid">10090</text><text x="277" y="112" class="tx-mono tx-sm tx-mid">58</text>
+        <text x="193" y="136" class="tx-mono tx-sm tx-mid">4</text><text x="235" y="136" class="tx-mono tx-sm tx-mid">10111</text><text x="277" y="136" class="tx-mono tx-sm tx-mid">65</text>
+        <line x1="130" y1="96" x2="170" y2="96" class="sw-2" marker-end="url(#arr)"/>
+        <text x="150" y="84" class="tx-sm tx-mid">gossip</text>
+        <text x="150" y="170" class="tx-sm tx-mid tx-muted">node 2's own clock reads 70</text>
+      </svg>
+      <p class="fig-label">Before: node 1's list arrives</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="After: node 2 has taken the larger counters for nodes 1 and 3 and stamped them with its own time 70; its own row and the equal row stay">
+        <rect x="38" y="48" width="84" height="24" class="fw-key st-none"/>
+        <rect x="38" y="96" width="84" height="24" class="fw-key st-none"/>
+        <rect x="8" y="28" width="114" height="20" class="fw-s3 st-none"/>
+        <rect x="8" y="28" width="114" height="116"/>
+        <line x1="38" y1="28" x2="38" y2="144" class="st-muted"/>
+        <line x1="92" y1="28" x2="92" y2="144" class="st-muted"/>
+        <line x1="8" y1="48" x2="122" y2="48" class="st-muted"/>
+        <line x1="8" y1="72" x2="122" y2="72" class="st-muted"/>
+        <line x1="8" y1="96" x2="122" y2="96" class="st-muted"/>
+        <line x1="8" y1="120" x2="122" y2="120" class="st-muted"/>
+        <text x="65" y="18" class="tx-sm tx-mid tx-bold">node 2 after</text>
+        <text x="23" y="42" class="tx-sm tx-mid">node</text>
+        <text x="65" y="42" class="tx-sm tx-mid">counter</text>
+        <text x="107" y="42" class="tx-sm tx-mid">time</text>
+        <text x="23" y="64" class="tx-mono tx-sm tx-mid">1</text><text x="65" y="64" class="tx-mono tx-sm tx-mid">10120</text><text x="107" y="64" class="tx-mono tx-sm tx-mid">70</text>
+        <text x="23" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="65" y="88" class="tx-mono tx-sm tx-mid">10110</text><text x="107" y="88" class="tx-mono tx-sm tx-mid">64</text>
+        <text x="23" y="112" class="tx-mono tx-sm tx-mid">3</text><text x="65" y="112" class="tx-mono tx-sm tx-mid">10098</text><text x="107" y="112" class="tx-mono tx-sm tx-mid">70</text>
+        <text x="23" y="136" class="tx-mono tx-sm tx-mid">4</text><text x="65" y="136" class="tx-mono tx-sm tx-mid">10111</text><text x="107" y="136" class="tx-mono tx-sm tx-mid">65</text>
+        <text x="132" y="64" class="tx-sm">larger: copy it, stamp 70</text>
+        <text x="132" y="88" class="tx-sm">own row is newer: keep</text>
+        <text x="132" y="112" class="tx-sm">larger: copy it, stamp 70</text>
+        <text x="132" y="136" class="tx-sm">equal: keep, time too</text>
+        <text x="150" y="172" class="tx-hand tx-mid">counters travel, times stay</text>
+      </svg>
+      <p class="fig-label">After: node 2 at time 70</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> The membership merge of p. 451, row by row. 10120 beats 10118 and 10098 beats 10090: both rows are copied and stamped with node 2's own time, 70. Node 2's own row, 10110, is newer than the 10103 it hears about. Row 4 is equal, so even its time stays 65.</figcaption>
+  </figure>
+
+  <h3>From silence to suspicion</h3>
+  <p>A silent node may be dead or only slow, and a fixed timeout errs one way or the other. The <mark class="key">accrual failure detector</mark> of p. 452 "outputs a value (PHI) representing suspicion", "Apps set an appropriate threshold", and "PHI = 5 =&gt; 10-15 sec detection time". PHI, φ, grows with the silence, measured against the "Inter-arrival times for gossip messages":</p>
+
+  <aside class="margin-note">From Applied Statistics: \(P_{\text{later}}\) is the p-value of the silence if the node is alive, and \(\varphi\) is that p-value on a minus-log scale.</aside>
+  <ol class="steps" id="l22-steps-phi">
+    <li><p>Let \(\Delta t = t_{now} - t_{last}\) be the silence and F the distribution of past gaps. A live node stays silent this long with the tail probability</p> \[ P_{\text{later}}(\Delta t) = 1 - F(\Delta t) \]</li>
+    <li><p>φ = 1 means a 10 % chance that a live node is this late; 2 means 1 %, 5 means 0.001 %:</p> \[ \varphi = -\log_{10} P_{\text{later}}(\Delta t) \]</li>
+    <li><p>Background: Cassandra takes the gaps as exponential with mean μ, so \(P_{\text{later}} = e^{-\Delta t / \mu}\) and</p> \[ \varphi = \frac{\Delta t}{\mu \ln 10} \]</li>
+    <li><p>With gossip about once a second (μ ≈ 1 s, background), φ = 5 after 5 ln 10 ≈ 11.5 s — inside the slide's 10–15 s. A slower network has a larger μ and a later alarm: the slide's "sensitive to actual inter-arrival time variations".</p></li>
+  </ol>
+
+  <aside class="redpen" data-page="452">
+    <p class="claim">"PHI(t) = - log(CDF or Probability(t_now – t_last))/log 10"</p>
+    <p class="fix">\(\varphi = -\log_{10}(1 - F(\Delta t))\): the tail probability, one minus the CDF — not the CDF.</p>
+    <p class="because">With the CDF itself, φ would peak right after a heartbeat and fall to 0 as the silence grows — the opposite of suspicion ("/log 10" just makes it \(\log_{10}\)). The exam may be matched against the printed line: know it, and write the tail in your answer.</p>
+  </aside>
+</section>
+
+
+<section id="l22-write">
+  <h2>A write is an append; a read is a merge</h2>
+
+  <p>A sale arrives for 'Milano'. "Writes" (p. 445): the client "sends write to one front-end node in Cassandra cluster (Coordinator)", "Which (via Partitioning function) sends it to all replica nodes responsible for key".</p>
+
+  <aside class="margin-note">The hour is a setting: today the hint window is configurable, three hours by default (background).</aside>
+  <p>"Always writable: Hinted Handoff": "If any replica is down, the coordinator writes to all other replicas, and keeps the write until down replica comes back up" — the kept write is a <mark class="key">hint</mark> — and "When all replicas are down, the Coordinator (front end) buffers writes (for up to an hour)". The slide adds "Atomicity for a given key (i.e., within ColumnFamily)": one write to one partition is applied whole, with no multi-key transactions. And "One ring per datacenter": the coordinator "can also send write to one replica per remote datacenter".</p>
+
+  <h3>At the replica: commit log, memtable, SSTable</h3>
+  <p>Writes "Need to be lock-free and fast (no reads or disk seeks)". At the replica (p. 446): "1. log it in disk commit log" — an append, so no seek, and the write survives a crash; "2. Make changes to appropriate memtables" — a <mark class="key">memtable</mark> is an "In-memory representation of multiple key-value pairs", sorted by key. Then the replica acknowledges (Fig. 4).</p>
+
+  <figure class="fig fig--plain" id="l22-fig-write">
+    <svg class="dia" viewBox="0 0 560 320" role="img" aria-label="The write path at a replica: the write is appended to the commit log on disk, added to the sorted memtable in memory and acknowledged; later the memtable is flushed to an immutable SSTable with an index file and a Bloom filter">
+      <rect x="14" y="40" width="72" height="26" rx="6" class="fi-paper"/>
+      <text x="50" y="57" class="tx-sm tx-mid">client</text>
+      <line x1="90" y1="53" x2="192" y2="53" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="136" y="36" class="tx-sm tx-mid halo">write Milano</text>
+      <text x="204" y="30" class="tx-sm">1 · commit log (disk)</text>
+      <rect x="200" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="212" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="224" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="236" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="248" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="260" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="272" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="284" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="296" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="308" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="320" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="332" y="43" width="12" height="20" class="fw-s1 st-s1 sw-2"/>
+      <line x1="272" y1="66" x2="272" y2="104" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="282" y="90" class="tx-sm halo">2 · add value to memtable</text>
+      <rect x="212" y="108" width="120" height="66" class="fi-paper sw-2"/>
+      <line x1="212" y1="130" x2="332" y2="130" class="st-muted"/>
+      <line x1="212" y1="152" x2="332" y2="152" class="st-muted"/>
+      <rect x="213" y="153" width="118" height="20" class="fw-s1 st-none"/>
+      <text x="222" y="124" class="tx-mono tx-sm">Como 7</text>
+      <text x="222" y="146" class="tx-mono tx-sm">Lodi 9</text>
+      <text x="222" y="168" class="tx-mono tx-sm">Milano 41</text>
+      <text x="200" y="124" class="tx-sm tx-end">memtable</text>
+      <text x="200" y="146" class="tx-sm tx-end tx-muted">memory, sorted</text>
+      <path d="M208,166 H50 V72" class="dash" marker-end="url(#arr)"/>
+      <text x="38" y="124" class="tx-sm tx-end">ack</text>
+      <text x="456" y="136" class="tx-hand tx-mid">no read, no seek,</text>
+      <text x="456" y="164" class="tx-hand tx-mid">no lock</text>
+      <line x1="272" y1="176" x2="272" y2="226" class="sw-2" marker-end="url(#arr)"/>
+      <text x="282" y="206" class="tx-sm halo">later: flush</text>
+      <rect x="56" y="230" width="420" height="82" class="fw-ink st-none"/>
+      <path d="M72,238 H102 L112,248 V288 H72 Z" class="fi-paper sw-2"/>
+      <path d="M102,238 V248 H112 Z" class="fi-soft"/>
+      <path d="M162,238 H192 L202,248 V288 H162 Z" class="fi-paper sw-2"/>
+      <path d="M192,238 V248 H202 Z" class="fi-soft"/>
+      <path d="M252,238 H282 L292,248 V288 H252 Z" class="fi-paper sw-2"/>
+      <path d="M282,238 V248 H292 Z" class="fi-soft"/>
+      <rect x="116" y="244" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="116" y="262" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="206" y="244" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="206" y="262" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="296" y="244" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="296" y="262" width="14" height="12" class="fw-s3 st-s3"/>
+      <line x1="314" y1="259" x2="330" y2="259" class="st-muted"/>
+      <text x="336" y="254" class="tx-sm">index file +</text>
+      <text x="336" y="276" class="tx-sm">Bloom filter</text>
+      <text x="92" y="304" class="tx-sm tx-mid">SSTable 1</text>
+      <text x="182" y="304" class="tx-sm tx-mid">SSTable 2</text>
+      <text x="272" y="304" class="tx-sm tx-mid">SSTable 3</text>
+      <text x="468" y="304" class="tx-sm tx-end tx-muted">disk</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The "write op" of p. 454 with the steps of p. 446. The write costs one append to the commit log and one insert into the memtable; the flush to an SSTable happens later, once per full memtable, again as one sequential write.</figcaption>
+  </figure>
+
+  <p>"Later, when memtable is full or old, flush to disk": once, in key order, as an <mark class="key">SSTable</mark> ("Sorted String Table – list of key value pairs, sorted by key"), with an index of <span class="nw">"(key, position</span> in data sstable) pairs" "And a Bloom filter". SSTables are never modified: newer versions of 'Milano' land in newer files, and <mark class="key">compaction</mark> merges SSTables, keeping each key's newest version ("Merge key updates, etc.").</p>
+
+  <h3>The Bloom filter: a cheap "no"</h3>
+  <p>To skip the SSTables that cannot hold a key, each has a <mark class="key">Bloom filter</mark> (p. 447), a "Compact way of representing a set of items": a bit array and k hash functions. "On insert, set all hashed bits." "On check-if-present, return true if all hashed bits set." One 0 proves absence; all 1s prove nothing — other keys may have set them. Hence "Some probability of false positives" but "Never false negatives".</p>
+
+  <div class="widget" id="l22-w-bloom">
+    <h3 class="widget-title">A Bloom filter of 32 bits</h3>
+    <p class="widget-intro">The twelve market keys are inserted in a fixed order (Milano first, Rimini last). Each key sets its k bits. Choose a probe: arrows show its k bits; a 0 among them, underlined, proves the key absent. The plot shows how often the filter says "maybe" for keys that were never inserted, as it fills.</p>
+    <ol class="tasks">
+      <li>With k = 3 and n = 4, probe Roma, which is never inserted. Predict the answer before you look.
+        <details class="answer"><summary>What you should see</summary>
+          <p>"Definitely not here": Roma's bits are 27, 13 and 6, and bits 27 and 6 are still 0. One zero is enough — the read never opens this SSTable.</p></details>
+      </li>
+      <li>Probe Milano, then other inserted keys, at any k and any n that includes them. Can you ever get "definitely not here"?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Never. An inserted key set all its bits, and bits are never cleared: no false negatives. That is the insight of the widget. A key not inserted yet — Rimini with k = 3 and n = 4 — rightly gets "definitely not here".</p></details>
+      </li>
+      <li>Probe Napoli with k = 3 and slide n from 8 to 12. Predict when the answer changes.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Up to n = 8 at least one of Napoli's bits is 0. At n = 9 Cremona sets bits 0 and 24, and with bit 10 already set by Varese all three bits are 1: "maybe here" for a key that was never inserted — a false positive. The fuller the filter, the more often it is wrong this way; the formula climbs to about 31 % at n = 12.</p></details>
+      </li>
+      <li>Keep n = 12 and try k from 1 to 6. Do more hash functions always help?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. The formula readout gives 31.3, 27.8, 30.8, 36.4, 43.5 and 51.3 %: with 32 bits for 12 keys, extra hash functions fill the array faster than they help (the measured crosses wobble around the curve). The slide's filter has 32 bits per key, where k = 4 gives 0.02 %.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l22-w-bloom', function (root, ui) {
+    var M = 32;
+    function fnvS(s, seed) { var h = (0x811c9dc5 ^ Math.imul(seed + 1, 0x9e3779b9)) >>> 0; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; }
+    function fmix(h) { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16; return h >>> 0; }
+    function bitsOf(s, k) { var out = []; for (var i = 0; i < k; i++) out.push(fmix(fnvS(s, i)) % M); return out; }
+    var KEYS = ['Milano', 'Treviso', 'Ravenna', 'Monza', 'Novara', 'Lodi', 'Varese', 'Como', 'Cremona', 'Mantova', 'Padova', 'Rimini'];
+    var ABSENT = ['Bergamo', 'Brescia', 'Pavia', 'Napoli', 'Roma', 'Torino'];
+    var TEST = []; for (var t = 0; t < 1000; t++) TEST.push('probe-' + t);
+    function filterOf(n, k) { var f = [], i, j; for (i = 0; i < M; i++) f.push(0); for (j = 0; j < n; j++) bitsOf(KEYS[j], k).forEach(function (p) { f[p] = 1; }); return f; }
+    function maybe(f, s, k) { var b = bitsOf(s, k); for (var i = 0; i < b.length; i++) if (!f[b[i]]) return false; return true; }
+    var cache = {};
+    function measured(k) {          // share of 1,000 never-inserted keys that the filter calls "maybe", for n = 0..12
+      if (cache[k]) return cache[k];
+      var out = [];
+      for (var n = 0; n <= 12; n++) { var f = filterOf(n, k), c = 0; for (var i = 0; i < TEST.length; i++) if (maybe(f, TEST[i], k)) c++; out.push([n, 100 * c / TEST.length]); }
+      cache[k] = out;
+      return out;
+    }
+    function formula(n, k) { return 100 * Math.pow(1 - Math.exp(-k * n / M), k); }
+
+    var sK = ui.slider({ label: 'hash functions k', min: 1, max: 6, step: 1, value: 3 });
+    var sN = ui.slider({ label: 'keys inserted n', min: 0, max: 12, step: 1, value: 4 });
+    var opts = KEYS.map(function (s, i) { return { value: s, label: s + ' (key ' + (i + 1) + ')' }; })
+      .concat(ABSENT.map(function (s) { return { value: s, label: s + ' (never inserted)' }; }));
+    var selP = ui.select('probe', opts, null, 'Roma');
+    var roAns = ui.readout('the filter answers');
+    var roBits = ui.readout('bits of the probe');
+    var roSet = ui.readout('bits set');
+    var roF = ui.readout('false positives, formula');
+    var roM = ui.readout('false positives, measured');
+    ui.note('Computed: k seeded hash functions over m = 32 bits; "measured" tries 1,000 keys that were never inserted. Two hash functions may hit the same bit. The slide\'s filter, k = 4, n = 100, m = 3,200 bits, gives (1 − e^(−0.125))^4 = 0.019 %, printed as 0.02 %.');
+    ui.legend([
+      { label: 'bit set to 1', color: 's3', mark: 'square' },
+      { label: 'probe and its k bits', color: 's2', mark: 'line' },
+      { label: 'a 0 bit: proof of absence', color: 'ink', mark: 'hl' },
+      { label: 'formula (1 − e^(−kn/m))^k', color: 's3', mark: 'line' },
+      { label: 'measured', color: 's2', mark: 'cross' }
+    ]);
+
+    var svgEl = ui.svg(560, 172, { label: 'A row of 32 bits; the set bits are filled; arrows lead from the probed key to its k bits, and a 0 among them is underlined' });
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    var X0 = 40, CW = 15, Y = 96;
+    function draw(name, f, b) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      S('text', { x: 280, y: 24, 'class': 'tx-mono tx-mid', text: name });
+      b.forEach(function (p) {
+        var xc = X0 + p * CW + CW / 2;
+        S('path', { d: 'M280,34 C280,64 ' + xc + ',58 ' + xc + ',90', 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+      });
+      for (var i = 0; i < M; i++) S('rect', { x: X0 + i * CW, y: Y, width: CW, height: 26, 'class': f[i] ? 'fi-s3 st-s3' : 'fi-paper' });
+      var done = {};
+      b.forEach(function (p) {
+        if (done[p]) return;
+        done[p] = true;
+        S('rect', { x: X0 + p * CW, y: Y, width: CW, height: 26, 'class': 'fi-none st-s2 sw-3' });
+        if (!f[p]) S('line', { x1: X0 + p * CW + 3, y1: Y + 34, x2: X0 + p * CW + CW - 3, y2: Y + 34, 'class': 'hl' });
+      });
+      [0, 5, 10, 15, 20, 25, 31].forEach(function (i) { S('text', { x: X0 + i * CW + CW / 2, y: Y + 66, 'class': 'tx-sm tx-mid tx-muted', text: String(i) }); });
+    }
+
+    var plot = ui.plot({ x: [0, 12], y: [0, 65], xLabel: 'keys inserted n', yLabel: 'false positives (%)', aspect: 2.2, xTicks: 7,
+      label: 'False-positive rate against the number of inserted keys: the formula as a line, the measured rate as crosses, the current n as a dashed line' });
+    plot.draw(function (g) {
+      var k = sK.value;
+      g.line(function (n) { return formula(n, k); }, { color: 's3', width: 2.5, domain: [0, 12] });
+      g.points(measured(k), { color: 's2', shape: 'cross' });
+      g.vline(sN.value, { color: 'soft', dash: true, label: 'n now' });
+    });
+
+    ui.onChange(function () {
+      var k = sK.value, n = sN.value, s = selP.value, f = filterOf(n, k), b = bitsOf(s, k);
+      var idx = KEYS.indexOf(s), inserted = idx >= 0 && idx < n;
+      var zeros = b.filter(function (p) { return !f[p]; }).filter(function (p, i, a) { return a.indexOf(p) === i; });
+      if (zeros.length) roAns.set('definitely not here: bit' + (zeros.length > 1 ? 's ' : ' ') + zeros.join(' and ') + (zeros.length > 1 ? ' are' : ' is') + ' 0', 'good');
+      else if (inserted) roAns.set('maybe here — and it is (key ' + (idx + 1) + ')', 'good');
+      else roAns.set('maybe here — but it was not inserted: a false positive', 'bad');
+      roBits.set(b.join(', '));
+      var set = 0; for (var i = 0; i < M; i++) set += f[i];
+      roSet.set(set + ' of 32 (' + Math.round(100 * set / M) + ' %)');
+      roF.set(Course.fmt(formula(n, k), 1) + ' %');
+      roM.set(Course.fmt(measured(k)[n][1], 1) + ' % of 1,000 absent keys');
+      draw(s, f, b);
+    });
+  });
+  </script>
+
+  <p>The slide's example — "k=4 hash functions", "100 items", "3200 bits", "FP rate = 0.02%" — checks out with the standard formula (background): a bit stays 0 with probability about \(e^{-kn/m}\), so</p>
+  <div class="formula">
+    \[ p_{FP} \approx \left(1 - e^{-kn/m}\right)^{k} \]
+    \[ \left(1 - e^{-400/3200}\right)^{4} = 0.1175^{4} \]
+    \[ 0.1175^{4} \approx 0.019\,\% \]
+    <dl class="legend">
+      <dt>\(m\)</dt><dd>bits in the array (3200)</dd>
+      <dt>\(n\)</dt><dd>keys inserted (100)</dd>
+      <dt>\(k\)</dt><dd>hash functions (4)</dd>
+    </dl>
+  </div>
+  <p>32 bits per key, whatever the key: a "no" costs k bit tests in memory, not a disk read.</p>
+
+  <h3>Deletes write a tombstone</h3>
+  <p>Immutable files cannot erase a row. "Delete: don't delete item right away" — "add a tombstone to the log"; "Compaction will remove tombstone and delete item" (p. 448). A <mark class="key">tombstone</mark> is a timestamped delete marker written like any write; it hides older values from reads (Fig. 5). Until compaction a delete adds data (background: a tombstone outlives a grace period, ten days by default, so that replicas that were down hear of it).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l22-fig-compact">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 244" role="img" aria-label="Before compaction: three SSTables hold two versions of Milano and a tombstone for Bergamo">
+        <rect x="14" y="10" width="272" height="60" class="fi-paper sw-2"/>
+        <rect x="15" y="11" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="50" x2="286" y2="50" class="st-muted"/>
+        <text x="22" y="25" class="tx-sm tx-bold">SSTable 1 · oldest</text>
+        <text x="22" y="45" class="tx-mono tx-sm">Bergamo</text><text x="150" y="45" class="tx-mono tx-sm">12</text><text x="250" y="45" class="tx-mono tx-sm tx-muted">t1</text>
+        <text x="22" y="65" class="tx-mono tx-sm">Milano</text><text x="150" y="65" class="tx-mono tx-sm">40</text><text x="250" y="65" class="tx-mono tx-sm tx-muted">t2</text>
+        <rect x="14" y="78" width="272" height="60" class="fi-paper sw-2"/>
+        <rect x="15" y="79" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="118" x2="286" y2="118" class="st-muted"/>
+        <text x="22" y="93" class="tx-sm tx-bold">SSTable 2</text>
+        <text x="22" y="113" class="tx-mono tx-sm">Como</text><text x="150" y="113" class="tx-mono tx-sm">7</text><text x="250" y="113" class="tx-mono tx-sm tx-muted">t3</text>
+        <text x="22" y="133" class="tx-mono tx-sm">Milano</text><text x="150" y="133" class="tx-mono tx-sm">41</text><text x="250" y="133" class="tx-mono tx-sm tx-muted">t4</text>
+        <rect x="14" y="146" width="272" height="60" class="fi-paper sw-2"/>
+        <rect x="15" y="147" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="186" x2="286" y2="186" class="st-muted"/>
+        <text x="22" y="161" class="tx-sm tx-bold">SSTable 3 · newest</text>
+        <text x="22" y="181" class="tx-mono tx-sm">Bergamo</text><text x="150" y="181" class="tx-mono tx-sm">tombstone</text><text x="250" y="181" class="tx-mono tx-sm tx-muted">t5</text>
+        <text x="22" y="201" class="tx-mono tx-sm">Lodi</text><text x="150" y="201" class="tx-mono tx-sm">9</text><text x="250" y="201" class="tx-mono tx-sm tx-muted">t6</text>
+        <text x="150" y="234" class="tx-hand tx-mid">versions pile up</text>
+      </svg>
+      <p class="fig-label">Before: three SSTables</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 244" role="img" aria-label="After compaction: one SSTable with Como, Lodi and the newest Milano; the old Milano, Bergamo and its tombstone are gone">
+        <rect x="14" y="10" width="272" height="80" class="fi-paper sw-2"/>
+        <rect x="15" y="11" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="50" x2="286" y2="50" class="st-muted"/>
+        <line x1="14" y1="70" x2="286" y2="70" class="st-muted"/>
+        <text x="22" y="25" class="tx-sm tx-bold">SSTable 4 · after compaction</text>
+        <text x="22" y="45" class="tx-mono tx-sm">Como</text><text x="150" y="45" class="tx-mono tx-sm">7</text><text x="250" y="45" class="tx-mono tx-sm tx-muted">t3</text>
+        <text x="22" y="65" class="tx-mono tx-sm">Lodi</text><text x="150" y="65" class="tx-mono tx-sm">9</text><text x="250" y="65" class="tx-mono tx-sm tx-muted">t6</text>
+        <text x="22" y="85" class="tx-mono tx-sm">Milano</text><text x="150" y="85" class="tx-mono tx-sm">41</text><text x="250" y="85" class="tx-mono tx-sm tx-muted">t4</text>
+        <text x="22" y="122" class="tx-sm tx-muted">dropped: Milano 40, an older version</text>
+        <text x="22" y="142" class="tx-sm tx-muted">dropped: Bergamo 12 and its tombstone</text>
+        <text x="150" y="234" class="tx-hand tx-mid">one file to read</text>
+      </svg>
+      <p class="fig-label">After: one SSTable</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> Compaction merges sorted files in one pass, keeping the newest timestamp of each key; a tombstone and the value it hides are dropped once its grace period is over. Before it, a read of Milano opens two files and a read of Bergamo must notice that the tombstone (t5) is newer than the value (t1).</figcaption>
+  </figure>
+
+  <h3>Reads merge</h3>
+  <p>A read merges 'Milano' from the memtable and the SSTables whose filter says "maybe", keeping the newest timestamp: reads "May be slower than writes" (p. 446).</p>
+
+  <aside class="redpen" data-page="446">
+    <p class="claim">"Reads need to touch log and multiple SSTables"</p>
+    <p class="fix">Reads touch the memtable and multiple SSTables; the commit log is replayed only when a node restarts, to rebuild the memtables it lost.</p>
+    <p class="because">Everything in the log is also in a memtable or, after a flush, in an SSTable. The exam may be matched against the printed line: know it, and in an answer write "the memtable and several SSTables (the commit log only at restart)".</p>
+  </aside>
+
+  <p>Page 455 adds the "Staged Event-Driven Architecture": "A general-purpose framework for high concurrency &amp; load conditioning" built of "stages separated by queues". The slide leaves the link implicit (background): in a Cassandra node writes, reads, gossip and compaction are such stages, so overload shows as a growing queue, and a slow compaction does not stop gossip.</p>
+
+  <h3>Back to the first puzzle</h3>
+  <p>So the 0.12 ms against 15 ms of p. 459: a write is one log append and one memory insert, with no read, seek or lock; a read merges several files, often on several replicas. Cassandra gave up cheap reads and in-place updates, and pays later instead: flushes, compactions, tombstones. The slide names no hardware or workload: read a ratio, not a benchmark.</p>
+
+</section>
+
+
+<section id="l22-quorum">
+  <h2>How many copies must answer: quorums</h2>
+
+  <p>Three copies of 'Milano': how many must answer a write, and how many a read? The client chooses (p. 449): "R = read replica count, W = write replica count", "N = total number of replicas for this key".</p>
+
+  <p>Reads "Wait for R replicas (R specified by clients)" and check the "remaining N-R replicas" in the background. The coordinator "can contact closest replica (e.g., in same rack)", "also fetches from multiple replicas", and starts a <mark class="key">read repair</mark> "if any two values are different" (p. 448). Writes "come in two flavors": "Block until quorum is reached", or "Async: Write to any node". A <mark class="key">quorum</mark> is a majority of the N copies.</p>
+
+  <aside class="redpen" data-page="448">
+    <p class="claim">"Read repair: uses gossip"</p>
+    <p class="fix">Read repair is done by the coordinator of the read, which compares the replicas' answers and writes the newest value back to the stale ones. Gossip carries node state, not rows.</p>
+    <p class="because">The gossip of pp. 441 and 451 exchanges heartbeat counters and state versions; the slide uses the word loosely. The exam may be matched against the printed line: know it, and if a question quotes it, say that the repair is coordinator-driven.</p>
+  </aside>
+
+  <div class="formula">
+    \[ Q = \left\lfloor \frac{N}{2} \right\rfloor + 1 \]
+    <dl class="legend">
+      <dt>\(N\)</dt><dd>replication factor: copies of the key</dd>
+      <dt>\(\lfloor \cdot \rfloor\)</dt><dd>round down</dd>
+    </dl>
+  </div>
+
+  <div class="pitfall"><p>"For N = 3, the slide's 'Quorum Q = N/2 + 1' (p. 449) is 2.5 replicas." No: the division rounds down, as in the Cassandra documentation — 2 of 3, 3 of 4, 3 of 5 — and so does the "(N /2) + 1" of p. 453. Write the floor.</p></div>
+
+  <h3>Why W + R &gt; N is enough</h3>
+  <p>The slide: "If W+R &gt; N and W &gt; N/2, you have consistency", and "Allowed (W=1, R=N) or (W=N, R=1) or (W=Q, R=Q)". The first half does the work:</p>
+
+  <ol class="steps" id="l22-steps-quorum">
+    <li><p>The write was acknowledged by a set A of W replicas; a later read hears from a set B of R replicas, out of the same N:</p> \[ |A \cup B| \le N \]</li>
+    <li><p>So the two sets share at least</p> \[ |A \cap B| = W + R - |A \cup B| \] \[ |A \cap B| \ge W + R - N \]</li>
+    <li><p>If W + R &gt; N, a replica answering the read holds the write, and the coordinator returns the most recent timestamp: "Return most recent TS" (p. 453).</p></li>
+    <li><p>The slide's corners pass: 1 + N, N + 1 and 2⌊N/2⌋ + 2 all exceed N.</p></li>
+  </ol>
+
+  <p>The corners pay differently: (1, N) has fast writes, but a read needs every replica up; (N, 1) has fast reads, but one replica down stops the writes; (Q, Q) balances both and survives N − Q failures — one of three, two of five.</p>
+
+  <div class="pitfall"><p>"W &gt; N/2 is required too." Not by the slide's own list: (W=1, R=N) is "Allowed", and 1 is not more than N/2. W &gt; N/2 keeps two writes from being accepted by disjoint sets; Cassandra settles concurrent writes by timestamp, and its documentation states the rule as W + R &gt; N alone.</p></div>
+
+  <div class="widget" id="l22-w-quorum">
+    <h3 class="widget-title">Quorum explorer: a write, then a read</h3>
+    <p class="widget-intro">The client writes v2 over an old v1, then reads. Filled replicas acknowledged the write; dashed outlines are the replicas the read asks. Drawn is the worst case — the read asks the replicas the write reached last — so a highlighted replica is one the inequality forces into both sets.</p>
+    <ol class="tasks">
+      <li>Start with N = 3, write ONE, read ONE. Predict: can a read right after the write miss it?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Yes. 1 + 1 = 2 ≤ 3: r1 acknowledged the write, the read asks r3, which still holds v1, and the coordinator returns v1. Read repair fixes r3 only afterwards.</p></details>
+      </li>
+      <li>Raise only the read to QUORUM. Enough? Then raise the write to QUORUM too.
+        <details class="answer"><summary>What you should see</summary>
+          <p>1 + 2 = 3 is still not greater than 3: the read set r2, r3 misses r1. With QUORUM on both sides, 2 + 2 = 4 &gt; 3 and r2 is in both sets. That is the insight: when W + R &gt; N, there is no room left for two disjoint sets.</p></details>
+      </li>
+      <li>Keep QUORUM and QUORUM and set N = 5. How many replicas does each operation wait for, how many may be down, and what does it cost against N = 3?
+        <details class="answer"><summary>What you should see</summary>
+          <p>⌊5/2⌋ + 1 = 3 for both; 3 + 3 = 6 &gt; 5. Two replicas may be down instead of one, but each operation waits for the third-fastest answer (9 ms) instead of the second (6 ms) — illustrative times.</p></details>
+      </li>
+      <li>Try write ALL with read ONE, then write ANY with read ALL. What does each buy, and what does it cost?
+        <details class="answer"><summary>What you should see</summary>
+          <p>ALL/ONE: reads are fast and always fresh (3 + 1 &gt; 3), but a write waits for the slowest replica and fails if any replica is down. ANY/ALL: the write may exist only as a hint on the coordinator, so even reading every replica can miss it — no guarantee. ANY buys availability, not consistency.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l22-w-quorum', function (root, ui) {
+    var LAT = [4, 6, 9, 15, 25, 40, 70];          // illustrative response times of the replicas, fastest first (ms)
+    var sN = ui.slider({ label: 'replicas N', min: 1, max: 7, step: 1, value: 3 });
+    var selW = ui.select('write level', ['ANY', 'ONE', 'QUORUM', 'ALL'], null, 'ONE');
+    var selR = ui.select('read level', ['ONE', 'QUORUM', 'ALL', 'ANY'], null, 'ONE');
+    function need(level, N) { return level === 'ONE' ? 1 : level === 'QUORUM' ? Math.floor(N / 2) + 1 : level === 'ALL' ? N : 0; }
+    function plural(n) { return n + ' replica' + (n === 1 ? '' : 's'); }
+    var roW = ui.readout('W: the write waits for');
+    var roR = ui.readout('R: the read waits for');
+    var roG = ui.readout('is the read sure to see the write?');
+    var roD = ui.readout('replicas that may be down');
+    var roL = ui.readout('waiting time (illustrative)');
+    ui.note('Drawn is the worst case: the write reached the replicas on the left first, the read asks those on the right. The replicas\' response times are illustrative, not from the slides — 4, 6, 9, 15, 25, 40, 70 ms — and an operation waits for its W-th (R-th) fastest answer.');
+    ui.legend([
+      { label: 'acknowledged the write: holds v2', color: 's1', mark: 'square' },
+      { label: 'asked by the read (worst case)', color: 's2', mark: 'dash' },
+      { label: 'in both sets', color: 'ink', mark: 'hl' }
+    ]);
+    var svgEl = ui.svg(560, 232, { label: 'A client, a coordinator and N replicas: the replicas that acknowledged the write hold v2, the read asks R replicas, and the replicas in both sets are highlighted' });
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+
+    function draw(N, W, R, any) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      S('rect', { x: 20, y: 16, width: 64, height: 28, rx: 6, 'class': 'fi-paper' });
+      S('text', { x: 52, y: 35, 'class': 'tx-sm tx-mid', text: 'client' });
+      S('line', { x1: 88, y1: 30, x2: 250, y2: 30, 'class': 'sw-2', 'marker-end': 'url(#arr)' });
+      S('rect', { x: 258, y: 16, width: 44, height: 28, 'class': 'fi-paper st-s6 dash sw-2' });
+      [24, 30, 36].forEach(function (y) { S('line', { x1: 266, y1: y, x2: 294, y2: y, 'class': 'st-muted' }); });
+      S('text', { x: 312, y: 35, 'class': 'tx-sm', text: 'coordinator' });
+      if (any) {
+        S('rect', { x: 436, y: 16, width: 54, height: 28, 'class': 'fw-s1 st-s1 dash' });
+        S('text', { x: 463, y: 35, 'class': 'tx-sm tx-mid', text: 'hint' });
+      }
+      if (R > 0) S('text', { x: 168, y: 60, 'class': 'tx-sm tx-mid halo', text: 'read returns ' + (W + R > N ? 'v2' : 'v1') });
+      var sp = 74, x0 = 280 - (N - 1) * sp / 2, i, cx, inW, inR;
+      for (i = 0; i < N; i++) {
+        cx = x0 + i * sp; inW = i < W; inR = R > 0 && i >= N - R;
+        if (inW && inR) S('rect', { x: cx - 31, y: 147, width: 62, height: 42, 'class': 'hl' });
+        S('line', { x1: 280, y1: 48, x2: cx, y2: 138, 'class': inW ? 'st-s1 sw-2' : 'st-muted dash', 'marker-end': inW ? 'url(#arr-s1)' : 'url(#arr-muted)' });
+      }
+      for (i = 0; i < N; i++) {
+        cx = x0 + i * sp; inW = i < W; inR = R > 0 && i >= N - R;
+        S('rect', { x: cx - 26, y: 152, width: 52, height: 32, 'class': inW ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        S('text', { x: cx, y: 174, 'class': 'tx-mono tx-mid', text: inW ? 'v2' : 'v1' });
+        if (inR) S('rect', { x: cx - 33, y: 144, width: 66, height: 48, 'class': 'st-s2 sw-2 dash' });
+        S('text', { x: cx, y: 218, 'class': 'tx-sm tx-mid', text: 'r' + (i + 1) });
+      }
+    }
+
+    ui.onChange(function () {
+      var N = sN.value, wl = selW.value, rl = selR.value;
+      var W = need(wl, N), R = rl === 'ANY' ? -1 : need(rl, N);
+      roW.set(wl === 'ANY' ? 'ANY → one node, maybe only a hint on the coordinator: 0 replicas sure'
+        : wl + ' → ' + (wl === 'QUORUM' ? '⌊' + N + '/2⌋ + 1 = ' : '') + plural(W));
+      if (R < 0) roR.set('ANY is not a read level — p. 453: "Try ONE instead"', 'bad');
+      else roR.set(rl + ' → ' + (rl === 'QUORUM' ? '⌊' + N + '/2⌋ + 1 = ' : '') + plural(R));
+      if (R < 0) roG.set('—');
+      else if (W + R > N) roG.set('yes: ' + W + ' + ' + R + ' = ' + (W + R) + ' > ' + N + ', at least ' + plural(W + R - N) + ' in both sets', 'good');
+      else roG.set('no: ' + W + ' + ' + R + ' = ' + (W + R) + ' ≤ ' + N + ', this read can return v1', 'bad');
+      roD.set('for the write: ' + (wl === 'ANY' ? 'all ' + N + ' (a hint counts)' : (N - W)) + ' · for the read: ' + (R < 0 ? '—' : (N - R)));
+      roL.set('write ≈ ' + (wl === 'ANY' ? LAT[0] : LAT[W - 1]) + ' ms · read ≈ ' + (R < 0 ? '—' : LAT[R - 1] + ' ms'));
+      draw(N, W, R, wl === 'ANY');
+    });
+  });
+  </script>
+
+  <h3>Consistency levels</h3>
+  <p>"In reality, a client can choose one of these levels for a read/write operation" (p. 450; Table 2). The older tables of p. 453 use old names: ZERO ("Good luck with that") is gone, and "DCQ for RackAware" is today's <code>LOCAL_QUORUM</code>. In cqlsh the level is set for the statements that follow (documentation syntax, not on the slides):</p>
+  <pre><code>-- next statements: wait for a majority
+CONSISTENCY QUORUM</code></pre>
+
+  <figure class="tbl-fig" id="l22-tbl-levels">
+    <figcaption>Table 2. The levels of p. 450, with the older tables of p. 453 next to them.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Level</th><th>Waits for (p. 450)</th><th>Write (p. 453)</th><th>Read (p. 453)</th></tr></thead>
+        <tbody>
+          <tr><td><code>ANY</code></td><td>"any node (may not be replica)"</td><td>"1 replica (hints count)"</td><td>"Try ONE instead"</td></tr>
+          <tr><td><code>ONE</code></td><td>"at least one replica"</td><td>"1 replica. read repair in bkgnd"</td><td>"1 replica"</td></tr>
+          <tr class="is-key"><td><code>QUORUM</code></td><td>"quorum across all replicas in all datacenters"</td><td>"(N /2) + 1"</td><td>"Return most recent TS after (N /2) + 1 report"</td></tr>
+          <tr><td><code>LOCAL_QUORUM</code></td><td>"in coordinator's DC"</td><td colspan="2">"DCQ for RackAware" in the old tables</td></tr>
+          <tr><td><code>EACH_QUORUM</code></td><td>"quorum in every DC"</td><td colspan="2">—</td></tr>
+          <tr><td><code>ALL</code></td><td>"all replicas all DCs"</td><td>"N = replication factor"</td><td>"N = replication factor"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>"The level <code>ANY</code> works for reads too." Page 450 lists it for "a read/write operation", but a hint cannot be read: p. 453 answers a read at <code>ANY</code> with "Try ONE instead".</p></div>
+
+  <p>With three copies in each of two datacenters (computed): <code>QUORUM</code> waits for 4 of the 6, wherever they are; <code>LOCAL_QUORUM</code> for 2 in the coordinator's datacenter, with no trip to the other — what "Supporting local queries" buys; <code>EACH_QUORUM</code> for 2 in each, the strictest and slowest.</p>
+
+  <h3>The trade, and when it pays</h3>
+  <aside class="margin-note">The deck's references (p. 461): a Medium guide to Cassandra on Docker and the book Cassandra: The Definitive Guide (O'Reilly).</aside>
+  <p>"Cassandra Summary" (p. 460): BASE, "Basically Available Soft-state Eventual Consistency"; Cassandra "Prefers Availability over Consistency", HBase "Prefers (strong) Consistency over Availability" — the CAP corners of <a href="l05.html">lesson 5</a>. Yet the choice is per operation: <code>ONE</code> and <code>ANY</code> keep accepting writes while replicas are down, <code>QUORUM</code> and <code>ALL</code> refuse rather than answer stale — "Eventual consistency, tunable per query" (p. 1550). Table 3 says when it pays.</p>
+
+  <figure class="tbl-fig" id="l22-tbl-fit">
+    <figcaption>Table 3. "is cassandra a good fit?" (p. 458): the two columns of the slide.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>It pays when…</th><th>…and the team can take</th></tr></thead>
+        <tbody>
+          <tr><td>"you need really fast writes"</td><td>"your programmers can deal": documentation, complexity, consistency model, change, visibility tools</td></tr>
+          <tr><td>"you need durability"</td><td>"your operations can deal": hardware considerations, can move data, JMX monitoring</td></tr>
+          <tr><td>"you have lots of data": &gt; GBs, &gt;= three servers</td><td></td></tr>
+          <tr><td>"your app is evolving": startup mode, fluid data structure</td><td></td></tr>
+          <tr><td>"loose domain data": "points of interest"</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">A read is sure to see the latest acknowledged write when W + R &gt; N; a quorum is ⌊N/2⌋ + 1, chosen per operation.</mark></p>
+</section>
+
+
+<section id="l22-hbase">
+  <h2>HBase: the same engine, one owner per row</h2>
+
+  <p>"HBase" (p. 463) brings Google's Bigtable design into Hadoop: "Major Apache project today, part of Hadoop"; "Facebook uses HBase internally". Its API (p. 464): <code>Get(row)</code>, <code>Put(row)</code>, <code>Scan(row range, filter)</code> ("range queries") and <code>MultiPut(rows)</code>. The scan is the first difference: rows stay sorted by row key, as with the order-preserving partitioner, so a range of rows is one sequential read. (Data model: <a href="l32.html">lesson 32</a>.)</p>
+
+  <aside class="redpen" data-page="463">
+    <p class="claim">"Yahoo! Open-sourced it -&gt; HBase"</p>
+    <p class="fix">Google never released Bigtable's code: it published the design as a paper (OSDI 2006). HBase is an open-source implementation of that design, written as part of the Hadoop project.</p>
+    <p class="because">HBase rebuilt the design from the paper, hence the "SSTable from Google's BigTable" of p. 466. The exam may be matched against the printed line: know it, and if asked where HBase comes from, write "an open-source implementation of Google's Bigtable design".</p>
+  </aside>
+
+  <p>The architecture of p. 465 (Fig. 6) has two floors. Upstairs, HBase: a client asks ZooKeeper which <mark class="key">HRegionServer</mark> serves its rows, then talks to it directly; the <mark class="key">HMaster</mark> assigns regions and watches the servers. Downstairs, Hadoop: every byte lives in HDFS DataNodes, which keep the copies.</p>
+
+  <figure class="fig fig--plain" id="l22-fig-hbase">
+    <svg class="dia" viewBox="0 0 560 424" role="img" aria-label="HBase architecture: the client asks ZooKeeper where its region is and then talks to the region server; the HMaster assigns regions; a region server holds regions, each with one Store per column family made of a MemStore and HFiles, plus one HLog; all files are stored as replicated blocks on HDFS DataNodes">
+      <rect x="12" y="16" width="72" height="28" rx="6" class="fi-paper"/>
+      <text x="48" y="35" class="tx-sm tx-mid">client</text>
+      <rect x="200" y="16" width="120" height="28" class="fw-s3 st-s3"/>
+      <text x="260" y="35" class="tx-sm tx-mid">ZooKeeper</text>
+      <rect x="430" y="16" width="110" height="28" class="fi-paper st-s6 dash sw-2"/>
+      <text x="485" y="35" class="tx-sm tx-mid">HMaster</text>
+      <line x1="88" y1="30" x2="194" y2="30" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="141" y="14" class="tx-sm tx-mid">which server?</text>
+      <line x1="426" y1="30" x2="326" y2="30" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="48" y1="46" x2="48" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="58" y="68" class="tx-sm">get / put / scan</text>
+      <line x1="485" y1="46" x2="485" y2="80" class="dash" marker-end="url(#arr)"/>
+      <text x="476" y="68" class="tx-sm tx-end">assigns regions</text>
+      <rect x="16" y="84" width="528" height="216" class="fi-paper sw-2"/>
+      <text x="28" y="104" class="tx-sm tx-bold">HRegionServer</text>
+      <rect x="28" y="114" width="406" height="132" class="st-muted"/>
+      <text x="40" y="132" class="tx-sm">HRegion · rows A–M</text>
+      <rect x="40" y="142" width="382" height="44" class="st-line"/>
+      <text x="50" y="169" class="tx-sm">Store · family 1</text>
+      <rect x="194" y="151" width="100" height="26" rx="13" class="fi-paper"/>
+      <text x="244" y="169" class="tx-sm tx-mid">MemStore</text>
+      <rect x="304" y="152" width="54" height="24" class="fw-s1 st-s1"/>
+      <text x="331" y="168" class="tx-sm tx-mid">HFile</text>
+      <rect x="364" y="152" width="54" height="24" class="fw-s1 st-s1"/>
+      <text x="391" y="168" class="tx-sm tx-mid">HFile</text>
+      <rect x="40" y="194" width="382" height="44" class="st-line"/>
+      <text x="50" y="221" class="tx-sm">Store · family 2</text>
+      <rect x="194" y="203" width="100" height="26" rx="13" class="fi-paper"/>
+      <text x="244" y="221" class="tx-sm tx-mid">MemStore</text>
+      <rect x="304" y="204" width="54" height="24" class="fw-s1 st-s1"/>
+      <text x="331" y="220" class="tx-sm tx-mid">HFile</text>
+      <rect x="442" y="114" width="92" height="132" class="st-muted dash"/>
+      <text x="488" y="174" class="tx-sm tx-mid">more</text>
+      <text x="488" y="194" class="tx-sm tx-mid">HRegions</text>
+      <text x="28" y="280" class="tx-sm">HLog · one per server</text>
+      <rect x="226" y="264" width="300" height="22" class="fw-s1 st-s1 sw-1"/>
+      <line x1="238" y1="264" x2="238" y2="286" class="st-s1 sw-1"/>
+      <line x1="250" y1="264" x2="250" y2="286" class="st-s1 sw-1"/>
+      <line x1="262" y1="264" x2="262" y2="286" class="st-s1 sw-1"/>
+      <line x1="274" y1="264" x2="274" y2="286" class="st-s1 sw-1"/>
+      <line x1="286" y1="264" x2="286" y2="286" class="st-s1 sw-1"/>
+      <line x1="298" y1="264" x2="298" y2="286" class="st-s1 sw-1"/>
+      <line x1="310" y1="264" x2="310" y2="286" class="st-s1 sw-1"/>
+      <line x1="322" y1="264" x2="322" y2="286" class="st-s1 sw-1"/>
+      <line x1="334" y1="264" x2="334" y2="286" class="st-s1 sw-1"/>
+      <line x1="346" y1="264" x2="346" y2="286" class="st-s1 sw-1"/>
+      <line x1="358" y1="264" x2="358" y2="286" class="st-s1 sw-1"/>
+      <line x1="370" y1="264" x2="370" y2="286" class="st-s1 sw-1"/>
+      <line x1="382" y1="264" x2="382" y2="286" class="st-s1 sw-1"/>
+      <line x1="394" y1="264" x2="394" y2="286" class="st-s1 sw-1"/>
+      <line x1="406" y1="264" x2="406" y2="286" class="st-s1 sw-1"/>
+      <line x1="418" y1="264" x2="418" y2="286" class="st-s1 sw-1"/>
+      <line x1="430" y1="264" x2="430" y2="286" class="st-s1 sw-1"/>
+      <line x1="442" y1="264" x2="442" y2="286" class="st-s1 sw-1"/>
+      <line x1="454" y1="264" x2="454" y2="286" class="st-s1 sw-1"/>
+      <line x1="466" y1="264" x2="466" y2="286" class="st-s1 sw-1"/>
+      <line x1="478" y1="264" x2="478" y2="286" class="st-s1 sw-1"/>
+      <line x1="490" y1="264" x2="490" y2="286" class="st-s1 sw-1"/>
+      <line x1="502" y1="264" x2="502" y2="286" class="st-s1 sw-1"/>
+      <line x1="514" y1="264" x2="514" y2="286" class="st-s1 sw-1"/>
+      <line x1="16" y1="318" x2="544" y2="318" class="st-muted dash"/>
+      <text x="544" y="342" class="tx-sm tx-end tx-muted">HDFS</text>
+      <line x1="120" y1="302" x2="96" y2="344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="300" y1="302" x2="270" y2="344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="460" y1="302" x2="440" y2="344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="30" y="348" width="130" height="44" class="fi-paper sw-2"/>
+      <rect x="205" y="348" width="130" height="44" class="fi-paper sw-2"/>
+      <rect x="378" y="348" width="122" height="44" class="fi-paper sw-2"/>
+      <rect x="40" y="359" width="30" height="22" class="fw-s1 st-s1"/><text x="55" y="375" class="tx-mono tx-sm tx-mid">h1</text>
+      <rect x="80" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="95" y="375" class="tx-mono tx-sm tx-mid">l1</text>
+      <rect x="120" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="135" y="375" class="tx-mono tx-sm tx-mid">h2</text>
+      <rect x="215" y="359" width="30" height="22" class="fw-s1 st-s1"/><text x="230" y="375" class="tx-mono tx-sm tx-mid">l1</text>
+      <rect x="255" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="270" y="375" class="tx-mono tx-sm tx-mid">h1</text>
+      <rect x="295" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="310" y="375" class="tx-mono tx-sm tx-mid">h2</text>
+      <rect x="386" y="359" width="30" height="22" class="fw-s1 st-s1"/><text x="401" y="375" class="tx-mono tx-sm tx-mid">h2</text>
+      <rect x="424" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="439" y="375" class="tx-mono tx-sm tx-mid">h1</text>
+      <rect x="462" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="477" y="375" class="tx-mono tx-sm tx-mid">l1</text>
+      <text x="95" y="414" class="tx-sm tx-mid">DataNode</text>
+      <text x="270" y="414" class="tx-sm tx-mid">DataNode</text>
+      <text x="439" y="414" class="tx-sm tx-mid">DataNode</text>
+    </svg>
+    <figcaption><b>Fig. 6.</b> HBase redrawn from p. 465. One server owns each region; inside it, one Store per column family, each a MemStore plus HFiles; one HLog per server. The files are written to HDFS as blocks (h for HFile, l for HLog), and HDFS keeps several copies of each, three by default: solid the first, dashed the others.</figcaption>
+  </figure>
+
+  <p>The "HBase Storage hierarchy" (p. 466), outside in: a table splits into <mark class="key">regions</mark>, ranges of row keys; a region has "One Store per ColumnFamily (subset of columns with similar query patterns)" — columns read together share a family, stored and read as one Store; a Store has a "Memstore" ("in-memory updates to Store; flushed to disk when full") and "StoreFiles … where the data lives", in blocks. A StoreFile is an <mark class="key">HFile</mark>, the "SSTable from Google's BigTable": data blocks, indexes and a trailer, every key-value record carrying its whole key (p. 467, Table 4).</p>
+
+  <aside class="redpen" data-page="466">
+    <p class="claim">"Split it into multiple regions: replicated across servers"</p>
+    <p class="fix">Regions are distributed across servers, each served by exactly one HRegionServer at a time; what is replicated is the files, by HDFS (Fig. 6).</p>
+    <p class="because">One owner per region is precisely why HBase can promise strong consistency (p. 460); several servers answering for a region would bring back Cassandra's question of which copy is fresh. The exam may be matched against the printed line: know it, and in an answer write "distributed across region servers, replicated by HDFS".</p>
+  </aside>
+
+  <figure class="tbl-fig" id="l22-tbl-hfile">
+    <figcaption>Table 4. One key-value record of an HFile (p. 467), with the slide's census example.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Field</th><th>Census example</th></tr></thead>
+        <tbody>
+          <tr><td>Key Length, Value Length</td><td>lengths of the two parts</td></tr>
+          <tr class="is-key"><td>Row Length, Row</td><td><code>SSN:000-00-0000</code> (15 characters)</td></tr>
+          <tr class="is-key"><td>Column Family Length, Column Family</td><td><code>Demographic</code> (11 characters)</td></tr>
+          <tr class="is-key"><td>Column Qualifier</td><td><code>Ethnicity</code></td></tr>
+          <tr class="is-key"><td>Time Stamp, Key Type</td><td>version of the cell; a value or a delete marker (background)</td></tr>
+          <tr><td>Value</td><td>the stored bytes</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Write-ahead log and replay</h3>
+  <p>"Strong Consistency: HBase Write-Ahead Log" (p. 468): a client's <code>put()</code>, <code>delete()</code> and <code>incr()</code> go "to HLog before writing to MemStore", so the server "Can recover from failure". The <mark class="key">HLog</mark> is HBase's commit log, forced to disk by a Log Flusher (<code>sync()</code>) and cut into files by a Log Roller (<code>rollWriter()</code>). "Log Replay" (p. 469): "After recovery from failure, or upon bootup", "Replay any stale logs (use timestamps to find out where the database is w.r.t. the logs)" — "add edits to the MemStore". One HLog per HRegionServer, not per region, "Avoids many concurrent writes, which on the local file system may involve many disk seeks".</p>
+
+  <h3>Across datacenters</h3>
+  <p>"Cross-data center replication" (p. 470) reuses the log: each region server of the master cluster ships its HLog edits, in batches, to slave clusters ("Synchronous Call"). ZooKeeper, "actually a file system for control information", keeps <code>/hbase/replication/state</code>, <code>/hbase/replication/peers/&lt;peer cluster number&gt;</code> and <code>/hbase/replication/rs/&lt;hlog&gt;</code>: per region server, the HLogs to ship and the offset reached.</p>
+
+  <div class="pitfall"><p>"'Synchronous Call' means a client's write waits for the other datacenter." No: each shipping call is synchronous, but replication runs behind the client — a write is acknowledged once it is in the local HLog and MemStore (background: the HBase Reference Guide calls the replication asynchronous).</p></div>
+
+  <h3>Back to the second puzzle</h3>
+  <figure class="tbl-fig" id="l22-tbl-vs">
+    <figcaption>Table 5. The same engine, two owners.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Cassandra</th><th>HBase</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>who serves a row</td><td>N equal replicas, no master</td><td>one HRegionServer per region</td></tr>
+          <tr><td>finding it</td><td>the hash ring, known to all by gossip</td><td>ZooKeeper; HMaster assigns regions</td></tr>
+          <tr><td>log, memory, disk</td><td>commit log, memtable, SSTable</td><td>HLog, MemStore, HFile</td></tr>
+          <tr><td>copies</td><td>N replicas on N nodes</td><td>HDFS copies of the files</td></tr>
+          <tr><td>row order</td><td>hash order; order inside a partition</td><td>sorted by row key: <code>Scan(row range)</code></td></tr>
+          <tr class="is-key"><td>p. 460</td><td>"Prefers Availability over Consistency"</td><td>"Prefers (strong) Consistency over Availability"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+  <p>Same engine, different owner. Cassandra lets any of N equal replicas take a write, so writes never wait for one machine, and replicas may disagree for a while. HBase gives each row one server, so a read sees every acknowledged write of the row, with no quorum arithmetic; but while a crashed server's regions are reassigned and its HLog replayed, those rows cannot be served. Facebook chose that simpler consistency for Messages.</p>
+</section>
+
+
+<section id="l22-columns">
+  <h2>The other columnar: storing each column apart</h2>
+
+  <p>The deck closes with "Other Columnar DBs" (p. 471) — another meaning of "columnar". Cassandra and HBase keep a row's columns together (HBase within each column family); MonetDB and LucidDB store each column apart, the column storage of <a href="l20.html">lesson 20</a>, for queries that read a few columns of many rows.</p>
+
+  <p>"MonetDB" (p. 472) runs an SQL front-end (relational model), an ODMG front-end (object-oriented model), an OLAP tool and a data-mining tool on one "Monet back-end" through the MIL Language, with "full vertical fragmentation": on p. 473 (Fig. 7) Order(id, day, discount) becomes order_id, order_day and order_discount, each pairing an object id, the oid, with one value.</p>
+
+  <figure class="fig fig--plain" id="l22-fig-monet">
+    <svg class="dia" viewBox="0 0 560 420" role="img" aria-label="MonetDB's full vertical fragmentation: the Order table with id, day and discount becomes three tables order_id, order_day and order_discount, each with an oid and one value; a query on discount reads only order_discount">
+      <text x="280" y="22" class="tx-sm tx-mid tx-bold">Order</text>
+      <rect x="182" y="30" width="196" height="22" class="fw-s3 st-none"/>
+      <rect x="182" y="30" width="196" height="154"/>
+      <line x1="222" y1="30" x2="222" y2="184" class="st-muted"/>
+      <line x1="298" y1="30" x2="298" y2="184" class="st-muted"/>
+      <line x1="182" y1="52" x2="378" y2="52" class="st-muted"/>
+      <text x="202" y="46" class="tx-sm tx-mid">id</text>
+      <text x="260" y="46" class="tx-sm tx-mid">day</text>
+      <text x="338" y="46" class="tx-sm tx-mid">discount</text>
+      <text x="202" y="69" class="tx-mono tx-sm tx-mid">10</text><text x="260" y="69" class="tx-mono tx-sm tx-mid">4/4/98</text><text x="338" y="69" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="202" y="91" class="tx-mono tx-sm tx-mid">11</text><text x="260" y="91" class="tx-mono tx-sm tx-mid">9/4/98</text><text x="338" y="91" class="tx-mono tx-sm tx-mid">0.065</text>
+      <text x="202" y="113" class="tx-mono tx-sm tx-mid">12</text><text x="260" y="113" class="tx-mono tx-sm tx-mid">1/2/98</text><text x="338" y="113" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="202" y="135" class="tx-mono tx-sm tx-mid">13</text><text x="260" y="135" class="tx-mono tx-sm tx-mid">9/4/98</text><text x="338" y="135" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="202" y="157" class="tx-mono tx-sm tx-mid">14</text><text x="260" y="157" class="tx-mono tx-sm tx-mid">7/2/98</text><text x="338" y="157" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="202" y="179" class="tx-mono tx-sm tx-mid">15</text><text x="260" y="179" class="tx-mono tx-sm tx-mid">1/2/98</text><text x="338" y="179" class="tx-mono tx-sm tx-mid">0.065</text>
+      <line x1="240" y1="190" x2="84" y2="212" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="280" y1="190" x2="216" y2="212" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="320" y1="190" x2="386" y2="212" class="sw-2" marker-end="url(#arr)"/>
+      <text x="60" y="230" class="tx-mono tx-sm tx-mid">order_id</text>
+      <text x="216" y="230" class="tx-mono tx-sm tx-mid">order_day</text>
+      <text x="390" y="230" class="tx-mono tx-sm tx-mid">order_discount</text>
+      <rect x="334" y="245" width="112" height="165" class="hl"/>
+      <rect x="20" y="250" width="80" height="154" class="fi-paper"/>
+      <rect x="20" y="250" width="80" height="22" class="fw-s3 st-none"/>
+      <rect x="20" y="250" width="80" height="154" class="fi-none"/>
+      <line x1="60" y1="250" x2="60" y2="404" class="st-muted"/>
+      <line x1="20" y1="272" x2="100" y2="272" class="st-muted"/>
+      <text x="40" y="266" class="tx-sm tx-mid">oid</text><text x="80" y="266" class="tx-sm tx-mid">int</text>
+      <text x="40" y="289" class="tx-mono tx-sm tx-mid">100</text><text x="80" y="289" class="tx-mono tx-sm tx-mid">10</text>
+      <text x="40" y="311" class="tx-mono tx-sm tx-mid">101</text><text x="80" y="311" class="tx-mono tx-sm tx-mid">11</text>
+      <text x="40" y="333" class="tx-mono tx-sm tx-mid">102</text><text x="80" y="333" class="tx-mono tx-sm tx-mid">12</text>
+      <text x="40" y="355" class="tx-mono tx-sm tx-mid">103</text><text x="80" y="355" class="tx-mono tx-sm tx-mid">13</text>
+      <text x="40" y="377" class="tx-mono tx-sm tx-mid">104</text><text x="80" y="377" class="tx-mono tx-sm tx-mid">14</text>
+      <text x="40" y="399" class="tx-mono tx-sm tx-mid">105</text><text x="80" y="399" class="tx-mono tx-sm tx-mid">15</text>
+      <rect x="160" y="250" width="112" height="154" class="fi-paper"/>
+      <rect x="160" y="250" width="112" height="22" class="fw-s3 st-none"/>
+      <rect x="160" y="250" width="112" height="154" class="fi-none"/>
+      <line x1="200" y1="250" x2="200" y2="404" class="st-muted"/>
+      <line x1="160" y1="272" x2="272" y2="272" class="st-muted"/>
+      <text x="180" y="266" class="tx-sm tx-mid">oid</text><text x="236" y="266" class="tx-sm tx-mid">date</text>
+      <text x="180" y="289" class="tx-mono tx-sm tx-mid">100</text><text x="236" y="289" class="tx-mono tx-sm tx-mid">4/4/98</text>
+      <text x="180" y="311" class="tx-mono tx-sm tx-mid">101</text><text x="236" y="311" class="tx-mono tx-sm tx-mid">9/4/98</text>
+      <text x="180" y="333" class="tx-mono tx-sm tx-mid">102</text><text x="236" y="333" class="tx-mono tx-sm tx-mid">1/2/98</text>
+      <text x="180" y="355" class="tx-mono tx-sm tx-mid">103</text><text x="236" y="355" class="tx-mono tx-sm tx-mid">9/4/98</text>
+      <text x="180" y="377" class="tx-mono tx-sm tx-mid">104</text><text x="236" y="377" class="tx-mono tx-sm tx-mid">7/2/98</text>
+      <text x="180" y="399" class="tx-mono tx-sm tx-mid">105</text><text x="236" y="399" class="tx-mono tx-sm tx-mid">1/2/98</text>
+      <rect x="340" y="250" width="100" height="154" class="fi-paper"/>
+      <rect x="340" y="250" width="100" height="22" class="fw-s3 st-none"/>
+      <rect x="340" y="250" width="100" height="154" class="fi-none"/>
+      <line x1="380" y1="250" x2="380" y2="404" class="st-muted"/>
+      <line x1="340" y1="272" x2="440" y2="272" class="st-muted"/>
+      <text x="360" y="266" class="tx-sm tx-mid">oid</text><text x="410" y="266" class="tx-sm tx-mid">float</text>
+      <text x="360" y="289" class="tx-mono tx-sm tx-mid">100</text><text x="410" y="289" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="360" y="311" class="tx-mono tx-sm tx-mid">101</text><text x="410" y="311" class="tx-mono tx-sm tx-mid">0.065</text>
+      <text x="360" y="333" class="tx-mono tx-sm tx-mid">102</text><text x="410" y="333" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="360" y="355" class="tx-mono tx-sm tx-mid">103</text><text x="410" y="355" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="360" y="377" class="tx-mono tx-sm tx-mid">104</text><text x="410" y="377" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="360" y="399" class="tx-mono tx-sm tx-mid">105</text><text x="410" y="399" class="tx-mono tx-sm tx-mid">0.065</text>
+      <text x="458" y="304" class="tx-sm">a query on</text>
+      <text x="458" y="326" class="tx-sm">discount</text>
+      <text x="458" y="348" class="tx-sm">reads this</text>
+    </svg>
+    <figcaption><b>Fig. 7.</b> The Order table of p. 473 split column by column. The six orders get the oids 100–105 in every piece, so a row is rebuilt by taking the same position in each piece; a query on the discount touches one narrow table instead of three columns.</figcaption>
+  </figure>
+
+  <p>"LucidDB" (pp. 474–476) keeps "column store tables" in one file, db.dat. A table "consists of set of clusters", by default one per column ("Each column maps to single cluster"), and a cluster page "stores the values for a specific set of rowIDs". A B-tree per cluster "maps rid values to pageIds" by each page's first rid: page 49 starts at rid 984 and page 50 at 1248, so page 49 holds rids 984–1247. Inside a page (p. 477) LucidDB stores "just the unique column values", each with "a bit-encoded vector" (Table 6).</p>
+
+  <figure class="tbl-fig" id="l22-tbl-lucid">
+    <figcaption>Table 6. The discounts of p. 473 as one page, stored the LucidDB way (computed): each distinct value once, one bit per row.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Distinct value</th><th>rid 0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0.175</td><td class="num">1</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+          <tr><td class="num">0.065</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td></tr>
+          <tr class="is-key"><td class="num">0.000</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">1</td><td class="num">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Hence the "Conclusion" (p. 478): "Column architecture doesn't read unnecessary columns"; "Avoids decompression costs and performs operations faster" — discount = 0.000 is answered by the vector 0 0 0 1 1 0, decompressing nothing; "Use of compression schemes allow us to lower our disk space requirements".</p>
+</section>
+
+
+<section id="l22-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Five theory questions in the forms of the theory part — open answers of a few sentences, and closed ones where a wrong tick may cost points — then two exercises: a quorum computation and a deployment question on the ER scenario of a past paper.</p>
+
+  <div class="exam" data-kind="open" id="l22-exam-write">
+    <div class="exam-q" lang="en">
+      <p>Describe step by step what a Cassandra replica node does when it receives a write, and explain why reads can be slower than writes.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The replica first appends the write to the commit log on disk, a sequential append that makes it durable, and then applies it to the memtable, an in-memory structure of key-value pairs sorted by key; then it can acknowledge. No read, no disk seek and no lock are needed. When the memtable is full or old, it is flushed to disk as an SSTable (Sorted String Table): an immutable file of key-value pairs sorted by key, with an index file of (key, position) pairs and a Bloom filter. Because SSTables are never modified, new versions and deletes (tombstones) accumulate in newer SSTables, and compaction periodically merges them, keeping the newest version of each key and removing deleted items. A read, instead, must look in the memtable and possibly in several SSTables — skipping those whose Bloom filter says the key is absent — and merge the versions by timestamp; the coordinator may also contact several replicas and start a read repair. This is why reads may be slower than writes.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer gives the order (commit log, then memtable), the words SSTable, flush, compaction and Bloom filter, and the reason for the asymmetry. The slide of p. 446 says reads "touch log and multiple SSTables": write memtable, and mention the log only for restarts.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l22-exam-pairs">
+    <div class="exam-q" lang="en">
+      <p>A keyspace has replication factor N = 3. Which write/read consistency-level pairs guarantee that a read returns the most recent acknowledged write? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>W = ONE, R = ONE <span class="fb">1 + 1 = 2 ≤ 3: the read may ask a replica the write has not reached.</span></li>
+      <li data-correct>W = QUORUM, R = QUORUM <span class="fb">2 + 2 = 4 &gt; 3: the two majorities share at least one replica.</span></li>
+      <li>W = ANY, R = ALL <span class="fb">ANY can be satisfied by a hint on a coordinator that is not a replica: until the hint is delivered, no replica has the value, so even reading all three can miss it.</span></li>
+      <li data-correct>W = ALL, R = ONE <span class="fb">3 + 1 = 4 &gt; 3: every replica has the value.</span></li>
+      <li data-correct>W = ONE, R = ALL <span class="fb">1 + 3 = 4 &gt; 3: the read asks every replica, including the one that acknowledged.</span></li>
+      <li>W = ONE, R = QUORUM <span class="fb">1 + 2 = 3, not greater than 3: the two replicas read may both be stale.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>QUORUM/QUORUM, ALL/ONE and ONE/ALL. The condition is W + R &gt; N (here 2 + 2, 3 + 1 and 1 + 3, all greater than 3): it forces the replicas that acknowledged the write and the replicas that answer the read to overlap in at least one node, and the coordinator returns the value with the most recent timestamp. ONE/ONE and ONE/QUORUM fail the inequality; ANY guarantees no replica at all, because a hint stored on the coordinator counts as a successful write.</p></div>
+      <div class="exam-note"><p>Three correct options out of six. ANY/ALL is the trap: it looks like the "read everything" corner, but W counts only real replicas. Wrong ticks may be penalised, so tick only what the inequality proves.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l22-exam-bloom">
+    <div class="exam-q" lang="en">
+      <p>True or false: a Bloom filter may report that a key is absent from an SSTable although the key is stored in it.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">That would be a false negative, which a Bloom filter never gives: the bits set when the key was inserted are never cleared.</span></li>
+      <li data-correct>False <span class="fb">No false negatives; only false positives — an absent key whose bits were all set by other keys.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. When a key is inserted, all its k hashed bits are set, and bits are never reset, so a stored key always finds its bits set and the filter answers "maybe present". The filter can only err the other way: an absent key may find all its bits set by other keys (a false positive). The rate is low; the lecture's example has k = 4 hash functions, 100 items and 3200 bits, with a false-positive rate of 0.02 %.</p></div>
+      <div class="exam-note"><p>A true/false question that tests the direction of the error. Write the reason, not just the word: "bits are never cleared".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l22-exam-gossip">
+    <div class="exam-q" lang="en">
+      <p>Explain how the nodes of a Cassandra cluster learn which nodes are alive without a master. Describe the membership list and how a node decides that another node is down.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Cassandra is peer to peer: no master knows the membership, so each node keeps its own membership list with, for every node, its address, the latest heartbeat counter heard and the local time at which that counter was received. Each node increments its own counter and periodically gossips its list to a few peers (up to three per round), with a three-message exchange (GossipDigestSyn, GossipDigestAck, GossipDigestAck2). On receipt, for every address the node keeps the larger counter and stamps it with its own local time, because the clocks are not synchronised: node 2 at local time 70 receives 10120 and 10098 for nodes 1 and 3, larger than its 10118 and 10090, and stores (10120, 70) and (10098, 70), while it keeps its own entry and the equal one. The traffic per node stays constant and the views converge (anti-entropy). A node whose counter stops increasing becomes suspect: the accrual failure detector computes a suspicion value PHI, minus the base-10 logarithm of the probability that a heartbeat arrives later than the silence observed so far, from the past inter-arrival times; the application sets the threshold (on the slide, PHI = 5 gives a detection time of 10–15 seconds).</p></div>
+      <div class="exam-note"><p>A complete answer has three parts: no master and gossip with few peers; the merge rule with local times; suspicion as a value with a threshold rather than a fixed timeout. The numbers of p. 451 make the merge rule concrete.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l22-exam-hbase">
+    <div class="exam-q" lang="en">
+      <p>Cassandra "prefers availability over consistency", while HBase "prefers (strong) consistency over availability". Explain where this difference comes from in the two architectures.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>In Cassandra every row has N equal replicas on a masterless ring. Any node can coordinate a write and sends it to all replicas; with levels such as ONE or ANY, and with hinted handoff, a write is accepted even while replicas are down, so the replicas may hold different versions for a while; they are reconciled later by timestamps, read repair and compaction (eventual consistency, BASE). In HBase a table is split into regions, and each region is served by exactly one HRegionServer at a time, assigned by the HMaster through ZooKeeper. Every write of a row goes through that single server, which appends it to its write-ahead log (HLog) before applying it to the MemStore, so every read of the row sees the latest write. The copies of the data are kept by HDFS at the file level, not by several servers answering for the same row. When a region server fails, its regions are unavailable until the HMaster reassigns them and the HLog is replayed into the new MemStores: HBase gives up availability during recovery to keep strong consistency.</p></div>
+      <div class="exam-note"><p>The core is "N equal replicas" against "one owner per region". The write-ahead log alone gives durability; consistency comes from the single owner. Mention BASE for Cassandra, and the unavailability during recovery for HBase.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="2" data-tol="0" id="l22-exam-num">
+    <div class="exam-q" lang="en">
+      <p>A keyspace uses the Simple Strategy with replication factor 4. Writes are performed at consistency level QUORUM. What is the smallest number of replicas a read must wait for, so that it is guaranteed to return the latest acknowledged write?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>QUORUM with N = 4 is ⌊4/2⌋ + 1 = 3 replicas, so W = 3. A fresh read needs W + R &gt; N, that is R &gt; 4 − 3 = 1, so R = 2 replicas. Of the lecture's levels, ONE is not enough and QUORUM (3) is more than needed.</p></div>
+      <div class="exam-note"><p>The two steps are the quorum size and the inequality. With N = 4 the slide's N/2 + 1 gives 3 with or without rounding; with an odd N only the rounded-down form is a whole number, so always write the floor.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l22-exam-keyspace">
+    <div class="exam-q" lang="en">
+      <p><b>ER scenario of the exam of 12 Sep 2025</b> (the exercise itself is exam-style, not from the paper): a data structure for tracking farmers and their sales at local markets. Market (Name, Location, Opening Time, Closing Time, Size) and Product (Product ID, Name, Quantity, Expiration Date) are linked by the relationship Sell, with cardinality (1, N) on both sides.</p>
+      <p>The sales are stored in Cassandra, partitioned by market location, on one datacenter of six nodes n1–n6 with tokens 10, 25, 40, 55, 70 and 85; the token of the partition 'Milano' is 62. Write the CQL statement that creates the keyspace markets so that every row is stored three times. Say which nodes hold the copies of 'Milano', and choose consistency levels for writes and reads so that a read always returns the latest acknowledged sale while one replica may be down.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE KEYSPACE markets
+  WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3};</code></pre>
+        <p>With the Simple Strategy the first copy goes to the first node clockwise from the token 62, that is n5 (token 70), and the other two to the next nodes clockwise, n6 (85) and n1 (10, after wrapping around the ring). Writes and reads at QUORUM wait for ⌊3/2⌋ + 1 = 2 replicas each: 2 + 2 &gt; 3, so every read overlaps the last acknowledged write, and either operation still succeeds with one replica down. (ONE/ALL or ALL/ONE would also be consistent, but a single replica down would block the reads or the writes.)</p>
+      </div>
+      <div class="exam-note"><p>The keyspace line opens every Cassandra script of the exercise session (p. 1553); here it is joined to the placement and quorum rules of this lesson. The wrap-around from n6 to n1 is where answers usually slip.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l22-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">In the ring widget, five nodes hold the keys with N = 1. B3 joins with the token 68, between A2 (56) and B2 (81). Which keys change node?</p>
+    <ul class="options">
+      <li>About five sixths of all keys, because the number of nodes changed <span class="fb">That is what hash modulo n does. On the ring a key changes owner only if the new token is now the first one clockwise from it.</span></li>
+      <li data-correct>Only the keys with tokens from 57 to 68 — Varese and Como — which move from B2 to B3 <span class="fb">B3 takes over the part of B2's arc that now ends at its own token; every other key keeps its owner. Try it: 5 to 6 nodes.</span></li>
+      <li>A sixth of the keys of every node, so that the load is even again <span class="fb">Spreading the load over all nodes is what virtual nodes add (background); on the slides' ring, one arc moves from one neighbour.</span></li>
+      <li>None until the next compaction <span class="fb">Compaction merges SSTables inside a node; which node owns a key is decided by the tokens.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about gossip in Cassandra are true? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>In each round a node talks to a few peers, up to three <span class="fb">"Each node picks its discussants (up to 3)" (p. 441).</span></li>
+      <li>Gossip carries the rows written by clients to the replicas <span class="fb">Writes go from the coordinator to the replicas directly (p. 445); gossip carries heartbeats and node state.</span></li>
+      <li data-correct>The network traffic per node stays about the same as the cluster grows <span class="fb">"Always a constant amount of network traffic": the partners per round do not grow with the cluster.</span></li>
+      <li data-correct>A received entry replaces the local one only if its heartbeat counter is larger <span class="fb">The merge rule of p. 451; the time is then the receiver's own.</span></li>
+      <li>A master node decides which nodes are dead and tells the others <span class="fb">There is no master: each node's own accrual detector turns silence into suspicion.</span></li>
+    </ul>
+    <p class="q-fb">Gossip spreads state about nodes, cheaply and repeatedly; the decisions — dead or alive — are taken by each node for itself.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Node 3 is at local time 42. Its list holds the row 1: (counter 500, time 30). A gossip message from node 4 carries 1: (498, 41). What does node 3 store for node 1 afterwards?</p>
+    <ul class="options">
+      <li>(498, 41) <span class="fb">The received counter is smaller: it is older news about node 1. And node 4's times mean nothing on node 3's clock.</span></li>
+      <li>(500, 42) <span class="fb">The time is restamped only when a larger counter arrives; here nothing changed.</span></li>
+      <li data-correct>(500, 30) <span class="fb">The larger counter wins, and it is the one node 3 already has: the row stays as it was, time included.</span></li>
+      <li>(498, 42) <span class="fb">This takes the older counter and stamps it as new — both halves are wrong.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">You delete the partition 'Lodi' and look at a replica's disk right away. What do you find?</p>
+    <ul class="options">
+      <li data-correct>More data: a tombstone was written, and the old rows stay until compaction <span class="fb">"Delete: don't delete item right away"; "add a tombstone to the log" (p. 448). The SSTables holding 'Lodi' are immutable.</span></li>
+      <li>Less data: the rows of 'Lodi' were removed from the SSTables <span class="fb">SSTables are never modified; nothing is erased in place.</span></li>
+      <li>The same data, minus the commit-log entry of 'Lodi' <span class="fb">The commit log is append-only: the delete is appended to it like any other write.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">N = 3. A client writes a new price at ONE and, a millisecond later, another client reads it at ONE. What can happen?</p>
+    <ul class="options">
+      <li>The read always returns the new price, because read repair runs first <span class="fb">Read repair fixes stale replicas after a read has noticed them, and with R = 1 the read may compare nothing at all.</span></li>
+      <li data-correct>The read may return the old price; the stale replica is fixed later <span class="fb">1 + 1 is not greater than 3: the two sets may not overlap. Eventual consistency, as in the widget's first task.</span></li>
+      <li>The read fails, because ONE cannot be used for reads <span class="fb">ONE is a read level ("1 replica", p. 453); ANY is the one that is not.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about HBase are correct? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>Each region is served by one HRegionServer at a time <span class="fb">The single owner is the source of HBase's strong consistency.</span></li>
+      <li data-correct>Every edit is appended to the HLog before it reaches the MemStore <span class="fb">"Write to HLog before writing to MemStore" (p. 468): the log makes the edit survive a crash.</span></li>
+      <li>Each region is served by three region servers, like Cassandra's three replicas <span class="fb">This is the reading that p. 466's "replicated across servers" invites, and it is wrong: copies are kept by HDFS, at the file level.</span></li>
+      <li data-correct>HDFS keeps several copies of the HFiles and the HLog <span class="fb">The lower floor of p. 465: blocks on several DataNodes.</span></li>
+      <li>Scan cannot read a range of rows, because the rows are hashed <span class="fb">HBase keeps rows sorted by row key: <code>Scan(row range, filter)</code> is in the API (p. 464).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In LucidDB's rid-to-pageId B-tree (p. 476), page 49 starts at rid 984 and page 50 at rid 1248. On which page is rid 1247?</p>
+    <ul class="options">
+      <li>Page 50 <span class="fb">Page 50 starts at 1248; 1247 is the last rid before it.</span></li>
+      <li>It cannot be told without reading the pages <span class="fb">Avoiding that is the job of the B-tree: it maps the first rid of each page to the page.</span></li>
+      <li data-correct>Page 49 <span class="fb">The B-tree finds the largest start rid not above 1247 — 984 — so page 49, which holds rids 984–1247.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l22-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A partitioner turns a key into a token — MD5 on the slide (p. 457) — and the first node clockwise on the ring owns it. The replication factor N sets the number of copies; the Simple Strategy puts them on the next nodes clockwise, the Network Topology Strategy per datacenter on different racks (pp. 442–444, 456). The order-preserving partitioner allows key ranges but gives the "'scrabble' distribution".</li>
+    <li>With no master, nodes gossip with up to three peers per round in a three-message handshake (p. 441). Membership lists merge by the larger heartbeat counter, stamped with the receiver's own time (p. 451); the accrual detector outputs a suspicion φ = −log₁₀ of the chance of a later heartbeat, against a threshold the application sets (p. 452).</li>
+    <li>The coordinator sends a write to all replicas and keeps hints for those that are down (p. 445). A replica appends to the commit log and updates the memtable; full memtables are flushed to immutable, sorted SSTables with an index and a Bloom filter; compaction merges them; a delete writes a tombstone (pp. 446–448, 454).</li>
+    <li>A read merges the memtable and the SSTables its Bloom filters do not rule out — never the commit log — so reads are slower than writes (pp. 446, 459). A Bloom filter has false positives but never false negatives (p. 447).</li>
+    <li>Q = ⌊N/2⌋ + 1, and a read is sure to see the latest acknowledged write when W + R &gt; N (p. 449). The levels are <code>ANY</code> (writes only), <code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>, <code>EACH_QUORUM</code> and <code>ALL</code> (pp. 450, 453); read repair is done by the coordinator.</li>
+    <li>HBase splits tables into regions, each served by one HRegionServer, with one Store per column family (MemStore plus HFiles) and one HLog per server written before the MemStore and replayed after a crash; HDFS replicates the files (pp. 463–470). One owner per region gives strong consistency; Cassandra's N equal replicas give availability (p. 460).</li>
+    <li>MonetDB and LucidDB are column stores in the other sense: MonetDB splits every column into its own (oid, value) table, LucidDB stores columns in clusters of pages with distinct values and bit vectors (pp. 471–478).</li>
+  </ul>
+  <aside class="cheat" id="l22-cheat">
+    <dl>
+      <dt>Token</dt><dd>MD5(key) with the random partitioner; the key itself with the order-preserving one (pp. 433, 457)</dd>
+      <dt>Owner of a key</dt><dd>the first node clockwise from the key's token</dd>
+      <dt>Simple Strategy</dt><dd>one datacenter; copies on the next N − 1 nodes clockwise (p. 442)</dd>
+      <dt>Network Topology Strategy</dt><dd>several datacenters; a replication factor per datacenter, copies on different racks (p. 444)</dd>
+      <dt>Keyspace</dt><dd><code>CREATE KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};</code></dd>
+      <dt>Gossip</dt><dd>up to 3 peers per round; GossipDigestSyn, Ack, Ack2; constant traffic (p. 441)</dd>
+      <dt>Membership merge</dt><dd>larger heartbeat counter wins, stamped with the receiver's local time (p. 451)</dd>
+      <dt>PHI</dt><dd>\(\varphi = -\log_{10}\big(1 - F(\Delta t)\big)\); threshold set by the application (p. 452)</dd>
+      <dt>Hinted handoff</dt><dd>the coordinator keeps the write of a down replica and delivers it later (p. 445)</dd>
+      <dt>Write path</dt><dd>commit log (append) → memtable → flush → SSTable + index + Bloom filter → compaction (p. 446)</dd>
+      <dt>Bloom filter</dt><dd>k bits per key; no false negatives; \(p_{FP} \approx (1 - e^{-kn/m})^k\) (background)</dd>
+      <dt>Tombstone</dt><dd>a timestamped delete marker, removed at compaction (p. 448)</dd>
+      <dt>Quorum</dt><dd>\(Q = \lfloor N/2 \rfloor + 1\)</dd>
+      <dt>Fresh read</dt><dd>\(W + R \gt N\), because \(|A \cap B| \ge W + R - N\)</dd>
+      <dt>Consistency levels</dt><dd><code>ANY</code> (writes only), <code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>, <code>EACH_QUORUM</code>, <code>ALL</code> (p. 450)</dd>
+      <dt>Read repair</dt><dd>the coordinator writes the newest value back to stale replicas (p. 448)</dd>
+      <dt>HBase hierarchy</dt><dd>table → regions (one server each) → Store per column family → MemStore + StoreFiles (HFile) → blocks (p. 466)</dd>
+      <dt>HLog</dt><dd>write-ahead log, one per HRegionServer; written before the MemStore, replayed after a crash (pp. 468–469)</dd>
+      <dt>MonetDB</dt><dd>full vertical fragmentation: one (oid, value) table per column (p. 473)</dd>
+      <dt>LucidDB</dt><dd>clusters of pages; B-tree from first rid to pageId; distinct values + bit vectors (pp. 474–477)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l22-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=uNxl3BFcKSA" target="_blank" rel="noopener">Distributed Systems 5.2: Quorums</a>
+      <span class="res-by">Martin Kleppmann, University of Cambridge</span>
+      <p class="res-why">Read and write quorums with three replicas, and why r + w &gt; n makes a read meet the latest write — the overlap of the quorum widget, drawn on a board.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://www.jasondavies.com/bloomfilter/" target="_blank" rel="noopener">Bloom Filters</a>
+      <span class="res-by">Jason Davies</span>
+      <p class="res-why">A 50-bit filter with three hash functions: add words, test words, and watch a false positive appear — a second playground next to the one in section 3.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://tzach.github.io/compaction-viz/" target="_blank" rel="noopener">Compaction visualizer</a>
+      <span class="res-by">Tzach Livyatan (ScyllaDB)</span>
+      <p class="res-why">Client, commit log, memtable, flush, SSTables and compaction, animated with live space and read amplification. Built for ScyllaDB, Cassandra's twin; its leveled, time-window and size-tiered strategies are Cassandra's too, the incremental one is ScyllaDB's own.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://cassandra.apache.org/doc/latest/architecture/dynamo.html" target="_blank" rel="noopener">Dynamo</a>
+      <span class="res-by">Apache Cassandra documentation</span>
+      <p class="res-why">The official version of sections 1, 2 and 4: the token ring and virtual nodes, both strategies, gossip, the Phi accrual detector, hinted handoff, the consistency levels and the rule W + R &gt; RF.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://engineering.fb.com/2010/11/15/core-infra/the-underlying-technology-of-messages/" target="_blank" rel="noopener">The Underlying Technology of Messages</a>
+      <span class="res-by">Facebook Engineering, 2010</span>
+      <p class="res-why">The source of the second puzzle: why the company that built Cassandra chose HBase, with "a simpler consistency model", for Messages.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Cassandra and HBase are built to write fast and to serve rows by key. The column stores at the end of the deck answer the opposite need: read a few columns of billions of rows for one business question — the job of the data warehouse.</p>
+</aside>
+
+</main>
+</body>
+</html>

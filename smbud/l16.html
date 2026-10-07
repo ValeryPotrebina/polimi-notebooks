@@ -1,0 +1,1109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scaling out MongoDB: shards, chunks, mongos and the CAP corner · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l16">
+
+<header class="lesson-head">
+  <h1>Scaling out MongoDB: shards, chunks, mongos and the CAP corner</h1>
+  <p class="lede">After this lesson you will name the parts of a sharded MongoDB cluster and what each one knows, follow a chunk from its first split to its migration, choose range, hash or tag-aware sharding for a workload, and say why the slides put MongoDB on the CP edge — with the slides' dated numbers corrected.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>A hospital's heating systems send a reading every minute — <code>{ deviceId, timestamp, kwh }</code> — and the collection has outgrown its server. The team shards it over three servers and, since every report asks for a time window, picks the <code>timestamp</code> as the shard key. MongoDB does the rest: the collection starts as one chunk, a chunk is cut in two when it grows too big, and the pieces travel to emptier servers while the application keeps writing.</p>
+  <p>A week later the three servers hold the same number of chunks each. Yet at any moment all new readings land on a single server, and the other two receive none. Nothing is broken: every part does exactly its job. How can the data be balanced and the writes not — and which one choice would have spread them?</p>
+  <p>Keep a second question for the end: when the busy server dies, what happens to the readings it holds?</p>
+</div>
+
+
+<section id="l16-why">
+  <h2>Sharding: partitioning that runs by itself</h2>
+
+  <p><a href="l03.html#l03-split">Lesson 3</a> met sharding as horizontal partitioning: whole rows spread over several machines. The MongoDB deck calls it "A new word: Sharding" (p. 287), "Essentially Data Partitioning", and lists what is "Different in NoSQL": "Fully automatic", "Configurable", "Transparent", "BASE principles" — "See for example MongoDB".</p>
+
+  <p>Read them as a division of labour: the database cuts, moves and routes by itself (automatic); a human chooses what to cut on, and how — the key and the strategy of section 4 (configurable); the application sees one database (transparent). "BASE principles" places it in the family of <a href="l05.html">lesson 5</a>; for MongoDB the deck's CAP slide is more precise (section 5).</p>
+
+  <p>The running example: the hospital heating system of the exam of 30 Jan 2026, plus what its ER diagram lacks — the readings each Heating System sends, one document each in a <code>readings</code> collection, the heater's <code>Heater_Sys_ID</code> stored as <code>deviceId</code> as on the slides. Readings grow without end, so they get their own collection (<a href="l13.html">lesson 13</a>'s stop sign of unbounded growth).</p>
+
+  <h3>Four reasons to shard</h3>
+  <p>Page 288 lists them, and p. 335 comes back to all four. "Sharding is a means of partitioning data across servers to enable":</p>
+  <ul>
+    <li>"Scale: needed by Modern applications to support massive workloads and data volume." Each server stores and serves only its part.</li>
+    <li>"Geo-Locality: to support geographically distributed deployments to support optimal UX for customers across vast geographies." Milan's readings on a server in Milan, Palermo's in Palermo.</li>
+    <li>"Hardware Optimizations: on Performance vs. Cost". This month's readings on fast SSD servers, last year's on cheap disks.</li>
+    <li>"Lower Recovery Times: to make 'Recovery Time Objectives' (RTO) feasible." The RTO is the longest outage the business accepts; three small shards restore in parallel, far faster than one big database.</li>
+  </ul>
+
+  <h3>Shard key, chunk, shard</h3>
+  <p>"Sharding involves a shard key defined by a data modeler that describes the partition space of a data set. Data is partitioned into data chunks by the shard key, and these chunks are distributed evenly across shards that reside across many physical servers" (p. 289). And the picture to keep (p. 324): "Key space is like points on a line", "Range is a segment of that line".</p>
+
+  <div class="def">
+    <p><dfn>Shard key</dfn> — the field, or fields, whose value decides where a document lives; "User defines shard key for partitioning" (p. 324).</p>
+    <p><dfn>Chunk</dfn> — a contiguous range of shard-key values, a segment of the key line, together with every document whose key falls in it; the unit that is split and moved.</p>
+    <p><dfn>Shard</dfn> — "a node of the cluster" (p. 327) that holds some of the chunks.</p>
+  </div>
+
+  <figure class="fig fig--plain" id="l16-fig-line">
+    <svg class="dia" viewBox="0 0 560 216" role="img" aria-label="The shard key deviceId drawn as a line from MinKey to MaxKey, cut at 250 and 600 into three chunks: MinKey to 250 and 600 to MaxKey on shard 1, 250 to 600 on shard 2; nine documents sit on the line as points, and the document with deviceId 560 falls in the chunk of shard 2">
+      <path d="M44,66 V58 H166 V66" class="st-s3 sw-2"/>
+      <path d="M174,66 V58 H320 V66" class="st-s3 sw-2"/>
+      <path d="M328,66 V58 H516 V66" class="st-s3 sw-2"/>
+      <line x1="40" y1="92" x2="520" y2="92" class="sw-2"/>
+      <line x1="170" y1="80" x2="170" y2="104" class="sw-2"/>
+      <line x1="324" y1="80" x2="324" y2="104" class="sw-2"/>
+      <circle cx="306" cy="92" r="11" class="hl"/>
+      <circle cx="76" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="112" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="149" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="188" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="216" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="262" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="306" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="402" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="460" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <text x="105" y="46" class="tx-sm tx-mid">[MinKey, 250)</text>
+      <text x="247" y="46" class="tx-sm tx-mid">[250, 600)</text>
+      <text x="422" y="46" class="tx-sm tx-mid">[600, MaxKey)</text>
+      <text x="40" y="126" class="tx-sm">MinKey</text>
+      <text x="170" y="126" class="tx-sm tx-mid">250</text>
+      <text x="324" y="126" class="tx-sm tx-mid">600</text>
+      <text x="520" y="126" class="tx-sm tx-end">MaxKey</text>
+      <text x="105" y="158" class="tx-sm tx-mid">on shard 1</text>
+      <text x="247" y="158" class="tx-sm tx-mid">on shard 2</text>
+      <text x="422" y="158" class="tx-sm tx-mid">on shard 1</text>
+      <text x="306" y="198" class="tx-mid">deviceId 560 → chunk [250, 600) → shard 2</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> "Key space is like points on a line", "Range is a segment of that line" (p. 324), drawn for the shard key <code>deviceId</code>. Two cuts make three chunks; each chunk includes its start and excludes its end. Shard 1 holds two chunks that are not neighbours: a shard owns a set of segments, and the record of which segment lives where is the chunk map of section 2. The two ends of the line are MongoDB's special values MinKey and MaxKey, which sort below and above everything; p. 331 draws them as −∞ and ∞, p. 334 names them.</figcaption>
+  </figure>
+
+  <div class="pitfall"><p>"Fully automatic (p. 287) means nothing to decide." The same deck says "User defines shard key" (p. 324): cutting, moving and routing are automatic, the key is yours — and no automation repairs a bad one.</p></div>
+
+  <p class="memo"><mark class="key">Sharding cuts the shard-key line into chunks and spreads the chunks over shards: you choose the key, MongoDB cuts, moves and routes.</mark></p>
+</section>
+
+
+<section id="l16-parts">
+  <h2>Who is who: mongod, mongos and the config servers</h2>
+
+  <p>Three kinds of process run a sharded cluster: "Mongod – Database instance", "Mongos - Sharding processes" (p. 321) and the config servers (p. 326). The third program of p. 321, "Mongo", is the shell of <a href="l14.html">lesson 14</a>.</p>
+
+  <h3>mongod, and what a shard is</h3>
+  <p><mark class="key">mongod</mark> — the "main daemon" (p. 329) — stores documents and answers queries. A shard "is a node of the cluster" and "can be a single mongod or a replica set" (p. 327). A <mark class="key">replica set</mark> is a group of mongod processes holding the same data: one <em>primary</em>, which receives every write, and <em>secondaries</em>, which copy those writes and can take its place — the slide draws a "Primary" box over two "Secondary" boxes.</p>
+
+  <aside class="redpen" data-page="327">
+    <p class="claim">"Shard can be a single mongod or a replica set"</p>
+    <p class="fix">Since MongoDB 3.6 a shard must be a replica set; a single mongod is no longer accepted.</p>
+    <p class="because">A shard holds chunks no other shard has: if its only server dies, that part of the collection is gone until it returns — switch on the failure in the widget of section 3. The exam may be matched against the printed sentence, so know both: "a single mongod or a replica set" as printed, "a replica set" today.</p>
+  </aside>
+
+  <p>Fig. 2 redraws the deck's picture of the cluster, the third panel of "MongoDB is fast and scalable" (p. 295). Down a column, "Replication /HA": the same data on three servers, which survive one failure. Along the row, "Horizontal Scaling": different data in each column, so another column adds capacity. A column is a replica set; the row is the set of shards.</p>
+
+  <figure class="fig fig--plain" id="l16-fig-axes">
+    <svg class="dia" viewBox="0 0 560 276" role="img" aria-label="A router above three shards. Each shard is a column of three servers: a primary on top and two secondaries, all holding the same two chunks. Shard 1 holds chunks 1 and 2, shard 2 chunks 3 and 4, shard 3 chunks 5 and 6. A vertical arrow along the columns reads replication / HA, a horizontal arrow under the row reads horizontal scaling">
+      <rect x="263" y="12" width="44" height="28" class="fi-paper"/>
+      <line x1="270" y1="20" x2="300" y2="20" class="st-muted"/>
+      <line x1="270" y1="26" x2="300" y2="26" class="st-muted"/>
+      <line x1="270" y1="32" x2="300" y2="32" class="st-muted"/>
+      <line x1="285" y1="42" x2="285" y2="58" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="315" y="31" class="tx-sm">mongos</text>
+      <text x="155" y="80" class="tx-sm tx-mid">shard 1</text>
+      <text x="285" y="80" class="tx-sm tx-mid">shard 2</text>
+      <text x="415" y="80" class="tx-sm tx-mid">shard 3</text>
+      <rect x="110" y="90" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+      <rect x="110" y="140" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="110" y="190" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="240" y="90" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+      <rect x="240" y="140" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="240" y="190" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="370" y="90" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+      <rect x="370" y="140" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="370" y="190" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <path d="M118,98 H146 M118,104 H146 M118,110 H146 M118,148 H146 M118,154 H146 M118,160 H146 M118,198 H146 M118,204 H146 M118,210 H146" class="st-muted"/>
+      <path d="M248,98 H276 M248,104 H276 M248,110 H276 M248,148 H276 M248,154 H276 M248,160 H276 M248,198 H276 M248,204 H276 M248,210 H276" class="st-muted"/>
+      <path d="M378,98 H406 M378,104 H406 M378,110 H406 M378,148 H406 M378,154 H406 M378,160 H406 M378,198 H406 M378,204 H406 M378,210 H406" class="st-muted"/>
+      <rect x="160" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="182" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="160" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="182" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="160" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="182" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="290" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="312" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="290" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="312" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="290" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="312" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="420" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="442" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="420" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="442" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="420" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="442" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="169" y="108" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="191" y="108" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="169" y="158" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="191" y="158" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="169" y="208" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="191" y="208" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="299" y="108" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="321" y="108" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="299" y="158" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="321" y="158" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="299" y="208" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="321" y="208" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="429" y="108" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="451" y="108" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="429" y="158" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="451" y="158" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="429" y="208" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="451" y="208" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="472" y="108" class="tx-sm">primary</text>
+      <text x="472" y="183" class="tx-sm">secondary</text>
+      <line x1="72" y1="218" x2="72" y2="96" class="sw-2" marker-end="url(#arr)"/>
+      <text x="58" y="157" class="tx-sm tx-mid" transform="rotate(-90 58 157)">replication / HA</text>
+      <line x1="110" y1="238" x2="456" y2="238" class="sw-2" marker-end="url(#arr)"/>
+      <text x="285" y="264" class="tx-sm tx-mid">horizontal scaling</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The third panel of "MongoDB is fast and scalable" (p. 295), redrawn with chunks in the boxes. Down a column — "Replication /HA" — the same chunks are copied: a primary (solid squares) and two secondaries (dashed squares), one replica set. Along the row — "Horizontal Scaling" — each column holds different chunks: these are the shards. The slide too draws the top server of each column in a colour of its own.</figcaption>
+  </figure>
+
+  <p>The middle panel, "In-Memory Caching", draws memory cells feeding disks: the data in use stays in RAM, written to disk behind the scenes — "Operates at in-memory speed wherever possible" (p. 294). The first panel, data locality, is <a href="l13.html#l13-fig-locality">lesson 13</a>'s.</p>
+
+  <h3>mongos, the router</h3>
+  <p>Applications do not talk to the shards: they talk to <mark class="key">mongos</mark>, "Analogous to a database router", which "Processes all requests", "Decides how many and which mongod should receive the query" and "Collates the results, and sends it back to the client" (p. 321). "How many and which" is the key phrase:</p>
+
+<pre><code>// targeted: has the shard key
+db.readings.find(
+  { "deviceId": 512 }
+)</code></pre>
+
+<pre><code>// broadcast: no shard key
+db.readings.find(
+  { "kwh": { "$gt": 5 } }
+)</code></pre>
+
+  <p>The first filter contains the shard key: mongos looks 512 up in the chunk map and asks the one shard holding it — a <mark class="key">targeted query</mark>. The second does not, so mongos asks every shard and merges the answers — a <mark class="key">broadcast</mark> (scatter-gather) query, which costs every shard work. Both names are the manual's; the slides say "routed to specific shards" (p. 326). A filter on the leading field of a composite key is targeted too. Fig. 3 follows both queries.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l16-fig-route">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 280" role="img" aria-label="Targeted query: the client sends find deviceId 512 to mongos (1), mongos forwards it to shard 2 only (2), shard 2 answers mongos (3), mongos answers the client (4); mongos knows the way from the chunk map of the config server">
+        <rect x="128" y="10" width="44" height="24" rx="6" class="fi-paper"/>
+        <text x="180" y="27" class="tx-sm">client</text>
+        <line x1="144" y1="36" x2="144" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="82" x2="156" y2="40" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="136" y="64" class="tx-sm tx-end">1</text>
+        <text x="164" y="64" class="tx-sm">4</text>
+        <rect x="128" y="84" width="44" height="28" class="fi-paper"/>
+        <path d="M135,92 H165 M135,98 H165 M135,104 H165" class="st-muted"/>
+        <text x="122" y="103" class="tx-sm tx-end">mongos</text>
+        <rect x="232" y="84" width="44" height="28" class="fi-paper st-s6 sw-3 dash"/>
+        <path d="M239,92 H269 M239,98 H269 M239,104 H269" class="st-muted"/>
+        <line x1="174" y1="98" x2="228" y2="98" class="st-muted dash"/>
+        <text x="201" y="91" class="tx-sm tx-mid">map</text>
+        <text x="254" y="128" class="tx-sm tx-mid">config server</text>
+        <line x1="144" y1="114" x2="144" y2="192" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="194" x2="156" y2="118" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="136" y="160" class="tx-sm tx-end">2</text>
+        <text x="164" y="160" class="tx-sm">3</text>
+        <rect x="40" y="196" width="44" height="28" class="fi-paper"/>
+        <rect x="128" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="216" y="196" width="44" height="28" class="fi-paper"/>
+        <path d="M47,204 H77 M47,210 H77 M47,216 H77 M135,204 H165 M135,210 H165 M135,216 H165 M223,204 H253 M223,210 H253 M223,216 H253" class="st-muted"/>
+        <text x="62" y="242" class="tx-sm tx-mid">shard 1</text>
+        <text x="150" y="242" class="tx-sm tx-mid">shard 2</text>
+        <text x="238" y="242" class="tx-sm tx-mid">shard 3</text>
+        <text x="196" y="178" class="tx-hand">one shard</text>
+        <text x="150" y="270" class="tx-mono tx-sm tx-mid">find({ deviceId: 512 })</text>
+      </svg>
+      <p class="fig-label">Targeted: the filter names the shard key</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 280" role="img" aria-label="Broadcast query: the client sends find kwh greater than 5 to mongos, mongos forwards it to all three shards, all three answer, and mongos collates the answers before replying to the client">
+        <rect x="128" y="10" width="44" height="24" rx="6" class="fi-paper"/>
+        <text x="180" y="27" class="tx-sm">client</text>
+        <line x1="144" y1="36" x2="144" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="82" x2="156" y2="40" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="136" y="64" class="tx-sm tx-end">1</text>
+        <text x="164" y="64" class="tx-sm">4</text>
+        <rect x="128" y="84" width="44" height="28" class="fi-paper"/>
+        <path d="M135,92 H165 M135,98 H165 M135,104 H165" class="st-muted"/>
+        <text x="122" y="103" class="tx-sm tx-end">mongos</text>
+        <rect x="232" y="84" width="44" height="28" class="fi-paper st-s6 sw-3 dash"/>
+        <path d="M239,92 H269 M239,98 H269 M239,104 H269" class="st-muted"/>
+        <line x1="174" y1="98" x2="228" y2="98" class="st-muted dash"/>
+        <text x="201" y="91" class="tx-sm tx-mid">map</text>
+        <text x="254" y="128" class="tx-sm tx-mid">config server</text>
+        <line x1="144" y1="114" x2="76" y2="190" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="48" y1="194" x2="122" y2="116" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="146" y1="114" x2="146" y2="192" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="158" y1="194" x2="158" y2="118" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="114" x2="224" y2="190" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="252" y1="194" x2="178" y2="116" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="96" y="148" class="tx-sm tx-end">2</text>
+        <text x="216" y="148" class="tx-sm">3</text>
+        <rect x="40" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="128" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="216" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <path d="M47,204 H77 M47,210 H77 M47,216 H77 M135,204 H165 M135,210 H165 M135,216 H165 M223,204 H253 M223,210 H253 M223,216 H253" class="st-muted"/>
+        <text x="62" y="242" class="tx-sm tx-mid">shard 1</text>
+        <text x="150" y="242" class="tx-sm tx-mid">shard 2</text>
+        <text x="238" y="242" class="tx-sm tx-mid">shard 3</text>
+        <text x="184" y="74" class="tx-hand">collates</text>
+        <text x="150" y="270" class="tx-mono tx-sm tx-mid">find({ kwh: { $gt: 5 } })</text>
+      </svg>
+      <p class="fig-label">Broadcast: the filter does not</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> The routing slide (p. 326) drawn twice. Left, its numbered path: ① the client's request reaches mongos, ② mongos sends it to the one shard whose chunk holds deviceId 512 — it knows which from the chunk map of the config server — ③ that shard answers, ④ mongos answers the client. Right, a filter without the shard key: every shard must look, and mongos "Collates the results" (p. 321) before answering.</figcaption>
+  </figure>
+
+  <aside class="margin-note">The slide's "router / balancer" is dated: in current MongoDB the balancer runs on the primary of the config servers, not in mongos.</aside>
+
+  <p>mongos "Acts as a router / balancer", has "No local data (persists to config database)" and "Can have 1 or many" (p. 329): "one mongos for the whole system", or "one local mongos for every client if you wanted to minimize network latency" (p. 321) — the two layouts at the bottom of p. 329. A local mongos saves a network hop; a crashed one loses nothing and reloads the map.</p>
+
+  <h3>The config servers, keepers of the map</h3>
+  <p>The map lives on the <mark class="key">config servers</mark>, which "Stores cluster chunk ranges and locations" (p. 326): each chunk's range and its shard. mongos caches it. As the one source of truth about where data lives — p. 329 joins "Config Server", "Mongos" and "Mongod" with two-way arrows — the config servers need the protection the data has.</p>
+
+  <aside class="redpen" data-page="326">
+    <p class="claim">"Can have only 1 or 3 (production must have 3)"</p>
+    <p class="fix">Since MongoDB 3.4 the config servers must form a replica set, in production usually of three members; stand-alone or mirrored config servers are no longer supported.</p>
+    <p class="because">mongos only caches the map: if every config server is lost, the cluster can stop working, so the map gets the protection of the data — a replica set, as on p. 327. The exam may quote the printed sentence: answer "1 or 3, 3 in production" for what the slide says, and add that today they form a replica set.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">mongod stores, mongos routes, the config servers remember where every chunk is.</mark></p>
+</section>
+
+
+<section id="l16-chunks">
+  <h2>The life of a chunk: split, then migrate</h2>
+
+  <p>"Distribution" (p. 325) tells the story in three lines: "Initially 1 chunk", "Default max chunk size: 64mb", "MongoDB automatically splits &amp; migrates chunks when max reached". Its picture catches the middle: "Shard 1" with three chunks, "Shard 2" with one.</p>
+
+  <p>Two events hide in "splits &amp; migrates". A <mark class="key">split</mark> cuts a chunk's range in two at a shard-key value: both halves stay put, only the chunk map changes, no document moves. A <mark class="key">migration</mark> moves one whole chunk to another shard: its documents are copied, the map updated, the old copy deleted. Migrations are the <mark class="key">balancer</mark>'s decision: "MongoDB balances cluster", "MongoDB migrates data to new nodes" (p. 326).</p>
+
+  <aside class="redpen" data-page="325">
+    <p class="claim">"Default max chunk size: 64mb"</p>
+    <p class="fix">64 MB was the default up to MongoDB 5.0. Since 6.0 it is 128 MB, the balancer compares data sizes instead of counting chunks, and chunks are split only when they must be migrated; the current manual calls a chunk a <em>range</em>.</p>
+    <p class="because">The mechanism of the slide — cut the line, move the pieces, keep the map — is unchanged; only the number and the trigger moved. The exam may be matched against the printed "64mb": give it as the slide's value, and add in one clause that current versions use 128 MB.</p>
+  </aside>
+
+  <div class="widget" id="l16-w-chunks">
+    <h3 class="widget-title">Split, migrate, balance: a collection that grows</h3>
+    <p class="widget-intro">The readings collection, sharded on <code>deviceId</code> (0 to 999) over three shards. Each lane is a shard; each chunk is drawn across the keys it covers, filled to its size (full = the slide's 64 MB). <b>Insert</b> adds 40 MB of readings with random deviceIds, and a chunk above 64 MB is split at its middle document. The balancer, when running, moves one chunk at a time from the shard with the most chunks to the one with the fewest, until no two shards differ by two chunks or more — the rule of the slides' era. The slider asks mongos where a deviceId lives. The one thing to see: every chunk lives on exactly one shard — a split cuts chunks, the balancer moves them, and neither copies them.</p>
+    <ol class="tasks">
+      <li>Press <em>Insert</em> once: one chunk of 40 MB on shard 1. Before pressing again, predict how many chunks there will be at 80 MB, and on which shards.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Two. The chunk [MinKey, MaxKey) passes 64 MB and is split at deviceId 496 into two chunks of 40 MB, both still on shard 1 — a split moves nothing. The balancer then sees 2 – 0 – 0 and moves [MinKey, 496) to shard 2; with 1 – 1 – 0 no two shards differ by two, so it stops.</p></details>
+      </li>
+      <li>Press <em>Start over</em>, switch the balancer off and insert six times. Predict where the 240 MB are. Then switch the balancer on.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Four chunks, all on shard 1: splits only redraw the map. With the balancer on, two migrations follow — [MinKey, 260) to shard 2, [260, 496) to shard 3 — leaving 2 – 1 – 1 chunks, 124 – 58 – 58 MB. Splitting keeps chunks small; only migrating spreads the data.</p></details>
+      </li>
+      <li>Start over with the balancer on, insert six times and read the readouts. Then press <em>Add a shard</em>: predict how many chunks the new shard receives.
+        <details class="answer"><summary>What you should see</summary>
+          <p>After six inserts the shards hold 1 – 2 – 1 chunks but 63 – 116 – 61 MB: a chunk-counting balancer calls that balanced. The new, empty shard 4 gets one chunk, [MinKey, 260) from shard 2, and the counts become 1 – 1 – 1 – 1 — "MongoDB migrates data to new nodes" (p. 326). Counting megabytes instead of chunks is exactly what MongoDB changed in version 6.0.</p></details>
+      </li>
+      <li>Press <em>Start over</em>, insert six times, choose "a single mongod", switch on the failure of shard 2 and set the deviceId to 300. Predict mongos's answer, then press <em>Insert</em>. Finally choose "a replica set" again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>deviceId 300 lies in [260, 496), a chunk of shard 2, so the lookup fails, and the next insert has 19 of its 40 MB refused: shard 2 held the deviceIds 0 to 495, about half the key space, and nobody else has a copy. With a replica set, a secondary of shard 2 becomes primary and nothing is lost — sharding divides, replication copies, and a shard needs both.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l16-w-chunks', function (root, ui) {
+    var MAXMB = 64, BATCH = 40, MAXINS = 12, SEED = 16, X0 = 160, X1 = 540, TOP = 64, LANE = 66;
+    var rng, chunks, nShards, inserted, events, moved, acted = false;
+    function reset() {
+      rng = Course.rng(SEED);
+      chunks = [{ lo: -Infinity, hi: Infinity, shard: 0, keys: [] }];
+      nShards = 3; inserted = 0; events = []; moved = [];
+    }
+    reset();
+    function act() { events = []; moved = []; acted = true; }
+    function fk(v) { return v === -Infinity ? 'MinKey' : v === Infinity ? 'MaxKey' : String(v); }
+    function rs(c) { return '[' + fk(c.lo) + ', ' + fk(c.hi) + ')'; }
+    function chunkOf(k) { for (var i = 0; i < chunks.length; i++) if (k >= chunks[i].lo && k < chunks[i].hi) return chunks[i]; return chunks[chunks.length - 1]; }
+
+    ui.button('Insert 40 MB of readings', function () {
+      act();
+      if (inserted >= MAXINS) { events.push('The demo stops at ' + (MAXINS * BATCH) + ' MB: press Start over.'); return; }
+      var refused = 0;
+      for (var i = 0; i < BATCH; i++) {
+        var k = rng.int(0, 999), c = chunkOf(k);
+        if (isDown(c.shard)) refused++; else c.keys.push(k);
+      }
+      inserted++;
+      events.push('Inserted ' + (BATCH - refused) + ' MB.' + (refused ? ' ' + refused + ' MB refused: those deviceIds belong to chunks of shard 2, which is down, and no other shard has them.' : ''));
+      splitAll();
+    }, { kind: 'primary' });
+    ui.button('Add a shard', function () {
+      act();
+      if (nShards >= 4) { events.push('The demo stops at four shards.'); return; }
+      nShards++;
+      events.push('Shard ' + nShards + ' joined the cluster, empty.' + (balancer.value ? '' : ' The balancer is off: nothing moves to it.'));
+    });
+    ui.button('Start over', function () { act(); reset(); events.push('One empty chunk, [MinKey, MaxKey), on shard 1.'); }, { kind: 'ghost', icon: 'refresh' });
+
+    var balancer = ui.toggle('balancer running', true);
+    var kind = ui.select('each shard is', [
+      { value: 'rs', label: 'a replica set: primary + 2 secondaries' },
+      { value: 'one', label: 'a single mongod (allowed on the slide)' }
+    ], null, 'rs');
+    var fail = ui.toggle('shard 2: its primary server fails', false);
+    var look = ui.slider({ label: 'mongos, where is deviceId…', min: 0, max: 999, step: 1, value: 600 });
+
+    function isDown(s) { return fail.value && kind.value === 'one' && s === 1; }
+    function split(c) {
+      var ks = c.keys.slice().sort(function (a, b) { return a - b; });
+      var m = ks[Math.floor(ks.length / 2)];
+      if (!(m > c.lo)) { m = null; for (var i = 0; i < ks.length; i++) if (ks[i] > c.lo) { m = ks[i]; break; } }
+      if (m === null || !(m < c.hi) || ks[0] === ks[ks.length - 1]) return false;
+      var L = { lo: c.lo, hi: m, shard: c.shard, keys: ks.filter(function (k) { return k < m; }) };
+      var R = { lo: m, hi: c.hi, shard: c.shard, keys: ks.filter(function (k) { return k >= m; }) };
+      chunks.splice(chunks.indexOf(c), 1, L, R);
+      events.push('Split ' + rs(c) + ' (' + ks.length + ' MB) at deviceId ' + m + ': ' + L.keys.length + ' + ' + R.keys.length + ' MB, both still on shard ' + (c.shard + 1) + '.');
+      return true;
+    }
+    function splitAll() {
+      var guard = 0, again = true;
+      while (again && guard++ < 100) {
+        again = false;
+        for (var i = 0; i < chunks.length; i++) if (chunks[i].keys.length > MAXMB && split(chunks[i])) { again = true; break; }
+      }
+    }
+    function counts() { var c = []; for (var s = 0; s < nShards; s++) c.push(0); chunks.forEach(function (ch) { c[ch.shard]++; }); return c; }
+    function mbs() { var m = []; for (var s = 0; s < nShards; s++) m.push(0); chunks.forEach(function (ch) { m[ch.shard] += ch.keys.length; }); return m; }
+    function balance() {
+      var out = [], guard = 0;
+      while (guard++ < 60) {
+        var c = counts(), mx = -1, mn = -1;
+        for (var s = 0; s < nShards; s++) {
+          if (isDown(s)) continue;
+          if (mx < 0 || c[s] > c[mx]) mx = s;
+          if (mn < 0 || c[s] < c[mn]) mn = s;
+        }
+        if (mx < 0 || c[mx] - c[mn] < 2) break;
+        var pick = null;
+        for (var i = 0; i < chunks.length; i++) if (chunks[i].shard === mx) { pick = chunks[i]; break; }
+        if (!pick) break;
+        pick.shard = mn;
+        out.push({ chunk: pick, text: 'Balancer: moved ' + rs(pick) + ' (' + pick.keys.length + ' MB) from shard ' + (mx + 1) + ' to shard ' + (mn + 1) + '.' });
+      }
+      return out;
+    }
+
+    var roC = ui.readout('chunks per shard'), roM = ui.readout('megabytes per shard'), roF = ui.readout('mongos looks it up');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'chunk, filled to its size (full = 64 MB)', color: 's1', mark: 'square' },
+      { label: 'the deviceId mongos looks up, and its chunk', color: 's2', mark: 'dash' },
+      { label: 'primary', color: 's4', mark: 'square' },
+      { label: 'secondary', color: 's5', mark: 'square' },
+      { label: 'just migrated', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 266, { label: 'The key space of deviceId as a line from MinKey to MaxKey above one lane per shard; each chunk is a box across the keys it covers, filled to its size; each shard shows its servers, a primary and two secondaries or a single mongod; a dashed line marks the deviceId that mongos looks up' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function xOf(v) { return v === -Infinity ? X0 : v === Infinity ? X1 : X0 + 10 + v * (X1 - X0 - 20) / 1000; }
+    function rack(x, y, role, dead) {
+      S('rect', { x: x, y: y, width: 36, height: 20, 'class': 'fi-paper' + (role === 'P' ? ' st-s4 sw-2' : role === 'S' ? ' st-s5 sw-2' : '') });
+      [6, 10, 14].forEach(function (dy) { S('line', { x1: x + 4, y1: y + dy, x2: x + 16, y2: y + dy, 'class': 'st-muted' }); });
+      if (role && !dead) T(x + 27, y + 15, role, 'tx-sm tx-mid');
+      if (dead) {
+        S('line', { x1: x - 2, y1: y - 2, x2: x + 38, y2: y + 22, 'class': 'st-bad sw-2' });
+        S('line', { x1: x + 38, y1: y - 2, x2: x - 2, y2: y + 22, 'class': 'st-bad sw-2' });
+      }
+    }
+    function draw(hit) {
+      var H = TOP + nShards * LANE + 4;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      S('line', { x1: X0, y1: 34, x2: X1, y2: 34, 'class': 'sw-2' });
+      chunks.forEach(function (c) { if (c.lo !== -Infinity) S('line', { x1: xOf(c.lo), y1: 27, x2: xOf(c.lo), y2: 41, 'class': 'sw-2' }); });
+      T(X0, 56, 'MinKey', 'tx-sm');
+      T(X1, 56, 'MaxKey', 'tx-sm tx-end');
+      for (var s = 0; s < nShards; s++) {
+        var top = TOP + s * LANE;
+        if (s > 0) S('line', { x1: 8, y1: top - 6, x2: 552, y2: top - 6, 'class': 'st-grid' });
+        T(10, top + 20, 'shard ' + (s + 1), 'tx-bold');
+        if (kind.value === 'rs') {
+          var f = fail.value && s === 1;
+          rack(10, top + 28, f ? '' : 'P', f);
+          rack(52, top + 28, f ? 'P' : 'S', false);
+          rack(94, top + 28, 'S', false);
+        } else {
+          rack(10, top + 28, '', isDown(s));
+        }
+        var dead = isDown(s);
+        chunks.forEach(function (c) {
+          if (c.shard !== s) return;
+          var x0 = xOf(c.lo) + 2, w = Math.max(1, xOf(c.hi) - xOf(c.lo) - 4), y = top + 4, h = 46;
+          if (moved.indexOf(c) >= 0) S('rect', { x: x0, y: y, width: w, height: h, 'class': 'hl' });
+          var fh = Math.min(1, c.keys.length / MAXMB) * (h - 4);
+          if (fh > 0) S('rect', { x: x0, y: y + h - fh, width: w, height: fh, 'class': 'fw-s1 st-none' });
+          S('rect', { x: x0, y: y, width: w, height: h, 'class': dead ? 'st-muted dash' : 'st-s1 sw-2' });
+          if (dead) {
+            S('line', { x1: x0, y1: y, x2: x0 + w, y2: y + h, 'class': 'st-bad sw-2' });
+            S('line', { x1: x0 + w, y1: y, x2: x0, y2: y + h, 'class': 'st-bad sw-2' });
+          }
+          if (c === hit) S('rect', { x: x0 - 3, y: y - 3, width: w + 6, height: h + 6, 'class': 'st-s2 sw-2 dash' });
+        });
+      }
+      var lx = xOf(look.value);
+      S('line', { x1: lx, y1: 24, x2: lx, y2: H - 4, 'class': 'st-s2 dash' });
+      T(Course.clamp(lx, X0 + 58, X1 - 58), 16, 'deviceId ' + look.value, 'tx-sm tx-mid');
+    }
+
+    ui.onChange(function () {
+      var mv = balancer.value ? balance() : [];
+      if (mv.length) {
+        if (!acted) { events = []; moved = []; }
+        mv.forEach(function (m) { events.push(m.text); moved.push(m.chunk); });
+      }
+      acted = false;
+      var c = counts(), m = mbs(), lc = [], lm = [];
+      for (var s = 0; s < nShards; s++) { lc.push('shard ' + (s + 1) + ': ' + c[s]); lm.push('shard ' + (s + 1) + ': ' + m[s]); }
+      roC.set(lc.join(' · '));
+      roM.set(lm.join(' · '));
+      var hit = chunkOf(Math.round(look.value)), sh = hit.shard + 1;
+      if (isDown(hit.shard)) roF.set(look.value + ' is in ' + rs(hit) + ' on shard ' + sh + ': error, shard ' + sh + ' is unreachable', 'bad');
+      else roF.set(look.value + ' is in ' + rs(hit) + ' on shard ' + sh + ': answered' + (fail.value && hit.shard === 1 ? ' by its new primary' : ''));
+      note.set(events.length ? events.join('<br>') : 'Press Insert: the tasks below say what to predict first.');
+      draw(hit);
+    });
+  });
+  </script>
+
+  <p>A split is cheap, a change of the map; a migration copies megabytes across the network, so the balancer moves as little as it can. And no chunk is on two shards: sharding divides, replication copies — which is why the failure switch hurts only a single-mongod shard.</p>
+
+  <h3>Auto-sharding in two steps</h3>
+  <p>"Auto-sharding" (p. 328) promises "Minimal effort required" in "Two steps": "Enable Sharding for a database" and "Shard collection within database". In the shell (command names from the MongoDB manual; the slides give only the steps):</p>
+
+<pre><code>// step 1: the database
+sh.enableSharding("hospital")</code></pre>
+
+<pre><code>// step 2: the collection, on
+// the composite key of p. 331
+sh.shardCollection(
+  "hospital.readings",
+  {
+    "deviceId": 1,
+    "timestamp": 1
+  }
+)</code></pre>
+
+  <p>Everything after step 2 happens without you; the key is the one decision MongoDB cannot take for you.</p>
+
+  <p class="memo"><mark class="key">A split only redraws the map; a migration moves a whole chunk; the balancer migrates until the shards are even.</mark></p>
+</section>
+
+
+<section id="l16-strategies">
+  <h2>Range, hash or tag: three ways to cut the line</h2>
+
+  <p>"MongoDB Sharding Strategies" (p. 330) names three: "Ranged", "Hashed", "Tag-aware". All cut the key line into chunks; they differ in what places a document on the line, and in who decides which shards hold a stretch of it. (The slide's drawing labels mongos "Query Router".)</p>
+
+  <h3>Range sharding</h3>
+  <p>Range sharding "Splits shards based on sub-range of a key (or also multiple keys combined)" (p. 331) — read "splits the data". The slide gives a "Simple Shard Key: {deviceId}" and a "Composite Shard Key: {deviceId, timestamp}" (the manual says compound): pairs ordered by <code>deviceId</code>, then by <code>timestamp</code> within a device, like a phone book sorted by surname, then first name. Its two chunks (Fig. 4) split inside device 1000's readings, between two consecutive seconds.</p>
+
+  <figure class="fig fig--plain" id="l16-fig-composite">
+    <svg class="dia" viewBox="0 0 560 162" role="img" aria-label="Two chunks of the composite shard key deviceId, timestamp, as on the slide: the first from minus infinity to device 1000 at time 1418244824, the second from device 1000 at time 1418244825 to infinity; the cut falls inside the readings of device 1000">
+      <rect x="30" y="34" width="240" height="52" class="fw-s1 st-s1 sw-2"/>
+      <rect x="290" y="34" width="240" height="52" class="fw-s1 st-s1 sw-2"/>
+      <text x="44" y="66" class="tx-sm">−∞</text>
+      <text x="258" y="66" class="tx-sm tx-end">(1000, 1418244824)</text>
+      <text x="302" y="66" class="tx-sm">(1000, 1418244825)</text>
+      <text x="518" y="66" class="tx-sm tx-end">∞</text>
+      <text x="150" y="110" class="tx-sm tx-mid">chunk 1</text>
+      <text x="410" y="110" class="tx-sm tx-mid">chunk 2</text>
+      <text x="280" y="148" class="tx-hand tx-mid">the cut falls inside device 1000</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The two chunks drawn on p. 331, printed there as "-∞ …1000,1418244824" and "…1000,1418244825 ∞". The timestamp is a Unix time: 1418244824 is 10 December 2014, 20:53:44 UTC (computed). Chunk 1 holds every device below 1000 and device 1000 up to that second; chunk 2 holds device 1000 from the next second on, and every device above it.</figcaption>
+  </figure>
+
+  <p>A range key keeps neighbours together: a query for a stretch of keys — device 1000 last week — reaches one shard or a few. That is also its weakness. When the key only grows, like a timestamp, every new document lands in the last chunk, the one ending at MaxKey: one chunk, one shard, all the writes — a hot spot. The slides do not discuss it; the MongoDB manual warns about it.</p>
+
+  <h3>Hash sharding</h3>
+  <p>Hash sharding is "A subset of Range Sharding": "MongoDB apples a MD5 hash on the key when a hash shard key is used" (read "applies"), which "Ensures data is distributed randomly within the range of MD5 values" (p. 332). The slide's one formula:</p>
+
+  <div class="formula" data-label="p. 332">
+    \[ \begin{aligned} &amp;\text{Hash Shard Key}(\mathit{deviceId}) \\ &amp;\quad = \text{MD5}(\mathit{deviceId}) \end{aligned} \]
+    <dl class="legend">
+      <dt>MD5</dt><dd>a hash function: the same input always gives the same output, while neighbouring inputs give unrelated outputs</dd>
+    </dl>
+  </div>
+
+  <p>"Subset" means the cutting is still by ranges — of hash values. Consecutive keys get unrelated hashes and scatter over all the chunks, so inserts spread evenly even when the key only grows. The price is the same scrambling: a range query on the key is broadcast to every shard. An equality query stays targeted, since mongos can hash the one value asked for.</p>
+
+  <div class="widget" id="l16-w-keys">
+    <h3 class="widget-title">One stream of readings, three shard keys</h3>
+    <p class="widget-intro">Six heaters, deviceIds 1000 to 1005, send one reading a minute each from the slide's timestamp 1418244825. <b>Run</b> inserts half an hour of readings (dots) into three shards of one chunk each. Switch the shard key at any time: the same readings are placed again, as if sharded that way from the start. Pick a query to see which shards mongos asks (orange outline) and which readings match (rings); the hash is a simple stand-in for MD5 with the same effect. The one thing to see: the shard key decides at once where every write lands and which queries reach a single shard.</p>
+    <ol class="tasks">
+      <li>Keep <code>{ timestamp: 1 }</code>, the ranged key of the hook. Before pressing <em>Run</em>, predict how the 180 readings of half an hour divide among the three shards.
+        <details class="answer"><summary>What you should see</summary>
+          <p>0 – 0 – 180: shard 3 takes all of them. Every new timestamp is larger than all the earlier ones, so every reading falls into the chunk that ends at MaxKey — the hot spot. Yet the time-window query is cheap: mongos sends it to shard 3 only.</p></details>
+      </li>
+      <li>Switch to <code>{ timestamp: "hashed" }</code>. Predict the share of the busiest shard, and how many shards mongos must ask for "the last 10 minutes".
+        <details class="answer"><summary>What you should see</summary>
+          <p>62 – 63 – 55: the busiest shard takes 35 %, close to a third. But the 60 readings of the last 10 minutes lie on all three shards, so the query is broadcast. Now pick "one exact second": mongos hashes 1418244825 and asks shard 3 alone — equality on a hashed key stays targeted.</p></details>
+      </li>
+      <li>Switch to the slide's composite key <code>{ deviceId: 1, timestamp: 1 }</code>. Predict the writes, then the routing of "device 1003, last 10 minutes" and of "the last 10 minutes".
+        <details class="answer"><summary>What you should see</summary>
+          <p>60 – 60 – 60: two devices per shard. Device 1003's window is one stretch of the line, inside the chunk of shard 2: targeted, 10 readings. Without a deviceId, the plain time window has no prefix of the key and is broadcast. This key spreads the writes and keeps the everyday query on one shard.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l16-w-keys', function (root, ui) {
+    var T0 = 1418244825, DEV = [1000, 1001, 1002, 1003, 1004, 1005], X0 = 160, X1 = 540, TOP = 58, LANE = 66, MAXT = 30;
+    var key = ui.select('shard key', [
+      { value: 'range', label: '{ timestamp: 1 } — ranged' },
+      { value: 'hash', label: '{ timestamp: "hashed" }' },
+      { value: 'comp', label: '{ deviceId: 1, timestamp: 1 } — ranged, composite' }
+    ], null, 'range');
+    var query = ui.select('query sent to mongos', [
+      { value: 'last', label: 'the readings of the last 10 minutes' },
+      { value: 'dev', label: 'device 1003, the last 10 minutes' },
+      { value: 'exact', label: 'the reading of one exact second' }
+    ], null, 'last');
+    var player = ui.player({ ms: 140, max: MAXT, label: 'Run', stepLabel: 'One minute' });
+
+    function ts(k, d) { return T0 + 60 * k + (d - 1000) * 7; }
+    function h32(x) {
+      var h = x | 0;
+      h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
+      h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+      h ^= h >>> 16;
+      return h >>> 0;
+    }
+    function place(d, t) {
+      var g = (t - T0) / (60 * MAXT + 60);
+      if (key.value === 'range') return { f: 2 / 3 + 0.03 + g * (1 / 3 - 0.06), s: 2 };
+      if (key.value === 'hash') { var u = h32(t) / 4294967296; return { f: u, s: Math.min(2, Math.floor(u * 3)) }; }
+      var b = d - 1000;
+      return { f: (b + 0.1 + 0.8 * g) / 6, s: b < 2 ? 0 : b < 4 ? 1 : 2 };
+    }
+    function state() {
+      var n = Course.clamp(player.ticks || 0, 0, MAXT), now = T0 + 60 * n, from = now - 600;
+      var pts = [], w = [0, 0, 0], hits = [0, 0, 0];
+      for (var k = 0; k < n; k++) DEV.forEach(function (d) {
+        var t = ts(k, d), p = place(d, t);
+        var m = query.value === 'last' ? t >= from : query.value === 'dev' ? (d === 1003 && t >= from) : t === T0;
+        pts.push({ d: d, t: t, f: p.f, s: p.s, hit: m });
+        w[p.s]++; if (m) hits[p.s]++;
+      });
+      var ask;
+      if (key.value === 'range') ask = [2];
+      else if (key.value === 'hash') ask = query.value === 'exact' ? [Math.min(2, Math.floor(h32(T0) / 4294967296 * 3))] : [0, 1, 2];
+      else ask = query.value === 'dev' ? [1] : [0, 1, 2];
+      return { n: n, from: from, pts: pts, w: w, hits: hits, ask: ask };
+    }
+
+    var roW = ui.readout('new readings per shard'), roB = ui.readout('busiest shard takes'), roQ = ui.readout('mongos sends the query to'), roH = ui.readout('matching readings');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'a reading (one document)', color: 's1', mark: 'dot' },
+      { label: 'a reading that matches the query', color: 's2', mark: 'ring' },
+      { label: 'a shard mongos must ask', color: 's2', mark: 'dash' }
+    ]);
+    var svg = ui.svg(560, 256, { label: 'The key space as a line above three lanes, one per shard, each holding one chunk; the readings appear as dots at their place on the key line; the shards that mongos asks for the chosen query are outlined, and the matching readings are ringed' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function xOf(f) { return X0 + f * (X1 - X0); }
+
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      S('rect', { x: 8, y: 4, width: 44, height: 28, 'class': 'fi-paper' });
+      [12, 18, 24].forEach(function (y) { S('line', { x1: 15, y1: y, x2: 45, y2: y, 'class': 'st-muted' }); });
+      T(58, 24, 'mongos', 'tx-sm');
+      T(X0, 16, key.value === 'range' ? '{ timestamp: 1 }: older → newer' : key.value === 'hash' ? '{ timestamp: "hashed" }: by hash' : '{ deviceId: 1, timestamp: 1 }', 'tx-sm');
+      S('line', { x1: X0, y1: 30, x2: X1, y2: 30, 'class': 'sw-2' });
+      [1 / 3, 2 / 3].forEach(function (f) { S('line', { x1: xOf(f), y1: 23, x2: xOf(f), y2: 37, 'class': 'sw-2' }); });
+      if (key.value === 'comp') DEV.forEach(function (d, i) { T(xOf((i + 0.5) / 6), 48, String(d), 'tx-sm tx-mid'); });
+      else { T(X0, 48, 'MinKey', 'tx-sm'); T(X1, 48, 'MaxKey', 'tx-sm tx-end'); }
+      var last = Math.max.apply(null, st.ask), mids = [];
+      for (var s = 0; s < 3; s++) {
+        var top = TOP + s * LANE, mid = top + 28;
+        mids.push(mid);
+        T(66, top + 33, 'shard ' + (s + 1), 'tx-bold');
+        S('rect', { x: xOf(s / 3) + 2, y: top + 4, width: (X1 - X0) / 3 - 4, height: 48, 'class': 'st-s1' });
+        if (st.ask.indexOf(s) >= 0) {
+          S('rect', { x: X0 - 4, y: top, width: X1 - X0 + 8, height: 56, 'class': 'st-s2 sw-2 dash' });
+          S('line', { x1: 30, y1: mid, x2: 60, y2: mid, 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+        }
+      }
+      S('line', { x1: 30, y1: 34, x2: 30, y2: mids[last], 'class': 'st-s2 sw-2' });
+      st.pts.forEach(function (p) {
+        var cx = xOf(p.f), cy = TOP + p.s * LANE + 12 + (p.d - 1000) * 6.6;
+        S('circle', { cx: cx, cy: cy, r: 2.6, 'class': 'fi-s1 st-none' });
+        if (p.hit) S('circle', { cx: cx, cy: cy, r: 5.2, 'class': 'st-s2 sw-2' });
+      });
+    }
+
+    ui.onChange(function () {
+      var st = state(), tot = st.w[0] + st.w[1] + st.w[2], nh = st.hits[0] + st.hits[1] + st.hits[2];
+      roW.set('shard 1: ' + st.w[0] + ' · shard 2: ' + st.w[1] + ' · shard 3: ' + st.w[2]);
+      roB.set(tot ? Math.round(100 * Math.max(st.w[0], st.w[1], st.w[2]) / tot) + ' %' : '—');
+      roQ.set(st.ask.length === 1 ? 'shard ' + (st.ask[0] + 1) + ' only: targeted' : 'all 3 shards: broadcast, then collates');
+      roH.set(nh + (nh ? ' (shard 1: ' + st.hits[0] + ' · shard 2: ' + st.hits[1] + ' · shard 3: ' + st.hits[2] + ')' : ''));
+      var filter = query.value === 'last' ? '{ timestamp: { $gte: ' + st.from + ' } }'
+        : query.value === 'dev' ? '{ deviceId: 1003, timestamp: { $gte: ' + st.from + ' } }' : '{ timestamp: ' + T0 + ' }';
+      var why = {
+        'range last': 'The filter names the shard key, and the window lies inside the last chunk: shard 3 only.',
+        'range dev': 'The timestamp in the filter is enough to target the last chunk; deviceId is not in the key and only filters inside shard 3.',
+        'range exact': 'One timestamp, one place on the line, one chunk: targeted.',
+        'hash last': 'Neighbouring timestamps have unrelated hashes, so the window is scattered over every chunk: broadcast.',
+        'hash dev': 'deviceId is not in the key, and the timestamps of the window are scattered by the hash: broadcast.',
+        'hash exact': 'Equality on the key: mongos hashes the one value and finds its chunk, on shard 3: targeted.',
+        'comp last': 'Without deviceId the filter has no prefix of the key, and every device has readings in the window: broadcast.',
+        'comp dev': 'deviceId leads the key, so device 1003’s window is one stretch of the line, in the chunk of shard 2: targeted.',
+        'comp exact': 'An exact timestamp without deviceId is no prefix of the key: broadcast, although only one shard holds the reading.'
+      }[key.value + ' ' + query.value];
+      var writes = key.value === 'range' ? 'Writes: every new timestamp is the largest so far, so it falls into the chunk ending at MaxKey, on shard 3.'
+        : key.value === 'hash' ? 'Writes: each timestamp’s hash lands anywhere on the line, so the writes spread.'
+        : 'Writes: each device writes into its own stretch of the line, two devices per shard.';
+      note.set(writes + '<br>Filter <code>' + filter + '</code> — ' + why);
+      draw(st);
+    });
+  });
+  </script>
+
+  <figure class="tbl-fig" id="l16-tbl-keys">
+    <figcaption>What the widget shows after half an hour (180 readings, 6 heaters, 3 shards): the writes on shards 1 · 2 · 3, and the shards mongos asks for each query — one shard means targeted, all 3 means broadcast.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Shard key</th><th>Writes</th><th>Last 10 min</th><th>Device 1003, last 10 min</th><th>One exact second</th></tr></thead>
+        <tbody>
+          <tr><td>timestamp, ranged</td><td class="num">0&nbsp;·&nbsp;0&nbsp;·&nbsp;180</td><td>shard&nbsp;3</td><td>shard&nbsp;3</td><td>shard&nbsp;3</td></tr>
+          <tr><td>timestamp, hashed</td><td class="num">62&nbsp;·&nbsp;63&nbsp;·&nbsp;55</td><td>all&nbsp;3</td><td>all&nbsp;3</td><td>shard&nbsp;3</td></tr>
+          <tr class="is-key"><td>deviceId + timestamp, ranged</td><td class="num">60&nbsp;·&nbsp;60&nbsp;·&nbsp;60</td><td>all&nbsp;3</td><td>shard&nbsp;2</td><td>all&nbsp;3</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Row by row: the timestamp makes time windows cheap and sends every insert to one shard; its hash spreads inserts and broadcasts every window; the composite key spreads inserts and keeps "one device, one window" on one shard.</p>
+
+  <h3>Tag-aware sharding</h3>
+  <p>The third strategy decides which shards may hold a stretch of the line: "Tag-aware sharding allows subset of shards to be tagged, and assigned to a sub-range of the shard-key" (p. 333). The example: users from 100 "regions", "Collection: Users, Shard Key: {uId, regionCode}", "Tag based on macro regions". Page 334 tags "Shard1" and "Shard2" West, "Shard3" and "Shard4" East, and assigns key ranges with the first row of the table below; the balancer keeps each range on its tagged shards. Since version 3.4 MongoDB calls tags <em>zones</em>; keep the slide's word at the exam.</p>
+
+  <figure class="tbl-fig" id="l16-tbl-tags">
+    <figcaption>"Tag Sharding Example" (p. 334): the ranges as printed, with the callouts "Assign Regions 1-50 to the West" and "Assign Regions 51-100 to the East" — and the corrected version (red pen below). A range includes its start and excludes its end.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Shard key</th><th>West: Shard1, Shard2</th><th>East: Shard3, Shard4</th></tr></thead>
+        <tbody>
+          <tr><td>As printed</td><td>{uId, regionCode}</td><td>MinKey, MinKey → MaxKey,50</td><td>MinKey, 50 → MaxKey, MaxKey</td></tr>
+          <tr class="is-key"><td>Corrected</td><td>{regionCode, uId}</td><td>(MinKey, MinKey) → (51, MinKey)</td><td>(51, MinKey) → (MaxKey, MaxKey)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="334">
+    <p class="claim">"Shard Key: {uId, regionCode}" — West: "MinKey, MinKey" to "MaxKey,50"; East: "MinKey, 50" to "MaxKey, MaxKey"; "Assign Regions 1-50 to the West"</p>
+    <p class="fix">With uId first, both printed ranges contain every user, whatever the region. To pin regions, the region must lead the key: shard key {regionCode, uId}, West from (MinKey, MinKey) to (51, MinKey), East from (51, MinKey) to (MaxKey, MaxKey).</p>
+    <p class="because">A composite key is compared field by field, like a phone book: the second field only orders documents that tie on the first. Every real uId lies between MinKey and MaxKey, so West, ending at (MaxKey, 50), holds all users, and so does East, starting at (MinKey, 50) — overlapping ranges, which current MongoDB refuses. The manual's rule: "the range must include the prefix of the shard key" (Fig. 5). The exam may quote the printed table: know it, and why it cannot work.</p>
+  </aside>
+
+  <figure class="fig fig--pair fig--plain" id="l16-fig-tags">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="With the shard key uId, regionCode the six users sit in uId order and their regions alternate between West and East; both printed ranges run from before the first user to after the last, so both cover all six users">
+        <line x1="20" y1="48" x2="280" y2="48" class="sw-2"/>
+        <circle cx="40" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="78" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <circle cx="128" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="166" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <circle cx="216" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="254" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <text x="40" y="30" class="tx-sm tx-mid">u1, 12</text>
+        <text x="84" y="30" class="tx-sm tx-mid">u2, 63</text>
+        <text x="128" y="30" class="tx-sm tx-mid">u3, 7</text>
+        <text x="172" y="30" class="tx-sm tx-mid">u4, 88</text>
+        <text x="216" y="30" class="tx-sm tx-mid">u5, 31</text>
+        <text x="260" y="30" class="tx-sm tx-mid">u6, 51</text>
+        <text x="20" y="68" class="tx-sm">MinKey</text>
+        <text x="280" y="68" class="tx-sm tx-end">MaxKey</text>
+        <path d="M20,76 V82 H280 V76" class="st-s3 sw-2"/>
+        <text x="150" y="98" class="tx-sm tx-mid">West ends at (MaxKey, 50)</text>
+        <path d="M20,110 V116 H280 V110" class="st-s3 sw-2 dash"/>
+        <text x="150" y="132" class="tx-sm tx-mid">East starts at (MinKey, 50)</text>
+        <text x="150" y="166" class="tx-hand tx-mid">both cover all six users</text>
+      </svg>
+      <p class="fig-label">As printed (p. 334): <code>{uId, regionCode}</code></p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="With the shard key regionCode, uId the users sit in region order: the three West users first, the three East users after them, and one cut at 51, MinKey separates the West range from the East range">
+        <line x1="20" y1="48" x2="280" y2="48" class="sw-2"/>
+        <line x1="150" y1="36" x2="150" y2="60" class="sw-2"/>
+        <circle cx="40" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="84" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="128" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="166" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <rect x="210" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <rect x="254" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <text x="40" y="30" class="tx-sm tx-mid">7, u3</text>
+        <text x="84" y="30" class="tx-sm tx-mid">12, u1</text>
+        <text x="128" y="30" class="tx-sm tx-mid">31, u5</text>
+        <text x="172" y="30" class="tx-sm tx-mid">51, u6</text>
+        <text x="216" y="30" class="tx-sm tx-mid">63, u2</text>
+        <text x="260" y="30" class="tx-sm tx-mid">88, u4</text>
+        <text x="20" y="68" class="tx-sm">MinKey</text>
+        <text x="150" y="74" class="tx-sm tx-mid">(51, MinKey)</text>
+        <text x="280" y="68" class="tx-sm tx-end">MaxKey</text>
+        <path d="M20,84 V90 H146 V84" class="st-s3 sw-2"/>
+        <path d="M154,84 V90 H280 V84" class="st-s3 sw-2 dash"/>
+        <text x="83" y="108" class="tx-sm tx-mid">West: regions 1–50</text>
+        <text x="217" y="108" class="tx-sm tx-mid">East: 51–100</text>
+        <text x="150" y="146" class="tx-hand tx-mid">one cut separates them</text>
+      </svg>
+      <p class="fig-label">Corrected: <code>{regionCode, uId}</code></p>
+    </div>
+    <figcaption><b>Fig. 5.</b> Six users of the slide's example in shard-key order. Circles: users of regions 1–50, which the slide assigns to the West; squares: regions 51–100, the East. Left, with uId first, the users sit in uId order and the regions alternate: no single stretch of the line holds the West users, and both printed ranges run from before the first user to after the last. Right, with regionCode first, all West users come before all East users, and one cut separates them.</figcaption>
+  </figure>
+
+  <h3>Which sharding to use?</h3>
+  <p>Page 335 closes the loop with the four reasons of p. 288 (the third column is ours).</p>
+
+  <figure class="tbl-fig" id="l16-tbl-which">
+    <figcaption>"Which Sharding to use?" (p. 335), with the reasons added.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Usage</th><th>Required Strategy</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Scale</td><td>Range or Hash</td><td>more shards hold and serve more data; any cut of the line spreads the volume</td></tr>
+          <tr><td>Geo-Locality</td><td>Tag-aware</td><td>a region's stretch of the line must live on that region's shards</td></tr>
+          <tr><td>Hardware Optimization</td><td>Tag-aware</td><td>hot ranges on fast shards, cold ones on cheap shards: a placement decision</td></tr>
+          <tr><td>Lower Recovery Times</td><td>Range or Hash</td><td>smaller shards restore faster, whatever the cut</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The rule: spreading volume (scale, recovery) needs any cut; putting particular data on particular machines (regions, hardware tiers) needs tags.</p>
+
+  <p class="memo"><mark class="key">Range keeps neighbours together, hash scatters them, tags pin ranges to chosen shards.</mark></p>
+</section>
+
+
+<section id="l16-cap">
+  <h2>The CAP corner</h2>
+
+  <p>The deck's last content slide, "CAP Theorem and Mongo" (p. 336), lays the MongoDB logo along the C–P edge of the triangle, next to the heading "Focus on Consistency and Partition tolerance". Its definitions: "Consistency – all replicas contain the same version of the data", "Availability – system remains operational on failing nodes", and "Partition tolarence" (read "tolerance") — "multiple entry points", "system remains operational on system split". The course notes agree: MongoDB is "built using a CP architecture".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l16-fig-cap">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="The CAP triangle with C at the top, A bottom left and P bottom right; the word MongoDB lies along the edge from C to P, highlighted; a lightning bolt for the partition sits inside">
+        <line x1="150" y1="40" x2="240" y2="192" class="hl"/>
+        <polygon points="150,40 60,192 240,192" class="sw-2"/>
+        <polyline points="152,96 136,126 154,124 140,156" class="st-bad sw-3"/>
+        <text x="150" y="30" class="tx-lg tx-bold tx-mid">C</text>
+        <text x="50" y="200" class="tx-lg tx-bold tx-end">A</text>
+        <text x="250" y="200" class="tx-lg tx-bold">P</text>
+        <text x="211" y="107" class="tx-bold tx-mid" transform="rotate(59.4 211 107)">MongoDB</text>
+        <text x="150" y="226" class="tx-sm tx-mid">Focus on Consistency and Partition tolerance</text>
+      </svg>
+      <p class="fig-label">p. 336: MongoDB on the C–P edge</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="A partition cuts a three-member replica set into one member and two. On the small side the old primary steps down and its client's write is refused. On the large side, two of three members, one has become the new primary, accepts the write and replicates it to the secondary">
+        <line x1="110" y1="26" x2="110" y2="190" class="st-bad sw-2 dash"/>
+        <text x="110" y="16" class="tx-sm tx-mid">partition</text>
+        <rect x="38" y="30" width="36" height="24" rx="6" class="fi-paper"/>
+        <line x1="56" y1="56" x2="56" y2="104" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <path d="M49,73 L63,87 M63,73 L49,87" class="st-bad sw-2"/>
+        <text x="44" y="84" class="tx-sm tx-end">refused</text>
+        <rect x="34" y="108" width="44" height="28" class="fi-paper st-muted dash"/>
+        <path d="M41,116 H71 M41,122 H71 M41,128 H71" class="st-muted"/>
+        <text x="56" y="154" class="tx-sm tx-mid">steps down</text>
+        <text x="56" y="170" class="tx-sm tx-mid">1 of 3</text>
+        <rect x="142" y="30" width="36" height="24" rx="6" class="fi-paper"/>
+        <line x1="160" y1="56" x2="160" y2="104" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="168" y="84" class="tx-sm">accepted</text>
+        <rect x="138" y="108" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+        <rect x="220" y="108" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+        <path d="M145,116 H175 M145,122 H175 M145,128 H175 M227,116 H257 M227,122 H257 M227,128 H257" class="st-muted"/>
+        <line x1="184" y1="122" x2="214" y2="122" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="160" y="154" class="tx-sm tx-mid">new primary</text>
+        <text x="242" y="154" class="tx-sm tx-mid">secondary</text>
+        <text x="200" y="174" class="tx-sm tx-mid">2 of 3: a majority</text>
+        <text x="150" y="222" class="tx-hand tx-mid">one version survives</text>
+      </svg>
+      <p class="fig-label">Why: one primary, chosen by a majority</p>
+    </div>
+    <figcaption><b>Fig. 6.</b> Left, the slide's picture (p. 336): the MongoDB logo lies along the edge between C and P; the lightning in the middle is the partition. Right, the mechanism behind it (background, not on the slide): a partition cuts a three-member replica set into one member and two. Only the side with a majority can keep a primary: the two elect one and keep accepting writes, while the lone old primary steps down as soon as it notices and its clients get errors. Availability is lost on the small side; whatever the old primary accepted in those seconds is rolled back, so only one version of the data survives.</figcaption>
+  </figure>
+
+  <p>Why CP? Because of the replica set. Only its primary accepts writes. If a partition splits a replica set, only the side that still sees a majority of the members may have a primary: it keeps it, or elects one among its secondaries. A primary left on the minority side steps down as soon as it notices, and refuses writes. Its clients get errors — availability is given up — but only the majority side's writes survive, so the data stays consistent: the CP line of <a href="l05.html#l05-choose">lesson 5</a>, "a timeout error or an error, otherwise". (Elections by majority are background; the slides do not describe them.)</p>
+
+  <div class="pitfall"><p>"Partition tolerance means multiple entry points." That line under P (p. 336) is no part of the definition: partition tolerance means the system keeps working when the network between nodes splits (p. 195, lesson 5). Quote the line as what the slide prints, not as the definition. And read "all replicas contain the same version" as a promise about reads through the primary: secondaries may lag a little.</p></div>
+
+  <p>"CP" describes the default path through the primary; each operation may choose otherwise — lesson 5's "It's at operation level!" (p. 198). In the manual's terms (background): a write can wait until a majority has it, the write concern <code>"majority"</code>, or only for the primary; a read can go to a secondary, closer but possibly stale.</p>
+
+  <div class="story" data-year="2013">
+    <p>Kyle Kingsbury's Jepsen tests partitioned a MongoDB 2.4 replica set while clients kept writing. For a while the isolated primary went on accepting writes, until it noticed it had lost the majority and stepped down; when the partition healed, those writes were rolled back. With the "safe" write concern of the time, 2,208 of 5,900 acknowledged writes were lost — 37 %; with the majority write concern, 2 of 5,700. What survives depends on how you write.</p>
+  </div>
+
+  <p class="memo"><mark class="key">MongoDB is CP because each replica set has a single primary, and the side of a partition without a majority stops accepting writes.</mark></p>
+</section>
+
+
+<section id="l16-back">
+  <h2>Back to the busy server</h2>
+
+  <p>The hook's cluster did everything the slides promise: one chunk, splits, migrations until every shard held the same number. But the key was the timestamp, and a timestamp only grows: every new reading falls into the chunk ending at MaxKey — on one shard. The balancer evens out what is stored, not where the next write goes: it balanced the past while the present landed in one place.</p>
+
+  <p>The one choice that would have spread the writes is the key. A hashed timestamp spreads them but broadcasts every time-window report; the slide's composite key <code>{deviceId, timestamp}</code> spreads them over the heaters and keeps "one heater, one window" on one shard — the highlighted row of the table.</p>
+
+  <p>And the second question: a single-mongod shard dies with its chunks — the hole in the first widget — while a replica-set shard elects a new primary and carries on. That is why every shard must be one today.</p>
+</section>
+
+
+<section id="l16-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>True/false, multiple choice and short open answers, as in the theory part, where a wrong tick may cost points. No past paper has a sharding exercise.</p>
+
+  <div class="exam" data-kind="mcq" id="l16-exam-hash">
+    <div class="exam-q" lang="en">
+      <p>True or false: with a hashed shard key, documents with consecutive shard-key values are stored in the same chunk, so a range query on the shard key is routed to a single shard.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">The MD5 hash scrambles the order: consecutive values get unrelated hashes, so they scatter over the chunks (p. 332).</span></li>
+      <li data-correct>False <span class="fb">Hash sharding distributes data "randomly within the range of MD5 values" (p. 332), so a range query on the key must be broadcast to all shards; only an equality query stays targeted.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. Hash sharding applies an MD5 hash to the shard key and partitions the data by ranges of hash values. Consecutive key values have unrelated hashes, so they are spread over different chunks and shards, and a range query on the key has to be broadcast to all shards. It is range sharding that keeps neighbouring values in the same chunk.</p></div>
+      <div class="exam-note"><p>The statement tests the price of hashing. The mirror statement — range sharding keeps neighbours together — is what makes range queries cheap and an always-growing key dangerous.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l16-exam-facts">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about a sharded MongoDB cluster agree with the lecture? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Sharding spreads different chunks of the data over different shards to scale, while replication keeps copies of the same data for high availability. <span class="fb">p. 295: "Horizontal Scaling" along the row of shards, "Replication /HA" down each column.</span></li>
+      <li data-correct>The config servers store the chunk ranges of the cluster and their locations. <span class="fb">p. 326: "Stores cluster chunk ranges and locations".</span></li>
+      <li>mongos stores a copy of the documents it routes, so adding mongos instances adds storage capacity. <span class="fb">mongos has "No local data (persists to config database)" (p. 329); capacity grows by adding shards.</span></li>
+      <li data-correct>Geo-locality and hardware optimization require tag-aware sharding. <span class="fb">p. 335; scale and lower recovery times take "Range or Hash".</span></li>
+      <li>A chunk that exceeds the maximum chunk size is moved, whole, to the shard with the fewest chunks. <span class="fb">It is first split (p. 325); moving chunks is the balancer's separate decision, taken when shards are uneven.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The first, second and fourth statements.</p></div>
+      <div class="exam-note"><p>A select-all question in which a wrong tick may cost points. The two false options are the classic traps: mongos holds no data, and split and migrate are two different events.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-procs">
+    <div class="exam-q" lang="en">
+      <p>Describe the roles of mongod, mongos and the config servers in a sharded MongoDB cluster. Explain the difference between a targeted and a broadcast query, and why a cluster can run several mongos instances.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>mongod is the database instance, the main daemon that stores the documents and executes queries on them. A shard is a node of the cluster: according to the slides a single mongod or a replica set of mongod processes (one primary and secondaries); current versions require a replica set. mongos is the router: it processes all client requests, decides how many and which shards must receive each query, and collates their results before answering the client. The config servers store the cluster metadata: the chunk ranges of the shard key and the shard that holds each chunk; mongos reads and caches this map to route requests. A query whose filter contains the shard key (or a prefix of a composite shard key) is targeted to the shards owning the matching chunks; a query without it is broadcast to all shards and the partial results are merged (scatter-gather). mongos keeps no local data, since its state persists in the config database, so it can be replicated freely: one shared mongos, or one local mongos per application server to save a network hop.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer covers four roles: who stores (mongod and the shard), who routes (mongos: "how many and which", then collates), who remembers (config servers: chunk ranges and locations), and why many mongos (no local data). The slide's "1 or 3" config servers is the dated detail: today they form a replica set.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-chunk">
+    <div class="exam-q" lang="en">
+      <p>Define shard key and chunk. Describe what MongoDB does as a sharded collection grows, and when a new shard is added to the cluster.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The shard key is the field, or combination of fields, chosen by the data modeler that defines the partition space of the collection: its values are ordered like points on a line, from MinKey to MaxKey. A chunk is a contiguous range of shard-key values, a segment of that line, together with the documents whose key falls in it. A newly sharded collection starts as a single chunk. When a chunk exceeds the maximum chunk size — 64 MB by default according to the slides, 128 MB in current versions — MongoDB splits it at a shard-key value into two chunks; a split only changes the metadata on the config servers and moves no data. The balancer then migrates whole chunks from the shards that hold more to the shards that hold fewer, so that the chunks are distributed evenly; when a new shard is added, chunks are migrated to it. The application keeps working throughout, because mongos routes with the updated chunk map.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer keeps the two mechanisms apart — split (metadata only) and migration (data moves) — and gives the number. Give the slide's 64 MB, and mention the current 128 MB in one clause.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-key">
+    <div class="exam-q" lang="en">
+      <p>A hospital heating management system stores one document per sensor reading, <code>{ deviceId, timestamp, kwh }</code>, in a sharded MongoDB collection. Readings arrive continuously from many devices; most queries ask for the readings of one device in a time window. Compare a ranged shard key on <code>timestamp</code>, a hashed shard key on <code>timestamp</code>, and the composite shard key <code>{ deviceId, timestamp }</code>. Which would you choose, and why?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A ranged key on timestamp keeps time windows together, so a time-window query is targeted, but timestamps grow monotonically: every new reading falls into the last chunk, the one bounded by MaxKey, so all inserts hit a single shard — a hot spot — and adding shards does not increase write throughput. A hashed key on timestamp applies MD5 to the value: inserts are spread evenly over chunks and shards, but neighbouring timestamps are scattered, so every time-window query must be broadcast to all shards; only an equality on one exact timestamp is targeted. The composite key { deviceId, timestamp } orders documents by device first and by time within a device: inserts from many devices spread over many chunks, and a query for one device in a time window covers one contiguous range of the key, so mongos targets one shard or a few. I would choose { deviceId, timestamp }; a query on time alone, without deviceId, would be broadcast, which is acceptable if it is rare.</p>
+      </div>
+      <div class="exam-note"><p>This is the hook of the lesson as an exam question, and the composite key is the slide's own (p. 331). For each key name three effects — where the inserts go, which queries are targeted, which are broadcast — and the comparison writes itself.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-cap">
+    <div class="exam-q" lang="en">
+      <p>According to the lecture, which two CAP properties does MongoDB focus on? Explain how a MongoDB replica set behaves during a network partition, and which property it gives up.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The lecture places MongoDB on the C–P edge of the CAP triangle: it focuses on Consistency and Partition tolerance, and the course notes call it a CP architecture. Each replica set has a single primary that accepts all writes, while the secondaries replicate them. If a network partition splits a replica set, only the side that can reach a majority of the members keeps or elects a primary; a primary left on the minority side steps down and refuses writes. Clients that can reach only the minority side receive errors, so availability is sacrificed there. In exchange, only the majority side's writes survive: whatever the old primary accepted before stepping down is rolled back when the partition heals, so the data stays consistent, and the system keeps operating on the majority side despite the partition. What survives a failover therefore depends on the write concern: writes acknowledged by a majority are not lost.</p>
+      </div>
+      <div class="exam-note"><p>Give the slide's classification first (C and P, p. 336), then the mechanism. The single primary and the majority rule are background, not slide text — they are the "why" behind the slide's label.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l16-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Shard 1 holds a 70 MB chunk, above the slide's 64 MB maximum, and MongoDB splits it. Before the balancer acts, how much data has moved to other shards?</p>
+    <ul class="options">
+      <li>Half of the chunk, about 35 MB, to the emptiest shard <span class="fb">That would be a migration — a separate step, decided later by the balancer.</span></li>
+      <li data-correct>None: both halves stay on shard 1, and only the chunk map on the config servers changes <span class="fb">A split cuts a range at a key value; no document leaves the shard.</span></li>
+      <li>The whole 70 MB chunk, to the shard with the fewest chunks <span class="fb">Chunks are moved whole, but only by the balancer, and only when the shards are uneven.</span></li>
+      <li>A copy of each half to every other shard, for safety <span class="fb">Sharding never keeps a chunk on two shards; copies are the replica set's job.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Each of your two app servers runs its own mongos. One mongos crashes and restarts. What is lost?</p>
+    <ul class="options">
+      <li data-correct>Nothing: mongos keeps no data of its own and reads the chunk map from the config servers again <span class="fb">"No local data (persists to config database)" (p. 329).</span></li>
+      <li>The documents written through it in the last minutes <span class="fb">Writes are stored by the shards' mongod processes, not by the router.</span></li>
+      <li>The chunk map, so the collection must be sharded again <span class="fb">The map lives on the config servers; mongos only caches it.</span></li>
+      <li>The chunks routed through it, until the balancer moves them back <span class="fb">Chunks live on shards; a router owns none.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The readings collection is sharded on <code>{ deviceId: 1, timestamp: 1 }</code>. Which filter can mongos send to a single shard?</p>
+    <ul class="options">
+      <li><code>{ timestamp: { $gte: 1418246025 } }</code> <span class="fb">No deviceId, so no prefix of the key: every device has readings in the window, and the query is broadcast.</span></li>
+      <li data-correct><code>{ deviceId: 1003, timestamp: { $gte: 1418246025 } }</code> <span class="fb">Device 1003's readings form one stretch of the line, ordered by time: targeted.</span></li>
+      <li><code>{ kwh: { $gt: 5 } }</code> <span class="fb">Not a shard-key field at all: broadcast.</span></li>
+      <li><code>{ timestamp: 1418244825 }</code> <span class="fb">An exact timestamp, but without deviceId the readings of that second may sit in any chunk: broadcast.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">According to "Which Sharding to use?" (p. 335), which goals require tag-aware sharding? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>Geo-locality <span class="fb">Keeping each region's data on servers in that region means pinning key ranges to chosen shards.</span></li>
+      <li data-correct>Hardware optimization <span class="fb">Recent data on fast shards, old data on cheap ones: again a placement decision.</span></li>
+      <li>Scale <span class="fb">Spreading the volume needs any cut: "Range or Hash".</span></li>
+      <li>Lower recovery times <span class="fb">Smaller shards restore faster whatever the cut: "Range or Hash".</span></li>
+    </ul>
+    <p class="q-fb">The rule: tags when a range must live on particular machines; range or hash when it only has to be spread.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A replica set has three members, and a network partition separates the primary from the two secondaries. What happens?</p>
+    <ul class="options">
+      <li data-correct>The two secondaries elect a new primary; the old primary steps down and refuses writes — availability is lost on its side, consistency is kept <span class="fb">Only the majority side can keep a primary; anything the old primary accepted before stepping down is rolled back, so one version of the data survives.</span></li>
+      <li>Both sides keep a primary and accept writes, and the writes are merged when the partition heals <span class="fb">That is the AP behaviour: two primaries accepting conflicting writes.</span></li>
+      <li>The whole replica set stops accepting writes until the partition heals <span class="fb">The majority side can still elect a primary and keep working.</span></li>
+      <li>The old primary keeps accepting writes, because it was primary first <span class="fb">A primary that cannot see a majority steps down; seniority does not count.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does a hashed shard key spread an ever-growing timestamp evenly over the shards?</p>
+    <ul class="options">
+      <li data-correct>Consecutive timestamps get unrelated hash values, so new readings fall into all the chunks, not only the last one <span class="fb">The chunks are ranges of hash values, and the hash scatters neighbours.</span></li>
+      <li>Because the balancer migrates hashed chunks more often <span class="fb">The balancer is the same; what changes is where each insert lands in the first place.</span></li>
+      <li>Because MongoDB sends hashed documents to the shards in turn, round-robin <span class="fb">The hash decides the place, not the order of arrival.</span></li>
+      <li>Because hashing makes the chunks smaller, so more of them fit on each shard <span class="fb">The chunk size is unchanged; only the positions on the line are scrambled.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can't the ranges of the slide's tag example select regions, with the shard key <code>{uId, regionCode}</code>?</p>
+    <ul class="options">
+      <li data-correct>A composite key is compared field by field, so a range from MinKey to MaxKey in uId contains every user, whatever the region <span class="fb">The region only orders users that tie on uId; it must lead the key to be cut on.</span></li>
+      <li>Because MinKey and MaxKey cannot appear in tag ranges <span class="fb">They can: they are the two ends of the line.</span></li>
+      <li>Because regionCode is a number and uId a string <span class="fb">Types are not the issue; the order of the fields is.</span></li>
+      <li>Because a tag range must start at MinKey <span class="fb">Any stretch of the line can be tagged: the corrected East range starts at (51, MinKey).</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l16-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Sharding is data partitioning run by the database — "Fully automatic", "Configurable", "Transparent" (p. 287) — for four reasons: scale, geo-locality, hardware optimization and lower recovery times (p. 288).</li>
+    <li>The shard key, chosen by the data modeler, orders the documents on a line from MinKey to MaxKey; a chunk is a segment of that line, and a shard is a node of the cluster holding some chunks (pp. 289, 324).</li>
+    <li>mongod stores; mongos routes, decides "how many and which" shards get a query, collates, and keeps no local data, so there can be one or many; the config servers store the chunk ranges and their locations. The slides allow a shard to be a single mongod and 1 or 3 config servers; today both are replica sets.</li>
+    <li>A collection starts as one chunk; past the maximum size (64 MB on the slide, 128 MB today) a chunk is split, which changes only the map, and the balancer migrates whole chunks until the shards are even, also onto new shards. Auto-sharding takes two steps: enable sharding for the database, shard the collection.</li>
+    <li>Range keeps neighbours together: range queries are targeted, but an always-growing key sends every insert to one shard. Hash is range over MD5 values: even writes, broadcast range queries, targeted equality. Tag-aware pins key ranges to tagged shards, and the tag field must lead the key.</li>
+    <li>The slide puts MongoDB on the C–P edge (p. 336): each replica set has one primary, and the side of a partition without a majority refuses writes — availability given up, consistency kept.</li>
+  </ul>
+  <aside class="cheat" id="l16-cheat">
+    <dl>
+      <dt>Sharding (p. 287)</dt><dd>"Essentially Data Partitioning": fully automatic, configurable, transparent</dd>
+      <dt>Why shard (p. 288)</dt><dd>scale · geo-locality · hardware optimizations · lower recovery times (RTO)</dd>
+      <dt>Shard key</dt><dd>field(s) chosen by the data modeler; the key space is a line, MinKey … MaxKey</dd>
+      <dt>Chunk</dt><dd>a range [low, high) of the shard key; max 64 MB on the slide, 128 MB today</dd>
+      <dt>Shard</dt><dd>a node of the cluster: single mongod or replica set (slide); replica set (today)</dd>
+      <dt>Replica set</dt><dd>one primary (all writes) + secondaries (copies); "Replication /HA"</dd>
+      <dt>mongod</dt><dd>database instance, the main daemon</dd>
+      <dt>mongos</dt><dd>router: how many and which shards, collates; no local data; 1 or many</dd>
+      <dt>Config servers</dt><dd>chunk ranges and locations; 1 or 3 (slide), a replica set (today)</dd>
+      <dt>Split / migrate</dt><dd>split: map only, no data moves · migrate: the balancer moves a whole chunk</dd>
+      <dt>Targeted / broadcast</dt><dd>filter with the shard key (or its prefix): some shards · without: all shards, then merge</dd>
+      <dt>Auto-sharding (p. 328)</dt><dd>enable sharding for the database, then shard the collection: <code>sh.enableSharding("db")</code> · <code>sh.shardCollection("db.coll", { key: 1 })</code></dd>
+      <dt>Range sharding</dt><dd>neighbours share chunks: range queries targeted; monotonic key → hot spot</dd>
+      <dt>Hash sharding (p. 332)</dt><dd>Hash Shard Key(deviceId) = MD5(deviceId): even writes, range queries broadcast, equality targeted</dd>
+      <dt>Tag-aware (zones)</dt><dd>tagged shards own key ranges; the tag field must be the key's prefix</dd>
+      <dt>Which strategy (p. 335)</dt><dd>Scale, Lower Recovery Times → Range or Hash · Geo-Locality, Hardware Optimization → Tag-aware</dd>
+      <dt>CAP (p. 336)</dt><dd>C + P: one primary per replica set; the minority side refuses writes</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l16-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Y6Ev8GIlbxc" target="_blank" rel="noopener">Distributed Systems in One Lesson</a>
+      <span class="res-by">Tim Berglund, Devoxx Poland</span>
+      <p class="res-why">A coffee shop outgrows one machine: why "buy a bigger box" stops working, then sharding, replication and the choice between waiting and answering stale — the whole background of this lesson told as one story.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.mongodb.com/docs/manual/sharding/" target="_blank" rel="noopener">Sharding</a>
+      <span class="res-by">MongoDB manual</span>
+      <p class="res-why">The vendor's own pictures of a sharded cluster (shards as replica sets, mongos, config servers) and of ranged against hashed sharding. Read it next to Fig. 2 and the second widget; remember that its numbers are today's, not the slides'.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://thesecretlivesofdata.com/raft/" target="_blank" rel="noopener">The Secret Lives of Data: Raft</a>
+      <span class="res-by">thesecretlivesofdata.com</span>
+      <p class="res-why">Click through a leader election and a network partition: the minority side's writes are rolled back when the network heals. Raft is the family MongoDB's replica-set protocol comes from — the mechanism of Fig. 6, animated.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://aphyr.com/posts/284-call-me-maybe-mongodb" target="_blank" rel="noopener">Call me maybe: MongoDB</a>
+      <span class="res-by">Kyle Kingsbury (Jepsen), 2013</span>
+      <p class="res-why">The test behind the 2013 story: a partitioned replica set, the rollback, and the write concerns compared. What "CP" means in practice once the network really breaks.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html" target="_blank" rel="noopener">Please stop calling databases CP or AP</a>
+      <span class="res-by">Martin Kleppmann, 2015</span>
+      <p class="res-why">By the author of the course textbook: why a single-leader system such as MongoDB fits neither corner cleanly, and how to say per operation what is guaranteed. Give the slide's "CP" at the exam; read this to know its limits.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>MongoDB looks inside every document: the shard key to route it, fields to filter it, a pipeline to aggregate it. The next family gives all that up — the value is opaque, the key the only way in. What is left to do with data, and why is it the fastest of all?</p>
+</aside>
+
+</main>
+</body>
+</html>

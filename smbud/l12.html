@@ -1,0 +1,1402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WITH as GROUP BY: the ER-to-graph recipe and the exam query · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local styles for the three widgets of this lesson: a query listing with the running clause marked,
+   the table of rows after each clause, and the ISA label chips. Tokens only. */
+.l12-query { margin: 0.75rem 1rem 0; font-size: var(--t-sm); }
+.l12-query code { display: block; min-width: max-content; }
+.l12-ln { display: block; padding: 0 0.35rem; border-radius: 3px; white-space: pre; }
+.l12-ln.is-now { background: var(--key-bg); color: var(--key-fg); }
+.l12-ln.is-off { color: var(--ink-3); text-decoration: line-through; }
+.l12-rows { margin: 0.75rem 1rem 0.5rem; }
+.l12-rows > p { margin: 0; font-family: var(--f-display); font-size: var(--t-sm); color: var(--ink-2); }
+.l12-rows .tbl td.is-drop { color: var(--ink-3); text-decoration: line-through; }
+.l12-rows .tbl tr.is-first > td { border-top: 1.5px solid var(--line-2); }
+.l12-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.25rem 1rem 0; }
+.l12-chip { font: inherit; font-family: var(--f-mono); font-variant-ligatures: none; font-size: var(--t-sm); line-height: 1.35; padding: 0.4rem 0.65rem; border: 1.5px solid var(--line-2); border-radius: var(--radius); background: var(--paper); color: var(--ink); cursor: pointer; text-align: left; max-width: 100%; overflow-wrap: anywhere; }
+.l12-chip:hover { border-color: var(--ink-2); }
+.l12-chip:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+.l12-chip.is-good { border-color: var(--good); background: var(--good-bg); }
+.l12-chip.is-bad { border-color: var(--bad); background: var(--bad-bg); }
+.l12-chip .l12-mark { font-weight: 700; margin-right: 0.4rem; }
+.l12-model { margin: 0.75rem 1rem 0.5rem; font-size: var(--t-sm); }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l12">
+
+<header class="lesson-head">
+  <h1>WITH as GROUP BY: the ER-to-graph recipe and the exam query</h1>
+  <p class="lede">After this lesson you will turn a past paper's ER diagram into a Neo4j model in the exam's textual notation, and write its "for each X, considering only X with at least N Y" query as MATCH → WITH → WHERE → RETURN without counting anything twice.</p>
+</header>
+
+<div class="hook" data-label="A puzzle from p. 1413">
+  <p>On a small test graph built on the session's AirBnB model, the host Ann has two listings with four reviews between them. The session's solution to its last exercise — for each host, the reviews of the listings with a First Aid Kit and the number of listings owned (p. 1413) — answers exactly that: 2 listings, 4 reviews.</p>
+  <p>Now drop the <code>WITH</code> in the middle and count both things in the <code>RETURN</code>. Neo4j answers, without an error or a warning: 8 listings, 8 reviews. Where do the extra four of each come from? Section 5 answers, and the same trap hides in many past-paper queries.</p>
+</div>
+
+
+<section id="l12-recipe">
+  <h2>From ER diagram to graph model: four rules</h2>
+
+  <p>Every past paper opens its Neo4j exercise with a graph model of a few ER entities: until 2025 a 1-point "graph model/example describing the nodes, main attributes, and edges"; on 30 Jan 2026, for 2 points, "a written textual representation (no graphical sketches) … using the typical Neo4J notation for nodes ( ), edges -[ ]-&gt;, and attributes { }. Include data types for attributes." The session's recipe, "quite simple" (p. 1350), applied to that hospital:</p>
+  <ol>
+    <li><b>An entity becomes a node.</b> "Entities -&gt; Neo4j nodes, maintaining their attributes and using the name of the entity as label." Building becomes <code>(:Building {building_id: String, name: String, year: Integer})</code>.</li>
+    <li><b>A relationship becomes a relationship.</b> "Relationships -&gt; their equivalent in Neo4j, maintaining their attributes and using the name of the relationship as label." Heats becomes <code>-[:HEATS {start_time: DateTime, end_time: DateTime}]-&gt;</code>.</li>
+    <li><b>An ISA child becomes one node with several labels</b> — below.</li>
+    <li><b>N:N needs nothing.</b> "N.B. N:N relationship do not need any special treatment" (p. 1351).</li>
+  </ol>
+
+  <aside class="margin-note">The slide says "label" for relationships too; Neo4j's word is type, one per relationship. The paper of 11 Feb 2025 asks for "the proper notation for labels, types".</aside>
+
+  <p>Rule 4 saves work: <a href="l08.html">lesson 8</a> needed a table for every N:N relationship; here many edges are many pairs. Background, not on the slide: an edge has two ends, so a relationship among three entities becomes a node.</p>
+
+  <h3>ISA: one node, several labels</h3>
+
+  <p>The ISA rule of p. 1351: "In ISA Hierarchies, parent entities -&gt; nodes, maintaining their attributes, name as label, and relationships (in partial relationships), while children entities -&gt; nodes, maintaining their attributes and relationships and inheriting the ones from the parent entity as well as their label." A child instance is one node wearing the parent's label and its own, with both sets of attributes: the slide's <code>CREATE (:Person:Student {name: "Alice", major: "Physics"})</code>. One person, one node: <code>MATCH (p:Person)</code> finds the students too, and <code>WHERE p:Student</code> picks the subtype without a join.</p>
+
+  <p>The coverage letters decide which label sets exist. Partial (P): a person who is neither paramedic nor firefighter is a plain <code>(:Person)</code>, the quote's "(in partial relationships)". Total (T): no node wears <code>:HeatingSystem</code> alone. Overlapping (O): "A paramedic can be a firefighter" (6 Jun 2024), so <code>:Person:Paramedic:Firefighter</code> is one node — the slide's "child entities might have multiple labels! (e.g., O - ISA)". Exclusive (E): never two sibling labels on one node.</p>
+
+  <div class="pitfall"><p>"Each child node gets only its own label." Then <code>MATCH (p:Person)</code> misses every paramedic. The slide's children inherit the parent's attributes "as well as their label".</p></div>
+
+  <div class="widget" id="l12-w-isa">
+    <h3 class="widget-title">ISA in labels: which nodes may exist?</h3>
+    <p class="widget-intro">Pick an ISA hierarchy from a past paper (only the entities its exercise asks for are drawn). Each chip is a kind of node you might write in your model: tap the ones that may exist — each tap is checked at once — and read your model, in the exam's notation, under the chips.</p>
+    <ol class="tasks">
+      <li>Hierarchy of 6 Jun 2024, (P, O). Before tapping: may a node wear <code>:Person:Paramedic:Firefighter</code>? May a node wear <code>:Person</code> alone?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Both turn green. Overlapping lets one person be paramedic and firefighter at once — one node, three labels; partial lets a person be neither — a plain <code>:Person</code>. Only <code>:Paramedic</code> without its parent label and the IS_A construction turn red.</p></details>
+      </li>
+      <li>Switch to the heating systems of 30 Jan 2026, (T, E). Predict which two kinds of node of the first hierarchy have no counterpart now, then tap to check.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The plain parent <code>:HeatingSystem</code> (total: every heating system is one of the children) and the double child <code>:HeatingSystem:HVACSystem:GasHeatingSystem</code> (exclusive). The model has exactly two node lines, each with both labels.</p></details>
+      </li>
+      <li>Last hierarchy, 11 Feb 2025, two levels. How many labels does a pilot wear? Can a node wear <code>:Person</code> alone? <code>:Person:TeamMember</code>?
+        <details class="answer"><summary>What you should see</summary>
+          <p>A pilot wears three labels, <code>:Person:TeamMember:Pilot</code>: a child inherits the labels of every ancestor. <code>:Person</code> alone is red, because the top level is total; <code>:Person:TeamMember</code> is green, because the lower level is partial. The insight: a child is one node that wears its parents' labels too; T removes the plain parent, E forbids two sibling labels on one node.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l12-w-isa', function (root, ui) {
+    /* one node line in the exam notation, the property list wrapped at about 58 characters */
+    function nodeLine(labels, list) {
+      var out = [], cur = '(' + labels + ' {';
+      list.forEach(function (p, i) {
+        var piece = p + (i < list.length - 1 ? ', ' : '})');
+        if (cur.length + piece.length > 58 && /[^ {]$/.test(cur.replace(/,\s*$/, ',x'))) { out.push(cur.replace(/\s+$/, '')); cur = '    '; }
+        cur += piece;
+      });
+      out.push(cur);
+      return out.join('\n');
+    }
+    var PERSON = ['personal_id: String', 'name: String', 'surname: String', 'postal_code: String'];
+    var VEH = ['plate: String', 'number_of_seats: Integer'];
+    var HS = ['heater_sys_id: String', 'heating_power: Float'];
+    var F1P = ['personal_id: String', 'name: String', 'surname: String', 'birth_date: Date', 'gender: String'];
+    var FRAGS = [
+      { id: 'po', label: '6 Jun 2024 · Person → Paramedic, Firefighter (P, O)', layout: 1,
+        ents: [{ n: 'Person', x: 280, y: 40 }, { n: 'Paramedic', x: 150, y: 170 }, { n: 'Firefighter', x: 410, y: 170 }], cov: ['(P, O)'],
+        intro: 'Person is partial and overlapping: "A paramedic can be a firefighter". (Policeman, the third child, is not in this exercise.)',
+        chips: [
+          { t: ':Person:Paramedic', ok: true, why: 'a child is one node that wears its parent\'s label and its own, with both sets of attributes.', line: nodeLine(':Person:Paramedic', PERSON.concat(['paramedic_id: String', 'training_level: String'])) },
+          { t: ':Paramedic', ok: false, why: 'the parent label is missing: MATCH (p:Person) would not find this paramedic, and Person\'s attributes would have no home.' },
+          { t: ':Person', ok: true, why: 'partial: a person who is neither a paramedic nor a firefighter is a plain :Person node.', line: nodeLine(':Person', PERSON) },
+          { t: '(:Person)-[:IS_A]->(:Paramedic)', ok: false, why: 'one real paramedic would become two nodes to be joined; the recipe gives one node with two labels.' },
+          { t: ':Person:Firefighter', ok: true, why: 'the second child, again with the parent\'s label.', line: nodeLine(':Person:Firefighter', PERSON.concat(['firefighter_id: String'])) },
+          { t: ':Person:Paramedic:Firefighter', ok: true, why: 'overlapping: one person may be both, so one node wears both child labels.', line: nodeLine(':Person:Paramedic:Firefighter', PERSON.concat(['paramedic_id: String', 'training_level: String', 'firefighter_id: String'])) }
+        ],
+        edges: ['(:Person)-[:DRIVES]->(:Vehicle)', '(:Paramedic)-[:DRIVES {driving_license_number: String}]\n    ->(:Ambulance)', '(:Firefighter)-[:DRIVES {driving_license_number: String}]\n    ->(:FireTruck)'] },
+      { id: 'pe', label: '6 Jun 2024 · Vehicle → Ambulance, Fire Truck (P, E)', layout: 1,
+        ents: [{ n: 'Vehicle', x: 280, y: 40 }, { n: 'Ambulance', x: 150, y: 170 }, { n: 'Fire Truck', x: 410, y: 170 }], cov: ['(P, E)'],
+        intro: 'Vehicle is partial and exclusive: a vehicle may be neither, never both.',
+        chips: [
+          { t: ':Vehicle:Ambulance:FireTruck', ok: false, why: 'exclusive: no vehicle is an ambulance and a fire truck at once.' },
+          { t: ':Vehicle', ok: true, why: 'partial: an ordinary car is a plain :Vehicle node.', line: nodeLine(':Vehicle', VEH) },
+          { t: ':FireTruck', ok: false, why: 'the parent label is missing: MATCH (v:Vehicle) would skip every fire truck.' },
+          { t: ':Vehicle:Ambulance', ok: true, why: 'a child node wears the parent\'s label and its own.', line: nodeLine(':Vehicle:Ambulance', VEH.concat(['stretcher: Boolean', 'defibrillator: Boolean'])) },
+          { t: ':Vehicle:FireTruck', ok: true, why: 'the second child, with the parent\'s label and attributes.', line: nodeLine(':Vehicle:FireTruck', VEH.concat(['water_capacity: Float', 'ladder: Boolean'])) }
+        ],
+        edges: ['(:Person)-[:DRIVES]->(:Vehicle)', '(:Paramedic)-[:DRIVES {driving_license_number: String}]\n    ->(:Ambulance)', '(:Firefighter)-[:DRIVES {driving_license_number: String}]\n    ->(:FireTruck)'] },
+      { id: 'te', label: '30 Jan 2026 · Heating System → HVAC, Gas (T, E)', layout: 1,
+        ents: [{ n: 'Heating System', x: 280, y: 40 }, { n: 'HVAC System', x: 150, y: 170 }, { n: 'Gas Heating System', x: 400, y: 170 }], cov: ['(T, E)'],
+        intro: 'Heating System is total and exclusive: every heating system is exactly one of the two.',
+        chips: [
+          { t: ':HeatingSystem', ok: false, why: 'total: every heating system is an HVAC or a gas system, so no node wears the parent label alone.' },
+          { t: ':HeatingSystem:GasHeatingSystem', ok: true, why: 'one node with the parent\'s label and its own.', line: nodeLine(':HeatingSystem:GasHeatingSystem', HS.concat(['hourly_sqm_cons: Float', 'cost_per_sqm: Float'])) },
+          { t: ':GasHeatingSystem', ok: false, why: 'the parent label is missing: MATCH (h:HeatingSystem) would skip it.' },
+          { t: ':HeatingSystem:HVACSystem', ok: true, why: 'the other child, again with both labels.', line: nodeLine(':HeatingSystem:HVACSystem', HS.concat(['hourly_kwh_cons: Float', 'cost_per_kwh: Float'])) },
+          { t: ':HeatingSystem:HVACSystem:GasHeatingSystem', ok: false, why: 'exclusive: never two sibling labels on one node.' }
+        ],
+        edges: ['(:HeatingSystem)-[:HEATS {start_time: DateTime,\n    end_time: DateTime}]->(:Floor)'] },
+      { id: 'two', label: '11 Feb 2025 · Person → Spectator, Team Member (T, E); Team Member → Pilot (P, E)', layout: 2,
+        ents: [{ n: 'Person', x: 280, y: 34 }, { n: 'Spectator', x: 140, y: 124 }, { n: 'Team Member', x: 420, y: 124 }, { n: 'Pilot', x: 420, y: 214 }], cov: ['(T, E)', '(P, E)'],
+        intro: 'Two levels: Person is total and exclusive; Team Member is partial and exclusive. (Team Owner, Engineer and Mechanic are not in this exercise.)',
+        chips: [
+          { t: ':Person', ok: false, why: 'the top level is total: every person is a spectator, a team owner or a team member.' },
+          { t: ':Person:TeamMember:Pilot', ok: true, why: 'a pilot inherits the labels of both ancestors: three labels on one node.', line: nodeLine(':Person:TeamMember:Pilot', F1P.concat(['championships_won: Integer', 'career: String'])) },
+          { t: ':TeamMember:Pilot', ok: false, why: 'the top label is missing: MATCH (p:Person) would not find this pilot.' },
+          { t: ':Person:Spectator', ok: true, why: 'a child of the top level, with the parent\'s label.', line: nodeLine(':Person:Spectator', F1P.concat(['favourite_team: String'])) },
+          { t: ':Person:Spectator:TeamMember', ok: false, why: 'exclusive at the top: a spectator is not also a team member.' },
+          { t: ':Person:TeamMember', ok: true, why: 'the lower level is partial: a team member may be none of engineer, mechanic and pilot.', line: nodeLine(':Person:TeamMember', F1P) }
+        ],
+        edges: ['(:Pilot)-[:COMPETES {winner: Boolean, fastest_lap: Duration}]\n    ->(:Race)', '(:Spectator)-[:BUYS]->(:Ticket)'] }
+    ];
+    var pressed = {}, last = null;
+    FRAGS.forEach(function (f) { pressed[f.id] = {}; });
+    function fragOf(id) { for (var i = 0; i < FRAGS.length; i++) if (FRAGS[i].id === id) return FRAGS[i]; return FRAGS[0]; }
+
+    var sel = ui.select('ISA hierarchy', FRAGS.map(function (f) { return { value: f.id, label: f.label }; }), function () { last = null; }, 'po');
+    ui.button('Show the model answer', function () {
+      var f = fragOf(sel.value), p = {};
+      f.chips.forEach(function (c) { if (c.ok) p[c.t] = true; });
+      pressed[f.id] = p; last = null;
+    }, { icon: 'check' });
+    ui.button('Clear', function () { pressed[sel.value] = {}; last = null; }, { kind: 'ghost', icon: 'refresh' });
+
+    var svg = ui.svg(560, 240, { label: 'The ISA hierarchy of the chosen past paper drawn as on the paper: the parent entity on top, the child entities under it, a hollow triangle on the line to the parent and the coverage letters beside it' });
+    var chipsBox = Course.el('div', { 'class': 'l12-chips', role: 'group', 'aria-label': 'kinds of node: tap the ones that may exist' });
+    var model = Course.el('pre', { 'class': 'l12-model' });
+    ui.stage.appendChild(chipsBox);
+    ui.stage.appendChild(model);
+    var roScore = ui.readout('your node kinds');
+    var note = ui.note('');
+
+    function draw(f) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      svg.setAttribute('viewBox', '0 0 560 ' + (f.layout === 1 ? 200 : 240));
+      function S(tag, a) { return Course.svg(tag, a, svg); }
+      var e = f.ents;
+      if (f.layout === 1) {
+        S('line', { x1: e[1].x, y1: 152, x2: e[1].x, y2: 118 });
+        S('line', { x1: e[2].x, y1: 152, x2: e[2].x, y2: 118 });
+        S('line', { x1: e[1].x, y1: 118, x2: e[2].x, y2: 118 });
+        S('line', { x1: 280, y1: 118, x2: 280, y2: 84 });
+        S('polygon', { points: '280,60 268,84 292,84', 'class': 'fi-paper sw-2' });
+        S('text', { x: 300, y: 80, 'class': 'tx-sm', text: f.cov[0] });
+      } else {
+        S('line', { x1: 140, y1: 106, x2: 140, y2: 92 });
+        S('line', { x1: 420, y1: 106, x2: 420, y2: 92 });
+        S('line', { x1: 140, y1: 92, x2: 420, y2: 92 });
+        S('line', { x1: 280, y1: 92, x2: 280, y2: 76 });
+        S('polygon', { points: '280,54 268,76 292,76', 'class': 'fi-paper sw-2' });
+        S('text', { x: 300, y: 72, 'class': 'tx-sm', text: f.cov[0] });
+        S('line', { x1: 420, y1: 196, x2: 420, y2: 166 });
+        S('polygon', { points: '420,144 408,166 432,166', 'class': 'fi-paper sw-2' });
+        S('text', { x: 440, y: 162, 'class': 'tx-sm', text: f.cov[1] });
+      }
+      e.forEach(function (en) {
+        var w = Math.max(100, en.n.length * 10 + 28);
+        S('rect', { x: en.x - w / 2, y: en.y - 18, width: w, height: 36, 'class': 'fi-paper sw-2' });
+        S('text', { x: en.x, y: en.y + 5, 'class': 'tx-mid', text: en.n });
+      });
+    }
+    function renderChips(f) {
+      chipsBox.textContent = '';
+      var p = pressed[f.id];
+      f.chips.forEach(function (c) {
+        var on = !!p[c.t], kids = [];
+        if (on) kids.push(Course.el('span', { 'class': 'l12-mark', 'aria-hidden': 'true', text: c.ok ? '✓' : '✗' }));
+        kids.push(Course.el('span', { text: c.t }));
+        var b = Course.el('button', { type: 'button', 'class': 'l12-chip' + (on ? (c.ok ? ' is-good' : ' is-bad') : ''), 'aria-pressed': on ? 'true' : 'false',
+          'aria-label': c.t + (on ? (c.ok ? ' — chosen, allowed' : ' — chosen, not allowed') : ' — not chosen') }, kids);
+        b.addEventListener('click', function () {
+          if (p[c.t]) delete p[c.t]; else p[c.t] = true;
+          last = { f: f.id, c: c, on: !!p[c.t] };
+          ui.changed();
+        });
+        chipsBox.appendChild(b);
+      });
+    }
+    function renderModel(f) {
+      var p = pressed[f.id], lines = ['// your model so far: one line per kind of node'], any = false;
+      f.chips.forEach(function (c) {
+        if (!p[c.t]) return;
+        any = true;
+        lines.push(c.ok ? c.line : '// ✗ ' + c.t + ' — not allowed here');
+      });
+      if (!any) lines.push('// (tap the chips above)');
+      lines.push('// edges of these entities');
+      f.edges.forEach(function (l) { lines.push(l); });
+      model.textContent = '';
+      model.appendChild(Course.el('code', { text: lines.join('\n') }));
+    }
+    ui.onChange(function () {
+      var f = fragOf(sel.value), p = pressed[f.id], good = 0, bad = 0, need = 0;
+      f.chips.forEach(function (c) { if (c.ok) need++; if (p[c.t]) { if (c.ok) good++; else bad++; } });
+      draw(f); renderChips(f); renderModel(f);
+      var miss = need - good;
+      roScore.set(good + ' right · ' + bad + ' wrong · ' + miss + ' still to find', bad ? 'bad' : (miss === 0 ? 'good' : undefined));
+      if (last && last.f === f.id) {
+        var c = last.c;
+        note.set(last.on ? ((c.ok ? '<b>✓ ' : '<b>✗ ') + c.t + '</b> — ' + c.why) : 'Chip <b>' + c.t + '</b> removed from your model.');
+      } else note.set(f.intro + (miss === 0 && !bad ? ' All the allowed kinds of node are in your model.' : ''));
+    });
+  });
+  </script>
+
+  <h3>The model the drills run on</h3>
+
+  <p>Fig. 1 is the model of the session's eleven AirBnB exercises (p. 1393) — drills 1–11 here, to keep "exercise" for the past papers — and what the papers call "a graph with types". Worth copying: a review is a node with its own identity, author and subject; an amenity is one shared node with a HAS edge from every listing that offers it.</p>
+
+  <figure class="fig fig--plain" id="l12-fig-airbnb">
+    <svg class="dia" viewBox="0 0 560 350" role="img" aria-label="The AirBnB data model of the exercise session: User WROTE Review, Review REVIEWS Listing, Host HOSTS Listing, Listing HAS Amenity, Listing IN_NEIGHBORHOOD Neighborhood, Neighborhood LOCATED_IN City, City IN_STATE State, State IN_COUNTRY Country">
+      <line x1="90" y1="278" x2="90" y2="206" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="112" y1="180" x2="234" y2="180" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="260" y1="278" x2="260" y2="206" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="279.5" y1="190.2" x2="467" y2="288" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="282" y1="180" x2="464" y2="180" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="490" y1="158" x2="490" y2="86" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="468" y1="60" x2="286" y2="60" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="238" y1="60" x2="116" y2="60" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <circle cx="90" cy="60" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="260" cy="60" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="490" cy="60" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="90" cy="180" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="260" cy="180" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="490" cy="180" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="90" cy="300" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="260" cy="300" r="22" class="fi-paper st-s1 sw-2"/>
+      <circle cx="490" cy="300" r="22" class="fi-paper st-s1 sw-2"/>
+      <text x="90" y="98" class="tx-mono tx-sm tx-mid">:Country</text>
+      <text x="260" y="98" class="tx-mono tx-sm tx-mid">:State</text>
+      <text x="490" y="28" class="tx-mono tx-sm tx-mid">:City</text>
+      <text x="90" y="146" class="tx-mono tx-sm tx-mid">:Review</text>
+      <text x="260" y="146" class="tx-mono tx-sm tx-mid">:Listing</text>
+      <text x="490" y="222" class="tx-mono tx-sm tx-mid">:Neighborhood</text>
+      <text x="90" y="338" class="tx-mono tx-sm tx-mid">:User</text>
+      <text x="260" y="338" class="tx-mono tx-sm tx-mid">:Host</text>
+      <text x="490" y="338" class="tx-mono tx-sm tx-mid">:Amenity</text>
+      <text x="80" y="245" class="tx-mono tx-end halo">WROTE</text>
+      <text x="174" y="170" class="tx-mono tx-mid halo">REVIEWS</text>
+      <text x="272" y="245" class="tx-mono halo">HOSTS</text>
+      <text x="392" y="232" class="tx-mono tx-mid halo">HAS</text>
+      <text x="374" y="170" class="tx-mono tx-mid halo">IN_NEIGHBORHOOD</text>
+      <text x="478" y="124" class="tx-mono tx-end halo">LOCATED_IN</text>
+      <text x="374" y="50" class="tx-mono tx-mid halo">IN_STATE</text>
+      <text x="174" y="50" class="tx-mono tx-mid halo">IN_COUNTRY</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The data model of the session's exercises, redrawn from p. 1393: every relationship has one type and one direction, and the geography points towards the larger area, listing → neighbourhood → city → state → country. Review sits between User and Listing as a node of its own.</figcaption>
+  </figure>
+
+  <p>The same model in the 2026 notation, with the attributes the drills use (the slide draws none):</p>
+
+<pre><code>// the AirBnB model of p. 1393: nodes
+(:User {name: String})
+(:Review)
+(:Listing {name: String, accommodates: Integer})
+(:Host {name: String})
+(:Amenity {name: String})
+(:Neighborhood {name: String})
+(:City)
+(:State {code: String})
+(:Country)
+// edges
+(:User)-[:WROTE]-&gt;(:Review)
+(:Review)-[:REVIEWS]-&gt;(:Listing)
+(:Host)-[:HOSTS]-&gt;(:Listing)
+(:Listing)-[:HAS]-&gt;(:Amenity)
+(:Listing)-[:IN_NEIGHBORHOOD]-&gt;(:Neighborhood)
+(:Neighborhood)-[:LOCATED_IN]-&gt;(:City)
+(:City)-[:IN_STATE]-&gt;(:State)
+(:State)-[:IN_COUNTRY]-&gt;(:Country)</code></pre>
+
+  <p>Labels in CamelCase, types in capitals, properties in snake_case with Neo4j's types (String, Integer, Float, Boolean, Date, DateTime, Duration). Fix each direction once: a reversed arrow silently matches nothing. The first two drills read the model one label or type at a time, LIMIT 10 (pp. 1395, 1397):</p>
+
+<pre><code>// ten Review nodes, to inspect their properties (p. 1395)
+MATCH (re:Review) RETURN re LIMIT 10</code></pre>
+
+<pre><code>// ten HOSTS relationships with their two end nodes (p. 1397)
+MATCH (h:Host)-[r:HOSTS]-&gt;(l:Listing) RETURN h, r, l LIMIT 10</code></pre>
+
+  <div class="pitfall"><p>"A typo gives an error." Not always. The slides' own versions: p. 1395 binds <code>re</code> and returns <code>r</code>, "Variable `r` not defined"; p. 1397 types HOST for HOSTS, and gets 0 rows with only a warning, "The provided relationship type is not in the database". And type ASCII <span class="nw"><code>-&gt;</code>,</span> <span class="nw"><code>&lt;-</code>,</span> <span class="nw"><code>-</code>,</span> not the slides' typographic arrows.</p></div>
+</section>
+
+
+<section id="l12-group">
+  <h2>WITH is GROUP BY: one row per key</h2>
+
+  <div class="def"><p><dfn>WITH</dfn> — "Using WITH, you can manipulate the output before it is passed on to the following query parts" (p. 1364): sort it (ORDER BY), cut it (LIMIT), "Introduce aggregates which can then be used in predicates in WHERE", alias expressions with AS and "Separate reading from updating of the graph".</p></div>
+
+  <p>The addendum to the session <span class="nw">(pp. 1379–1380)</span> says the grouping part in one sentence: "Cypher doesn't have an explicit GROUP BY keyword; instead, grouping is implied by the non-aggregated variables passed through WITH." Its example counts "the number of times each product has been purchased", beside the SQL it calls equivalent:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="SQL: the key is written out">
+<pre><code>-- SQL (p. 1380)
+SELECT p.name AS product,
+  COUNT(*) AS total
+FROM Customer c
+JOIN BOUGHT b
+  ON c.id = b.customer_id
+JOIN Product p
+  ON b.product_id = p.id
+GROUP BY p.name
+ORDER BY total DESC;</code></pre>
+    </div>
+    <div class="compare-col" data-label="Cypher: the key is what is not aggregated">
+<pre><code>// Cypher (p. 1379)
+MATCH (c:Customer)-[:BUYS]-&gt;
+      (p:Product)
+WITH p.name AS product,
+     count(*) AS purchases
+RETURN product, purchases
+ORDER BY purchases DESC</code></pre>
+    </div>
+  </div>
+
+  <p>MATCH finds all purchases, one row per BUYS edge; WITH turns the rows of each <code>p.name</code> into one row; ORDER BY sorts "by popularity" (Table 1 of p. 1380 starts with Wireless Mouse 45).</p>
+
+  <div class="def"><p><dfn>Grouping key</dfn> — every expression of a WITH or a RETURN that is not inside an aggregate function. Rows with equal keys form a group, and each group leaves the clause as one row: its keys and its aggregates. With no key, the whole input is one group.</p></div>
+
+  <p>RETURN groups the same way: drills 4 and 5 (pp. 1401, 1403) count with no WITH, which you need only to go on after the aggregate — to filter on it (section 3) or to match again (section 5). The two drills differ in the key:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Key: the node (p. 1401)">
+<pre><code>// one row per user node
+MATCH (u:User)-[:WROTE]-&gt;
+      (re:Review)
+RETURN u, count(re)</code></pre>
+      <p>Test graph: Uma (user 1) 2 · Vic 1 · Uma (user 4) 2</p>
+    </div>
+    <div class="compare-col" data-label="Key: the name (p. 1403)">
+<pre><code>// one row per distinct name
+MATCH (u:User)-[:WROTE]-&gt;
+      (re:Review)
+RETURN u.name, count(re)</code></pre>
+      <p>Test graph: Uma 4 · Vic 1</p>
+    </div>
+  </div>
+
+  <p>Two users called Uma merge when the key is the name. Group by the node and return the name beside it: "each artistic director whose name is "Chiara"" means two rows for two Chiaras.</p>
+
+  <figure class="tbl-fig" id="l12-tbl-agg">
+    <figcaption>The aggregate functions an exam query needs. The slides use count and collect; the papers also ask for "the total heating power" (30 Jan 2026) and "their average age" (13 Jun 2025).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Function</th><th>Per group · asked as</th></tr></thead>
+        <tbody>
+          <tr><td><code>count(*)</code></td><td>the number of rows — "the number of …" when one row is one thing</td></tr>
+          <tr><td><code>count(x)</code></td><td>the rows where <code>x</code> is not null — zero counts after an OPTIONAL MATCH</td></tr>
+          <tr><td><code>count(DISTINCT x)</code></td><td>the number of different values of <code>x</code> — "different", "at least N different"</td></tr>
+          <tr><td><code>collect(x)</code></td><td>the list of the values of <code>x</code> — "return the collection of …"</td></tr>
+          <tr><td><code>sum(x)</code>, <code>avg(x)</code></td><td>the total and the mean of <code>x</code> — "total heating power", "average age"</td></tr>
+          <tr><td><code>min(x)</code>, <code>max(x)</code></td><td>the smallest and the largest <code>x</code> — "the first", "the most recent"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">Every item of a WITH or a RETURN that is not aggregated is a grouping key: its presence matters, its position does not.</mark></p>
+
+  <aside class="redpen" data-page="1364">
+    <p class="claim">"When performing grouping operations, it is essential for the elements w.r.t. which the grouping is performed to be defined at the beginning of the WITH statement"</p>
+    <p class="fix">The position does not matter: an expression is a grouping key because it is listed without an aggregate function, wherever it stands.</p>
+    <p class="because"><code>WITH count(*) AS movieCount, person</code> groups by <code>person</code> exactly like <code>WITH person, count(*) AS movieCount</code>: 35 persons with more than one film either way (Movies graph, Neo4j 5.26). The addendum has it right: "all non-aggregated variables in WITH become grouping keys" (p. 1380). Keys first is a habit, not a rule; a true/false question may quote the slide, so know both.</p>
+  </aside>
+
+  <aside class="redpen" data-page="1401">
+    <p class="claim">"* RETURN COUNT(u) → distinct_user_count = 55917"</p>
+    <p class="fix">With <code>COUNT(u)</code> as the only item the grouping key is gone, and it counts rows — one per WROTE edge — not users. Distinct users are <code>count(DISTINCT u)</code>.</p>
+    <p class="because">On the test graph above, five reviews by three users: <code>COUNT(u)</code> gives 5, <code>count(DISTINCT u)</code> 3; the two agree only if every user wrote exactly one review. The line returns on p. 1403, and an exam question may quote it: know that it counts rows.</p>
+  </aside>
+</section>
+
+
+<section id="l12-template">
+  <h2>The exam template: MATCH, WITH, WHERE, RETURN</h2>
+
+  <p>The first WITH exercise (p. 1365), on the Movies graph of <a href="l11.html">lesson 11</a>, has the shape of every past-paper query: count per entity, keep the entities over a threshold.</p>
+
+<pre><code>// persons with more than one movie, and their count
+MATCH (person:Person)-[:ACTED_IN]-&gt;(movie)
+WITH person, count(*) AS movieCount
+WHERE movieCount &gt; 1
+RETURN person, movieCount</code></pre>
+
+  <p>MATCH: one row per (person, movie). WITH: one row per person, the count aliased. WHERE: "Extract the actors who acted in at least 2 movies".</p>
+
+  <aside class="redpen" data-page="1365">
+    <p class="claim"><code>MATCH (person:Person)-[ACTED_IN]→(movie)</code> — "Count the movies in which each person acted in"</p>
+    <p class="fix">The colon is missing: write <code>-[:ACTED_IN]-&gt;</code>. Without it, <code>ACTED_IN</code> is a variable and the pattern matches a relationship of any type.</p>
+    <p class="because">The session's own rule: <code>[relatedTo]</code> is "Only variable name (any relationship)" (p. 1359). On the Movies graph the printed query keeps 52 persons, the corrected one 35; the extra 17 pass thanks to DIRECTED, WROTE, PRODUCED, REVIEWED or FOLLOWS relationships, Lana and Lilly Wachowski among them (Neo4j 5.26). A question may show the printed line: recognise it, but write the colon.</p>
+  </aside>
+
+  <p>Two rules hide in it. First, a WHERE after MATCH filters rows, as in drill 3 (p. 1399), "Return the list of listings with accommodates less or equal than 3":</p>
+
+<pre><code>// listings for at most 3 guests (p. 1399)
+MATCH (l:Listing)
+WHERE l.accommodates &lt;= 3
+RETURN l, l.accommodates</code></pre>
+
+  <p>The slide adds a habit: swap the last line for <code>RETURN COUNT(l)</code> "to be sure of the correctness of the solution" (2517 on the session's data). A WHERE after WITH, instead, filters groups: "To filter aggregates in Cypher, it is possible to use the WITH and WHERE clauses after aggregation. In SQL, this must be done using the HAVING clause instead" (p. 1380). A count in the first WHERE is refused, "Invalid use of aggregating function count(...) in this context": there, nothing is counted yet.</p>
+
+  <p>Second, WITH is a wall: "All data that is not passed through to the WITH statement won't be available in the following part of the query" (p. 1364); "If the person variable wouldn't have been included within the clause, I wouldn't have been able to RETURN it" (p. 1365). A forgotten variable gives "Variable `l` not defined".</p>
+
+  <figure class="fig fig--plain" id="l12-fig-pipe">
+    <svg class="dia" viewBox="0 0 560 190" role="img" aria-label="The exam query as a pipeline of four clauses, MATCH, WITH, WHERE and RETURN, with 9, 4 and 2 rows passing between them; under each clause what it does to the rows and its SQL counterpart: FROM and JOIN, GROUP BY, HAVING, SELECT">
+      <rect x="15" y="48" width="90" height="32" class="fi-paper sw-2"/>
+      <rect x="158" y="48" width="90" height="32" class="fi-paper sw-2"/>
+      <rect x="301" y="48" width="90" height="32" class="fi-paper sw-2"/>
+      <rect x="444" y="48" width="90" height="32" class="fi-paper sw-2"/>
+      <line x1="105" y1="64" x2="152" y2="64" marker-end="url(#arr)"/>
+      <line x1="248" y1="64" x2="295" y2="64" marker-end="url(#arr)"/>
+      <line x1="391" y1="64" x2="438" y2="64" marker-end="url(#arr)"/>
+      <text x="60" y="69" class="tx-mono tx-mid">MATCH</text>
+      <text x="203" y="69" class="tx-mono tx-mid">WITH</text>
+      <text x="346" y="69" class="tx-mono tx-mid">WHERE</text>
+      <text x="489" y="69" class="tx-mono tx-mid">RETURN</text>
+      <text x="130" y="38" class="tx-sm tx-mid">9 rows</text>
+      <text x="273" y="38" class="tx-sm tx-mid">4 rows</text>
+      <text x="416" y="38" class="tx-sm tx-mid">2 rows</text>
+      <text x="60" y="104" class="tx-sm tx-mid">row per path</text>
+      <text x="203" y="104" class="tx-sm tx-mid">row per key</text>
+      <text x="346" y="104" class="tx-sm tx-mid">keeps groups</text>
+      <text x="489" y="104" class="tx-sm tx-mid">prints</text>
+      <text x="60" y="134" class="tx-mono tx-sm tx-mid">FROM, JOIN</text>
+      <text x="203" y="134" class="tx-mono tx-sm tx-mid">GROUP BY</text>
+      <text x="346" y="134" class="tx-mono tx-sm tx-mid">HAVING</text>
+      <text x="489" y="134" class="tx-mono tx-sm tx-mid">SELECT</text>
+      <text x="280" y="176" class="tx-hand tx-mid">only what WITH lists goes on</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The exam template, clause by clause. Under each clause: what it does to the rows and its SQL counterpart. The row counts are those of the widget below for N = 2: nine paths, four users, two users kept.</figcaption>
+  </figure>
+
+  <p>Drill 9 (p. 1411), "Return the number of neighborhoods for each state", groups in the RETURN; drill 10 (p. 1412), "Return the name of the states with at least 10 neighborhoods", adds WITH and WHERE. The slides leave both relationships anonymous, <code>[ ]</code>, and return <code>s.code</code> (State nodes carry a code); typing the relationships says which one you mean.</p>
+
+<pre><code>// the number of neighbourhoods for each state (p. 1411)
+MATCH (s:State)&lt;-[:IN_STATE]-(:City)
+      &lt;-[:LOCATED_IN]-(n:Neighborhood)
+RETURN s.code, count(n)</code></pre>
+
+<pre><code>// states with at least 10 neighbourhoods (p. 1412)
+MATCH (s:State)&lt;-[:IN_STATE]-(:City)
+      &lt;-[:LOCATED_IN]-(n:Neighborhood)
+WITH s, count(n) AS neighborhood_count
+WHERE neighborhood_count &gt;= 10
+RETURN s.code, neighborhood_count</code></pre>
+
+  <div class="widget" id="l12-w-pipe">
+    <h3 class="widget-title">The exam query, one clause at a time</h3>
+    <p class="widget-intro">Four users, nine reviews, four listings. The question: for each user, the number of different listings they reviewed, keeping only users with at least N. Press Next to run one clause at a time; the table under the query shows the rows that leave it. Move N, and switch DISTINCT off to see what it was doing.</p>
+    <ol class="tasks">
+      <li>Before the first Next: how many rows will MATCH produce — one per user, one per listing, or one per path?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Nine, one per path User → Review → Listing. Uma's two reviews of the Cozy loft are two rows: rows are paths, not things.</p></details>
+      </li>
+      <li>Set N = 2 and step to the WHERE. Who survives? Now switch DISTINCT off. Who slips in, and why is that wrong for "at least 2 different listings"?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Uma (3) and Zoe (2). Without DISTINCT, Vic slips in with 2: he reviewed the same studio twice, so <code>count(l)</code> counts his two rows. "Different" in a question means <code>count(DISTINCT …)</code>.</p></details>
+      </li>
+      <li>With DISTINCT on, go to the last step and move N from 1 to 4. When does the answer become empty? And why could this filter not be written in a WHERE right after MATCH?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At N = 4: Uma, the best, has 3. After MATCH each row is one review and the count does not exist yet; only after WITH is there one row per user to test. That is the insight: a WHERE after WITH filters groups, not rows — SQL's HAVING.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l12-w-pipe', function (root, ui) {
+    var USERS = [{ id: 'Uma', y: 62 }, { id: 'Vic', y: 141 }, { id: 'Wes', y: 196 }, { id: 'Zoe', y: 251 }];
+    var LIST = [{ id: 'Cozy loft', y: 44 }, { id: 'Big house', y: 112 }, { id: 'Studio', y: 180 }, { id: 'Beach flat', y: 244 }];
+    var REV = [
+      { n: 1, u: 'Uma', l: 'Cozy loft', y: 34 }, { n: 2, u: 'Uma', l: 'Big house', y: 56 },
+      { n: 3, u: 'Uma', l: 'Cozy loft', y: 78 }, { n: 4, u: 'Uma', l: 'Beach flat', y: 100 },
+      { n: 5, u: 'Vic', l: 'Studio', y: 130 }, { n: 6, u: 'Vic', l: 'Studio', y: 152 },
+      { n: 7, u: 'Wes', l: 'Big house', y: 196 },
+      { n: 8, u: 'Zoe', l: 'Beach flat', y: 240 }, { n: 9, u: 'Zoe', l: 'Studio', y: 262 }
+    ];
+    var XU = 80, XR = 280, XL = 470;
+    function find(arr, id) { for (var i = 0; i < arr.length; i++) if (arr[i].id === id) return arr[i]; return arr[0]; }
+
+    var stepper = ui.stepper({ steps: [
+      'Nothing has run yet: the graph and the query.',
+      '<b>MATCH</b>: one row for every path User → Review → Listing.',
+      '<b>WITH u, count(…) AS listings</b>: the rows of each user collapse into one.',
+      '<b>WHERE listings &gt;= N</b>: groups under the threshold are dropped — this is HAVING.',
+      '<b>RETURN … ORDER BY listings DESC</b>: what the answer prints.'
+    ] });
+    var nSl = ui.slider({ label: 'threshold N', min: 1, max: 4, step: 1, value: 2 });
+    var dist = ui.toggle('count(DISTINCT l) — off: count(l)', true);
+    var svg = ui.svg(560, 290, { label: 'Four users on the left, nine reviews in the middle and four listings on the right, joined by WROTE and REVIEWS edges; after MATCH the matched paths turn orange, after WITH each user shows its count, after WHERE the users under the threshold are dashed' });
+    var query = Course.el('pre', { 'class': 'l12-query' });
+    var rowsBox = Course.el('div', { 'class': 'l12-rows' });
+    ui.stage.appendChild(query);
+    ui.stage.appendChild(rowsBox);
+    var roRows = ui.readout('rows after this clause');
+    var roVic = ui.readout('Vic: two reviews of one studio');
+    var note = ui.note('');
+    ui.legend([{ label: 'stored relationship', color: 's1', mark: 'line' }, { label: 'matched by the pattern', color: 's2', mark: 'line' },
+               { label: 'group dropped by WHERE', color: 'muted', mark: 'dash' }]);
+
+    function N() { return Math.round(nSl.value); }
+    function groups() {
+      return USERS.map(function (u) {
+        var rows = REV.filter(function (r) { return r.u === u.id; }), seen = {}, d = 0;
+        rows.forEach(function (r) { if (!seen[r.l]) { seen[r.l] = true; d++; } });
+        return { u: u.id, rows: rows, n: dist.value ? d : rows.length };
+      });
+    }
+    function lines() {
+      return ['MATCH (u:User)-[:WROTE]->(:Review)-[:REVIEWS]->(l:Listing)',
+              'WITH u, ' + (dist.value ? 'count(DISTINCT l)' : 'count(l)') + ' AS listings',
+              'WHERE listings >= ' + N(),
+              'RETURN u.name, listings',
+              'ORDER BY listings DESC'];
+    }
+    function renderQuery(k) {
+      query.textContent = '';
+      var code = Course.el('code');
+      lines().forEach(function (t, i) {
+        var now = (k === 1 && i === 0) || (k === 2 && i === 1) || (k === 3 && i === 2) || (k === 4 && i >= 3);
+        code.appendChild(Course.el('span', { 'class': 'l12-ln' + (now ? ' is-now' : ''), text: t }));
+      });
+      query.appendChild(code);
+    }
+    function table(head, rows) {
+      var tr = Course.el('tr', null, head.map(function (h) { return Course.el('th', { text: h }); }));
+      var body = Course.el('tbody');
+      rows.forEach(function (r) {
+        body.appendChild(Course.el('tr', { 'class': r.first ? 'is-first' : null },
+          r.cells.map(function (c) { return Course.el('td', { text: String(c), 'class': r.drop ? 'is-drop' : null }); })));
+      });
+      return Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, tr), body]));
+    }
+    function renderRows(k, gs, n) {
+      rowsBox.textContent = '';
+      if (k === 0) { rowsBox.appendChild(Course.el('p', { text: 'The rows appear here after MATCH.' })); return; }
+      if (k === 1) {
+        rowsBox.appendChild(table(['u', 'review', 'l'], REV.map(function (r, i) {
+          return { cells: [r.u, 'r' + r.n, r.l], first: i > 0 && REV[i - 1].u !== r.u };
+        })));
+        return;
+      }
+      if (k === 2 || k === 3) {
+        rowsBox.appendChild(table(['u', 'l in its rows', 'listings'], gs.map(function (g) {
+          return { cells: [g.u, g.rows.map(function (r) { return r.l; }).join(', '), g.n], drop: k === 3 && g.n < n };
+        })));
+        return;
+      }
+      var kept = gs.filter(function (g) { return g.n >= n; }).sort(function (a, b) { return b.n - a.n || (a.u < b.u ? -1 : 1); });
+      if (!kept.length) { rowsBox.appendChild(Course.el('p', { text: 'No row: no user reaches N = ' + n + '. The query is right and the answer is empty.' })); return; }
+      rowsBox.appendChild(table(['u.name', 'listings'], kept.map(function (g) { return { cells: [g.u, g.n] }; })));
+    }
+    function draw(k, gs, n) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      function S(tag, a) { return Course.svg(tag, a, svg); }
+      var keep = {}, cnt = {};
+      gs.forEach(function (g) { keep[g.u] = k < 3 || g.n >= n; cnt[g.u] = g.n; });
+      S('text', { x: XU, y: 16, 'class': 'tx-mono tx-sm tx-mid', text: ':User' });
+      S('text', { x: XR, y: 16, 'class': 'tx-mono tx-sm tx-mid', text: ':Review' });
+      S('text', { x: XL, y: 16, 'class': 'tx-mono tx-sm tx-mid', text: ':Listing' });
+      REV.forEach(function (r) {
+        var u = find(USERS, r.u), l = find(LIST, r.l), off = k >= 3 && !keep[r.u], on = k >= 1 && !off;
+        var cls = on ? 'st-s2 sw-2' : (off ? 'st-muted dash' : 'st-s1'), mk = on ? 'url(#arr-s2)' : (off ? 'url(#arr-muted)' : 'url(#arr-s1)');
+        S('line', { x1: XU + 18, y1: u.y, x2: XR - 10, y2: r.y, 'class': cls, 'marker-end': mk });
+        S('line', { x1: XR + 7, y1: r.y, x2: XL - 24, y2: l.y, 'class': cls, 'marker-end': mk });
+      });
+      REV.forEach(function (r) {
+        var off = k >= 3 && !keep[r.u];
+        S('rect', { x: XR - 6, y: r.y - 6, width: 12, height: 12, 'class': 'fi-paper sw-2 ' + (off ? 'st-muted' : (k >= 1 ? 'st-s2' : 'st-s1')) });
+      });
+      LIST.forEach(function (l) {
+        S('circle', { cx: XL, cy: l.y, r: 20, 'class': 'fi-paper sw-2 ' + (k >= 1 ? 'st-s2' : 'st-s1') });
+        S('text', { x: XL, y: l.y + 36, 'class': 'tx-sm tx-mid', text: l.id });
+      });
+      USERS.forEach(function (u) {
+        var off = k >= 3 && !keep[u.id];
+        S('circle', { cx: XU, cy: u.y, r: 18, 'class': 'fi-paper sw-2 ' + (off ? 'st-muted dash' : (k >= 1 ? 'st-s2' : 'st-s1')) });
+        S('text', { x: XU - 26, y: u.y + 5, 'class': 'tx-end' + (off ? ' tx-muted' : ''), text: u.id });
+        if (k >= 2) S('text', { x: XU, y: u.y + 6, 'class': 'tx-mid tx-bold' + (off ? ' tx-muted' : ''), text: String(cnt[u.id]) });
+      });
+    }
+    ui.onChange(function () {
+      var k = stepper.index, gs = groups(), n = N();
+      var kept = gs.filter(function (g) { return g.n >= n; });
+      renderQuery(k); renderRows(k, gs, n); draw(k, gs, n);
+      roRows.set(['—', '9, one per path', '4, one per user', kept.length + ' of 4 groups kept', kept.length + ' printed'][k]);
+      if (k < 2) roVic.set('not grouped yet');
+      else {
+        var v = dist.value ? 1 : 2, txt = 'listings = ' + v + (k >= 3 ? (v >= n ? ', kept' : ', dropped') : '');
+        roVic.set(txt + (dist.value ? '' : ' — but he reviewed one listing'), dist.value ? 'good' : 'bad');
+      }
+      var names = kept.map(function (g) { return g.u + ' ' + g.n; }).join(', ');
+      var printed = kept.slice().sort(function (a, b) { return b.n - a.n || (a.u < b.u ? -1 : 1); })
+                        .map(function (g) { return g.u + ' ' + g.n; }).join(', ');
+      note.set([
+        'The question: for each user, the number of different listings they reviewed, keeping only users with at least N. Press Next.',
+        'Nine rows: Uma 4, Vic 2, Wes 1, Zoe 2. A row is a path, so Uma\'s two reviews of the Cozy loft are two rows.',
+        dist.value ? 'One row per user. <code>count(DISTINCT l)</code> counts different listings: Uma 3, Vic 1, Wes 1, Zoe 2.'
+                   : 'One row per user. <code>count(l)</code> counts rows: Uma 4, Vic 2, Wes 1, Zoe 2 — Vic\'s two reviews of the same studio count twice.',
+        'The WHERE sees one row per user and keeps those with listings ≥ ' + n + ': ' + (names || 'none') + '. The column it tests exists only since the WITH.',
+        kept.length ? 'Printed, largest first: ' + printed + '.' : 'Nobody reaches ' + n + ': an empty answer, which is a correct answer.'
+      ][k]);
+    });
+  });
+  </script>
+
+  <h3>"The collection of …": collect, ORDER BY, LIMIT</h3>
+
+  <p>For "return the collection of", the aggregate is <code>collect()</code>: it packs the values of a group into one list. Drill 8 (p. 1411), "the collection of all the listings' names in the same neighborhood":</p>
+
+<pre><code>// one row per neighbourhood name, with its listings' names
+MATCH (l:Listing)-[:IN_NEIGHBORHOOD]-&gt;(n:Neighborhood)
+RETURN n.name, collect(l.name)</code></pre>
+
+  <p>With no key, <code>collect()</code> makes a single list. p. 1366 sorts, cuts and collects — on the Movies graph, one row: ["Zach Grenier", "Wil Wheaton", "Werner Herzog"]. ORDER BY and LIMIT can follow a WITH, not only a RETURN.</p>
+
+<pre><code>// the three names that come last alphabetically, as one list
+MATCH (n:Person)
+WITH n AS person
+ORDER BY person.name DESC
+LIMIT 3
+RETURN collect(person.name)</code></pre>
+
+  <p>p. 1367 shows the last use, "Separate reading from updating"; "Inception" is not in the Movies graph, so read it as a template:</p>
+
+<pre><code>// tag every actor of "Inception" with a second label (p. 1367)
+MATCH (p:Person)-[:ACTED_IN]-&gt;(m:Movie)
+WHERE m.title = "Inception"
+WITH p
+SET p:InceptionActor
+RETURN p.name</code></pre>
+
+  <h3>A WITH also takes a WHERE out of a pattern: shortest paths</h3>
+
+  <p>Lesson 11 showed how Neo4j plans a <code>shortestPath</code> (pp.&nbsp;1368–1373): a fast bidirectional breadth-first search when the condition can be checked while the path grows, and a slower exhaustive depth-first search as a fallback when the condition needs the whole path. A WITH changes that plan. "Predicates used in the WHERE clause that apply to the shortest path pattern are evaluated before choosing the shortest matching path" (p.&nbsp;1371), but "The inclusion of the WITH clause means that the query plan will not include the fallback to the Slower Exhaustive Search Algorithm" (p.&nbsp;1372). After WITH the WHERE is a plain filter on the one path already chosen, so the slide labels that query "Not guaranteed to return a result, even if it exists" (p.&nbsp;1373). The slides' search pictures, their three queries and a widget that runs both searches are in <a href="l11.html#l11-planner">lesson 11</a>.</p>
+
+  <p>On the Movies graph (Neo4j 5.26) Tom Hanks acted in Cast Away, one hop. Asked for a longer path, the first query below plans the exhaustive search and finds three hops; the second finds nothing. Keep the bound <code>*..3</code>: with <code>[*]</code> the search ran for over a minute.</p>
+
+<pre><code>// guaranteed: the condition belongs to the pattern
+MATCH (a:Person {name: "Tom Hanks"}),
+      (b:Movie {title: "Cast Away"}),
+      p = shortestPath((a)-[*..3]-(b))
+WHERE length(p) &gt; 1
+RETURN p</code></pre>
+
+<pre><code>// not guaranteed: finds the one-hop path, then filters it out
+MATCH (a:Person {name: "Tom Hanks"}),
+      (b:Movie {title: "Cast Away"}),
+      p = shortestPath((a)-[*..3]-(b))
+WITH p
+WHERE length(p) &gt; 1
+RETURN p</code></pre>
+</section>
+
+
+<section id="l12-hops">
+  <h2>Conditions on several hops, and zero counts</h2>
+
+  <p>Exam conditions often sit on a neighbour of the counted node. The recommendation slide shows the tools (p. 1376): "Find actors that "Tom Hanks" hasn't yet worked with, but his co-actors have."</p>
+
+<pre><code>// actors Tom Hanks never worked with, ranked (p. 1376)
+MATCH (tom:Person {name:"Tom Hanks"})-[:ACTED_IN]-&gt;(m)
+        &lt;-[:ACTED_IN]-(coActors),
+      (coActors)-[:ACTED_IN]-&gt;(m2)&lt;-[:ACTED_IN]-(cocoActors)
+WHERE NOT (tom)-[:ACTED_IN]-&gt;()&lt;-[:ACTED_IN]-(cocoActors)
+  AND tom &lt;&gt; cocoActors
+RETURN cocoActors.name AS Recommended, count(*) AS Strength
+ORDER BY Strength DESC</code></pre>
+
+  <p>The comma joins two patterns on <code>coActors</code> into one four-hop chain. <code>NOT (pattern)</code> is true when no such path exists, and <code>tom &lt;&gt; cocoActors</code> removes Tom himself. RETURN groups by name and <code>count(*)</code> counts routes — Tom Cruise and Zach Grenier lead with 5 on the Movies graph. No WITH: nothing filters the count.</p>
+
+  <p>Rows are paths, not people: "Find someone to introduce Tom Hanks to Tom Cruise" (p. 1377) returns five rows, three through Meg Ryan, who made three films with Tom Hanks.</p>
+
+<pre><code>// every route Tom Hanks to Tom Cruise via a co-actor (p. 1377)
+MATCH (tom:Person {name:"Tom Hanks"})-[:ACTED_IN]-&gt;(m)
+        &lt;-[:ACTED_IN]-(coActors),
+      (coActors)-[:ACTED_IN]-&gt;(m2)
+        &lt;-[:ACTED_IN]-(cruise:Person {name:"Tom Cruise"})
+RETURN tom, m, coActors, m2, cruise</code></pre>
+
+  <p>Two conditions on two neighbours need two variables, as in drill 7 (p. 1407), "listings whose amenities include "First Aid Kit" and "Wireless Internet"":</p>
+
+<pre><code>// listings that offer both amenities (p. 1407)
+MATCH (l:Listing)-[r1:HAS]-&gt;(a1:Amenity),
+      (l)-[r2:HAS]-&gt;(a2:Amenity)
+WHERE a1.name = "First Aid Kit" AND a2.name = "Wireless Internet"
+RETURN l, a1, a2</code></pre>
+
+  <p>One amenity variable with <code>a.name = "First Aid Kit" AND a.name = "Wireless Internet"</code> asks one node for two names: 0 rows. "One of which should either be an Ambulance or a Fire Truck" is one node and an OR: <code>WHERE s:Ambulance OR s:FireTruck</code>.</p>
+
+  <h3>Entities with nothing to count</h3>
+
+  <p>Drill 6 (p. 1405), "Return the list of users and the number of reviews they wrote", must list users with no review too. MATCH makes no row for them, so the session adds them with a UNION:</p>
+
+<pre><code>// every user and their number of reviews, 0 included (p. 1405)
+MATCH (u:User)-[r:WROTE]-&gt;(re:Review)
+RETURN u, count(re) AS `COUNT`
+UNION
+MATCH (u:User)
+WHERE NOT (u)-[:WROTE]-&gt;(:Review)
+RETURN u, 0 AS `COUNT`</code></pre>
+
+  <p>UNION needs the same column names on both sides, hence <code>AS `COUNT`</code> twice; otherwise "All sub queries in an UNION must have the same return column names".</p>
+
+  <aside class="redpen" data-page="1405">
+    <p class="claim">"WHERE NOT (u) – [ :WRITE] → ( :Review)"</p>
+    <p class="fix">The type is WROTE, as on p. 1393 and in the first half of the same query: <code>WHERE NOT (u)-[:WROTE]-&gt;(:Review)</code>.</p>
+    <p class="because">No relationship has the type WRITE, so the NOT holds for every user and the second half adds them all again with 0: on a test graph of four users, three with reviews, 7 rows instead of 4, with only the warning "The provided relationship type is not in the database". An exam question may quote the printed line: recognise the slip, and type WROTE.</p>
+  </aside>
+
+  <p>Not on the slides, but Neo4j's own tool: OPTIONAL MATCH keeps <code>u</code> when the pattern finds nothing, with <code>re</code> null.</p>
+
+<pre><code>// every user and their number of reviews, in one query
+MATCH (u:User)
+OPTIONAL MATCH (u)-[:WROTE]-&gt;(re:Review)
+RETURN u, count(re) AS reviews</code></pre>
+
+  <div class="pitfall"><p>"After OPTIONAL MATCH, <code>count(*)</code> gives the zeros." It gives 1: the user still has one row, whose <code>re</code> is null. <code>count(re)</code> skips nulls and gives 0.</p></div>
+</section>
+
+
+<section id="l12-stages">
+  <h2>Two stages: aggregate before you expand again</h2>
+
+  <p>Drill 11 (p. 1413) asks for two counts over two patterns of the same host: "For each host, return the total number of reviews assigned to their listings with "First Aid Kit" amenity, the total number of listings they own, and their name." The printed solution, in ASCII:</p>
+
+<pre><code>// per host: listings owned, reviews of its kit listings (p. 1413)
+MATCH (h:Host)-[:HOSTS]-&gt;(l:Listing)&lt;-[:REVIEWS]-(r:Review),
+      (l)-[:HAS]-&gt;(a:Amenity)
+WHERE a.name = "First Aid Kit"
+WITH h, count(r) AS reviews_count
+MATCH (h)-[:HOSTS]-&gt;(li:Listing)
+WITH h, reviews_count, count(li) AS all_listings_count
+RETURN h.name, all_listings_count, reviews_count</code></pre>
+
+  <p>Stage 1 makes one row per review of a kit listing and collapses them into one row per host; stage 2 matches the host's listings from that row, <code>reviews_count</code> riding along, and counts them. On the hook's graph: Ann, 2, 4.</p>
+
+  <div class="widget" id="l12-w-double">
+    <h3 class="widget-title">Ann's eight listings</h3>
+    <p class="widget-intro">Ann's corner of the test graph: two listings, both with a First Aid Kit, and four reviews. Choose query A, the printed solution, or query B, the same without the WITH in the middle, and step through the clauses. The table shows the rows that leave each clause.</p>
+    <ol class="tasks">
+      <li>Query B. Before stepping: how many rows reach the RETURN, and what will <code>count(li)</code> say?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Eight rows: each of the four review rows meets both of Ann's listings, 4 × 2. Both counts count rows, so both say 8. That is the insight: a second MATCH multiplies every row it receives.</p></details>
+      </li>
+      <li>Query A, step 3. How many rows does the second MATCH produce, and why is <code>reviews_count</code> the same on all of them?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Two rows, one per listing: the WITH had already reduced the four review rows to one row per host, so the multiplier is 1 × 2. <code>reviews_count</code> belongs to that single row and is copied to each row that grows out of it.</p></details>
+      </li>
+      <li>Switch DISTINCT on for B. Are the numbers right now? Is B now as good as A?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The counts become 2 and 4, but the table still has 8 rows: the multiplication happens and DISTINCT hides it. That works for counts only; a sum cannot be rescued that way, because <code>sum(DISTINCT x)</code> adds equal values once even when they belong to different things.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l12-w-double', function (root, ui) {
+    var STAGE1 = [{ l: 'Cozy loft', r: 'r1' }, { l: 'Big house', r: 'r2' }, { l: 'Cozy loft', r: 'r3' }, { l: 'Cozy loft', r: 'r5' }];
+    var LISTINGS = ['Cozy loft', 'Big house'];
+    var REVPOS = { r1: 30, r3: 72, r5: 114, r2: 194 };
+    var qSel = ui.select('query', [{ value: 'A', label: 'A · p. 1413 as printed' }, { value: 'B', label: 'B · without the WITH in the middle' }], null, 'A');
+    var dTg = ui.toggle('B counts with DISTINCT', false);
+    var stepper = ui.stepper({ steps: [
+      'Nothing has run yet.',
+      'Clause 1, the first MATCH: one row per review of a listing with the kit.',
+      'Clause 2, the WITH in the middle (deleted in B).',
+      'Clause 3, the second MATCH: each row meets every listing of its host.',
+      'Clause 4, the second WITH (B has none).',
+      'Clause 5, RETURN.'
+    ] });
+    var svg = ui.svg(560, 240, { label: 'Ann, a host, with HOSTS edges to her two listings, the Cozy loft and the Big house; both listings have a HAS edge to the First Aid Kit; three reviews point to the Cozy loft and one to the Big house. The relationships matched by the first MATCH turn orange; the HOSTS edges walked again by the second MATCH are highlighted' });
+    var query = Course.el('pre', { 'class': 'l12-query' });
+    var rowsBox = Course.el('div', { 'class': 'l12-rows' });
+    ui.stage.appendChild(query);
+    ui.stage.appendChild(rowsBox);
+    var roRows = ui.readout('rows after this clause');
+    var roL = ui.readout('all_listings_count');
+    var roR = ui.readout('reviews_count');
+    var note = ui.note('');
+    ui.legend([{ label: 'stored relationship', color: 's1', mark: 'line' }, { label: 'matched by the first MATCH', color: 's2', mark: 'line' },
+               { label: 'walked again by the second MATCH', color: 'ink', mark: 'hl' }]);
+
+    function isB() { return qSel.value === 'B'; }
+    function lines() {
+      var d = dTg.value;
+      var L = ['MATCH (h:Host)-[:HOSTS]->(l:Listing)<-[:REVIEWS]-(r:Review),',
+               '      (l)-[:HAS]->(a:Amenity)',
+               'WHERE a.name = "First Aid Kit"',
+               'WITH h, count(r) AS reviews_count',
+               'MATCH (h)-[:HOSTS]->(li:Listing)'];
+      if (!isB()) return L.concat(['WITH h, reviews_count, count(li) AS all_listings_count',
+                                   'RETURN h.name, all_listings_count, reviews_count']);
+      return L.concat(['RETURN h.name, ' + (d ? 'count(DISTINCT li)' : 'count(li)') + ' AS all_listings_count,',
+                       '       ' + (d ? 'count(DISTINCT r)' : 'count(r)') + ' AS reviews_count']);
+    }
+    function renderQuery(k) {
+      query.textContent = '';
+      var code = Course.el('code'), b = isB();
+      lines().forEach(function (t, i) {
+        var off = b && i === 3;
+        var now = (k === 1 && i <= 2) || (k === 2 && i === 3 && !b) || (k === 3 && i === 4) || (k === 4 && i === 5 && !b) || (k === 5 && (b ? i >= 5 : i === 6));
+        code.appendChild(Course.el('span', { 'class': 'l12-ln' + (off ? ' is-off' : (now ? ' is-now' : '')), text: t }));
+      });
+      query.appendChild(code);
+    }
+    function table(head, rows) {
+      var tr = Course.el('tr', null, head.map(function (h) { return Course.el('th', { text: h }); }));
+      var body = Course.el('tbody');
+      rows.forEach(function (r) { body.appendChild(Course.el('tr', { 'class': r.first ? 'is-first' : null }, r.cells.map(function (c) { return Course.el('td', { text: String(c) }); }))); });
+      return Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, tr), body]));
+    }
+    function crossRows() {
+      var out = [];
+      STAGE1.forEach(function (s, i) { LISTINGS.forEach(function (li, j) { out.push({ cells: ['Ann', s.l, s.r, li], first: i > 0 && j === 0 }); }); });
+      return out;
+    }
+    function state(k) {
+      var b = isB(), d = dTg.value;
+      if (k === 0) return { n: 0 };
+      if (k === 1 || (b && k === 2)) return { n: 4, head: ['h', 'l', 'r'], rows: STAGE1.map(function (s) { return { cells: ['Ann', s.l, s.r] }; }) };
+      if (!b && k === 2) return { n: 1, head: ['h', 'reviews_count'], rows: [{ cells: ['Ann', 4] }] };
+      if (!b && k === 3) return { n: 2, head: ['h', 'reviews_count', 'li'], rows: LISTINGS.map(function (li) { return { cells: ['Ann', 4, li] }; }) };
+      if (b && (k === 3 || k === 4)) return { n: 8, head: ['h', 'l', 'r', 'li'], rows: crossRows() };
+      if (!b && k === 4) return { n: 1, head: ['h', 'reviews_count', 'all_listings_count'], rows: [{ cells: ['Ann', 4, 2] }] };
+      var L = b ? (d ? 2 : 8) : 2, R = b ? (d ? 4 : 8) : 4;
+      return { n: 1, head: ['h.name', 'all_listings_count', 'reviews_count'], rows: [{ cells: ['Ann', L, R] }], L: L, R: R };
+    }
+    function draw(k) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      function S(tag, a) { return Course.svg(tag, a, svg); }
+      var on = k >= 1, again = k >= 3;
+      var c1 = on ? 'st-s2 sw-2' : 'st-s1 sw-2', m1 = on ? 'url(#arr-s2)' : 'url(#arr-s1)';
+      if (again) {
+        S('line', { x1: 90.7, y1: 112.7, x2: 217.4, y2: 68, 'class': 'hl' });
+        S('line', { x1: 90.5, y1: 127.9, x2: 217.6, y2: 176.4, 'class': 'hl' });
+      }
+      S('line', { x1: 90.7, y1: 112.7, x2: 217.4, y2: 68, 'class': c1, 'marker-end': m1 });
+      S('line', { x1: 90.5, y1: 127.9, x2: 217.6, y2: 176.4, 'class': c1, 'marker-end': m1 });
+      S('line', { x1: 260.5, y1: 68, x2: 377.6, y2: 113.3, 'class': c1, 'marker-end': m1 });
+      S('line', { x1: 260.5, y1: 177, x2: 377.7, y2: 130.8, 'class': c1, 'marker-end': m1 });
+      [['r1', 55.5], ['r3', 59.8], ['r5', 64.1]].forEach(function (p) {
+        S('line', { x1: 507, y1: REVPOS[p[0]], x2: 265, y2: p[1], 'class': c1, 'marker-end': m1 });
+      });
+      S('line', { x1: 507, y1: REVPOS.r2, x2: 265, y2: 185.5, 'class': c1, 'marker-end': m1 });
+      S('circle', { cx: 70, cy: 120, r: 22, 'class': 'fi-paper sw-2 ' + (on ? 'st-s2' : 'st-s1') });
+      S('circle', { cx: 240, cy: 60, r: 22, 'class': 'fi-paper sw-2 ' + (on ? 'st-s2' : 'st-s1') });
+      S('circle', { cx: 240, cy: 185, r: 22, 'class': 'fi-paper sw-2 ' + (on ? 'st-s2' : 'st-s1') });
+      S('circle', { cx: 400, cy: 122, r: 18, 'class': 'fi-paper sw-2 ' + (on ? 'st-s2' : 'st-s1') });
+      ['r1', 'r3', 'r5', 'r2'].forEach(function (r) {
+        S('rect', { x: 508, y: REVPOS[r] - 7, width: 14, height: 14, 'class': 'fi-paper sw-2 ' + (on ? 'st-s2' : 'st-s1') });
+        S('text', { x: 530, y: REVPOS[r] + 5, 'class': 'tx-mono tx-sm', text: r });
+      });
+      S('text', { x: 70, y: 125, 'class': 'tx-mid tx-sm', text: 'Ann' });
+      S('text', { x: 70, y: 162, 'class': 'tx-mono tx-sm tx-mid', text: ':Host' });
+      S('text', { x: 240, y: 26, 'class': 'tx-sm tx-mid', text: 'Cozy loft' });
+      S('text', { x: 240, y: 226, 'class': 'tx-sm tx-mid', text: 'Big house' });
+      S('text', { x: 400, y: 160, 'class': 'tx-sm tx-mid', text: 'First Aid Kit' });
+      S('text', { x: 135, y: 124, 'class': 'tx-mono tx-sm tx-mid halo', text: 'HOSTS' });
+      S('text', { x: 330, y: 126, 'class': 'tx-mono tx-sm tx-mid halo', text: 'HAS' });
+      S('text', { x: 420, y: 216, 'class': 'tx-mono tx-sm tx-mid halo', text: 'REVIEWS' });
+    }
+    ui.onChange(function () {
+      var k = stepper.index, b = isB(), s = state(k);
+      renderQuery(k); draw(k);
+      rowsBox.textContent = '';
+      if (k === 0) rowsBox.appendChild(Course.el('p', { text: 'The rows appear here after the first MATCH.' }));
+      else rowsBox.appendChild(table(s.head, s.rows));
+      roRows.set(k === 0 ? '—' : String(s.n));
+      if (k === 5) { roL.set(String(s.L), s.L === 2 ? 'good' : 'bad'); roR.set(String(s.R), s.R === 4 ? 'good' : 'bad'); }
+      else { roL.set('—'); roR.set('—'); }
+      note.set([
+        'Ann has 2 listings and 4 reviews on listings with the kit. Choose a query and press Next.',
+        'Four rows, one per review of a listing with the First Aid Kit: r1, r3 and r5 on the Cozy loft, r2 on the Big house.',
+        b ? 'B has no WITH here: the four rows go on as they are.' : 'The WITH groups by h: the four rows become one, (Ann, 4).',
+        b ? 'Each of the four rows meets both of Ann\'s listings: 4 × 2 = 8 rows.' : 'The single row meets Ann\'s two listings: 1 × 2 = 2 rows, each carrying reviews_count = 4.',
+        b ? 'B has no second WITH either: the eight rows go straight to RETURN.' : 'The second WITH groups by (h, reviews_count) and counts the listings: (Ann, 4, 2).',
+        b ? (dTg.value ? 'DISTINCT counts different listings and reviews among the eight rows: 2 and 4. Right numbers, still eight rows.' : 'Both counts count the eight rows: 8 and 8. Two wrong numbers, no error.')
+          : 'Right: 2 listings, 4 reviews.'
+      ][k]);
+    });
+  });
+  </script>
+
+  <p>Back to the hook. Without the WITH, each of the four review rows meets both of Ann's listings in the second MATCH: <span class="nw">4 × 2 = 8</span> rows, and <code>count(li)</code> and <code>count(r)</code> both count rows. With the WITH, the four rows first become one: <span class="nw">1 × 2.</span> For R matching reviews and L listings, the version without the WITH gives</p>
+
+  <div class="formula">
+    \[ \text{rows} = R \times L \quad \text{in both counts.} \]
+  </div>
+
+  <p class="memo"><mark class="key">Aggregate to one row per entity before the next MATCH expands it again; otherwise every count after it is multiplied.</mark></p>
+
+  <p>DISTINCT repairs the counts, <code>count(DISTINCT li)</code> 2 and <code>count(DISTINCT r)</code> 4, but not a sum: <code>sum(DISTINCT x)</code> adds equal values once, so two different heaters of 0.3 MW would total 0.3. For sums, use the WITH, or <code>WITH DISTINCT</code> on the pair of nodes (section 6).</p>
+
+  <details class="why">
+    <summary>And if all three patterns go into one MATCH, separated by commas?</summary>
+    <p>Neo4j answers 4 and 4, another wrong pair. Inside one MATCH a relationship is never used twice, so each review row can meet only the other listing as <code>li</code>. Two MATCH clauses have no such rule — hence the 8 of the hook.</p>
+  </details>
+
+  <p>Mind "for each host" too: stage 1 is a plain MATCH, so a host without a reviewed kit listing vanishes — Bob and Cyd on the test graph. When "for each" must include zeros, make the first pattern optional (Ann 2 4, Bob 1 0, Cyd 1 0), and state your reading.</p>
+
+<pre><code>// every host, with 0 when no kit listing has a review
+MATCH (h:Host)
+OPTIONAL MATCH (h)-[:HOSTS]-&gt;(l:Listing)&lt;-[:REVIEWS]-(r:Review),
+      (l)-[:HAS]-&gt;(:Amenity {name: "First Aid Kit"})
+WITH h, count(r) AS reviews_count
+MATCH (h)-[:HOSTS]-&gt;(li:Listing)
+RETURN h.name, count(li) AS all_listings_count, reviews_count</code></pre>
+</section>
+
+
+<section id="l12-papers">
+  <h2>Two past papers, end to end</h2>
+
+  <p>No official solutions exist: the model answers below are this notebook's own, each run on a test graph built with its traps.</p>
+
+  <h3>Exam of 30 Jan 2026, exercise 1: hospital heating (6 PT)</h3>
+
+  <figure class="tbl-fig" id="l12-tbl-er26">
+    <figcaption>The part of the ER diagram the exercise uses (read off the diagram of the paper).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Element</th><th>Attributes · cardinality</th></tr></thead>
+        <tbody>
+          <tr><td>Building</td><td>Building_ID, Name, Year</td></tr>
+          <tr><td>Floor</td><td>Floor_ID, Number, Has_Elevator</td></tr>
+          <tr><td>Department</td><td>Department_ID, Specialty, N_Beds, Head_Physician_ID</td></tr>
+          <tr><td>Heating System</td><td>Heater_Sys_ID, Heating_Power; children HVAC System (Hourly_KWh_Cons, Cost_Per_KWh) and Gas Heating System (Hourly_SQM_Cons, Cost_Per_SQM), (T, E)</td></tr>
+          <tr><td>Has Floor</td><td>Building 1:N, Floor 1:1</td></tr>
+          <tr><td>Placed Into</td><td>Department 1:N, Floor 1:N</td></tr>
+          <tr><td>Heats</td><td>Start_Time, End_Time; Heating System 1:N, Floor 1:N</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Part 1: "Consider the entities Heating System (and its child entities), Floor, Building, and Department … Provide a written textual representation (no graphical sketches) of the graph model … Include data types for attributes. <span class="nw">(2 PT)</span>"</p>
+
+<pre><code>// nodes; (T, E): every heating system wears two labels
+(:Building {building_id: String, name: String, year: Integer})
+(:Floor {floor_id: String, number: Integer,
+    has_elevator: Boolean})
+(:Department {department_id: String, specialty: String,
+    n_beds: Integer, head_physician_id: String})
+(:HeatingSystem:HVACSystem {heater_sys_id: String,
+    heating_power: Float, hourly_kwh_cons: Float,
+    cost_per_kwh: Float})
+(:HeatingSystem:GasHeatingSystem {heater_sys_id: String,
+    heating_power: Float, hourly_sqm_cons: Float,
+    cost_per_sqm: Float})
+// edges
+(:Building)-[:HAS_FLOOR]-&gt;(:Floor)
+(:Department)-[:PLACED_INTO]-&gt;(:Floor)
+(:HeatingSystem)-[:HEATS {start_time: DateTime,
+    end_time: DateTime}]-&gt;(:Floor)</code></pre>
+
+  <p>Part 2: "Write a Cypher query that returns, for every Department occupying more than 2 Floors in the same Building, the total heating power of all their Heaters. Filter the results to show only those Departments whose total power exceeds 0.5 MWh and sort them in descending order by power. <span class="nw">(2 PT)</span>" Three stages, two guards: <code>WITH DISTINCT d</code> (a department passing in two buildings) and <code>WITH DISTINCT d, h</code> (a heater on two of its floors). Assumptions to write down: "their Heaters" are all the heaters of the department's floors, in any building; power is in MW, so "0.5 MWh" is read as 0.5 MW.</p>
+
+<pre><code>// departments on more than 2 floors of one building: power &gt; 0.5
+MATCH (d:Department)-[:PLACED_INTO]-&gt;(f:Floor)
+      &lt;-[:HAS_FLOOR]-(b:Building)
+WITH d, b, count(DISTINCT f) AS floors
+WHERE floors &gt; 2
+WITH DISTINCT d
+MATCH (d)-[:PLACED_INTO]-&gt;(:Floor)&lt;-[:HEATS]-(h:HeatingSystem)
+WITH DISTINCT d, h
+WITH d, sum(h.heating_power) AS total_power
+WHERE total_power &gt; 0.5
+RETURN d.department_id AS department, total_power
+ORDER BY total_power DESC</code></pre>
+
+  <p>Test graph: a 0.3 MW heater heats two floors of one department; 0.75 with the guard, 1.05 without. Part 3: "Write a Cypher query that returns all Buildings built after 1967 with a total number of beds greater than or equal to 20, located on floors with an elevator or located on the ground level. <span class="nw">(2 PT)</span>" The beds are those of the departments on qualifying floors; the ground level is assumed to be number 0.</p>
+
+<pre><code>// buildings after 1967 with at least 20 beds on qualifying floors
+MATCH (b:Building)-[:HAS_FLOOR]-&gt;(f:Floor)
+      &lt;-[:PLACED_INTO]-(d:Department)
+WHERE b.year &gt; 1967 AND (f.has_elevator = true OR f.number = 0)
+WITH DISTINCT b, d
+WITH b, sum(d.n_beds) AS beds
+WHERE beds &gt;= 20
+RETURN b.building_id AS building, b.name AS name, beds</code></pre>
+
+  <p>Without <code>WITH DISTINCT b, d</code>, a department on two qualifying floors adds its beds twice: 42 instead of 21 on the test graph.</p>
+
+  <h3>Exam of 6 Jun 2024, exercise 2: natural disasters (5 PT)</h3>
+
+  <figure class="tbl-fig" id="l12-tbl-er24">
+    <figcaption>The part of the ER diagram the exercise uses. Note on the paper: "A paramedic can be a firefighter".</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Element</th><th>Attributes · cardinality</th></tr></thead>
+        <tbody>
+          <tr><td>Person</td><td>Personal ID, Name, Surname, Postal Code; children Paramedic (Paramedic ID, Training Level), Firefighter (Firefighter ID), Policeman, (P, O)</td></tr>
+          <tr><td>Vehicle</td><td>Plate, Number of Seats; children Ambulance (Stretcher, Defibrillator), Fire Truck (Water Capacity, Ladder), (P, E)</td></tr>
+          <tr><td>Drive</td><td>Person 0:N, Vehicle 0:N</td></tr>
+          <tr><td>Drive (Paramedic – Ambulance), Drive (Firefighter – Fire Truck)</td><td>Driving License Number; 0:N, 0:N</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Part 1: "Consider the entities Person, Paramedic, Firefighter, Vehicle, Ambulance, and Fire Truck … Sketch a graph model/example … Either show an example graph or a graph with types. <span class="nw">(1 PT)</span>" Fig. 3 is an example graph; the ISA widget of section 1 builds the typed list.</p>
+
+  <figure class="fig fig--plain" id="l12-fig-disaster">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="An example graph for the natural-disasters paper: Ann, a plain Person, drives the car V2; Mia, a Person who is both Paramedic and Firefighter, drives V2, the ambulance A1 and the fire truck T1; John, a Person and Firefighter, drives T1; the ambulance and the fire truck also carry the Vehicle label">
+      <line x1="194" y1="55" x2="383" y2="55" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="192.3" y1="141.2" x2="384.9" y2="64.9" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="194" y1="150" x2="383" y2="150" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="192.3" y1="158.8" x2="384.9" y2="235.1" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="194" y1="245" x2="383" y2="245" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <circle cx="170" cy="55" r="24" class="fi-paper st-s1 sw-2"/>
+      <circle cx="170" cy="150" r="24" class="fi-paper st-s1 sw-2"/>
+      <circle cx="170" cy="245" r="24" class="fi-paper st-s1 sw-2"/>
+      <circle cx="410" cy="55" r="24" class="fi-paper st-s1 sw-2"/>
+      <circle cx="410" cy="150" r="24" class="fi-paper st-s1 sw-2"/>
+      <circle cx="410" cy="245" r="24" class="fi-paper st-s1 sw-2"/>
+      <text x="170" y="60" class="tx-sm tx-mid">Ann</text>
+      <text x="170" y="155" class="tx-sm tx-mid">Mia</text>
+      <text x="170" y="250" class="tx-sm tx-mid">John</text>
+      <text x="410" y="60" class="tx-sm tx-mid">V2</text>
+      <text x="410" y="155" class="tx-sm tx-mid">A1</text>
+      <text x="410" y="250" class="tx-sm tx-mid">T1</text>
+      <text x="136" y="60" class="tx-mono tx-sm tx-end">:Person</text>
+      <text x="136" y="134" class="tx-mono tx-sm tx-end">:Person</text>
+      <text x="136" y="151" class="tx-mono tx-sm tx-end">:Paramedic</text>
+      <text x="136" y="168" class="tx-mono tx-sm tx-end">:Firefighter</text>
+      <text x="136" y="240" class="tx-mono tx-sm tx-end">:Person</text>
+      <text x="136" y="257" class="tx-mono tx-sm tx-end">:Firefighter</text>
+      <text x="444" y="60" class="tx-mono tx-sm">:Vehicle</text>
+      <text x="444" y="145" class="tx-mono tx-sm">:Vehicle</text>
+      <text x="444" y="162" class="tx-mono tx-sm">:Ambulance</text>
+      <text x="444" y="240" class="tx-mono tx-sm">:Vehicle</text>
+      <text x="444" y="257" class="tx-mono tx-sm">:FireTruck</text>
+      <text x="290" y="47" class="tx-mono tx-mid halo">DRIVES</text>
+      <text x="290" y="142" class="tx-mono tx-mid halo">DRIVES</text>
+      <text x="290" y="237" class="tx-mono tx-mid halo">DRIVES</text>
+      <text x="300" y="168" class="tx-sm tx-mid halo">+ license number</text>
+      <text x="300" y="263" class="tx-sm tx-mid halo">+ license number</text>
+      <text x="10" y="214" class="tx-hand">one node, three labels</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The 2024 sketch as an example graph. Mia is one node with three labels, because the Person hierarchy is partial and overlapping; Ann is a plain <code>:Person</code>. No vehicle wears both <code>:Ambulance</code> and <code>:FireTruck</code>: that hierarchy is exclusive. The DRIVES edges from an ISA child to its kind of vehicle carry <code>driving_license_number</code> — marked on Mia to A1 and John to T1; Mia to T1 carries it too — and the generic ones do not.</figcaption>
+  </figure>
+
+  <p>Part 2: "Write a Cypher query to collect the number of people who drive at least 5 different vehicles, one of which should either be an Ambulance or a Fire Truck <span class="nw">(2 PT)</span>". Stage 1 counts different vehicles per person, stage 2 looks for a special one; <code>count(DISTINCT p)</code> matters, since a person with an ambulance and a fire truck makes two rows.</p>
+
+<pre><code>// people with at least 5 different vehicles, one of them special
+MATCH (p:Person)-[:DRIVES]-&gt;(v:Vehicle)
+WITH p, count(DISTINCT v) AS vehicles
+WHERE vehicles &gt;= 5
+MATCH (p)-[:DRIVES]-&gt;(s:Vehicle)
+WHERE s:Ambulance OR s:FireTruck
+RETURN count(DISTINCT p) AS people</code></pre>
+
+  <p>On the test graph: 7, and 20 with both DISTINCTs removed. Part 3: "Write a Cypher query to return the collection of Fire Trucks with a water capacity greater than 100 litres that were driven by at least 5 Firefighters named John, who also drove 10 non-Fire Truck vehicles each. <span class="nw">(2 PT)</span>" Three stages, from the end of the sentence: Johns with at least 10 other vehicles ("10" read as at least 10), such Johns per fire truck, the collection.</p>
+
+<pre><code>// fire trucks over 100 l, 5+ Johns with 10+ other vehicles
+MATCH (f:Firefighter {name: "John"})-[:DRIVES]-&gt;(v:Vehicle)
+WHERE NOT v:FireTruck
+WITH f, count(DISTINCT v) AS others
+WHERE others &gt;= 10
+MATCH (f)-[:DRIVES]-&gt;(t:FireTruck)
+WHERE t.water_capacity &gt; 100
+WITH t, count(DISTINCT f) AS johns
+WHERE johns &gt;= 5
+RETURN collect(t) AS fire_trucks</code></pre>
+
+  <h3>A checklist for answering without a database</h3>
+
+  <p>Write each answer as if nothing could run it: the session's count check (p. 1399) then happens in your head.</p>
+  <ol>
+    <li>Model first: labels from entity names, ISA labels by T/P and E/O, types from relationship names, one direction per type.</li>
+    <li>Rewrite the question as "for each <i>key</i>, <i>aggregate</i> of <i>what</i>, considering only …": is the key a node or a name?</li>
+    <li>Conditions on one row go after MATCH; conditions on counts and sums after the WITH that computes them.</li>
+    <li>"Different": <code>count(DISTINCT …)</code> — can two paths reach the same thing?</li>
+    <li>Two counts: two stages, carrying every variable you still need through each WITH.</li>
+    <li>A sum over things two paths can reach: <code>WITH DISTINCT</code> on the pair, never <code>sum(DISTINCT …)</code>.</li>
+    <li>"For each X" with zeros: OPTIONAL MATCH and <code>count(y)</code>, or UNION with equal column names.</li>
+    <li>Names as in your model, ASCII arrows, dates as <code>date("2024-08-18")</code>, assumptions written down.</li>
+    <li>Run it on five nodes in your head: what should come out, and what does your query return?</li>
+  </ol>
+</section>
+
+
+<section id="l12-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Four exercises from past papers, in their printed wording and with their printed points, each after the ER it assumes; then two theory questions. Write your answer before opening the model answer.</p>
+
+  <div class="exam" data-kind="open" data-points="1" id="l12-exam-f1model">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 11 Feb 2025, exercise 1 (Formula 1).</b> ER: Person (Personal_ID, Name, Surname, Birth_Date, Gender) is the parent of Spectator (Favourite_Team), Team Owner and Team Member, ISA (T, E); Team Member is the parent of Engineer, Mechanic and Pilot (Championships_Won, Career), ISA (P, E). Race (Race_ID, Laps_Number, Max_Tickets, Date); Track (Location, Length [Km], Time_Record); Ticket (Ticket_ID, Price, Purchase_Date). Compete: Race (10:N) – Pilot (1:N), with Winner (Yes/No) and Fastest_Lap; On: Race (1:1) – Track (1:N); Attend: Ticket (1:1) – Race (1:N); Buy: Ticket (1:1) – Spectator (1:N).</p>
+      <p>"Consider the Pilot, Race, Track, Ticket, and Spectator entities from the ER model. Sketch a graph model/example describing the nodes, main attributes, and edges. Use the proper notation for labels, types, etc. <span class="nw">(1 PT)</span>"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>// nodes
+(:Person:TeamMember:Pilot {personal_id: String, name: String,
+    surname: String, birth_date: Date, gender: String,
+    championships_won: Integer, career: String})
+(:Person:Spectator {personal_id: String, name: String,
+    surname: String, birth_date: Date, gender: String,
+    favourite_team: String})
+(:Race {race_id: String, laps_number: Integer,
+    max_tickets: Integer, date: Date})
+(:Track {location: String, length_km: Float,
+    time_record: Duration})
+(:Ticket {ticket_id: String, price: Float, purchase_date: Date})
+// edges
+(:Pilot)-[:COMPETES {winner: Boolean,
+    fastest_lap: Duration}]-&gt;(:Race)
+(:Race)-[:ON]-&gt;(:Track)
+(:Ticket)-[:ATTENDS]-&gt;(:Race)
+(:Spectator)-[:BUYS]-&gt;(:Ticket)</code></pre>
+        <p>A pilot is one node with the labels of both ancestors; there is no plain :Person node, because the top hierarchy is total. Compete's attributes are properties of the COMPETES relationship.</p>
+      </div>
+      <div class="exam-note"><p>What to get right: the two-level ISA (three labels on a pilot, the inherited attributes on the node), the relationship attributes on the edge, labels and types written as such, one direction per type. Ticket stays a node: it has its own key, its attributes and two relationships.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="2" id="l12-exam-f1races">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 11 Feb 2025, exercise 1, continued.</b> Same ER, and the model of the previous answer.</p>
+      <p>"Write a Cypher query to return the total number of races for each track in which at least 1'000 tickets were bought by female spectators, at least 500 of which have Ferrari as their favourite team. <span class="nw">(2 PT)</span>"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>// per track: races with 1000+ female, 500+ Ferrari-fan tickets
+MATCH (t:Track)&lt;-[:ON]-(r:Race)&lt;-[:ATTENDS]-(k:Ticket)
+      &lt;-[:BUYS]-(s:Spectator)
+WHERE s.gender = "Female"
+WITH t, r, count(DISTINCT k) AS female_tickets
+WHERE female_tickets &gt;= 1000
+MATCH (r)&lt;-[:ATTENDS]-(k2:Ticket)&lt;-[:BUYS]-(s2:Spectator)
+WHERE s2.gender = "Female" AND s2.favourite_team = "Ferrari"
+WITH t, r, count(DISTINCT k2) AS ferrari_tickets
+WHERE ferrari_tickets &gt;= 500
+RETURN t.location AS track, count(r) AS races</code></pre>
+        <p>Assumption: gender is stored as "Female".</p>
+      </div>
+      <div class="exam-note"><p>Two thresholds on two sets of tickets of the same race: count, filter, count again, filter again — only then count races per track. Each WITH keeps <code>t</code> and <code>r</code>, or the next clause could not use them. The step that decides the answer is the grouping per race, <code>(t, r)</code>, before the count per track.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="2" id="l12-exam-chiara">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 13 Jun 2025, exercise 2 (concerts).</b> ER: Person (Personal ID, Name, Surname, Birth Date) is the parent of Audience (Favourite Music Type), Artistic Director (Biography), Maestro and Musician, ISA (T, E). Concert (ID, Title, Start Time, Duration (minutes)); Location (Name, Address, Type, N Seats). Attend: Audience (1,N) – Concert (0,N); Organize: Artistic Director (1,N) – Concert (1,1); Located: Concert (1,1) – Location (1,N).</p>
+      <p>"Write a Cypher query to count the total number of concerts managed by each artistic director whose name is "Chiara", that lasted more than 100 minutes, and with more than 1000 attendances<span class="nw">(2 PT)</span>"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>// each Chiara: concerts over 100 min with 1000+ attendees
+MATCH (a:ArtisticDirector {name: "Chiara"})
+      -[:ORGANIZES]-&gt;(c:Concert)&lt;-[:ATTENDS]-(p:Audience)
+WHERE c.duration &gt; 100
+WITH a, c, count(DISTINCT p) AS attendances
+WHERE attendances &gt; 1000
+RETURN a.personal_id AS director, count(c) AS concerts</code></pre>
+        <p>Model assumed: <code>(:Person:ArtisticDirector)-[:ORGANIZES]-&gt;(:Concert)&lt;-[:ATTENDS]-(:Person:Audience)</code>; "managed" is the ER's Organize.</p>
+      </div>
+      <div class="exam-note"><p>The trap: Concert has no attendance attribute, so "attendances" is an aggregate per concert — a first stage with its own WHERE — before the count per director. Counting concerts straight over the attendance rows gives thousands (2502 instead of 2 on a test graph). Group by the director node, not the name: two Chiaras are two rows.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="1.5" id="l12-exam-federico">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 6 Sep 2024, exercise 2 (restaurant).</b> ER: Person (Personal_ID, Name, Surname, Birth Date, Phone Number) is the parent of Owner, Customer, Waiter (Hiring Date) and Chef. Table (Table_ID, Table Number, Max Seats); Dish (Dish_ID, Name, Price, Recipe, Description). Serve: Table (1:N) – Waiter (1:N); Order: Table (1:N) – Dish (1:N); Book: Table (1:N) – Customer (1:N), with Number of People and Booking Date. "N.B. … Tables are served by more Waiters overall, but only one at a time."</p>
+      <p>"Write a Cypher query to collect the total number of different dishes that were served at each table, considering only tables whose max seats is greater than 10 and served by at least one waiter whose name is "Federico" <span class="nw">(1.5 PT)</span>"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>// tables over 10 seats served by a Federico: different dishes
+MATCH (w:Waiter {name: "Federico"})-[:SERVES]-&gt;(t:Table)
+WHERE t.max_seats &gt; 10
+WITH DISTINCT t
+MATCH (t)-[:ORDERS]-&gt;(d:Dish)
+RETURN t.table_id AS table, count(DISTINCT d) AS different_dishes</code></pre>
+        <p>Model assumed: <code>(:Person:Waiter)-[:SERVES]-&gt;(:Table)-[:ORDERS]-&gt;(:Dish)</code>; the dishes "served at" a table are the ER's Order.</p>
+      </div>
+      <div class="exam-note"><p>Two conditions on the table, one of them on a neighbour, then a count on another neighbour. <code>WITH DISTINCT t</code> keeps two Federicos serving the same table from doubling its rows, and <code>count(DISTINCT d)</code> answers "different dishes". On a test graph without both DISTINCTs, one table showed 4 dishes instead of 2.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l12-exam-group">
+    <div class="exam-q" lang="en">
+      <p>Explain how Cypher groups rows when a query uses an aggregate function, and why a condition such as "at least 5 different vehicles" cannot be written in the WHERE that directly follows MATCH. Compare with SQL.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Cypher has no GROUP BY keyword. In a WITH or RETURN that contains aggregate functions, every expression that is not aggregated is a grouping key: the rows coming from MATCH are partitioned by the values of those keys, and each group becomes one row with its aggregates. So <code>WITH p, count(DISTINCT v) AS n</code> plays the role of SQL's GROUP BY p. The WHERE attached to MATCH filters single rows, before any group exists, so it cannot use <code>count()</code>; Neo4j rejects it as an invalid use of an aggregating function. The condition goes into a WHERE after the WITH that computes the aggregate, <code>WITH p, count(DISTINCT v) AS n WHERE n &gt;= 5</code>, which corresponds to SQL's HAVING. Only the variables listed in that WITH are available afterwards.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer says three things: the implicit keys, WHERE after WITH as HAVING, and the reason (rows before groups). The addendum (p. 1380) makes the SQL comparison in these terms, so its vocabulary is safe to use. Recent Neo4j versions also accept an optional explicit GROUP BY (see the Cypher Manual in the resources); the course, and this answer, use the implicit rule.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l12-exam-with">
+    <div class="exam-q" lang="en">
+      <p>Which statements about WITH in Cypher are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Every expression of a WITH that is not inside an aggregate function becomes a grouping key. <span class="fb">The addendum: "all non-aggregated variables in WITH become grouping keys" (p. 1380).</span></li>
+      <li>The grouping keys must be written before the aggregates inside the WITH. <span class="fb">Position does not matter: <code>WITH count(*) AS c, person</code> groups by person too. The slide of p. 1364 calls the position "essential"; that is a habit, not a rule.</span></li>
+      <li data-correct>A variable that is not listed in a WITH cannot be used in the clauses after it. <span class="fb">p. 1364: "All data that is not passed through to the WITH statement won't be available in the following part of the query."</span></li>
+      <li data-correct>A WHERE written right after a WITH can filter on an aggregate computed by that WITH. <span class="fb">That is Cypher's HAVING (p. 1380).</span></li>
+      <li>An aggregation always needs a WITH. <span class="fb">RETURN groups too: <code>RETURN u, count(re)</code> on p. 1401 has no WITH.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: the first, the third and the fourth. The position of the keys is irrelevant, and RETURN can aggregate without any WITH.</p></div>
+      <div class="exam-note"><p>Wrong answers may carry a penalty at the real exam (it is announced just before it), so tick only what you can justify. The second option is the printed wording of p. 1364 turned into a statement: know that the slide says it and that Neo4j does not require it.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l12-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Two different users are called Uma and wrote 2 reviews each; Vic wrote 1. What does <code>MATCH (u:User)-[:WROTE]-&gt;(re:Review) RETURN u.name, count(re)</code> return?</p>
+    <ul class="options">
+      <li>Three rows: Uma 2, Uma 2, Vic 1 <span class="fb">That is the result of grouping by the node <code>u</code>, as on p. 1401.</span></li>
+      <li data-correct>Two rows: Uma 4, Vic 1 <span class="fb">The key is the value of <code>u.name</code>, so the two Umas fall into one group.</span></li>
+      <li>One row: 5 <span class="fb">That needs a RETURN with no key at all, <code>RETURN count(re)</code>.</span></li>
+      <li>An error, because there is no WITH <span class="fb">RETURN groups by itself; WITH is needed only to go on after the aggregate.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">After <code>MATCH (h:Host)-[:HOSTS]-&gt;(l:Listing) WITH h, count(l) AS n</code>, which names can the next clause use?</p>
+    <ul class="options">
+      <li data-correct><code>h</code> and <code>n</code> <span class="fb">Only what WITH lists passes the wall.</span></li>
+      <li><code>h</code>, <code>l</code> and <code>n</code> <span class="fb"><code>l</code> was not listed; asking for it gives "Variable `l` not defined".</span></li>
+      <li>Only <code>n</code> <span class="fb"><code>h</code> is listed too, as the grouping key.</span></li>
+      <li>Everything bound in the MATCH, plus <code>n</code> <span class="fb">That is exactly what WITH prevents.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">"For each building built after 1967, the number of different departments, considering only buildings with at least 3 of them." Which conditions can be written in the WHERE right after MATCH, before any WITH? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct><code>b.year &gt; 1967</code> <span class="fb">A condition on a single row: it belongs before the WITH, and it shrinks the rows to group.</span></li>
+      <li data-correct><code>d.n_beds &gt;= 10</code>, if the question also asked for departments with at least 10 beds <span class="fb">Also a property of one row.</span></li>
+      <li><code>count(DISTINCT d) &gt;= 3</code> <span class="fb">An aggregate: Neo4j refuses it there. It goes after <code>WITH b, count(DISTINCT d) AS n</code>, as <code>WHERE n &gt;= 3</code>.</span></li>
+      <li><code>n &gt;= 3</code>, where <code>n</code> is the alias of a later WITH <span class="fb">The alias does not exist before the WITH that defines it.</span></li>
+    </ul>
+    <p class="q-fb">Rule of thumb: if the condition talks about one thing, put it after MATCH; if it talks about how many, put it after WITH.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Host Ben has 3 listings, all with a First Aid Kit, and 5 reviews spread over them. In the query of p. 1413 you remove the WITH in the middle and count both things in the RETURN. What does the RETURN print?</p>
+    <ul class="options">
+      <li>3 listings and 5 reviews <span class="fb">That is the printed two-stage query.</span></li>
+      <li data-correct>15 and 15 <span class="fb">Five review rows, each meeting all three listings: 5 × 3 rows, and both counts count rows.</span></li>
+      <li>8 and 8 <span class="fb">That is Ann's case, 4 × 2.</span></li>
+      <li>An error about a missing variable <span class="fb">Nothing is missing: both MATCH clauses bind <code>h</code>, and the RETURN uses only bound names.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text"><code>MATCH (u:User) OPTIONAL MATCH (u)-[:WROTE]-&gt;(r:Review) RETURN u.name, count(*), count(r)</code>. What are the two numbers for a user who wrote nothing?</p>
+    <ul class="options">
+      <li>0 and 0 <span class="fb"><code>count(*)</code> counts rows, and the user still has one row.</span></li>
+      <li data-correct>1 and 0 <span class="fb">One row, in which <code>r</code> is null: <code>count(*)</code> says 1, <code>count(r)</code> skips the null.</span></li>
+      <li>1 and 1 <span class="fb"><code>count(r)</code> ignores nulls.</span></li>
+      <li>The user does not appear <span class="fb">That is what a plain MATCH would do; OPTIONAL MATCH keeps the user.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A department's heaters must be summed, and one heater heats two floors of the department. Which is right?</p>
+    <ul class="options">
+      <li><code>WITH d, sum(DISTINCT h.heating_power) AS total</code> <span class="fb">It merges equal values: two different heaters of 0.3 MW would count once.</span></li>
+      <li data-correct><code>WITH DISTINCT d, h</code>, then <code>WITH d, sum(h.heating_power) AS total</code> <span class="fb">First one row per (department, heater), then the sum: each heater once, whatever its power.</span></li>
+      <li><code>WITH d, sum(h.heating_power) / 2 AS total</code> <span class="fb">Only that heater is counted twice; halving the whole sum is wrong for the others.</span></li>
+      <li><code>WITH d, count(DISTINCT h) AS total</code> <span class="fb">That counts heaters; the question asks for power.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Heating System has the children HVAC System and Gas Heating System, ISA (T, E). Which label sets can a node of the graph model carry? Select all that apply.</p>
+    <ul class="options">
+      <li><code>:HeatingSystem</code> <span class="fb">Total: every heating system is one of the two children, so no node wears the parent label alone.</span></li>
+      <li data-correct><code>:HeatingSystem:HVACSystem</code> <span class="fb">A child node wears the parent's label and its own.</span></li>
+      <li data-correct><code>:HeatingSystem:GasHeatingSystem</code> <span class="fb">The other child, again with both labels.</span></li>
+      <li><code>:HeatingSystem:HVACSystem:GasHeatingSystem</code> <span class="fb">Exclusive: never two sibling labels on one node.</span></li>
+      <li><code>:GasHeatingSystem</code> <span class="fb">Without the parent label, <code>MATCH (h:HeatingSystem)</code> would miss it.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l12-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>ER to Neo4j <span class="nw">(pp. 1350–1351)</span>: an entity becomes a node labelled with its name, a relationship becomes an edge whose type is its name, attributes become properties on either, and N:N needs nothing special. Write it as <code>(:Label {attr: Type})-[:TYPE {attr: Type}]-&gt;(:Label)</code>.</li>
+    <li>An ISA child is one node wearing its own label and those of its ancestors. A plain parent node exists only for a partial hierarchy, and several child labels on one node only for an overlapping one.</li>
+    <li>Cypher has no GROUP BY: every non-aggregated item of a WITH or a RETURN is a grouping key, wherever it stands. Group by the node and return its name.</li>
+    <li>The exam template is MATCH → WHERE on rows → <code>WITH key, count(DISTINCT x) AS n</code> → <code>WHERE n &gt;= N</code>, which is HAVING → RETURN, ORDER BY. Only what a WITH lists goes on.</li>
+    <li>Rows are paths: use DISTINCT for "different", collect for "the collection of", and OPTIONAL MATCH with <code>count(y)</code>, or UNION with <code>NOT (pattern)</code>, for zero counts.</li>
+    <li>Aggregate to one row per entity before matching again, or every count is multiplied (Ann: 4 × 2 = 8). A WITH before the WHERE of a <code>shortestPath</code> removes the exhaustive fallback, and with it the guarantee of a result.</li>
+  </ul>
+  <aside class="cheat" id="l12-cheat">
+    <dl>
+      <dt>Entity → node</dt><dd><code>(:Building {building_id: String, year: Integer})</code></dd>
+      <dt>Relationship → edge</dt><dd><code>-[:HEATS {start_time: DateTime}]-&gt;</code>; one type per edge</dd>
+      <dt>ISA child</dt><dd><code>(:Parent:Child {…})</code>; (P): plain <code>(:Parent)</code> too; (O): <code>(:Parent:ChildA:ChildB)</code> allowed</dd>
+      <dt>Grouping key</dt><dd>every non-aggregated item of WITH / RETURN</dd>
+      <dt>Aggregates</dt><dd><code>count(*)</code>, <code>count(x)</code>, <code>count(DISTINCT x)</code>, <code>collect(x)</code>, <code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code></dd>
+      <dt>HAVING</dt><dd><code>WITH x, count(DISTINCT y) AS n WHERE n &gt;= N</code></dd>
+      <dt>Collection, top k</dt><dd><code>RETURN collect(x.name)</code>; <code>ORDER BY n DESC LIMIT k</code></dd>
+      <dt>Two neighbours</dt><dd><code>(l)-[:HAS]-&gt;(a1), (l)-[:HAS]-&gt;(a2)</code></dd>
+      <dt>Anti-pattern</dt><dd><code>WHERE NOT (a)-[:T]-&gt;(b) AND a &lt;&gt; b</code></dd>
+      <dt>Zero counts</dt><dd><code>OPTIONAL MATCH … RETURN x, count(y)</code>; or <code>UNION</code> with the same column names</dd>
+      <dt>Two stages</dt><dd><code>MATCH … WITH h, count(r) AS n MATCH (h)-… WITH h, n, count(li) AS m</code></dd>
+      <dt>Sum without doubles</dt><dd><code>WITH DISTINCT d, h WITH d, sum(h.p) AS total</code></dd>
+      <dt>Date literal</dt><dd><code>date("2024-08-18")</code></dd>
+      <dt>shortestPath + WITH p</dt><dd>fast search only: "Not guaranteed to return a result, even if it exists."</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l12-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://neo4j.com/docs/getting-started/data-modeling/relational-to-graph-modeling/" target="_blank" rel="noopener">Modeling: relational to graph</a>
+      <span class="res-by">Neo4j Getting Started</span>
+      <p class="res-why">The recipe of section 1 in Neo4j's own words and pictures: entity to label, row to node, join table to a relationship with properties.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://arrows.app" target="_blank" rel="noopener">arrows.app</a>
+      <span class="res-by">Neo4j Labs</span>
+      <p class="res-why">Draw a past paper's entities as labelled nodes and typed arrows, then export them to Cypher: the text it prints is close to the 2026 "written textual representation".</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://neo4j.com/docs/cypher-manual/current/functions/aggregating/" target="_blank" rel="noopener">Aggregating functions</a>
+      <span class="res-by">Neo4j Cypher Manual</span>
+      <p class="res-why">The official form of the rule of section 2, "Grouping keys are non-aggregating expressions", and <code>count(*)</code> against <code>count(x)</code> with nulls. Its newest version also describes an optional GROUP BY added after the course's Cypher 5: the exam expects the implicit rule.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://graphacademy.neo4j.com/courses/cypher-aggregation/" target="_blank" rel="noopener">Cypher Aggregations</a>
+      <span class="res-by">Neo4j GraphAcademy</span><span class="res-dur">60 min</span>
+      <p class="res-why"><code>count</code> against <code>count(DISTINCT)</code>, <code>collect</code>, the grouping-key rule and "aggregate early with WITH", with a live database: the session's advice to perform the queries yourself, for free.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://neo4j.com/blog/common-confusions-cypher/" target="_blank" rel="noopener">Common confusions on Cypher (and how to avoid them)</a>
+      <span class="res-by">Nicole White, Neo4j, 2016</span>
+      <p class="res-why">Five before/after mistakes, two of them this lesson's: a variable dropped by a WITH, and an extra WITH item that silently changes the grouping.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>In a graph, every relationship is an edge you can walk from either end, and the query decides at run time which way to walk. A document database makes the opposite bet: store together what is read together, so that one read brings back the whole object — and the exam's next question becomes "how many collections would you define?".</p>
+</aside>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1636 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CQL: the key that decides everything · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local styles for the two widgets of this lesson: the typed WHERE field and the node view of l21-w-key,
+   the cqlsh-like table and the statement log of l21-w-upsert. Tokens only. */
+.l21-ctl-wide { grid-column: 1 / -1; }
+.l21-ctl-wide input { width: 100%; min-height: 2.5rem; padding: 0.3rem 0.6rem; font-family: var(--f-mono); font-size: var(--t-sm); background: var(--paper); color: var(--ink); border: 1.5px solid var(--line-2); border-radius: var(--radius); }
+.l21-ctl-wide input:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.l21-stmt { margin: 0.75rem 1rem 0; font-size: var(--t-sm); }
+.l21-stmt code { display: block; min-width: max-content; white-space: pre; }
+.l21-pkpart { background: var(--key-bg); color: var(--key-fg); }
+.l21-ckpart { box-shadow: inset 0 -2px 0 var(--s3); }
+.l21-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15.5rem), 1fr)); gap: 0.75rem; padding: 0.75rem 1rem 1rem; }
+.l21-node { border: 1.5px solid var(--line-2); border-radius: var(--radius); background: var(--paper); padding: 0.45rem 0.55rem 0.55rem; min-width: 0; }
+.l21-node.is-on { border: 2px dashed var(--s2); }
+.l21-node.is-off { opacity: 0.55; }
+.l21-node-h { display: flex; align-items: center; gap: 0.45rem; font-family: var(--f-display); font-size: var(--t-xs); font-weight: 640; color: var(--ink-2); margin-bottom: 0.3rem; }
+.l21-node-h svg { width: 1.6rem; height: 1.05rem; flex: none; }
+.l21-badge { margin-left: auto; font-weight: 520; color: var(--ink-2); text-align: right; }
+.l21-tbl { border-collapse: collapse; width: 100%; font-family: var(--f-mono); font-size: var(--t-xs); font-variant-numeric: tabular-nums; }
+.l21-tbl th, .l21-tbl td { padding: 0.2rem 0.4rem 0.2rem 0.3rem; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.l21-tbl th { font-weight: 600; color: var(--ink-2); }
+.l21-tbl th.is-pk { background: var(--key-bg); color: var(--key-fg); }
+.l21-tbl th.is-ck { box-shadow: inset 0 -2.5px 0 var(--s3); }
+.l21-tbl tr.is-first > td { border-top: 1.5px solid var(--ink-3); }
+.l21-tbl tr.is-hit > td { background: color-mix(in srgb, var(--s2) 24%, transparent); color: var(--ink); font-weight: 650; }
+.l21-tbl tr.is-read > td { color: var(--ink-3); text-decoration: line-through; }
+.l21-out { margin: 0.6rem 1rem 0.2rem; }
+.l21-out > p { margin: 0 0 0.3rem; font-family: var(--f-mono); font-size: var(--t-xs); color: var(--ink-2); }
+.l21-log { list-style: none; margin: 0.35rem 1rem 0.85rem; padding: 0; font-family: var(--f-mono); font-size: var(--t-xs); line-height: 1.5; }
+.l21-log li { margin: 0.1rem 0; overflow-wrap: anywhere; }
+.l21-log .is-ok { color: var(--good); font-weight: 600; }
+.l21-log .is-err { color: var(--bad); font-weight: 600; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l21">
+
+<header class="lesson-head">
+  <h1>CQL: the key that decides everything</h1>
+  <p class="lede">After this lesson you will read a PRIMARY KEY line the way Cassandra does — which columns choose the node, which ones sort the rows — predict which SELECT, UPDATE and DELETE it accepts, and write the CQL of every Cassandra exercise of the past papers.</p>
+</header>
+
+<div class="hook" data-label="A puzzle from p. 1607">
+  <p>The exercise session asks for a table of cars "sorted by max_speed in ascending order" and answers with the key <code>PRIMARY KEY (car_id, max_speed)</code> and the option <code>WITH CLUSTERING ORDER BY (max_speed ASC)</code> (p. 1607). Cassandra accepts the table without a word.</p>
+  <p>Load nine cars and ask for all of them with <code>SELECT * FROM car;</code>. One run printed the speeds 340, 190, 180, 160, 320, 160, 296, 180, 170. Ask for the promised order, <code>SELECT * FROM car ORDER BY max_speed;</code>, and Cassandra refuses: "ORDER BY is only supported when the partition key is restricted by an EQ or an IN."</p>
+  <p>Nothing is broken: the table does exactly what its PRIMARY KEY line says. Read that line as Cassandra reads it, and section 6 repairs the table by moving one column.</p>
+</div>
+
+
+<section id="l21-cassandra">
+  <h2>Cassandra in one slide, and a keyspace to work in</h2>
+
+  <aside class="margin-note">The slide adds "It's created by Meta". The lecture says "Originally designed at Facebook" (p. 410): the same company, called Meta since 2021.</aside>
+
+  <p>The session opens with a definition (p. 1548): "Apache Cassandra is a highly scalable, high-performance non-relational, distributed database designed to handle large amounts of data, providing high availability with no single point of failure." The feature list (p. 1549) adds "Highly and Linearly Scalable", "Quick Response Time", "Flexible Data Storage", "Easy Data Distribution", "BASE Properties" and "Fast Writes".</p>
+
+  <p>Behind each claim is a mechanism. No master: every node can serve any request and every row is copied to several nodes, so one dead machine stops nothing. A new node takes over its share of the rows, so capacity grows with the nodes. A write is appended to memory and a log without reading first, so writes are fast. How the nodes share the rows is <a href="l22.html">lesson 22</a>; this lesson is the language you talk to them in. The session sums up the theory in two tables worth knowing word for word:</p>
+
+  <div class="tabs" id="l21-tabs-base">
+    <div data-tab="ACID vs BASE (p. 1550)">
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th></th><th>ACID (RDBMS)</th><th>BASE (Cassandra)</th></tr></thead>
+          <tbody>
+            <tr><th>Atomicity</th><td>Transactions are all-or-nothing</td><td>Atomicity not guaranteed; partial updates possible</td></tr>
+            <tr><th>Consistency</th><td>Strict rules, always valid state</td><td>Eventual consistency, tunable per query</td></tr>
+            <tr><th>Isolation</th><td>Transactions don't interfere</td><td>Concurrent writes may cause temporary conflicts</td></tr>
+            <tr><th>Durability</th><td>Data persists once committed</td><td>Durable, but replicas may lag</td></tr>
+            <tr><th>Availability</th><td>May sacrifice availability for consistency</td><td>Always available, even if inconsistent</td></tr>
+            <tr><th>State</th><td>Strong, predictable</td><td>Soft, may change asynchronously</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div data-tab="Relational vs Cassandra (p. 1551)">
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th>Feature</th><th>Relational Databases (RDBMS)</th><th>Cassandra</th></tr></thead>
+          <tbody>
+            <tr><th>Data Model</th><td>Tables with rows (records) and columns (attributes). Normalized schema with relationships (foreign keys, joins).</td><td>Keyspaces (like databases) contain tables (column families). Tables are wide-column stores with flexible schemas.</td></tr>
+            <tr><th>Schema</th><td>Rigid, predefined schema. Each row must follow the same structure.</td><td>Schema is flexible. Columns can vary by row; supports sparse data.</td></tr>
+            <tr><th>Relationships</th><td>Strong support for joins, foreign keys, normalization.</td><td>No joins or foreign keys. Data is denormalized and duplicated for query efficiency.</td></tr>
+            <tr><th>Query Language</th><td>SQL (Structured Query Language). Rich support for joins, aggregations, transactions.</td><td>CQL (Cassandra Query Language). Similar to SQL syntax but limited (no joins, limited aggregations).</td></tr>
+            <tr><th>Transactions</th><td>ACID-compliant (Atomicity, Consistency, Isolation, Durability).</td><td>Tunable consistency (choose between strong and eventual consistency). Focus on availability and partition tolerance.</td></tr>
+            <tr><th>Scalability</th><td>Vertical scaling (adding more power to a single server). Horizontal scaling is harder.</td><td>Horizontal scaling by adding nodes. Designed for distributed environments with no single point of failure.</td></tr>
+            <tr><th>Performance</th><td>Optimized for complex queries and consistency.</td><td>Optimized for high write throughput and fast reads across distributed nodes.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <details class="why">
+    <summary>Is a Cassandra write really "partial"?</summary>
+    <p>Not inside one partition. Background from the Cassandra documentation, not from the slides: an INSERT, UPDATE or DELETE that touches one partition is applied as a whole, and a logged BATCH ends up either fully applied or not at all. What Cassandra gives up is the bank transaction: several partitions changed in isolation. Answer with the table as printed, and add this when the question is open. The CAP side of the story is <a href="l05.html">lesson 5</a>.</p>
+  </details>
+
+  <p>The vocabulary nests like a filing cabinet. A <mark class="key">keyspace</mark> is "the outermost container in Cassandra" (p. 1553), roughly a database. It holds <mark class="key">tables</mark>, the lecture's column families: the keyword TABLE "can be interchanged with COLUMNFAMILY" (p. 1563). Tables hold rows, rows hold columns; <a href="l20.html">lesson 20</a> draws the picture, and from here on everything is CQL typed at the cqlsh prompt.</p>
+
+<pre><code>-- p. 1553: a keyspace that keeps three copies of every row
+CREATE KEYSPACE population
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 3};</code></pre>
+
+  <p>Read it aloud: create a container called population; replicate every row with the simple strategy, three copies. The replication map, strategy plus factor, is the one property a keyspace must declare. On a one-node laptop the statement still runs, with a warning: "Your replication factor 3 for keyspace population is higher than the number of nodes 1".</p>
+
+<pre><code>-- p. 1555: the prompt becomes cqlsh:population&gt;
+USE population;</code></pre>
+
+<pre><code>-- p. 1555: list the keyspaces (DESCRIBE tables; and
+-- DESCRIBE person; do the same for tables, pp. 1558-1559)
+DESCRIBE keyspaces;</code></pre>
+
+<pre><code>-- p. 1556: change the properties of a keyspace
+ALTER KEYSPACE population
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 2};</code></pre>
+
+<pre><code>-- p. 1556: remove the keyspace and every table in it
+DROP KEYSPACE population;</code></pre>
+
+  <div class="pitfall"><p>"Type the code as the slide shows it." The slides print typographic quotes, ‘SimpleStrategy’, and several boxes end without a semicolon. cqlsh rejects the curly quotes ("Invalid syntax at line 1, char 48") and waits for more input until it sees <code>;</code>. Straight single quotes and a final semicolon, always.</p></div>
+</section>
+
+
+<section id="l21-key">
+  <h2>PRIMARY KEY: where a row lives, and in which order</h2>
+
+  <p>The session's first table (p. 1558) describes people:</p>
+
+<pre><code>-- p. 1558: one partition per person, its rows sorted by age
+CREATE TABLE person (
+  personal_id text,
+  name text,
+  age varint,
+  birth_date text,
+  gender text,
+  PRIMARY KEY (personal_id, age)
+);</code></pre>
+
+  <p>Column by column it is SQL; the last line is not. The columns inside PRIMARY KEY "have different meaning depending on the order and the brackets" (p. 1560), and the slide gives both meanings:</p>
+
+  <div class="def"><p><dfn>Partition key</dfn> — "The first value (or set of values) is referred to as the Partition Key(s). It defines how the data is partitioned within the Cassandra nodes." Here: <code>personal_id</code>.</p></div>
+  <div class="def"><p><dfn>Clustering key</dfn> — "The second value (or set of values) is named Clustering Key(s). It is used to define the way data is stored within a partition (i.e., the sorting)." Here: <code>age</code>.</p></div>
+
+  <p>The mechanism: Cassandra hashes the partition-key value, and the number that comes out, the token, names the node that stores the row. Rows with the same partition-key value get the same token, so they sit together in one <mark class="key">partition</mark> on one node, kept sorted by the clustering key. Think of an archive: the hash of the surname picks the building, and inside it the folders stand in date order.</p>
+
+  <figure class="tbl-fig" id="l21-tbl-brackets">
+    <figcaption>The bracket grammar of p. 1560: the first element is the partition key, the rest are clustering columns.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>PRIMARY KEY …</th><th>Partition key: which node</th><th>Clustering key: order inside</th></tr></thead>
+        <tbody>
+          <tr><td><code>(a)</code></td><td>a</td><td>none: one row per partition</td></tr>
+          <tr><td><code>(a, b, c)</code></td><td>a</td><td>b, then c</td></tr>
+          <tr><td><code>((a, b), c)</code></td><td>a and b together: a composite partition key</td><td>c</td></tr>
+          <tr><td><code>((a, b), c, d)</code></td><td>a and b together</td><td>c, then d</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="fig fig--plain" id="l21-fig-key">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="The key PRIMARY KEY ((brand, year), max_speed, car_id) split in two: the inner brackets brand and year are hashed to a token that picks node 3 of three nodes; the clustering columns max_speed and car_id sort the rows inside the partition (Fiat, 2024) stored on node 3, speed 160 before 170">
+      <text x="280" y="22" class="tx-mono tx-mid">PRIMARY KEY ((brand, year), max_speed, car_id)</text>
+      <rect x="50" y="40" width="190" height="40" class="fi-paper sw-2"/>
+      <line x1="92" y1="64" x2="198" y2="64" class="hl"/>
+      <text x="145" y="65" class="tx-mono tx-mid">(brand, year)</text>
+      <rect x="320" y="40" width="190" height="40" class="fi-paper st-s3 sw-2"/>
+      <text x="415" y="65" class="tx-mono tx-mid">max_speed, car_id</text>
+      <line x1="145" y1="80" x2="145" y2="104" marker-end="url(#arr)"/>
+      <text x="145" y="124" class="tx-mono tx-mid">hash(brand, year)</text>
+      <line x1="168" y1="134" x2="208" y2="156" marker-end="url(#arr)"/>
+      <rect x="190" y="156" width="60" height="40" class="fw-key st-none"/>
+      <rect x="48" y="162" width="44" height="28" class="fi-paper"/>
+      <line x1="56" y1="169" x2="84" y2="169" class="st-muted"/>
+      <line x1="56" y1="176" x2="84" y2="176" class="st-muted"/>
+      <line x1="56" y1="183" x2="84" y2="183" class="st-muted"/>
+      <rect x="123" y="162" width="44" height="28" class="fi-paper"/>
+      <line x1="131" y1="169" x2="159" y2="169" class="st-muted"/>
+      <line x1="131" y1="176" x2="159" y2="176" class="st-muted"/>
+      <line x1="131" y1="183" x2="159" y2="183" class="st-muted"/>
+      <rect x="198" y="162" width="44" height="28" class="fi-paper sw-2"/>
+      <line x1="206" y1="169" x2="234" y2="169" class="st-muted"/>
+      <line x1="206" y1="176" x2="234" y2="176" class="st-muted"/>
+      <line x1="206" y1="183" x2="234" y2="183" class="st-muted"/>
+      <text x="70" y="212" class="tx-sm tx-mid">node 1</text>
+      <text x="145" y="212" class="tx-sm tx-mid">node 2</text>
+      <text x="220" y="212" class="tx-sm tx-mid">node 3</text>
+      <line x1="415" y1="80" x2="415" y2="100" marker-end="url(#arr)"/>
+      <rect x="320" y="104" width="190" height="108" class="fi-paper sw-2"/>
+      <line x1="372" y1="124" x2="458" y2="124" class="hl"/>
+      <text x="415" y="129" class="tx-mono tx-mid">(Fiat, 2024)</text>
+      <text x="330" y="156" class="tx-mono tx-sm">max_speed</text>
+      <text x="440" y="156" class="tx-mono tx-sm">car_id</text>
+      <line x1="330" y1="164" x2="500" y2="164" class="st-s3 sw-2"/>
+      <text x="370" y="184" class="tx-mono tx-mid">160</text>
+      <text x="474" y="184" class="tx-mono tx-mid">6</text>
+      <text x="370" y="204" class="tx-mono tx-mid">170</text>
+      <text x="474" y="204" class="tx-mono tx-mid">5</text>
+      <line x1="252" y1="176" x2="314" y2="176" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <text x="150" y="258" class="tx-hand tx-mid">decides the node</text>
+      <text x="415" y="244" class="tx-hand tx-mid">sorts the rows</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> One key, two jobs. The inner brackets are hashed together into a token that picks the node: the partition (Fiat, 2024) lands on node 3 (a toy placement, as in the widget below; the real ring is lesson 22). The columns after them sort the rows inside the partition: 160 before 170.</figcaption>
+  </figure>
+
+  <p>A composite partition key is one value: (Fiat, 2024) and (Fiat, 2023) are two partitions, possibly on two nodes. And the full primary key, partition plus clustering columns, identifies one row: two rows with the same full key are the same row — the trap of section 4.</p>
+
+  <aside class="margin-note">The list must start at the first clustering column: with clustering columns year, max_speed, the order (max_speed DESC) alone is refused, "Missing CLUSTERING ORDER for column year".</aside>
+
+  <p>Inside a partition the order is ascending unless the table says otherwise (p. 1554):</p>
+
+<pre><code>-- p. 1554's option (printed ASC), here DESC:
+-- in each partition, the oldest first
+CREATE TABLE person_by_age_desc (
+  personal_id text,
+  age varint,
+  name text,
+  PRIMARY KEY (personal_id, age)
+) WITH CLUSTERING ORDER BY (age DESC);</code></pre>
+
+  <p>The papers state the key in words:</p>
+
+  <figure class="tbl-fig" id="l21-tbl-phrases">
+    <figcaption>How the past papers phrase the key, and what to write.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>The paper says</th><th>You write</th></tr></thead>
+        <tbody>
+          <tr><td>"Personal_ID as the partition key and Policeman_ID as the clustering key" (6 Jun 2024)</td><td><code>PRIMARY KEY (personal_id, policeman_id)</code></td></tr>
+          <tr><td>"… ordering the table based on the Phone Number" (6 Sep 2024)</td><td>the clustering key, plus <code>WITH CLUSTERING ORDER BY (phone_number ASC)</code></td></tr>
+          <tr><td>"Favourite_Team as a clustering key and Name as an additional partition key" (11 Feb 2025)</td><td><code>PRIMARY KEY ((personal_id, name), favourite_team)</code></td></tr>
+          <tr><td>"query Heaters simultaneously by Floor number and Department specialty, sorting the results by total heating power" (30 Jan 2026)</td><td><code>PRIMARY KEY ((floor_number, specialty), heating_power, heater_sys_id)</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">Inside the inner brackets: where the row lives. After them: the order the rows keep there. All of it together: which row it is.</mark></p>
+
+  <h3>Changing a table, and what cannot change</h3>
+
+  <p>The other table statements work as in SQL (pp. 1561–1563), and each accepts COLUMNFAMILY in place of TABLE. The session adds the address that its INSERT fills in section 4:</p>
+
+<pre><code>-- p. 1562: a new column; the existing rows have no value in it
+ALTER TABLE person ADD address text;</code></pre>
+
+<pre><code>-- p. 1562: salary, added the same way, is dropped again
+ALTER TABLE person DROP salary;</code></pre>
+
+<pre><code>-- p. 1563: remove every row, keep the table
+TRUNCATE TABLE person;</code></pre>
+
+<pre><code>-- p. 1563: remove the table itself
+DROP TABLE person;</code></pre>
+
+  <p>The key is the one thing ALTER cannot touch: <code>ALTER TABLE person DROP age;</code> answers "Cannot drop PRIMARY KEY column age", so a wrong key means a new table and a copy of the data. And this is what "Schema is flexible" (p. 1551) means in CQL: every table declares its columns, a row may leave any non-key column empty at no cost, and ALTER TABLE adds a column at any time.</p>
+</section>
+
+
+<section id="l21-read">
+  <h2>Reading: what a WHERE clause may say</h2>
+
+  <p>The query Cassandra is built for names the partition (p. 1567):</p>
+
+<pre><code>-- one hash, one node, one partition: Francesco's rows
+SELECT * FROM person WHERE personal_id = 'FRNTRZ95E12F675T';</code></pre>
+
+  <p>Cassandra hashes the value, goes to the node that owns the token and reads one partition. A WHERE clause that does not name the partition is a question one hash cannot answer, and the session tries one at once (p. 1568), "Let's retrieve people by gender":</p>
+
+<pre><code>-- refused: gender is neither a key column nor indexed
+SELECT * FROM person WHERE gender = 'Male';</code></pre>
+
+  <p>cqlsh answers: "Cannot execute this query as it might involve data filtering and thus may have unpredictable performance. If you want to execute this query despite the performance unpredictability, use ALLOW FILTERING". An exact description: to find the men, Cassandra would read every row on every node and throw most of them away.</p>
+
+  <aside class="redpen" data-page="1568">
+    <p class="claim">"To solve the issue, it’s necessary to query with respect to the attributes included in the partition key AND to create a secondary index on gender."</p>
+    <p class="fix">Either one is enough. With an index on gender, <code>SELECT * FROM person WHERE gender = 'Male';</code> runs with no partition key; with the full partition key and no index, the gender condition needs ALLOW FILTERING, cheap inside one partition.</p>
+    <p class="because">The session does it itself on p. 1611: <code>CREATE INDEX car_price ON car (price);</code>, then <code>SELECT * FROM car WHERE price = 35000;</code>, no partition key. Both forms run on Cassandra 5.0.9. The printed query fails even earlier: in <code>gender = "male"</code> the double quotes make male a column name (a SyntaxException), and the stored value is 'Male'. The exam may be matched against the printed sentence: know it as printed, and write the either/or in your own answers.</p>
+  </aside>
+
+  <p>The next slide (p. 1569) lists the rules. In order, each with its reason:</p>
+
+  <ol>
+    <li><b>Name every column of the partition key</b>, with <code>=</code> or <code>IN</code>: "WHERE clauses must include ALL components of the partition key". Half a composite key gives no token.</li>
+    <li><b>Restrict clustering columns as a prefix, in their order; only the last may be a range.</b> "To filter on a later clustering key, all preceding clustering key(s) must be specified". The rows are sorted by the clustering columns, so such a prefix is one contiguous slice; anything else means hopping. Skip one and cqlsh says, for example, "PRIMARY KEY column "max_speed" cannot be restricted as preceding column "year" is not restricted".</li>
+    <li><b>No OR.</b> "Clustering Keys constraints producing non-contiguous results will fail": a range with a hole in it cannot be asked for. Conditions are joined by AND only; the red pen below explains why the slide's own example fails.</li>
+    <li><b>Any other column needs a secondary index, and then only <code>=</code>.</b> "To include additional fields in the query, it is necessary to create a secondary index." A range on an indexed column, <code>gender &gt; 'A'</code>, still needs ALLOW FILTERING.</li>
+    <li><b>ALLOW FILTERING switches the rules off</b>, "although it is not recommended due to bad execution-time performance": Cassandra reads and discards, so the cost grows with the table, not with the answer.</li>
+  </ol>
+
+  <aside class="redpen" data-page="1569">
+    <p class="claim">"Clustering Keys constraints producing non-contiguous results will fail (i.e., age &lt; '30' OR age &gt; '33')."</p>
+    <p class="fix">The example fails for another reason: CQL has no OR at all, so it is a syntax error before any key rule is checked, and '30' in quotes is text, not a varint. And "will fail" is too absolute: IN is non-contiguous and runs.</p>
+    <p class="because">On Cassandra 5.0.9 the printed condition stops at "no viable alternative at input 'OR'". With the key <code>(brand, max_speed, car_id)</code>, <code>WHERE brand = 'Ferrari' AND max_speed IN (296, 340)</code> runs and skips the 320 in between. The exam may be matched against the printed rule: know it with its example, and why the example fails.</p>
+  </aside>
+
+  <p>A SELECT with no WHERE, <code>SELECT * FROM car;</code>, needs no ALLOW FILTERING: it reads everything but discards nothing. The index of rule 4 is created as on p. 1564, and the car exercise uses it so (p. 1611):</p>
+
+<pre><code>-- p. 1611: an index on a column that is not part of the key
+CREATE INDEX car_price ON car (price);</code></pre>
+
+<pre><code>-- p. 1611: now legal, without partition key or ALLOW FILTERING
+SELECT * FROM car WHERE price = 35000;</code></pre>
+
+<pre><code>-- p. 1610: a range on that column: only ALLOW FILTERING helps
+SELECT * FROM car WHERE price &gt; 100000 ALLOW FILTERING;</code></pre>
+
+<pre><code>-- p. 1565: remove an index you no longer need
+DROP INDEX person_address;</code></pre>
+
+  <details class="why">
+    <summary>The slide calls indexes "one of the most important elements of a table". Why does the lecture prefer an "index factory"?</summary>
+    <p>Background from the Cassandra documentation: a secondary index is local. Every node indexes only its own rows, so a query by the indexed column alone asks every node. Fine for a small table, and exactly the exam's "further operation". On a large cluster the lecture's answer scales better: "cassandra is an index factory" (p. 431, <a href="l20.html#l20-queries">lesson 20</a>) — a second table whose partition key is the searched column, so the query is one hash again (section 5).</p>
+  </details>
+
+  <div class="widget" id="l21-w-key">
+    <h3 class="widget-title">The bracket grammar on three nodes</h3>
+    <p class="widget-intro">Nine cars in the table <code>car (car_id, brand, year, max_speed, price)</code>. Choose a PRIMARY KEY and watch the rows move: the partition key places each partition on a node (a toy hash, not Cassandra's), the clustering columns sort the rows inside it. Then pick or type a WHERE clause: the verdict and the message are those of a real Cassandra 5.0.9 node, checked on this very table. Rows the query returns are tinted; rows it reads and then throws away are struck through.</p>
+    <ol class="tasks">
+      <li>Key <code>(car_id, max_speed)</code>, the session's, and "(no WHERE clause)". Before looking: how many partitions are there, and how many rows does each one hold? In what order will <code>SELECT * FROM car;</code> return them?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Nine partitions of one row each, three per node: <code>car_id</code> is unique, so every car is a partition of its own and <code>max_speed</code> has nothing to sort. The rows come back partition by partition, in token order — the order of hashes, not of speeds. The toy hash gives one order, the real one another; that is why the hook's run printed 340, 190, 180, …</p></details>
+      </li>
+      <li>WHERE <code>brand = 'Ferrari'</code>. Switch between <code>((brand, year), max_speed, car_id)</code> and <code>(brand, year, max_speed, car_id)</code>. Predict which one answers without ALLOW FILTERING, and how many nodes each one contacts once you tick it.
+        <details class="answer"><summary>What you should see</summary>
+          <p><code>(brand, year, …)</code>: brand is the whole partition key, so node 3 reads one partition and returns three rows, sorted by year and then speed. <code>((brand, year), …)</code>: brand is half a partition key, there is no token, and cqlsh asks for ALLOW FILTERING; with it, all three nodes read all nine rows to return three. Same columns, other brackets: the brackets decide where a row lives.</p></details>
+      </li>
+      <li>Key <code>(brand, year, max_speed, car_id)</code>, WHERE <code>brand = 'Fiat' AND max_speed = 160</code>. Predict cqlsh's answer, then repair the query in two different ways.
+        <details class="answer"><summary>What you should see</summary>
+          <p>"PRIMARY KEY column "max_speed" cannot be restricted as preceding column "year" is not restricted" — rule 2. Repair one: name the year too, <code>brand = 'Fiat' AND year = 2023 AND max_speed = 160</code>, and node 1 reads exactly one row. Repair two: tick ALLOW FILTERING; node 1 still answers alone, because the partition key is given, but it reads the whole Fiat partition and discards one of the three rows.</p></details>
+      </li>
+      <li>Key <code>(brand, max_speed, car_id)</code>: try <code>price = 35000</code>, then <code>price &gt; 100000</code>. Predict, then create the index on price and predict again. Last, choose the key <code>(brand, max_speed)</code>: how many cars are stored?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Without the index both need ALLOW FILTERING. With it, <code>price = 35000</code> runs: every node looks up its local index and two cars come back, but <code>price &gt; 100000</code> still needs ALLOW FILTERING — a secondary index answers equality only (pp. 1610–1611). With the key <code>(brand, max_speed)</code> only 7 of the 9 cars remain: two Fiats share (Fiat, 160) and two Lancias share (Lancia, 180), and the later INSERT overwrote the earlier one. A key that does not identify the car loses cars, silently.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l21-w-key', function (root, ui) {
+    /* The rule engine: Cassandra's restriction checks rebuilt for this table and compared with 22 450 answers of a real
+       Cassandra 5.0.9 node (every key preset, index and ALLOW FILTERING choice, preset and random WHERE clauses). */
+    var L = (function () {
+      var COLS = { car_id: 'int', brand: 'text', year: 'int', max_speed: 'int', price: 'int' };
+      var PRESETS = {
+        A: { pk: ['car_id'], ck: ['max_speed'] },
+        B: { pk: ['brand'], ck: ['max_speed', 'car_id'] },
+        C: { pk: ['brand', 'year'], ck: ['max_speed', 'car_id'] },
+        D: { pk: ['brand'], ck: ['year', 'max_speed', 'car_id'] },
+        E: { pk: ['brand'], ck: ['max_speed'] }
+      };
+      var FILTER_MSG = 'Cannot execute this query as it might involve data filtering and thus may have unpredictable performance. If you want to execute this query despite the performance unpredictability, use ALLOW FILTERING';
+      function fail(kind, msg, extra) { var r = { ok: false, kind: kind, msg: msg }; if (extra) for (var k in extra) r[k] = extra[k]; return r; }
+      function tokenize(s) {
+        var out = [], i = 0, m;
+        while (i < s.length) {
+          var c = s[i];
+          if (/\s/.test(c)) { i++; continue; }
+          if (c === "'") {
+            var j = i + 1, v = '';
+            for (;;) {
+              if (j >= s.length) return { error: 'unterminated', pos: i };
+              if (s[j] === "'") { if (s[j + 1] === "'") { v += "'"; j += 2; continue; } break; }
+              v += s[j]; j++;
+            }
+            out.push({ t: 'str', v: v, pos: i }); i = j + 1; continue;
+          }
+          if (c === '"') {
+            var k = s.indexOf('"', i + 1);
+            if (k < 0) return { error: 'unterminated', pos: i };
+            out.push({ t: 'qid', v: s.slice(i + 1, k), pos: i }); i = k + 1; continue;
+          }
+          if ((m = /^-?\d+(\.\d+)?([eE][+-]?\d+)?/.exec(s.slice(i)))) { out.push({ t: (m[1] || m[2]) ? 'float' : 'int', v: m[0], pos: i }); i += m[0].length; continue; }
+          if ((m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i)))) { out.push({ t: 'id', v: m[0], pos: i }); i += m[0].length; continue; }
+          if ((m = /^(<=|>=|!=|=|<|>|\(|\)|,)/.exec(s.slice(i)))) { out.push({ t: 'op', v: m[0], pos: i }); i += m[0].length; continue; }
+          return { error: 'char', pos: i, ch: c };
+        }
+        return { tokens: out };
+      }
+      function parse(where) {
+        var tk = tokenize(where);
+        if (tk.error === 'unterminated') return { syntax: true, unterminated: true, pos: where.length, near: '<EOF>' };
+        if (tk.error) return { syntax: true, pos: tk.pos, near: tk.ch };
+        var t = tk.tokens, i = 0, rels = [];
+        function kw(x, w) { return x && x.t === 'id' && x.v.toUpperCase() === w; }
+        function synt(tok) {
+          if (tok && tok.t === 'qid') { var k = t.indexOf(tok); tok = t[k + 1]; }
+          return { syntax: true, pos: tok ? tok.pos : where.length, near: tok ? (tok.t === 'str' ? "'" + tok.v + "'" : tok.v) : '<EOF>', eof: !tok, tok: tok };
+        }
+        if (!t.length) return { rels: [] };
+        for (;;) {
+          var col = t[i];
+          if (!col || (col.t !== 'id' && col.t !== 'qid') || kw(col, 'OR') || kw(col, 'AND')) return synt(col);
+          i++;
+          var op = t[i];
+          var rel = { col: col.t === 'qid' ? col.v : col.v.toLowerCase(), colTok: col };
+          if (kw(op, 'IN')) {
+            i++;
+            if (!t[i] || t[i].v !== '(') return synt(t[i]);
+            i++;
+            rel.op = 'IN'; rel.vals = [];
+            if (t[i] && t[i].v === ')') { i++; rels.push(rel); if (i >= t.length) break; if (kw(t[i], 'AND')) { i++; continue; } return synt(t[i]); }
+            for (;;) {
+              var term = t[i];
+              if (!term || (term.t !== 'str' && term.t !== 'int' && term.t !== 'float')) return synt(term);
+              rel.vals.push(term); i++;
+              if (t[i] && t[i].v === ',') { i++; continue; }
+              if (t[i] && t[i].v === ')') { i++; break; }
+              return synt(t[i]);
+            }
+          } else {
+            if (!op || op.t !== 'op' || !/^(=|<|>|<=|>=|!=)$/.test(op.v)) return synt(op);
+            i++;
+            var term2 = t[i];
+            if (term2 && term2.t === 'qid') return synt(term2);
+            if (!term2 || (term2.t !== 'str' && term2.t !== 'int' && term2.t !== 'float')) return synt(term2);
+            rel.op = op.v; rel.vals = [term2]; i++;
+          }
+          rels.push(rel);
+          if (i >= t.length) break;
+          if (kw(t[i], 'AND')) { i++; continue; }
+          return synt(t[i]);
+        }
+        return { rels: rels };
+      }
+      function typeCheck(rel) {
+        var ty = COLS[rel.col];
+        for (var k = 0; k < rel.vals.length; k++) {
+          var v = rel.vals[k];
+          if (ty === 'int' && v.t === 'str') return 'Invalid STRING constant (' + v.v + ') for "' + rel.col + '" of type int';
+          if (ty === 'int' && v.t === 'float') return 'Invalid FLOAT constant (' + v.v + ') for "' + rel.col + '" of type int';
+          if (ty === 'text' && v.t === 'int') return 'Invalid INTEGER constant (' + v.v + ') for "' + rel.col + '" of type text';
+          if (ty === 'text' && v.t === 'float') return 'Invalid FLOAT constant (' + v.v + ') for "' + rel.col + '" of type text';
+        }
+        return null;
+      }
+      function kindOf(op) { return op === '=' ? 'EQ' : op === 'IN' ? 'IN' : (op === '>' || op === '>=') ? 'START' : 'END'; }
+      function analyse(presetId, indexCol, where, af, tableName) {
+        var P = PRESETS[presetId], tname = tableName || 'car_dealer.car';
+        var p = parse(where);
+        if (p.syntax) return fail('syntax', p.near, { pos: p.pos, eof: !!p.eof, near: p.near, unterminated: !!p.unterminated });
+        var pos = {};
+        P.ck.forEach(function (c, k) { pos[c] = k; });
+        function role(c) { return P.pk.indexOf(c) >= 0 ? 'pk' : (c in pos ? 'ck' : 'reg'); }
+        function supports(c, kind) { return indexCol && indexCol === c && kind === 'EQ'; }
+        var R = {}, order = [];
+        for (var r = 0; r < p.rels.length; r++) {
+          var rel = p.rels[r];
+          if (!(rel.col in COLS)) return fail('invalid', 'Undefined column name ' + rel.col + ' in table ' + tname, { why: 'col' });
+          if (rel.op === '!=') {
+            var v0 = rel.vals[0];
+            return fail('invalid', 'Unsupported "!=" relation: ' + rel.col + ' != ' + (v0.t === 'str' ? "'" + v0.v.replace(/'/g, "''") + "'" : v0.v), { why: 'neq' });
+          }
+          var te = typeCheck(rel);
+          if (te) return fail('invalid', te, { why: 'type', col: rel.col });
+          var kd = kindOf(rel.op), ex = R[rel.col];
+          if (ex) {
+            if (ex.kind === 'EQ') return fail('invalid', rel.col + ' cannot be restricted by more than one relation if it includes an Equal', { why: 'dup' });
+            if (ex.kind === 'IN') return fail('invalid', rel.col + ' cannot be restricted by more than one relation if it includes a IN', { why: 'dup' });
+            if (kd === 'EQ' || kd === 'IN') return fail('invalid', 'Column "' + rel.col + '" cannot be restricted by both an equality and an inequality relation', { why: 'dup' });
+            if ((kd === 'START' && ex.start) || (kd === 'END' && ex.end)) return fail('invalid', 'More than one restriction was found for the ' + (kd === 'START' ? 'start' : 'end') + ' bound on ' + rel.col, { why: 'dup' });
+          }
+          if (role(rel.col) === 'ck' && order.length && !af && !supports(rel.col, kd)) {
+            var last = order.reduce(function (a, b) { return pos[b] > pos[a] ? b : a; }, order[0]);
+            var lastSlice = R[last].kind === 'SLICE';
+            var newIsSlice = (kd === 'START' || kd === 'END') || (ex && ex.kind === 'SLICE');
+            if (lastSlice && pos[rel.col] > pos[last]) return fail('invalid', 'Clustering column "' + rel.col + '" cannot be restricted (preceding column "' + last + '" is restricted by a non-EQ relation)', { why: 'ckrange' });
+            if (pos[rel.col] < pos[last] && newIsSlice) {
+              var next = order.filter(function (c) { return pos[c] > pos[rel.col]; }).sort(function (a, b) { return pos[a] - pos[b]; })[0];
+              return fail('invalid', 'PRIMARY KEY column "' + next + '" cannot be restricted (preceding column "' + rel.col + '" is restricted by a non-EQ relation)', { why: 'ckrange' });
+            }
+          }
+          if (!ex) { ex = R[rel.col] = { col: rel.col, kind: (kd === 'START' || kd === 'END') ? 'SLICE' : kd, rels: [] }; if (role(rel.col) === 'ck') order.push(rel.col); }
+          if (kd === 'START') ex.start = rel; else if (kd === 'END') ex.end = rel;
+          ex.rels.push(rel);
+        }
+        var pkR = P.pk.filter(function (c) { return R[c]; });
+        var ckR = P.ck.filter(function (c) { return R[c]; });
+        var regR = Object.keys(COLS).filter(function (c) { return role(c) === 'reg' && R[c]; });
+        function sup(c) { return supports(c, R[c].kind); }
+        var hasQCK = ckR.some(sup);
+        var hasQI = hasQCK || pkR.some(sup) || regR.some(sup);
+        var usesSI = false, isKeyRange = false, filterCols = [];
+        var pkMissing = P.pk.length - pkR.length;
+        var pkHasSlice = pkR.some(function (c) { return R[c].kind === 'SLICE'; });
+        if (pkR.length === 0) { isKeyRange = true; usesSI = hasQI; }
+        var pkNeedsFilter = pkR.length > 0 && (pkMissing > 0 || pkHasSlice);
+        if (pkNeedsFilter) {
+          if (!af && !hasQI) return fail('filter', FILTER_MSG, { why: pkHasSlice ? 'pkrange' : 'pkpart', cols: P.pk.filter(function (c) { return !R[c]; }) });
+          isKeyRange = true; usesSI = hasQI;
+        }
+        if (usesSI || pkNeedsFilter) filterCols = filterCols.concat(pkR);
+        var ckNeedsFilter = false, expect = 0;
+        for (var q = 0; q < ckR.length; q++) {
+          var c2 = ckR[q];
+          if (pos[c2] !== expect) { ckNeedsFilter = true; break; }
+          if (R[c2].kind !== 'SLICE') expect = pos[c2] + 1; else expect = -1;
+        }
+        if (ckR.length && ckNeedsFilter) {
+          if (hasQI) usesSI = true;
+          else if (!af) {
+            for (var z = 0; z < ckR.length; z++) {
+              if (P.ck[z] !== ckR[z]) return fail('invalid', 'PRIMARY KEY column "' + ckR[z] + '" cannot be restricted as preceding column "' + P.ck[z] + '" is not restricted', { why: 'ckgap' });
+            }
+          }
+        }
+        if (isKeyRange && hasQCK) usesSI = true;
+        if (usesSI || ckNeedsFilter) filterCols = filterCols.concat(ckR);
+        if (regR.length) {
+          if (hasQI) usesSI = true;
+          else if (!af) return fail('filter', FILTER_MSG, { why: 'reg', cols: regR });
+          filterCols = filterCols.concat(regR);
+        }
+        if (usesSI) {
+          var keyIn = pkR.some(function (c) { return R[c].kind === 'IN'; });
+          if (keyIn) return fail('invalid', 'Select on indexed columns and with IN clause for the PRIMARY KEY are not supported', { why: 'idxin' });
+        }
+        if (!af && (isKeyRange || usesSI)) {
+          var unserved = filterCols.filter(function (c) { return !(usesSI && sup(c)); });
+          var nf = unserved.length > 0 || (filterCols.length === 0 && ckR.length > 0);
+          if (nf) return fail('filter', FILTER_MSG, { why: usesSI ? 'idxextra' : 'nopk', cols: unserved });
+        }
+        return { ok: true, R: R, pkR: pkR, ckR: ckR, regR: regR, usesSI: usesSI, isKeyRange: isKeyRange, af: af, ckNeedsFilter: ckNeedsFilter,
+                 pkFull: pkMissing === 0 && !pkHasSlice, indexCol: usesSI ? (pkR.concat(ckR, regR).filter(sup)[0] || null) : null };
+      }
+      function stored(presetId, cars) {
+        var P = PRESETS[presetId], map = {}, keys = [];
+        cars.forEach(function (c) {
+          var k = P.pk.concat(P.ck).map(function (col) { return c[col]; }).join('|');
+          if (!(k in map)) keys.push(k);
+          map[k] = c;
+        });
+        return keys.map(function (k) { return map[k]; });
+      }
+      function test(rel, row) {
+        var x = row[rel.col];
+        var vs = rel.vals.map(function (v) { return v.t === 'str' ? v.v : Number(v.v); });
+        switch (rel.op) {
+          case '=': return x === vs[0];
+          case 'IN': return vs.indexOf(x) >= 0;
+          case '<': return x < vs[0];
+          case '>': return x > vs[0];
+          case '<=': return x <= vs[0];
+          case '>=': return x >= vs[0];
+        }
+        return false;
+      }
+      function matches(an, row) {
+        for (var c in an.R) for (var k = 0; k < an.R[c].rels.length; k++) if (!test(an.R[c].rels[k], row)) return false;
+        return true;
+      }
+      function syntaxMsg(prefixLen, where, an, af) {
+        if (an.unterminated) return 'line 1:' + (prefixLen + where.length + (af ? 16 : 0)) + " mismatched character '<EOF>' expecting '''";
+        if (an.eof) return af ? 'line 1:' + (prefixLen + where.length + 1) + " no viable alternative at input 'ALLOW'" : "line 0:-1 no viable alternative at input '<EOF>'";
+        return 'line 1:' + (prefixLen + an.pos) + " no viable alternative at input '" + an.near + "'";
+      }
+      return { PRESETS: PRESETS, analyse: analyse, stored: stored, matches: matches, test: test, syntaxMsg: syntaxMsg };
+    })();
+
+    var CARS = [
+      { car_id: 1, brand: 'Ferrari', year: 2024, max_speed: 320, price: 200000 },
+      { car_id: 2, brand: 'Ferrari', year: 2023, max_speed: 340, price: 250000 },
+      { car_id: 3, brand: 'Ferrari', year: 2024, max_speed: 296, price: 180000 },
+      { car_id: 4, brand: 'Fiat', year: 2023, max_speed: 160, price: 15000 },
+      { car_id: 5, brand: 'Fiat', year: 2024, max_speed: 170, price: 18000 },
+      { car_id: 6, brand: 'Fiat', year: 2024, max_speed: 160, price: 35000 },
+      { car_id: 7, brand: 'Lancia', year: 2023, max_speed: 180, price: 35000 },
+      { car_id: 8, brand: 'Lancia', year: 2024, max_speed: 190, price: 42000 },
+      { car_id: 9, brand: 'Lancia', year: 2024, max_speed: 180, price: 30000 }
+    ];
+    var ORDER = ['car_id', 'brand', 'year', 'max_speed', 'price'];
+    var KEYS = [
+      { value: 'A', label: '(car_id, max_speed) · p. 1607' },
+      { value: 'B', label: '(brand, max_speed, car_id)' },
+      { value: 'C', label: '((brand, year), max_speed, car_id)' },
+      { value: 'D', label: '(brand, year, max_speed, car_id)' },
+      { value: 'E', label: '(brand, max_speed)' }
+    ];
+    var WHERES = ["brand = 'Ferrari'", "brand = 'Ferrari' AND year = 2024", "brand = 'Fiat' AND max_speed = 160",
+      "brand = 'Ferrari' AND max_speed > 300", 'car_id = 3', 'max_speed > 300', 'price = 35000', 'price > 100000',
+      "brand IN ('Ferrari', 'Lancia')", 'year = 2024', 'max_speed < 170 OR max_speed > 300', 'brand = "Ferrari"', ''];
+    var PREFIX = 'SELECT * FROM car WHERE '.length;
+    function fnv(s) { var h = 0x811c9dc5; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; }
+    function pkOf(P, r) { return P.pk.map(function (c) { return r[c]; }).join(':'); }
+    function nodeOf(P, r) { return fnv('t160' + pkOf(P, r)) % 3; }
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+    var input = null;
+    var keySel = ui.select('PRIMARY KEY', KEYS, null, 'B');
+    var descT = ui.toggle('first clustering column DESC', false);
+    var idxSel = ui.select('CREATE INDEX on', [{ value: 'none', label: 'no index' }, 'price', 'year', 'max_speed', 'brand'], null, 'none');
+    var whereSel = ui.select('WHERE clause: an example', WHERES.map(function (w) { return { value: w, label: w || '(no WHERE clause)' }; }),
+      function (v) { if (input) input.value = v; }, WHERES[0]);
+    input = Course.el('input', { type: 'text', id: 'l21-w-key-where', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off' });
+    input.value = whereSel.value;
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl l21-ctl-wide' }, [
+      Course.el('label', { 'for': 'l21-w-key-where', text: '… or type your own conditions (joined by AND)' }), input]));
+    input.addEventListener('input', function () { ui.changed(); });
+    var afT = ui.toggle('ALLOW FILTERING', false);
+
+    var stmtPre = Course.el('pre', { 'class': 'l21-stmt' });
+    var nodesBox = Course.el('div', { 'class': 'l21-nodes' });
+    ui.stage.appendChild(stmtPre);
+    ui.stage.appendChild(nodesBox);
+    ui.legend([{ label: 'partition key', color: 'key', mark: 'area' }, { label: 'clustering columns', color: 's3', mark: 'line' },
+               { label: 'row returned', color: 's2', mark: 'area' }, { label: 'node contacted', color: 's2', mark: 'dash' }]);
+    var roStored = ui.readout('rows stored'), roVerdict = ui.readout('cqlsh says'), roNodes = ui.readout('nodes contacted'), roRows = ui.readout('rows read → returned');
+    var note = ui.note('');
+
+    function state() {
+      var P = L.PRESETS[keySel.value], ix = idxSel.value === 'none' ? null : idxSel.value, ixErr = null;
+      if (ix && P.pk.length === 1 && P.pk[0] === ix) { ixErr = 'Cannot create secondary index on the only partition key column ' + ix; ix = null; }
+      var raw = input.value.replace(/;\s*$/, '').trim();
+      var afTyped = /\bALLOW\s+FILTERING$/i.test(raw);
+      var w = raw.replace(/\s*\bALLOW\s+FILTERING$/i, '').replace(/^WHERE\s+/i, '').trim();
+      var af = afT.value || afTyped;
+      var an = L.analyse(keySel.value, ix, w, af);
+      var needed = true;
+      if (an.ok && af) needed = !L.analyse(keySel.value, ix, w, false).ok;
+      return { key: keySel.value, P: P, rows: L.stored(keySel.value, CARS), ix: ix, ixErr: ixErr, w: w, af: af, an: an, afNeeded: needed };
+    }
+    function plan(s) {
+      var an = s.an, P = s.P, out = { nodes: [false, false, false], read: {}, hit: {}, mode: '', parts: {} };
+      if (!an.ok) return out;
+      function all(cols, r) { return cols.every(function (c) { return an.R[c].rels.every(function (rel) { return L.test(rel, r); }); }); }
+      s.rows.forEach(function (r) { if (L.matches(an, r)) out.hit[r.car_id] = true; });
+      if (an.pkFull && !an.usesSI) {
+        out.mode = (an.ckNeedsFilter || an.regR.length) ? 'part-filter' : 'part';
+        s.rows.forEach(function (r) {
+          if (!all(an.pkR, r)) return;
+          out.nodes[nodeOf(P, r)] = true; out.parts[pkOf(P, r)] = true;
+          if (an.ckNeedsFilter || all(an.ckR, r)) out.read[r.car_id] = true;
+        });
+      } else if (an.usesSI) {
+        out.mode = 'index';
+        s.rows.forEach(function (r) {
+          if (an.pkFull && !all(an.pkR, r)) return;
+          if (an.pkFull) out.nodes[nodeOf(P, r)] = true;
+          if (all([an.indexCol], r)) out.read[r.car_id] = true;
+        });
+        if (!an.pkFull) out.nodes = [true, true, true];
+      } else {
+        out.mode = s.w ? 'scan' : 'all';
+        out.nodes = [true, true, true];
+        s.rows.forEach(function (r) { out.read[r.car_id] = true; });
+      }
+      return out;
+    }
+    function rack() {
+      var sv = Course.svg('svg', { viewBox: '0 0 44 28', 'class': 'dia', role: 'img', 'aria-label': 'a node of the cluster' });
+      Course.svg('rect', { x: 1, y: 1, width: 42, height: 26, 'class': 'fi-paper' }, sv);
+      [8, 14, 20].forEach(function (y) { Course.svg('line', { x1: 8, y1: y, x2: 36, y2: y, 'class': 'st-muted' }, sv); });
+      return sv;
+    }
+    function renderStmt(s) {
+      var P = s.P, code = Course.el('code');
+      function add(t, cls) { code.appendChild(Course.el('span', { 'class': cls || null, text: t })); }
+      add('CREATE TABLE car (\n  car_id int, brand text, year int,\n  max_speed int, price int,\n  PRIMARY KEY (');
+      add(P.pk.length > 1 ? '(' + P.pk.join(', ') + ')' : P.pk[0], 'l21-pkpart');
+      add(', ');
+      add(P.ck.join(', '), 'l21-ckpart');
+      add(')\n)' + (descT.value ? ' WITH CLUSTERING ORDER BY (' + P.ck[0] + ' DESC)' : '') + ';\n');
+      if (idxSel.value !== 'none') add('CREATE INDEX car_' + idxSel.value + ' ON car (' + idxSel.value + ');\n');
+      add('SELECT * FROM car' + (s.w ? ' WHERE ' + s.w : '') + (s.af ? ' ALLOW FILTERING' : '') + ';');
+      stmtPre.textContent = '';
+      stmtPre.appendChild(code);
+    }
+    function badge(s, pl, n) {
+      if (!s.an.ok) return '';
+      if (!pl.nodes[n]) return 'not asked';
+      return { part: 'reads a slice', 'part-filter': 'reads, then filters', index: 'local index lookup', scan: 'reads all, filters', all: 'returns all its rows' }[pl.mode] || '';
+    }
+    function renderNodes(s, pl) {
+      nodesBox.textContent = '';
+      var P = s.P, desc = descT.value;
+      var cols = P.pk.concat(P.ck, ORDER.filter(function (c) { return P.pk.indexOf(c) < 0 && P.ck.indexOf(c) < 0; }));
+      for (var n = 0; n < 3; n++) {
+        var parts = {}, keys = [];
+        s.rows.filter(function (r) { return nodeOf(P, r) === n; }).forEach(function (r) {
+          var k = pkOf(P, r);
+          if (!parts[k]) { parts[k] = []; keys.push(k); }
+          parts[k].push(r);
+        });
+        keys.sort(function (a, b) { return fnv('t160' + a) - fnv('t160' + b); });
+        var box = Course.el('div', { 'class': 'l21-node' + (s.an.ok ? (pl.nodes[n] ? ' is-on' : ' is-off') : '') });
+        box.appendChild(Course.el('div', { 'class': 'l21-node-h' }, [rack(), Course.el('span', { text: 'node ' + (n + 1) }), Course.el('span', { 'class': 'l21-badge', text: badge(s, pl, n) })]));
+        var head = Course.el('tr', null, cols.map(function (c) {
+          var ck = P.ck.indexOf(c);
+          return Course.el('th', { 'class': P.pk.indexOf(c) >= 0 ? 'is-pk' : (ck >= 0 ? 'is-ck' : null), text: c + (ck >= 0 ? (ck === 0 && desc ? ' ↓' : ' ↑') : '') });
+        }));
+        var body = Course.el('tbody');
+        keys.forEach(function (k) {
+          var prow = parts[k].slice().sort(function (a, b) {
+            for (var i = 0; i < P.ck.length; i++) {
+              var c = P.ck[i], d = a[c] < b[c] ? -1 : (a[c] > b[c] ? 1 : 0);
+              if (i === 0 && desc) d = -d;
+              if (d) return d;
+            }
+            return 0;
+          });
+          prow.forEach(function (r, i) {
+            var cls = [];
+            if (i === 0) cls.push('is-first');
+            if (s.an.ok && pl.hit[r.car_id]) cls.push('is-hit');
+            else if (s.an.ok && pl.read[r.car_id]) cls.push('is-read');
+            body.appendChild(Course.el('tr', { 'class': cls.join(' ') || null }, cols.map(function (c) {
+              return Course.el('td', { text: (P.pk.indexOf(c) >= 0 && i > 0) ? '' : String(r[c]) });
+            })));
+          });
+        });
+        box.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'l21-tbl' }, [Course.el('thead', null, head), body])));
+        nodesBox.appendChild(box);
+      }
+    }
+    function hint(s) {
+      var an = s.an, c = (an.cols || []).join(', ');
+      if (an.kind === 'syntax') {
+        if (an.near === 'OR') return 'Rule 3: CQL has no OR; the conditions of a WHERE clause are joined by AND only.';
+        if (/"/.test(s.w) && !an.unterminated) return 'Double quotes make a name, not a value: write the text value in single quotes, \'Ferrari\'.';
+        return 'Each condition is column, operator, value; text values in single quotes; conditions joined by AND.';
+      }
+      return {
+        pkpart: 'Rule 1: the partition key also needs ' + c + '; half a partition key gives no token, hence no node.',
+        pkrange: 'Rule 1: a range on the partition key gives no single token, so every node would have to look.',
+        reg: 'Rule 4: ' + c + ' is not part of the key, and no index can serve this condition (an index serves = only).',
+        idxextra: 'Rule 4: the index finds the rows of one condition; the other condition would still be checked row by row.',
+        nopk: 'Rule 1: clustering columns without the partition key mean searching every partition of every node.',
+        ckgap: 'Rule 2: clustering columns are restricted as a prefix, in the order of the key.',
+        ckrange: 'Rule 2: after a range on a clustering column, no later clustering column may be restricted.',
+        type: 'Text values take single quotes; numbers take none.',
+        neq: 'CQL has no != in a WHERE clause.',
+        dup: 'A column takes one relation, or two that are the two ends of a range.',
+        idxin: 'An index query cannot be combined with IN on the partition key.',
+        col: 'The table has the columns car_id, brand, year, max_speed and price.'
+      }[an.why] || '';
+    }
+    function explain(s, pl, nRead, nHit) {
+      var an = s.an, nodes = [];
+      pl.nodes.forEach(function (on, i) { if (on) nodes.push(i + 1); });
+      var t = '';
+      if (pl.mode === 'all') t = 'No WHERE clause: every node returns all its partitions, in token order. Nothing is read and then discarded, so no ALLOW FILTERING is needed.';
+      else if (pl.mode === 'part') t = 'The hash of the partition key names node ' + nodes.join(' and node ') + ': Cassandra reads ' + (Object.keys(pl.parts).length > 1 ? Object.keys(pl.parts).length + ' partitions' : 'one partition') + (an.ckR.length ? ', one contiguous slice in clustering order' : '') + '.';
+      else if (pl.mode === 'part-filter') t = 'ALLOW FILTERING inside the partition: node ' + nodes.join(' and node ') + ' reads ' + nRead + ' row' + (nRead === 1 ? '' : 's') + ' and keeps ' + nHit + '. Cheap, because one partition is small.';
+      else if (pl.mode === 'index') t = an.pkFull ? 'The partition key names node ' + nodes.join(' and node ') + '; its local index on ' + an.indexCol + ' finds ' + nRead + ' row' + (nRead === 1 ? '' : 's') + '.' : 'Every node looks up its local index on ' + an.indexCol + ' (' + nRead + ' match' + (nRead === 1 ? '' : 'es') + ') and returns the rows that pass.';
+      else if (pl.mode === 'scan') t = 'ALLOW FILTERING: every node reads all its rows (' + nRead + ' in all) and keeps ' + nHit + '. The cost grows with the table, not with the answer.';
+      if (s.af && !s.afNeeded) t += ' ALLOW FILTERING was not needed here.';
+      return t;
+    }
+
+    ui.onChange(function () {
+      var s = state(), pl = plan(s);
+      renderStmt(s);
+      renderNodes(s, pl);
+      var lost = CARS.length - s.rows.length;
+      roStored.set(lost ? s.rows.length + ' of 9: ' + lost + ' overwritten' : '9', lost ? 'bad' : undefined);
+      var pre = s.ixErr ? '<b>CREATE INDEX fails:</b> <code>' + esc(s.ixErr) + '</code>; the SELECT runs without an index. ' : '';
+      if (lost) pre += 'Two pairs of cars share their whole key, (Fiat, 160) and (Lancia, 180): the later INSERT replaced the earlier row. ';
+      if (!s.an.ok) {
+        var syn = s.an.kind === 'syntax';
+        roVerdict.set(s.an.kind === 'filter' ? 'needs ALLOW FILTERING' : (syn ? 'syntax error' : 'invalid request'), 'bad');
+        roNodes.set('—');
+        roRows.set('—');
+        note.set(pre + '<b>' + (syn ? 'SyntaxException' : 'InvalidRequest') + ':</b> <code>' + esc(syn ? L.syntaxMsg(PREFIX, s.w, s.an, s.af) : s.an.msg) + '</code> ' + esc(hint(s)));
+        return;
+      }
+      var nRead = Object.keys(pl.read).length, nHit = Object.keys(pl.hit).length, nNodes = pl.nodes.filter(Boolean).length;
+      roVerdict.set('runs', 'good');
+      roNodes.set(nNodes + ' of 3');
+      roRows.set(nRead + ' → ' + nHit);
+      note.set(pre + esc(explain(s, pl, nRead, nHit)));
+    });
+  });
+  </script>
+
+  <div class="tip"><p>"If any further operation is required, write its CQL code" asks exactly this: is the WHERE column part of the key? If not, the further operation is <code>CREATE INDEX</code> for an equality; for a range only ALLOW FILTERING works — write it, and say it is not recommended.</p></div>
+</section>
+
+
+<section id="l21-write">
+  <h2>Writing: every write is an upsert</h2>
+
+  <p>The session inserts a person (p. 1566):</p>
+
+<pre><code>-- p. 1566: Francesco, aged 26
+INSERT INTO person (personal_id, address, age,
+                    birth_date, gender, name)
+VALUES ('FRNTRZ95E12F675T', 'Via Milano 12', 26,
+        '12-05-1995', 'Male', 'Francesco Terzani');</code></pre>
+
+  <p>Columns and values match in order; the primary-key columns must be there, the others may be left out. The template's <code>USING &lt;option&gt;</code> is not explained on the slide: it sets a time to live, <code>USING TTL 86400</code> expires the values after a day, or a write timestamp (Cassandra documentation).</p>
+
+  <p>Now the question no slide asks: what if a row with that primary key already exists? In SQL, a duplicate-key error. In Cassandra, nothing: the INSERT overwrites the columns it lists and keeps the others. An INSERT is an <mark class="key">upsert</mark> — update or insert, decided by the primary key alone. Cassandra never reads before writing, part of why writes are fast; to refuse duplicates you ask for it, <code>INSERT … IF NOT EXISTS</code>, a lightweight transaction (not in the slides).</p>
+
+  <p>UPDATE follows the same logic (p. 1570): "The WHERE clause must include all components of the primary key (partition key and clustering keys). You cannot update or change primary key values." Leave out <code>age</code> and cqlsh answers "Some clustering keys are missing: age"; try <code>SET age = 27</code> and it answers "PRIMARY KEY part age found in SET part". When no row has the key, the UPDATE creates one.</p>
+
+<pre><code>-- p. 1570 as printed: "Let's update Francesco's address"
+UPDATE person
+SET address = 'Via Milani 13'
+WHERE personal_id = 'FRNTRZ95E12F675T' AND age = 32;</code></pre>
+
+  <aside class="redpen" data-page="1570">
+    <p class="claim">"Let’s update Francesco’s address to ‘Via Milani 13’" — <code>WHERE personal_id = ‘FRNTRZ95E12F675T’ AND age = 32;</code></p>
+    <p class="fix">Francesco was inserted with age 26 (p. 1566); the statement that updates him ends with <code>AND age = 26;</code>.</p>
+    <p class="because">age is part of the primary key, so (FRNTRZ95E12F675T, 32) is another row, one that does not exist. The UPDATE creates it with only the address and leaves Francesco at Via Milano 12: on Cassandra 5.0.9 the partition then holds two rows, and cqlsh reports no error. The widget below replays it. The exam may be matched against the printed slide: know that its statement writes a second, ghost row, and write the key Francesco really has.</p>
+  </aside>
+
+  <div class="widget" id="l21-w-upsert">
+    <h3 class="widget-title">The upsert trap</h3>
+    <p class="widget-intro">The session's <code>person</code> table, empty. Choose its PRIMARY KEY, pick a statement and press Run; under the statement you see what <code>SELECT * FROM person WHERE personal_id = 'FRNTRZ95E12F675T';</code> returns afterwards, and below it cqlsh's replies so far. Changing the key starts the table over.</p>
+    <ol class="tasks">
+      <li>Key <code>(personal_id, age)</code>. Run "INSERT Francesco, age 26", then predict: after "INSERT Francesco again, age 32", how many rows? Then switch the key to <code>(personal_id)</code> and run the same two statements.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Two rows: age is part of the key, so (…, 32) is a new row. With the key <code>(personal_id)</code>: one row — the second INSERT overwrote age and name, and the address of the first one stayed, because an upsert writes only the columns it lists. No error either time.</p></details>
+      </li>
+      <li>Start over with <code>(personal_id, age)</code>. Run the session's INSERT (p. 1566) and its UPDATE (p. 1570). Is Francesco's address updated?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. The UPDATE names age = 32, a key no row has, so it creates a second row holding only the address; Francesco keeps Via Milano 12. cqlsh answers OK both times. The insight: the primary key alone decides which row a write lands on, and Cassandra never checks whether that row exists.</p></details>
+      </li>
+      <li>Run "DELETE … by partition key". How many rows go? Then try "UPDATE … without age" and "DELETE … AND age = 26" under each key.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Every row of Francesco: the partition key alone deletes the whole partition (p. 1571). "UPDATE … without age" is refused under <code>(personal_id, age)</code> with "Some clustering keys are missing: age" — an UPDATE must name one row. Under <code>(personal_id)</code> age is not a key column at all, so the DELETE that names it is refused: "Non PRIMARY KEY columns found in where clause: age".</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l21-w-upsert', function (root, ui) {
+    /* replies checked on Cassandra 5.0.9 with both keys (the build folder of the lesson keeps the script) */
+    var PID = 'FRNTRZ95E12F675T';
+    var NOPK = 'Non PRIMARY KEY columns found in where clause: age';
+    var ST = [
+      { value: 'i26', label: 'INSERT Francesco, age 26 · p. 1566', cql: "INSERT INTO person (personal_id, address, age, birth_date, gender, name)\nVALUES ('FRNTRZ95E12F675T', 'Via Milano 12', 26, '12-05-1995', 'Male', 'Francesco Terzani');" },
+      { value: 'i32', label: 'INSERT Francesco again, age 32', cql: "INSERT INTO person (personal_id, age, name)\nVALUES ('FRNTRZ95E12F675T', 32, 'Francesco Terzani');" },
+      { value: 'u32', label: 'UPDATE … AND age = 32 · p. 1570', cql: "UPDATE person\nSET address = 'Via Milani 13'\nWHERE personal_id = 'FRNTRZ95E12F675T' AND age = 32;" },
+      { value: 'u26', label: 'UPDATE … AND age = 26', cql: "UPDATE person\nSET address = 'Via Milani 13'\nWHERE personal_id = 'FRNTRZ95E12F675T' AND age = 26;" },
+      { value: 'u', label: 'UPDATE … without age', cql: "UPDATE person\nSET address = 'Via Milani 13'\nWHERE personal_id = 'FRNTRZ95E12F675T';" },
+      { value: 'd', label: 'DELETE … by partition key · p. 1571', cql: "DELETE FROM person\nWHERE personal_id = 'FRNTRZ95E12F675T';" },
+      { value: 'd26', label: 'DELETE … AND age = 26', cql: "DELETE FROM person\nWHERE personal_id = 'FRNTRZ95E12F675T' AND age = 26;" }
+    ];
+    var rows = [], log = [], last = null;
+    function byValue(v) { for (var i = 0; i < ST.length; i++) if (ST[i].value === v) return ST[i]; return ST[0]; }
+
+    var keySel = ui.select('PRIMARY KEY of person', [{ value: '2', label: '(personal_id, age) · p. 1558' }, { value: '1', label: '(personal_id)' }], function () { reset(); }, '2');
+    var stSel = ui.select('statement', ST.map(function (s) { return { value: s.value, label: s.label }; }), null, 'i26');
+    ui.button('Run', function () { run(stSel.value); }, { kind: 'primary', icon: 'play' });
+    ui.button('Start over', function () { reset(); }, { kind: 'ghost', icon: 'refresh' });
+
+    var stmtPre = Course.el('pre', { 'class': 'l21-stmt' });
+    var outBox = Course.el('div', { 'class': 'l21-out' });
+    var logBox = Course.el('ul', { 'class': 'l21-log', 'aria-label': 'cqlsh replies so far' });
+    ui.stage.appendChild(stmtPre);
+    ui.stage.appendChild(outBox);
+    ui.stage.appendChild(logBox);
+    var roRows = ui.readout('rows of FRNTRZ95E12F675T', { digits: 0 }), roReply = ui.readout('last reply');
+    var note = ui.note('');
+
+    function two() { return keySel.value === '2'; }
+    function find(age) { for (var i = 0; i < rows.length; i++) if (!two() || rows[i].age === age) return rows[i]; return null; }
+    function upsert(vals) {
+      var r = find(vals.age), created = !r;
+      if (!r) { r = { personal_id: PID, age: null, address: null, birth_date: null, gender: null, name: null }; rows.push(r); }
+      for (var c in vals) r[c] = vals[c];
+      return created;
+    }
+    function keyText(age) { return two() ? '(' + PID + ', ' + age + ')' : '(' + PID + ')'; }
+    function reset() { rows = []; log = []; last = null; }
+    function run(id) {
+      var res = { ok: true, reply: 'OK', note: '' };
+      if (id === 'i26' || id === 'i32') {
+        var vals = id === 'i26' ? { personal_id: PID, address: 'Via Milano 12', age: 26, birth_date: '12-05-1995', gender: 'Male', name: 'Francesco Terzani' }
+                                : { personal_id: PID, age: 32, name: 'Francesco Terzani' };
+        var created = upsert(vals);
+        res.note = created ? 'No row had the key ' + keyText(vals.age) + ': a new row.'
+                           : 'A row with the key ' + keyText(vals.age) + ' existed: the columns this INSERT lists were overwritten, the others kept. No error, no warning.';
+      } else if (id === 'u32' || id === 'u26') {
+        var age = id === 'u32' ? 32 : 26;
+        if (!two()) { res.ok = false; res.reply = NOPK; res.note = 'With PRIMARY KEY (personal_id), age is an ordinary column: a WHERE that names a row may use key columns only.'; }
+        else {
+          var made = upsert({ personal_id: PID, age: age, address: 'Via Milani 13' });
+          res.note = made ? 'No row had the key ' + keyText(age) + ': the UPDATE created one, holding only the address, and cqlsh says OK.' : 'The row ' + keyText(age) + ' got the new address.';
+        }
+      } else if (id === 'u') {
+        if (two()) { res.ok = false; res.reply = 'Some clustering keys are missing: age'; res.note = 'An UPDATE must name one row: the whole primary key, age included (p. 1570).'; }
+        else { var made2 = upsert({ personal_id: PID, address: 'Via Milani 13' }); res.note = made2 ? 'No row had the key: the UPDATE created one, holding only the address.' : 'The row of the key got the new address.'; }
+      } else if (id === 'd') {
+        var n = rows.length;
+        rows = [];
+        res.note = n ? 'The whole partition went: ' + n + ' row' + (n > 1 ? 's' : '') + '. The partition key alone deletes every row that shares it (p. 1571).' : 'Nothing to delete, and cqlsh still says OK: a DELETE is a write too.';
+      } else if (id === 'd26') {
+        if (!two()) { res.ok = false; res.reply = NOPK; res.note = 'With PRIMARY KEY (personal_id), age is not a key column, so a DELETE cannot use it to pick a row.'; }
+        else {
+          var before = rows.length;
+          rows = rows.filter(function (r) { return r.age !== 26; });
+          res.note = before !== rows.length ? 'One row went, the one with age 26; the rest of the partition stays.' : 'No row has age 26: nothing changes, and cqlsh says OK.';
+        }
+      }
+      log.push({ label: byValue(id).label, res: res });
+      if (log.length > 6) log.shift();
+      last = res;
+    }
+    function renderOut() {
+      outBox.textContent = '';
+      var cols = two() ? ['personal_id', 'age', 'address', 'birth_date', 'gender', 'name'] : ['personal_id', 'address', 'age', 'birth_date', 'gender', 'name'];
+      var sorted = rows.slice().sort(function (a, b) { return (a.age || 0) - (b.age || 0); });
+      outBox.appendChild(Course.el('p', { text: 'SELECT * FROM person WHERE personal_id = \'' + PID + '\';' }));
+      var body = Course.el('tbody', null, sorted.map(function (r) {
+        return Course.el('tr', null, cols.map(function (c) { return Course.el('td', { text: r[c] === null || r[c] === undefined ? 'null' : String(r[c]) }); }));
+      }));
+      var head = Course.el('thead', null, Course.el('tr', null, cols.map(function (c) {
+        var pk = c === 'personal_id', ck = two() && c === 'age';
+        return Course.el('th', { 'class': pk ? 'is-pk' : (ck ? 'is-ck' : null), text: c });
+      })));
+      outBox.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'l21-tbl' }, [head, body])));
+      outBox.appendChild(Course.el('p', { text: '(' + sorted.length + ' rows)' }));
+    }
+    function renderLog() {
+      logBox.textContent = '';
+      if (!log.length) { logBox.appendChild(Course.el('li', { text: 'cqlsh replies appear here.' })); return; }
+      log.forEach(function (e) {
+        logBox.appendChild(Course.el('li', null, [Course.el('span', { text: e.label + ' → ' }),
+          Course.el('span', { 'class': e.res.ok ? 'is-ok' : 'is-err', text: e.res.ok ? 'OK' : 'InvalidRequest: ' + e.res.reply })]));
+      });
+    }
+    ui.onChange(function () {
+      stmtPre.textContent = '';
+      stmtPre.appendChild(Course.el('code', { text: byValue(stSel.value).cql }));
+      renderOut();
+      renderLog();
+      roRows.set(rows.length);
+      roReply.set(last ? (last.ok ? 'OK' : 'InvalidRequest') : '—', last ? (last.ok ? 'good' : 'bad') : undefined);
+      note.set(last ? last.note : 'Choose a statement and press Run.');
+    });
+  });
+  </script>
+
+  <p>DELETE needs less (p. 1571): "You must specify the full partition key in the WHERE clause of a DELETE. Instead, Clustering Key(s) are not strictly required." The width of the WHERE decides how much goes:</p>
+
+<pre><code>-- p. 1571: the whole partition, every row of Francesco
+DELETE FROM person WHERE personal_id = 'FRNTRZ95E12F675T';</code></pre>
+
+<pre><code>-- one row of the partition
+DELETE FROM person
+WHERE personal_id = 'FRNTRZ95E12F675T' AND age = 26;</code></pre>
+
+<pre><code>-- one column of one row: the address becomes null
+DELETE address FROM person
+WHERE personal_id = 'FRNTRZ95E12F675T' AND age = 26;</code></pre>
+
+  <p>A delete is itself a write: a marker, a tombstone, hides the old values until a later cleanup (<a href="l22.html#l22-write">lesson 22</a>). Several writes can also travel together (p. 1572):</p>
+
+<pre><code>-- the template of p. 1572, filled in:
+-- one request, one timestamp for every statement
+BEGIN BATCH
+  INSERT INTO person (personal_id, age, name)
+    VALUES ('RSSMRA80A01F205X', 45, 'Maria Rossi');
+  UPDATE person SET address = 'Via Roma 1'
+    WHERE personal_id = 'RSSMRA80A01F205X' AND age = 45;
+  DELETE FROM person
+    WHERE personal_id = 'FRNTRZ95E12F675T';
+APPLY BATCH;</code></pre>
+
+  <aside class="redpen" data-page="1572">
+    <p class="claim">"A set of INSERT, UPDATE, and DELETE operations can be organized in a BATCH. In that way, they are executed one after another with a single command."</p>
+    <p class="fix">One command, yes; one after another, no. All statements of a batch carry the same timestamp, so their order decides nothing: when two of them write the same cell, a delete beats a write and the larger value beats the smaller, wherever they stand.</p>
+    <p class="because">On Cassandra 5.0.9, a batch with <code>DELETE</code> of a row followed by <code>INSERT</code> of the same row leaves no row — the delete wins although it came first — and <code>INSERT … name 'b'</code> followed by <code>UPDATE … SET name = 'a'</code> leaves 'b'. The exam may be matched against the printed sentence, for example in a true/false question: know it as printed, and know that the statements are sent together and applied as one write.</p>
+  </aside>
+
+  <p>The batch earns its place elsewhere: when one fact is stored in two tables, a logged batch (the default) writes both copies or neither — background from the Cassandra documentation, and the glue of section 5.</p>
+</section>
+
+
+<section id="l21-types">
+  <h2>Types, scripts, and the JOIN that is not there</h2>
+
+  <p>Types first (p. 1577): "text, varint, float, double, Boolean, etc.", plus <code>int</code>, <code>date</code>, <code>timestamp</code> and <code>uuid</code>, filled by the function <code>uuid()</code> (p. 1609). Two kinds are special. A <mark class="key">collection</mark> keeps several values in one column: <code>list&lt;T&gt;</code> (ordered, duplicates allowed), <code>set&lt;T&gt;</code> (unique values), <code>map&lt;K, V&gt;</code>. The slide shows the list:</p>
+
+<pre><code>-- p. 1577: a column that holds a list of e-mails
+CREATE TABLE test (id int PRIMARY KEY, email list&lt;text&gt;);</code></pre>
+
+<pre><code>-- p. 1577: append to the list; a set takes {'x'}, a map {'k': 1.5}
+UPDATE test SET email = email + ['a@polimi.it'] WHERE id = 1;</code></pre>
+
+  <p>A <mark class="key">user-defined type</mark> is a named record used as a column type; "it is necessary to define the data type before using it" (p. 1578). The car exercise defines a feature (p. 1608):</p>
+
+<pre><code>-- p. 1608: a feature has a name and a description
+CREATE TYPE feature (
+  name text,
+  description text
+);</code></pre>
+
+  <aside class="margin-note">The slide says frozen is necessary for every user-defined type. Cassandra 5.0 refuses only the collection case: Non-frozen UDTs are not allowed inside collections. At the exam, write frozen anyway.</aside>
+
+<pre><code>-- p. 1608: a list of features, the type frozen
+ALTER TABLE car ADD features list&lt;frozen&lt;feature&gt;&gt;;</code></pre>
+
+  <p>"A frozen data type can only be overwritten; it can't be edited anymore" (p. 1608): the value is stored as one block. <code>DESCRIBE TYPE feature;</code> checks it; <code>ALTER TYPE</code> and <code>DROP TYPE</code> change or remove it (p. 1578). Three commands of the cqlsh console, not CQL statements, complete the toolkit (pp. 1573–1575):</p>
+
+<pre><code>-- p. 1575 (path quoted): run every statement of a file, as if typed
+SOURCE 'D:/Program Files/Cassandra/Queries/query_1.txt';</code></pre>
+
+<pre><code>-- p. 1573 (path quoted): query results go to the file until CAPTURE off;
+CAPTURE 'D:/Program Files/Cassandra/Outputs/output.txt';</code></pre>
+
+<pre><code>-- p. 1574: one line per column, for wide rows; EXPAND off; stops it
+EXPAND on;</code></pre>
+
+  <aside class="redpen" data-page="1575">
+    <p class="claim"><code>cqlsh&gt; SOURCE D:/Program Files/Cassandra/Queries/query_1.txt;</code></p>
+    <p class="fix">The path is a string in single quotes: <code>SOURCE 'D:/Program Files/Cassandra/Queries/query_1.txt';</code>. The same holds for CAPTURE, printed unquoted on p. 1573.</p>
+    <p class="because">cqlsh 5.0.9 answers the unquoted form with "Improper SOURCE command." — space in the path or not — and the CAPTURE twin with "Improper CAPTURE command."; quoted, both work, spaces and backslashes included. The session itself quotes the path on pp. 1610 and 1612. SOURCE earned a whole point on 11 Feb 2025 and part of one on 6 Jun 2024: quote the path. The exam may be matched against the printed form: recognise it, but write the quotes.</p>
+  </aside>
+
+  <p>Last, the slide everybody expects, "FOREIGN KEY (?)" (p. 1576): "In Cassandra there is no concept of FOREIGN KEYS and/or relationships, if you want any cross-table check to be performed, you have to manage it by yourself." The reason is again the key: two tables place their rows by two different partition keys, on different nodes, so a join would be a conversation between machines for every row. Instead, p. 1551: "Data is denormalized and duplicated for query efficiency", and the lecture's method (<a href="l20.html#l20-queries">lesson 20</a>): "Start from queries, then design the data model" (p. 430); "cassandra is an index factory" (p. 431). The puzzles paper of 30 May 2025 searches purchases by puzzle and by the buyer's city or country — two tables, every purchase written into both:</p>
+
+  <figure class="fig fig--plain" id="l21-fig-denorm">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="One purchase, Ada of Milan buying puzzle PZ01, is written by one batch into two tables: purchases_by_puzzle with partition key puzzle_id, and purchases_by_location with partition key country and city as the first clustering column; each table answers its query from one partition">
+      <rect x="150" y="10" width="260" height="34" class="fw-s1 st-s1"/>
+      <text x="280" y="32" class="tx-sm tx-mid">Ada, Milan, Italy, buys PZ01</text>
+      <line x1="280" y1="44" x2="280" y2="102" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <polyline points="410,27 546,27 546,228 528,228" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="296" y="80" class="tx-mono tx-sm">BATCH</text>
+      <text x="40" y="100" class="tx-mono tx-sm">purchases_by_puzzle</text>
+      <rect x="40" y="108" width="120" height="24" class="fw-s3"/>
+      <rect x="160" y="108" width="120" height="24" class="fw-s3"/>
+      <rect x="280" y="108" width="120" height="24" class="fw-s3"/>
+      <rect x="400" y="108" width="120" height="24" class="fw-s3"/>
+      <line x1="40" y1="120" x2="160" y2="120" class="hl"/>
+      <rect x="160" y="108" width="240" height="24" class="fi-none st-s3 sw-2"/>
+      <text x="100" y="125" class="tx-mono tx-sm tx-mid">puzzle_id</text>
+      <text x="220" y="125" class="tx-mono tx-sm tx-mid">buy_date</text>
+      <text x="340" y="125" class="tx-mono tx-sm tx-mid">personal_id</text>
+      <text x="460" y="125" class="tx-mono tx-sm tx-mid">city</text>
+      <rect x="40" y="132" width="480" height="24" class="fi-paper"/>
+      <text x="100" y="149" class="tx-mono tx-sm tx-mid">PZ01</text>
+      <text x="220" y="149" class="tx-mono tx-sm tx-mid">2025-05-02</text>
+      <text x="340" y="149" class="tx-mono tx-sm tx-mid">U1</text>
+      <text x="460" y="149" class="tx-mono tx-sm tx-mid">Milan</text>
+      <text x="40" y="178" class="tx-mono tx-sm">WHERE puzzle_id = 'PZ01'</text>
+      <text x="40" y="208" class="tx-mono tx-sm">purchases_by_location</text>
+      <rect x="40" y="216" width="120" height="24" class="fw-s3"/>
+      <rect x="160" y="216" width="120" height="24" class="fw-s3"/>
+      <rect x="280" y="216" width="120" height="24" class="fw-s3"/>
+      <rect x="400" y="216" width="120" height="24" class="fw-s3"/>
+      <line x1="40" y1="228" x2="160" y2="228" class="hl"/>
+      <rect x="160" y="216" width="360" height="24" class="fi-none st-s3 sw-2"/>
+      <text x="100" y="233" class="tx-mono tx-sm tx-mid">country</text>
+      <text x="220" y="233" class="tx-mono tx-sm tx-mid">city</text>
+      <text x="340" y="233" class="tx-mono tx-sm tx-mid">buy_date</text>
+      <text x="460" y="233" class="tx-mono tx-sm tx-mid">puzzle_id</text>
+      <rect x="40" y="240" width="480" height="24" class="fi-paper"/>
+      <text x="100" y="257" class="tx-mono tx-sm tx-mid">Italy</text>
+      <text x="220" y="257" class="tx-mono tx-sm tx-mid">Milan</text>
+      <text x="340" y="257" class="tx-mono tx-sm tx-mid">2025-05-02</text>
+      <text x="460" y="257" class="tx-mono tx-sm tx-mid">PZ01</text>
+      <text x="40" y="288" class="tx-mono tx-sm">WHERE country = 'Italy' AND city = 'Milan'</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> One purchase, two tables, one batch. Each table has the partition key its question names (highlighted) and the order its answer needs (outlined: the clustering columns). By puzzle, the first table answers from one partition; by country, or country and city — a prefix of the clustering columns — the second does. The lecture's "aggregate key" <code>state:city</code> (p. 432) is the same idea in the older notation.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">One table per query: its equality conditions become the partition key, its order the clustering key, and every column it returns is copied in.</mark></p>
+</section>
+
+
+<section id="l21-dealer">
+  <h2>The car dealership, end to end</h2>
+
+  <p>The exercise session (pp. 1606–1612) is a complete exam script on one table. Keyspace and table first:</p>
+
+<pre><code>-- p. 1606: the keyspace of the exercise
+CREATE KEYSPACE car_dealer
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 3};</code></pre>
+
+<pre><code>-- p. 1607: "sorted by max_speed in ascending order"
+CREATE TABLE car (
+  car_id uuid,
+  brand text,
+  max_speed varint,
+  price float,
+  consumption_lt_per_km float,
+  PRIMARY KEY (car_id, max_speed)
+) WITH CLUSTERING ORDER BY (max_speed ASC);</code></pre>
+
+  <p><code>DESCRIBE car_dealer;</code> checks the keyspace (p. 1606). After <code>USE car_dealer;</code> and the feature column of section 5 — added and dropped again, "As we do not want to deal with complex fields" (p. 1609) — the session inserts a car with a generated key:</p>
+
+<pre><code>-- p. 1609: uuid() generates the unique car_id
+INSERT INTO car (car_id, brand, max_speed, price, consumption_lt_per_km)
+VALUES (uuid(), 'Ferrari', 320, 200000.00, 30.00);</code></pre>
+
+  <p>The rest of the data comes from a file, <code>SOURCE '&lt;path_to_your_folder&gt;/car_data.txt';</code> (p. 1610). The deck does not show the file; the runs quoted here used nine cars, three Ferraris, three Fiats and three Lancias — the nine of the widget. The queries of pp. 1610–1612 then give:</p>
+
+<pre><code>-- p. 1610: "cost more than 100'000": a range, so ALLOW FILTERING (3 Ferraris)
+SELECT * FROM car WHERE price &gt; 100000 ALLOW FILTERING;</code></pre>
+
+<pre><code>-- p. 1611: "exactly 35'000 (without using ALLOW FILTERING)": an index first
+CREATE INDEX car_price ON car (price);</code></pre>
+
+<pre><code>-- p. 1611: then the equality (a Fiat and a Lancia)
+SELECT * FROM car WHERE price = 35000;</code></pre>
+
+<pre><code>-- p. 1611: the sum of all prices: 805000, printed 8.05e+05 for a float
+SELECT SUM(price) FROM car;</code></pre>
+
+<pre><code>-- p. 1612: count the Ferraris and store the result in ferrari_count.txt
+CAPTURE '&lt;path_to_folder&gt;/ferrari_count.txt';
+CREATE INDEX car_brand ON car (brand);
+SELECT COUNT(*) FROM car WHERE brand = 'Ferrari';
+CAPTURE off;</code></pre>
+
+  <p>Neither aggregate names a partition, so both ask every node, and cqlsh adds the warning "Aggregation query used without partition key". The file receives the count, 3, and that warning; while the capture is on, the screen only says "Now capturing query output to …".</p>
+
+  <h3>Back to the hook</h3>
+
+  <p>Read the key of p. 1607 as Cassandra does. <code>car_id</code> is the partition key, so every car is a partition of its own, and <code>max_speed</code> sorts the rows of a partition that holds a single row. <code>SELECT * FROM car;</code> walks the partitions in token order — the order of the hashes, hence 340, 190, 180 — and ORDER BY is refused because it only sorts inside partitions that the WHERE clause names. The repair moves one column into the partition key:</p>
+
+  <figure class="fig fig--pair fig--plain" id="l21-fig-fix">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Before: with PRIMARY KEY (car_id, max_speed) nine partitions hold one row each; SELECT star returns them in token order 340, 190, 180, 160, 320, 160, 296, 180, 170, and ORDER BY is refused">
+        <text x="150" y="24" class="tx-sm tx-mid">9 partitions, 1 row each</text>
+        <rect x="10" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="41" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="72" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="103" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="134" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="165" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="196" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="227" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <rect x="258" y="44" width="28" height="28" class="fw-s1 st-s1"/>
+        <text x="24" y="62" class="tx-mono tx-sm tx-mid">340</text>
+        <text x="55" y="62" class="tx-mono tx-sm tx-mid">190</text>
+        <text x="86" y="62" class="tx-mono tx-sm tx-mid">180</text>
+        <text x="117" y="62" class="tx-mono tx-sm tx-mid">160</text>
+        <text x="148" y="62" class="tx-mono tx-sm tx-mid">320</text>
+        <text x="179" y="62" class="tx-mono tx-sm tx-mid">160</text>
+        <text x="210" y="62" class="tx-mono tx-sm tx-mid">296</text>
+        <text x="241" y="62" class="tx-mono tx-sm tx-mid">180</text>
+        <text x="272" y="62" class="tx-mono tx-sm tx-mid">170</text>
+        <line x1="12" y1="92" x2="284" y2="92" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="150" y="114" class="tx-sm tx-mid">SELECT * returns them in token order</text>
+        <text x="150" y="150" class="tx-mono tx-sm tx-mid">ORDER BY max_speed</text>
+        <text x="150" y="168" class="tx-sm tx-mid tx-bad">refused: no partition named</text>
+        <text x="150" y="206" class="tx-hand tx-mid">nothing to sort</text>
+      </svg>
+      <p class="fig-label">Before: <code>(car_id, max_speed)</code></p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="After: with PRIMARY KEY (brand, max_speed, car_id) there are three partitions, Ferrari 296 320 340, Fiat 160 160 170 and Lancia 180 180 190, each sorted; WHERE brand = Ferrari reads the Ferrari partition, already in order">
+        <text x="55" y="24" class="tx-sm tx-mid">Ferrari</text>
+        <text x="150" y="24" class="tx-sm tx-mid">Fiat</text>
+        <text x="245" y="24" class="tx-sm tx-mid">Lancia</text>
+        <rect x="20" y="36" width="70" height="96" class="fi-none st-s2 dash sw-2"/>
+        <rect x="30" y="44" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="30" y="72" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="30" y="100" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="125" y="44" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="125" y="72" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="125" y="100" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="220" y="44" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="220" y="72" width="50" height="24" class="fw-s1 st-s1"/>
+        <rect x="220" y="100" width="50" height="24" class="fw-s1 st-s1"/>
+        <text x="55" y="61" class="tx-mono tx-sm tx-mid">296</text>
+        <text x="55" y="89" class="tx-mono tx-sm tx-mid">320</text>
+        <text x="55" y="117" class="tx-mono tx-sm tx-mid">340</text>
+        <text x="150" y="61" class="tx-mono tx-sm tx-mid">160</text>
+        <text x="150" y="89" class="tx-mono tx-sm tx-mid">160</text>
+        <text x="150" y="117" class="tx-mono tx-sm tx-mid">170</text>
+        <text x="245" y="61" class="tx-mono tx-sm tx-mid">180</text>
+        <text x="245" y="89" class="tx-mono tx-sm tx-mid">180</text>
+        <text x="245" y="117" class="tx-mono tx-sm tx-mid">190</text>
+        <text x="150" y="160" class="tx-mono tx-sm tx-mid">WHERE brand = 'Ferrari'</text>
+        <text x="150" y="178" class="tx-sm tx-mid">one partition, already sorted</text>
+        <text x="150" y="208" class="tx-hand tx-mid">sorted inside each</text>
+      </svg>
+      <p class="fig-label">After: <code>(brand, max_speed, car_id)</code></p>
+    </div>
+    <figcaption><b>Fig. 3.</b> The hook's table and its repair, with the nine cars of the runs. Before: the speeds as one run of <code>SELECT * FROM car;</code> printed them, nine one-row partitions in token order. After: three partitions, each sorted by speed; the Ferrari query (dashed) reads one of them, 296, 320, 340.</figcaption>
+  </figure>
+
+<pre><code>-- the cars of each brand, sorted by speed: brand decides the node
+CREATE TABLE car_by_brand (
+  brand text,
+  max_speed varint,
+  car_id uuid,
+  price float,
+  PRIMARY KEY (brand, max_speed, car_id)
+) WITH CLUSTERING ORDER BY (max_speed ASC);</code></pre>
+
+<pre><code>-- 296, 320, 340: one partition, already in order
+SELECT * FROM car_by_brand WHERE brand = 'Ferrari';</code></pre>
+
+  <p><code>car_id</code> stays at the end of the key so that it still identifies a car: without it, two Fiats with the same top speed would be one row. With the partition named, ORDER BY works as well: <code>ORDER BY max_speed DESC</code> gives 340, 320, 296. The exam keeps using the session's pattern — "Personal_ID as the partition key and Phone Number as the clustering key, ordering the table based on the Phone Number" (6 Sep 2024) — and there the order is real: a chef with two phone numbers is one partition of two sorted rows.</p>
+
+  <h3>The past papers: six exercises, five patterns</h3>
+
+  <figure class="tbl-fig" id="l21-tbl-papers">
+    <figcaption>Every Cassandra exercise of the nine papers (points as printed). This section solves the first; the exam section below solves the other five.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Paper</th><th>What is asked</th></tr></thead>
+        <tbody>
+          <tr><td>6 Jun 2024, ex. 5 (3 PT)</td><td>table with given keys; query on a non-key column with "further operation"; script file and SOURCE</td></tr>
+          <tr><td>6 Sep 2024, ex. 5 (4 PT)</td><td>table with given keys and order; query with "further operation"; custom data type</td></tr>
+          <tr><td>11 Feb 2025 (4 PT)</td><td>composite partition key; query with extra statements "only if it's strictly necessary"; SOURCE from a path</td></tr>
+          <tr><td>30 May 2025, ex. 1 (1 PT)</td><td>tables for two given queries</td></tr>
+          <tr><td>12 Sep 2025, ex. 1 (1 PT)</td><td>tables for two given queries</td></tr>
+          <tr><td>30 Jan 2026, ex. 2 (3 PT)</td><td>tables for a query, "Do not use indexes"; query with "further operation"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The first one, worked in full. The ER of 6 Jun 2024 tracks natural disasters: Person (Personal ID, Name, Surname, Postal Code) is the parent of Paramedic, Firefighter and Policeman (Policeman ID, Rank), ISA (P, O). "Consider the Policeman table. Write a Cassandra script to perform the operations listed below." A policeman row carries the inherited Person columns too:</p>
+
+<pre><code>-- "Create the Policeman table with Personal_ID as the partition key and
+--  Policeman_ID as the clustering key. (1 PT)"
+CREATE TABLE policeman (
+  personal_id text,
+  policeman_id text,
+  name text,
+  surname text,
+  postal_code text,
+  rank text,
+  PRIMARY KEY (personal_id, policeman_id)
+);</code></pre>
+
+<pre><code>-- "collect the Policemen whose Surname is "Rossi". If any further operation
+--  is required, write its CQL code. (1 PT)": surname is not a key column
+CREATE INDEX policeman_surname ON policeman (surname);
+SELECT * FROM policeman WHERE surname = 'Rossi';</code></pre>
+
+<pre><code>-- "the CQL script to be written in an "operations.txt" file to insert two new
+--  policemen ... and the CQL operation to run the whole script from the file. (1 PT)"
+-- content of operations.txt
+INSERT INTO policeman (personal_id, policeman_id, name, surname, postal_code, rank)
+VALUES ('RSSMRA80A01F205X', 'PL001', 'Mario', 'Rossi', '20133', 'Sergeant');
+INSERT INTO policeman (personal_id, policeman_id, name, surname, postal_code, rank)
+VALUES ('VRDLGU85B02F205Y', 'PL002', 'Luigi', 'Verdi', '20121', 'Captain');
+-- in cqlsh
+SOURCE 'D:/Cassandra/operations.txt';</code></pre>
+
+  <p>A full script opens with the keyspace and <code>USE</code>, as on p. 1606. Postal codes are text, not numbers: a code with a leading zero must keep it. Run with these two rows, the query returns Mario Rossi; <code>surname = 'Rossi' ALLOW FILTERING</code> returns him too, and is the alternative to name as "not recommended".</p>
+</section>
+
+
+<section id="l21-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Five exercises from the past papers in their printed wording, each after the ER part it uses, with the points the paper prints; then two theory questions. No official solutions exist: every CQL answer below was run on a Cassandra 5.0.9 node with test rows that contain the traps. Write your answer first.</p>
+
+  <div class="exam" data-kind="open" data-points="4" id="l21-exam-chef">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 6 Sep 2024, exercise 5 (restaurant).</b> ER: Person (Personal_ID, Name, Surname, Birth Date, Phone Number) is the parent of Owner, Customer, Waiter and Chef (Hiring Date); Head Chef (Head Chef Since) is a Chef.</p>
+      <p>"Consider the Chef table. Write a Cassandra script to perform the operations listed below. Create the Chef table, with Personal_ID as the partition key and Phone Number as the clustering key, ordering the table based on the Phone Number. (1.5 PT) Write a CQL query to collect the chef whose name is "Riccardo". If any further operation is required, write its CQL code. (1 PT) Create a Custom data type named "contact" that contains the name, surname, and phone number of the chef (1.5 PT)"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE KEYSPACE restaurant
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 3};
+USE restaurant;
+
+CREATE TABLE chef (
+  personal_id text,
+  phone_number text,
+  name text,
+  surname text,
+  birth_date date,
+  hiring_date date,
+  PRIMARY KEY (personal_id, phone_number)
+) WITH CLUSTERING ORDER BY (phone_number ASC);
+
+-- name is not part of the key: the further operation is an index
+CREATE INDEX chef_name ON chef (name);
+SELECT * FROM chef WHERE name = 'Riccardo';
+
+CREATE TYPE contact (
+  name text,
+  surname text,
+  phone_number text
+);
+-- optional, to use it: a list of contacts of the chef
+ALTER TABLE chef ADD contacts list&lt;frozen&lt;contact&gt;&gt;;</code></pre>
+        <p>Without the index, <code>SELECT * FROM chef WHERE name = 'Riccardo' ALLOW FILTERING;</code> also works, but it scans the table and is not recommended.</p>
+      </div>
+      <div class="exam-note"><p>The three sub-questions test three things: the bracket form with the clustering order, the index as the "further operation" for a non-key column, and the type definition. Phone numbers are text (a leading + or 0 must survive). On test data, a Riccardo with two phone numbers came back as two rows of one partition, sorted by number: here the clustering order means something.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="4" id="l21-exam-f1">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 11 Feb 2025, Cassandra exercise (Formula 1).</b> ER: Person (Personal_ID, Name, Surname, Birth_Date, Gender) is the parent of Spectator (Favourite_Team), Team Owner and Team Member, ISA (T, E).</p>
+      <p>"Consider the spectator entity. Write a CQL statement to create its corresponding Cassandra Table using Favourite_Team as a clustering key and Name as an additional partition key (1 PT)." "Write a CQL statement to return a list of all the spectators whose name is Bill, whose age is over 65, and whose favourite team is "Ferrari". Besides the query, write any additional CQL statements only if it's strictly necessary. (2 PT)" "Write the CQL command to perform a set of statements by loading them from a file located in "D:\Cassandra\Scripts\statement.txt". (1 PT)"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE TABLE spectator (
+  personal_id text,
+  name text,
+  favourite_team text,
+  surname text,
+  birth_date date,
+  gender text,
+  PRIMARY KEY ((personal_id, name), favourite_team)
+);
+
+-- over 65 on the day of the exam (11/02/2025): born before 11/02/1960
+SELECT * FROM spectator
+WHERE name = 'Bill' AND favourite_team = 'Ferrari'
+  AND birth_date &lt; '1960-02-11'
+ALLOW FILTERING;
+
+SOURCE 'D:\Cassandra\Scripts\statement.txt';</code></pre>
+        <p>No additional statement is strictly necessary. personal_id is unknown, so the partition key is incomplete, and age is a range on a column outside the key: ALLOW FILTERING is unavoidable. An index on name (allowed on one part of a composite partition key) would narrow the scan, but the query would still need ALLOW FILTERING because of the range.</p>
+      </div>
+      <div class="exam-note"><p>The key point is "additional partition key": name goes inside the inner brackets next to personal_id. The ER has no age, so it is computed from Birth_Date; state the assumption. Both claims were checked on Cassandra 5.0.9: without ALLOW FILTERING the query is refused, even with an index on name; with it, of five test spectators only the Bill born in 1955 who supports Ferrari comes back. The path may be written with forward slashes too; the quotes are what matters.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="1" id="l21-exam-puzzles">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 30 May 2025, exercise 1 (puzzles; the paper's header prints "June 30, 2025").</b> ER: User (Personal ID, Name, Surname, Age, Birth Date, City, Country) — Buy (Buy Date) — Puzzle (Puzzle ID, Name, Collection Name, Number of Pieces, Width, Height, Description); Puzzle (0, N), User (0, N).</p>
+      <p>"Suppose you expect to record a large number of purchases of puzzles and you decide to store them in a columnar database. Assume you want to run typical queries by searching by the puzzle IDs and by User City or Country. Write the specification of the tables (and other artifacts if necessary) of a Cassandra deployment that stores the required data."</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE KEYSPACE puzzle_sales
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 3};
+USE puzzle_sales;
+
+-- query 1: purchases of a puzzle, newest first
+CREATE TABLE purchases_by_puzzle (
+  puzzle_id text,
+  buy_date date,
+  personal_id text,
+  puzzle_name text,
+  user_name text,
+  user_surname text,
+  city text,
+  country text,
+  PRIMARY KEY ((puzzle_id), buy_date, personal_id)
+) WITH CLUSTERING ORDER BY (buy_date DESC, personal_id ASC);
+
+-- query 2: purchases by country, or by country and city
+CREATE TABLE purchases_by_location (
+  country text,
+  city text,
+  buy_date date,
+  puzzle_id text,
+  personal_id text,
+  puzzle_name text,
+  user_name text,
+  user_surname text,
+  PRIMARY KEY ((country), city, buy_date, puzzle_id, personal_id)
+) WITH CLUSTERING ORDER BY (city ASC, buy_date DESC, puzzle_id ASC, personal_id ASC);
+
+-- SELECT * FROM purchases_by_puzzle WHERE puzzle_id = 'PZ01';
+-- SELECT * FROM purchases_by_location WHERE country = 'Italy' AND city = 'Milan';</code></pre>
+        <p>Each purchase is written into both tables, in one BATCH. Cassandra has no joins, so the puzzle and user columns the queries return are copied into each table.</p>
+      </div>
+      <div class="exam-note"><p>A complete answer shows one table per query, the searched attribute as partition key, a clustering key that keeps rows unique (otherwise two purchases overwrite each other), and denormalised columns. City is the first clustering column, so one table serves both "by country" and "by country and city"; a query by city alone is refused (checked), since a city name is not unique across countries anyway. Separate tables per city and per country are also correct. If one country's partition grows too large, a time bucket can join the partition key, for example <code>((country, buy_year), …)</code>.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="1" id="l21-exam-farm">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 12 Sep 2025, exercise 1 (farmers and local markets).</b> ER: Product (Product ID, Name, Quantity (in grams), Expiration Date) — Sell — Market (Name and Location, both underlined, Opening Time, Closing Time, Size); Product — Buy (Buy Date, Amount) — People (Personal ID, …); every cardinality (1, N).</p>
+      <p>"Suppose you expect to record large-scale, continuously increasing number of sales of products in the market, and therefore you decide to store it in a columnar database. Write the specification of the tables (column families) of a Cassandra deployment assuming you may want to query the data by market location or product name."</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>-- a sale: who bought which product, when and how much (Buy), at which market (Sell)
+CREATE TABLE sales_by_market_location (
+  market_location text,
+  sale_date date,
+  sale_id uuid,
+  market_name text,
+  product_id text,
+  product_name text,
+  personal_id text,
+  amount int,
+  PRIMARY KEY ((market_location), sale_date, sale_id)
+) WITH CLUSTERING ORDER BY (sale_date DESC, sale_id ASC);
+
+CREATE TABLE sales_by_product_name (
+  product_name text,
+  sale_date date,
+  sale_id uuid,
+  product_id text,
+  market_name text,
+  market_location text,
+  personal_id text,
+  amount int,
+  PRIMARY KEY ((product_name), sale_date, sale_id)
+) WITH CLUSTERING ORDER BY (sale_date DESC, sale_id ASC);
+
+-- SELECT * FROM sales_by_market_location WHERE market_location = 'Lodi';
+-- SELECT * FROM sales_by_product_name WHERE product_name = 'Pecorino'
+--   AND sale_date &gt;= '2025-09-01';</code></pre>
+        <p>Both tables receive every sale (one BATCH per sale); <code>sale_id</code>, filled with <code>uuid()</code>, keeps two sales of the same day apart.</p>
+      </div>
+      <div class="exam-note"><p>Same pattern as the puzzles: two queries, two column families, the search attribute as partition key, the date as clustering key so the newest sales come first and a date range is one slice. "Continuously increasing" is the hint about growth: without <code>sale_id</code> sales of one day would overwrite each other, and for a market that never stops selling a month bucket in the partition key, <code>((market_location, sale_month), …)</code>, keeps each partition bounded.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="3" id="l21-exam-heat">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 30 Jan 2026, exercise 2 (hospital heating).</b> ER: Heating System (Heater_Sys_ID, Heating_Power) is the parent of HVAC System (Hourly_KWh_Cons, Cost_Per_KWh) and Gas Heating System (Hourly_SQM_Cons, Cost_Per_SQM), ISA (T, E); Floor (Floor_ID, Number, Has_Elevator); Department (Department_ID, Specialty, N_Beds, Head_Physician_ID). Heats: Heating System (1:N) – Floor (1:N), with Start_Time, End_Time; Placed Into: Department (1:N) – Floor (1:N).</p>
+      <p>"Consider the entities Heating System (and its child entities), Floor, and Department. Define the database structure so that one can query Heaters simultaneously by Floor number and Department specialty, sorting the results by total heating power. Write the specification of the tables of a Cassandra deployment that stores the required data. Do not use indexes. (2 PT)" "Write a CQL query to collect all the Gas Heating Systems running for "cardiology" Departments. If any further operation is required, write its CQL code. (1 PT)"</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>-- one row per heater, for each floor number and specialty it heats;
+-- (T, E): one table with a type column, the other type's columns stay empty
+CREATE TABLE heaters_by_floor_and_specialty (
+  floor_number int,
+  specialty text,
+  heating_power float,
+  heater_sys_id text,
+  heater_type text,
+  hourly_kwh_cons float,
+  cost_per_kwh float,
+  hourly_sqm_cons float,
+  cost_per_sqm float,
+  PRIMARY KEY ((floor_number, specialty), heating_power, heater_sys_id)
+) WITH CLUSTERING ORDER BY (heating_power DESC, heater_sys_id ASC);
+-- SELECT * FROM heaters_by_floor_and_specialty
+--   WHERE floor_number = 2 AND specialty = 'cardiology';
+
+-- further operation for the second query: a table keyed by its conditions
+CREATE TABLE heaters_by_specialty_and_type (
+  specialty text,
+  heater_type text,
+  heater_sys_id text,
+  heating_power float,
+  hourly_sqm_cons float,
+  cost_per_sqm float,
+  hourly_kwh_cons float,
+  cost_per_kwh float,
+  PRIMARY KEY ((specialty, heater_type), heater_sys_id)
+);
+SELECT * FROM heaters_by_specialty_and_type
+WHERE specialty = 'cardiology' AND heater_type = 'Gas';</code></pre>
+      </div>
+      <div class="exam-note"><p>"Simultaneously by Floor number and Department specialty" makes both a composite partition key; "sorting by heating power" makes it the first clustering column, DESC assumed (state it); heater_sys_id keeps two heaters of equal power apart. The second query lacks the floor number, so on the first table it would need ALLOW FILTERING over everything (it runs, checked); "Do not use indexes" points to the query-first answer, a second table. The ISA (T, E) becomes a type column in one table, empty columns costing nothing in Cassandra.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l21-exam-theory">
+    <div class="exam-q" lang="en">
+      <p>Explain the roles of the partition key and of the clustering key of a Cassandra table. Which conditions can the WHERE clause of a SELECT contain without ALLOW FILTERING, and why does Cassandra impose these rules?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The primary key has two parts. The partition key, the first element (or the columns in the inner brackets), is hashed into a token that decides on which nodes the row is stored: all rows with the same partition key form one partition on the same replicas. The clustering key, the remaining columns, decides how the rows are sorted inside the partition (WITH CLUSTERING ORDER BY sets ASC or DESC). Without ALLOW FILTERING, a SELECT that restricts the partition key must restrict every one of its columns with = or IN, so Cassandra can compute the token and go to the right node. Clustering columns may be restricted only as a prefix in their declared order, with a range only on the last one, because then the result is one contiguous slice of the sorted partition; OR does not exist. Any other column needs a secondary index and an equality condition, and such a query may omit the partition key, at the price of asking every node. ALLOW FILTERING lifts the rules, but makes Cassandra read and discard rows, so its cost grows with the size of the table.</p></div>
+      <div class="exam-note"><p>A complete answer names both roles, the three legal kinds of condition and the reason behind each: the hash for the partition key, the sorted storage for the clustering prefix, the per-node lookup for the index. Quoting the slide's definitions (p. 1560) is safe.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l21-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which statements about CQL are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>The clustering key decides on which node a row is stored. <span class="fb">That is the partition key; the clustering key sorts the rows inside a partition (p. 1560).</span></li>
+      <li data-correct>With PRIMARY KEY ((a, b), c) and no index, the clause WHERE a = 1 is rejected unless ALLOW FILTERING is added. <span class="fb">Rule 1 of p. 1569: "WHERE clauses must include ALL components of the partition key"; half a composite key gives no token.</span></li>
+      <li>A secondary index makes range conditions (&lt;, &gt;) on the indexed column legal without ALLOW FILTERING. <span class="fb">An index answers equality only: "most comparison operators require the additional statement ALLOW FILTERING" (p. 1568), and <code>price &gt; 100000</code> still needs it after <code>CREATE INDEX car_price</code>.</span></li>
+      <li>An INSERT fails if a row with the same primary key already exists. <span class="fb">INSERT is an upsert: it overwrites the listed columns without an error.</span></li>
+      <li data-correct>With PRIMARY KEY (a, b, c) and no index, the clause WHERE a = 1 AND c = 2 is rejected unless ALLOW FILTERING is added. <span class="fb">c is restricted while the preceding clustering column b is not (rule 2).</span></li>
+      <li data-correct>A DELETE that names only the partition key removes every row of that partition. <span class="fb">p. 1571: the clustering key is "not strictly required"; without it the whole partition goes.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: the second, the fifth and the sixth.</p></div>
+      <div class="exam-note"><p>Wrong answers may carry a penalty at the real exam (it is announced just before it), so tick only what you can justify. The fourth option is the SQL reflex; the third is the most common slip about secondary indexes.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l21-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A table has <code>PRIMARY KEY ((city, year), month, day)</code>. Which WHERE clause runs without ALLOW FILTERING?</p>
+    <ul class="options">
+      <li><code>city = 'Milan' AND month = 5</code> <span class="fb">The partition key is (city, year): without year there is no token.</span></li>
+      <li><code>city = 'Milan' AND year = 2025 AND day = 3</code> <span class="fb">day is restricted but month, the clustering column before it, is not: "PRIMARY KEY column "day" cannot be restricted as preceding column "month" is not restricted".</span></li>
+      <li data-correct><code>city = 'Milan' AND year = 2025 AND month &gt;= 5</code> <span class="fb">The whole partition key, then a prefix of the clustering columns with the range on its last column: one contiguous slice.</span></li>
+      <li><code>year = 2025 AND month = 5 AND day = 3</code> <span class="fb">city is missing, so the partition cannot be found.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The table <code>person</code> has <code>PRIMARY KEY (personal_id, age)</code> and one row ('X', 26) with an address. You run <code>INSERT INTO person (personal_id, age, name) VALUES ('X', 26, 'Ann');</code>. What happens?</p>
+    <ul class="options">
+      <li>cqlsh reports a duplicate primary key <span class="fb">Cassandra has no such error: it never reads before writing.</span></li>
+      <li>A second row ('X', 26) appears <span class="fb">Two rows with the same full key are the same row.</span></li>
+      <li>The row is replaced: the address becomes null <span class="fb">An upsert writes only the columns it lists; the address is kept.</span></li>
+      <li data-correct>The existing row gets the name 'Ann' and keeps its address <span class="fb">Same key, same row; the INSERT overwrote the name and touched nothing else.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">The table <code>car</code> has <code>PRIMARY KEY (brand, max_speed, car_id)</code> and a secondary index on price. Which SELECTs run without ALLOW FILTERING? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct><code>WHERE price = 35000</code> <span class="fb">Equality on an indexed column: every node looks up its local index.</span></li>
+      <li><code>WHERE price &gt; 100000</code> <span class="fb">An index serves equality only; a range needs ALLOW FILTERING.</span></li>
+      <li data-correct><code>WHERE brand = 'Fiat' AND max_speed &gt;= 160</code> <span class="fb">The partition key, then a range on the first clustering column: a slice of one partition.</span></li>
+      <li><code>WHERE max_speed = 160</code> <span class="fb">A clustering column without the partition key: every partition would be searched.</span></li>
+      <li><code>WHERE brand = 'Fiat' AND price &gt; 20000</code> <span class="fb">The partition is named, but the range on price cannot use the index: it must be filtered.</span></li>
+    </ul>
+    <p class="q-fb">All five were run on Cassandra 5.0.9. Equality uses an index, a range never does.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Francesco has two rows in <code>person</code>, ages 26 and 32. What does <code>DELETE FROM person WHERE personal_id = 'FRNTRZ95E12F675T';</code> remove?</p>
+    <ul class="options">
+      <li>Nothing: the clustering key is missing <span class="fb">For a DELETE the clustering key is "not strictly required" (p. 1571).</span></li>
+      <li data-correct>Both rows <span class="fb">The partition key alone names the whole partition.</span></li>
+      <li>Only the row with age 26 <span class="fb">Nothing in the statement singles out age 26.</span></li>
+      <li>Only the most recently written row <span class="fb">Write order plays no role; the WHERE names the partition.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A batch holds <code>DELETE FROM person WHERE personal_id = 'B';</code> followed by <code>INSERT INTO person (personal_id, age, name) VALUES ('B', 1, 'Bo');</code>. What is left after <code>APPLY BATCH;</code>?</p>
+    <ul class="options">
+      <li>Bo's row, since the INSERT came last <span class="fb">That is the "one after another" reading of p. 1572, and it is wrong.</span></li>
+      <li>An error: a batch cannot mix DELETE and INSERT <span class="fb">The slide's own template mixes INSERT, UPDATE and DELETE.</span></li>
+      <li data-correct>No row for 'B' <span class="fb">Both statements share one timestamp, and at equal timestamps the delete wins, wherever it stands.</span></li>
+      <li>Two versions of the row <span class="fb">A primary key identifies one row.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The session's table has <code>PRIMARY KEY (car_id, max_speed)</code>, car_id a uuid, and <code>WITH CLUSTERING ORDER BY (max_speed ASC)</code>. What does the clustering order change in the output of <code>SELECT * FROM car;</code>?</p>
+    <ul class="options">
+      <li>The cars come out sorted by speed <span class="fb">Only rows inside one partition are sorted, and here each partition holds one car.</span></li>
+      <li>The cars of each brand come out sorted by speed <span class="fb">brand is not part of the key; it plays no role in placement or order.</span></li>
+      <li>The SELECT is refused without ORDER BY <span class="fb">A SELECT with no WHERE is allowed; it is the ORDER BY that is refused.</span></li>
+      <li data-correct>Nothing visible: partitions come out in token order <span class="fb">Every car is its own partition, so there is nothing to sort inside one.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Which command runs the statements stored in D:\Cassandra\Scripts\statement.txt from cqlsh?</p>
+    <ul class="options">
+      <li><code>SOURCE D:\Cassandra\Scripts\statement.txt;</code> <span class="fb">Without quotes cqlsh answers "Improper SOURCE command."</span></li>
+      <li data-correct><code>SOURCE 'D:\Cassandra\Scripts\statement.txt';</code> <span class="fb">The path is a quoted string; the backslashes are kept as typed.</span></li>
+      <li><code>CAPTURE 'D:\Cassandra\Scripts\statement.txt';</code> <span class="fb">CAPTURE writes query results into a file; it does not run one.</span></li>
+      <li><code>EXPAND 'D:\Cassandra\Scripts\statement.txt';</code> <span class="fb">EXPAND only switches the vertical display on or off.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l21-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Cassandra is a distributed, masterless, BASE database: no single point of failure, linear scaling, fast writes. Know the ACID/BASE table of p. 1550 and the comparison with relational systems of p. 1551.</li>
+    <li>In <code>PRIMARY KEY ((partition key), clustering columns)</code> the partition key is hashed to pick the node, the clustering columns sort the rows inside the partition (<code>WITH CLUSTERING ORDER BY</code>), and the whole key identifies one row.</li>
+    <li>Without ALLOW FILTERING a WHERE clause either names every partition-key column with = or IN and then a prefix of the clustering columns, with at most one range at its end, or uses = on a column with a secondary index; OR does not exist.</li>
+    <li>INSERT and UPDATE are upserts: the key decides the row and nothing is checked, so a wrong clustering value writes a ghost row. UPDATE needs the full primary key and cannot change it; DELETE needs the partition key and removes as much as its WHERE names; a BATCH gives all its statements one timestamp.</li>
+    <li>No joins, no foreign keys: denormalise, one table per query, its equalities as partition key and its order as clustering key. Collections and frozen user-defined types keep related values in one row.</li>
+    <li>cqlsh commands take quoted paths: <code>SOURCE 'file';</code>, <code>CAPTURE 'file';</code> … <code>CAPTURE off;</code>, and <code>EXPAND on;</code> for wide rows.</li>
+  </ul>
+  <aside class="cheat" id="l21-cheat">
+    <dl>
+      <dt>Keyspace</dt><dd><code>CREATE KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};</code> then <code>USE k;</code></dd>
+      <dt><code>PRIMARY KEY (a, b, c)</code></dt><dd>a is the partition key (which node); b, then c sort the rows inside it</dd>
+      <dt><code>PRIMARY KEY ((a, b), c)</code></dt><dd>composite partition key (a, b), hashed together; c is the clustering key</dd>
+      <dt>Order</dt><dd><code>WITH CLUSTERING ORDER BY (b DESC)</code>, starting from the first clustering column</dd>
+      <dt>Change a table</dt><dd><code>ALTER TABLE t ADD c text;</code> · <code>ALTER TABLE t DROP c;</code> · <code>TRUNCATE TABLE t;</code> (empty it) · <code>DROP TABLE t;</code>; TABLE = COLUMNFAMILY; the key never changes</dd>
+      <dt>WHERE without ALLOW FILTERING</dt><dd>every partition-key column with = or IN; clustering prefix, one range at the end; no OR</dd>
+      <dt>Non-key column</dt><dd><code>CREATE INDEX t_col ON t (col);</code> then <code>WHERE col = …</code> (equality only)</dd>
+      <dt><code>ALLOW FILTERING</code></dt><dd>read and discard; the cost grows with the table; last resort</dd>
+      <dt>INSERT, UPDATE</dt><dd>upserts; UPDATE needs the full primary key and cannot change it</dd>
+      <dt>DELETE</dt><dd>needs the partition key: whole partition, one row (+ clustering key), one column (<code>DELETE col FROM …</code>)</dd>
+      <dt>BATCH</dt><dd><code>BEGIN BATCH … APPLY BATCH;</code>: one request, one timestamp, not one after another</dd>
+      <dt>Types</dt><dd><code>list&lt;T&gt;</code>, <code>set&lt;T&gt;</code>, <code>map&lt;K, V&gt;</code>; <code>CREATE TYPE t (f text, …);</code> used as <code>list&lt;frozen&lt;t&gt;&gt;</code>; <code>uuid()</code></dd>
+      <dt>cqlsh</dt><dd><code>SOURCE 'path';</code> · <code>CAPTURE 'path';</code> … <code>CAPTURE off;</code> · <code>EXPAND on;</code> · <code>DESCRIBE keyspaces;</code></dd>
+      <dt>No JOIN</dt><dd>one table per query, named <code>entity_by_attribute</code>, data duplicated and kept in sync with a BATCH</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l21-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://cassandra.apache.org/_/quickstart.html" target="_blank" rel="noopener">Quickstart</a>
+      <span class="res-by">Apache Cassandra</span>
+      <p class="res-why">A one-node Cassandra and cqlsh in a few commands (it needs Docker): the place to type this lesson's statements, the session's car script and your exam answers, and to read the real messages.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://cassandra.apache.org/doc/stable/cassandra/developing/data-modeling/data-modeling_logical.html" target="_blank" rel="noopener">Logical data modeling</a>
+      <span class="res-by">Apache Cassandra documentation</span>
+      <p class="res-why">The procedure of the design exercises worked on a hotel example: a list of queries becomes tables named <code>hotels_by_poi</code>, each with its partition and clustering columns. Read it next to sections 5 and 6.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://cassandra.apache.org/doc/latest/cassandra/developing/cql/indexing/2i/2i-working-with.html" target="_blank" rel="noopener">Working with secondary indexing (2i)</a>
+      <span class="res-by">Apache Cassandra documentation</span>
+      <p class="res-why">When a secondary index helps and when it hurts, with the exact ALLOW FILTERING message: the background behind rule 4 and the "further operation" answers.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.instaclustr.com/blog/apache-cassandra-scalability-allow-filtering-partition-keys/" target="_blank" rel="noopener">Apache Cassandra Scalability: Allow Filtering and Partition Keys</a>
+      <span class="res-by">Anup Shirolkar, Instaclustr</span>
+      <p class="res-why">Measurements of the same query with and without the partition key as the cluster grows: why the slide calls ALLOW FILTERING "not recommended".</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Every query of this lesson began with a hash that "names the node", and every keyspace promised three copies of each row. Which three nodes, who decides, and what happens when one of them is down while you write?</p>
+</aside>
+
+</main>
+</body>
+</html>

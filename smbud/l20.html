@@ -1,0 +1,1241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Column stores and the Cassandra data model · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l20">
+
+<header class="lesson-head">
+  <h1>Column stores and the Cassandra data model</h1>
+  <p class="lede">After this lesson you will explain what a column store gains and what it pays, decode a run-length-encoded column, draw Cassandra's data the way the slides do — keyspace, column family, row key, columns of name, value and timestamp, super columns — and say why Cassandra's tables start from the queries.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>The lecture of this lesson is called "Columnar Databases – Cassandra" (p. 396). Its first half defines the family: "The Column Oriented Database stores data in columns", "mainly used in OLAP" (p. 401). A chart on p. 405 shows why: to read 4 bytes of each 148-byte record, a row store needs about 51 seconds — and about 51 seconds to read all 148. A column store reads the 4 bytes in about one second.</p>
+  <p>Then the deck turns to Cassandra, the database of its title, and p. 417 says in large grey letters: "think of cassandra as row-oriented". Page 412 adds "Often write-heavy workloads" — the opposite of analytics.</p>
+  <p>So is Cassandra a column store or not? Both slides are right. By the end of the lesson you will know in which sense each one is meant, and how to say it at the exam.</p>
+</div>
+
+
+<section id="l20-workload">
+  <h2>Wide-column stores and the workload behind them</h2>
+
+  <p>Picture a messaging service: many users writing and reading small messages all day, in no particular order, and no two mailboxes alike. Page 399, "Issues with today's workloads", describes exactly this:</p>
+
+  <ul>
+    <li>"Data large and unstructured" — too big for one machine, with no fixed set of fields;</li>
+    <li>"Lots of random reads and writes" — many small operations, not one long scan;</li>
+    <li>"Foreign keys rarely needed" — each record is read on its own.</li>
+  </ul>
+
+  <p>Its "Actual Needs": "Incremental Scalability", "Speed", "No Single point of failure", "Low cost (TCO) and admin" (TCO: total cost of ownership) and "Scale out, not up" — add ordinary machines instead of buying a bigger one (<a href="l03.html">lesson 3</a>).</p>
+
+  <p>Page 397 places the systems built for this among the NoSQL families of <a href="l05.html">lesson 5</a>: "Data stored in 4 types: Document, Graph, Key-value, Wide-column". Page 398, the title page of this part of the deck, reads "Big Column Stores"; the course notes explain the name: a single row can have "a huge number of different columns and that is why columnar db are also often called Big Column stores".</p>
+
+  <figure class="tbl-fig" id="l20-tbl-families">
+    <figcaption>"Overview – NoSQL Family" (p. 397): the logo grid as a table, with the lessons of this notebook.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Family on the slide</th><th>Systems on the slide</th><th>Lessons</th></tr></thead>
+        <tbody>
+          <tr><td>Document Database</td><td>CouchDB, Couchbase, MarkLogic, mongoDB</td><td class="num">13–16</td></tr>
+          <tr><td>Graph Databases</td><td>Neo4j, InfiniteGraph</td><td class="num">10–12</td></tr>
+          <tr><td>Key-value Databases</td><td>redis, Amazon DynamoDB, Aerospike, riak</td><td class="num">17–19</td></tr>
+          <tr class="is-key"><td>Wide Column Stores</td><td>Accumulo, Hypertable, Cassandra, Apache HBase, Amazon SimpleDB</td><td class="num">20–22</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Page 400 recalls the CAP theorem of <a href="l05.html#l05-cap">lesson 5</a> — "Consistency: all nodes have same data at any time", "Availability: the system allows operations all the time", "Partition-tolerance: the system continues to work in spite of network partitions" — and places Cassandra: "Eventual (weak) consistency, Availability, Partition-tolerance". For a mailbox that is right: a message a second late hurts nobody, a mailbox that will not open does.</p>
+
+  <aside class="redpen" data-page="400">
+    <p class="claim">"at most 2 out of the 3 guarantees"</p>
+    <p class="fix">Partition tolerance cannot be dropped: in a distributed system partitions will happen. While one lasts, the system gives up consistency or availability — Cassandra, by default, consistency.</p>
+    <p class="because">A node cut off from the others can only refuse (no availability) or answer from its own copy (no consistency): the argument of <a href="l05.html#l05-cap">lesson 5</a>, where p. 195 makes the same claim and p. 196 corrects it ("CA doesn't make any sense"). The exam may be matched against the printed wording: know it, and answer with the correction.</p>
+  </aside>
+
+  <p>"Eventual" is only the default: each read or write says how many copies must answer (the CL of section 4), so one operation can buy consistency with waiting — p. 438's "tuneably consistent" (<a href="l22.html">lesson 22</a>).</p>
+</section>
+
+
+<section id="l20-colstore">
+  <h2>Column-oriented storage: read less, write more</h2>
+
+  <p>Before Cassandra, pp. 401–408 describe a different design that shares the word "column". Take a chain of shops that records every sale with the five columns of p. 402: date, store, product, customer, price. The cashier adds a sale every few seconds. The analyst asks, once a night, for the revenue of each store — two of the five columns, over every sale ever made.</p>
+
+  <p>Page 401: "The Column Oriented Database stores data in columns", "mainly used in OLAP(online Analytical Processing), Data Mining operations". <mark class="key">OLAP</mark> is the analyst's question: few columns, very many rows. Its opposite, OLTP (online transaction processing), is the cashier's: whole records, one at a time.</p>
+
+  <p>Page 402 sets the two layouts side by side. A <mark class="key">row store</mark> keeps each record in one piece: "+ easy to add/modify a record", "- might read in unnecessary data". A <mark class="key">column store</mark> keeps each column in a piece of its own: "+ only need to read in relevant data", "- tuple writes require multiple accesses" (a tuple is a record). Verdict: "suitable for read-mostly, read-intensive, large data repositories".</p>
+
+  <div class="widget" id="l20-w-layout">
+    <h3 class="widget-title">One table, two ways to put it on disk</h3>
+    <p class="widget-intro">Sixteen sales with eight columns (quarter, date, store, product, customer, quantity, price, channel), four bytes per value. Above, the row store: the sales one after another, two per line. Below, the column store: one file per column. Only the quarter and the price are printed in the cells. Choose a query; dashed outlines show what each layout reads from disk, washed cells what the query needs. The two switches compress the quarter column and change the order of the rows.</p>
+    <ol class="tasks">
+      <li>Keep the query "sum of price per quarter". Before you read the readouts, predict: of the bytes the row store reads, what share does the query need? Then compare the dashed outlines above and below.
+        <details class="answer"><summary>What you should see</summary>
+          <p>A quarter: 128 of the 512 bytes. The row store must read all sixteen records whole; the column store reads two files, 128 bytes, and nothing else. This is the insight the widget is built for: a column store reads only the columns a query names — here 2 of 8.</p></details>
+      </li>
+      <li>Switch to "the whole record of sale 7", then to "insert a new sale". For each, predict how many separate places on disk each layout touches.
+        <details class="answer"><summary>What you should see</summary>
+          <p>1 against 8, both times. A record is one piece in the row store and eight pieces in the column store: eight seeks and a rebuild by position to read it, eight writes to add one. These are the cons of p. 404 — seek time, cost of inserts, tuple reconstruction — and the reason for "read-mostly".</p></details>
+      </li>
+      <li>Go back to "sum of price per quarter" and switch on run-length encoding. Predict how many runs the quarter column becomes, then read the 1,750-row readout. Finally sort the rows by customer and predict again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Four runs, (Q1, 1, 3) (Q2, 4, 3) (Q3, 7, 5) (Q4, 12, 5): 48 bytes instead of 64. At 1,750 rows they become the triples of p. 407 and 7,000 bytes shrink to 48. Sorted by customer, neighbouring quarters always differ: 16 runs of length 1 would take 192 bytes, three times the raw column, so it stays raw (the 1,750 quarters of p. 407 in a simulated random order: 1,306 runs, 15,672 bytes). Run-length encoding pays only on sorted or clustered columns.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l20-w-layout', function (root, ui) {
+    var COLS = ['qtr', 'date', 'store', 'prod', 'cust', 'qty', 'price', 'chan'];
+    var R = [
+      ['Q1', '01-12', 'S1', 'P1', 'C4', 2, 5, 'shop'], ['Q1', '02-03', 'S2', 'P1', 'C1', 1, 7, 'web'],
+      ['Q1', '03-20', 'S1', 'P2', 'C3', 1, 2, 'shop'], ['Q2', '04-02', 'S3', 'P1', 'C2', 3, 9, 'web'],
+      ['Q2', '05-15', 'S1', 'P2', 'C5', 1, 6, 'shop'], ['Q2', '06-08', 'S2', 'P3', 'C1', 2, 8, 'shop'],
+      ['Q3', '07-01', 'S2', 'P1', 'C3', 1, 5, 'web'], ['Q3', '07-19', 'S3', 'P2', 'C4', 2, 3, 'shop'],
+      ['Q3', '08-05', 'S1', 'P3', 'C2', 1, 8, 'web'], ['Q3', '08-30', 'S2', 'P1', 'C5', 4, 1, 'shop'],
+      ['Q3', '09-14', 'S3', 'P2', 'C1', 1, 4, 'web'], ['Q4', '10-03', 'S1', 'P1', 'C2', 2, 6, 'shop'],
+      ['Q4', '10-27', 'S2', 'P3', 'C4', 1, 2, 'web'], ['Q4', '11-11', 'S3', 'P1', 'C3', 3, 7, 'shop'],
+      ['Q4', '12-02', 'S1', 'P2', 'C5', 1, 9, 'web'], ['Q4', '12-18', 'S2', 'P2', 'C1', 2, 4, 'shop']
+    ];
+    var NEW = ['Q4', '12-29', 'S3', 'P1', 'C3', 1, 5, 'web'];
+    var BYQ = R.map(function (r, i) { return i + 1; });
+    var BYC = [2, 6, 11, 16, 4, 9, 12, 3, 7, 14, 1, 8, 13, 5, 10, 15];   // sorted by customer, then by sale number
+    var B = 4, N = 16, M = 8, REC = B * M, BIG = 1750;
+    var BIGRUNS = [['Q1', 1, 300], ['Q2', 301, 350], ['Q3', 651, 500], ['Q4', 1151, 600]];   // p. 407
+    var bigShuffled = (function () {          // runs of the 1,750 quarters when the rows follow the customers instead
+      var q = [];
+      BIGRUNS.forEach(function (p) { for (var i = 0; i < p[2]; i++) q.push(p[0]); });
+      var s = Course.rng(20).shuffle(q), runs = 1;
+      for (var i = 1; i < s.length; i++) if (s[i] !== s[i - 1]) runs++;
+      return runs;
+    })();
+    var Q = {
+      sum: { label: 'sum of price per quarter (2 of 8 columns)', cols: [0, 6], kind: 'scan' },
+      avg: { label: 'average price (1 of 8 columns)', cols: [6], kind: 'scan' },
+      rec: { label: 'the whole record of sale 7', cols: [0, 1, 2, 3, 4, 5, 6, 7], kind: 'rec' },
+      ins: { label: 'insert a new sale (sale 17)', cols: [0, 1, 2, 3, 4, 5, 6, 7], kind: 'ins' }
+    };
+    var qSel = ui.select('query', ['sum', 'avg', 'rec', 'ins'].map(function (k) { return { value: k, label: Q[k].label }; }), null, 'sum');
+    var rle = ui.toggle('run-length encode the quarter column', false);
+    var cust = ui.toggle('keep the rows sorted by customer instead of by quarter', false);
+    var roRow = ui.readout('row store'), roCol = ui.readout('column store'), roQ = ui.readout('quarter column'), roBig = ui.readout('scaled to the 1,750 rows of p. 407 (computed)');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'needed by the query', color: 's2', mark: 'area' },
+      { label: 'read from disk', color: 's2', mark: 'dash' },
+      { label: 'written by the insert', color: 's1', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 480, { label: 'The same sixteen sales laid out on disk twice. Above, a row store with two records per line; below, a column store with one line per column. Dashed outlines mark what the chosen query reads, washed cells what it needs or what an insert writes.' });
+
+    function n(x) { return String(x).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function state() {
+      var q = Q[qSel.value] || Q.sum, order = cust.value ? BYC : BYQ;
+      var recs = order.map(function (r) { return R[r - 1]; });
+      if (q.kind === 'ins') recs = recs.concat([NEW]);
+      var runs = [];
+      recs.forEach(function (r, i) {
+        var last = runs[runs.length - 1];
+        if (last && last.v === r[0]) last.l++; else runs.push({ v: r[0], s: i + 1, l: 1 });
+      });
+      var rawQ = recs.length * B, rleQ = runs.length * 3 * B;
+      return { q: q, order: order, recs: recs, runs: runs, rawQ: rawQ, rleQ: rleQ, useRle: rle.value && rleQ < rawQ, pos7: order.indexOf(7) };
+    }
+    function runTxt(r) { return '(' + r.v + ', ' + r.s + ', ' + r.l + ')'; }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    var X0 = 76, CW = 28, CH = 20, LH = 24, RY = 30, CY = 282;
+    function shown(rec, c) { return c === 0 ? rec[0] : c === 6 ? String(rec[6]) : ''; }
+
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var q = st.q, slots = st.recs.length, need = {};
+      q.cols.forEach(function (c) { need[c] = true; });
+      T(10, 18, 'row store: one sale after another, two per line', 'tx-sm tx-bold');
+      T(10, CY - 14, 'column store: one file per column', 'tx-sm tx-bold');
+      /* row store */
+      for (var k = 0; k < Math.ceil(slots / 2); k++) {
+        var y = RY + k * LH, a = 2 * k + 1, b = Math.min(2 * k + 2, slots);
+        T(66, y + 15, a === b ? String(a) : a + '–' + b, 'tx-sm tx-end');
+        for (var c = 0; c < 16; c++) {
+          var slot = 2 * k + (c >= 8 ? 1 : 0);
+          if (slot >= slots) continue;
+          var col = c % 8, x = X0 + c * CW, cls = 'fi-paper st-muted';
+          if (q.kind === 'scan' && need[col]) cls = 'fw-s2 st-s2';
+          if (q.kind === 'rec' && slot === st.pos7) cls = 'fw-s2 st-s2';
+          if (q.kind === 'ins' && slot === slots - 1) cls = 'fw-s1 st-s1';
+          S('rect', { x: x + 1, y: y, width: CW - 2, height: CH, 'class': cls });
+          var v = shown(st.recs[slot], col);
+          if (v) T(x + CW / 2, y + 15, v, 'tx-mono tx-sm tx-mid');
+        }
+        if (2 * k + 1 < slots) S('line', { x1: X0 + 8 * CW, y1: y - 2, x2: X0 + 8 * CW, y2: y + CH + 2, 'class': 'sw-2' });
+      }
+      if (q.kind === 'scan') S('rect', { x: X0 - 3, y: RY - 4, width: 16 * CW + 6, height: 7 * LH + CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+      if (q.kind === 'rec') {
+        var kk = Math.floor(st.pos7 / 2), half = st.pos7 % 2;
+        S('rect', { x: X0 + half * 8 * CW - 3, y: RY + kk * LH - 4, width: 8 * CW + 6, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+      }
+      /* column store */
+      for (var j = 0; j < M; j++) {
+        var y2 = CY + j * LH;
+        T(66, y2 + 15, COLS[j], 'tx-mono tx-sm tx-end');
+        if (j === 0 && st.useRle) {
+          st.runs.forEach(function (r, i) {
+            var x = X0 + i * 3 * CW, cls = 'fi-paper';
+            var hit = q.kind === 'rec' && st.pos7 + 1 >= r.s && st.pos7 + 1 <= r.s + r.l - 1;
+            if ((q.kind === 'scan' && need[0]) || hit) cls = 'fw-s2 st-s2';
+            if (q.kind === 'ins' && i === st.runs.length - 1) cls = 'fw-s1 st-s1';
+            S('rect', { x: x + 1, y: CY, width: 3 * CW - 2, height: CH, 'class': cls });
+            T(x + 1.5 * CW, CY + 15, '(' + r.v + ',' + r.s + ',' + r.l + ')', 'tx-sm tx-mid');
+            if (hit) S('rect', { x: x - 2, y: CY - 4, width: 3 * CW + 4, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+          });
+          if (q.kind === 'scan' && need[0]) S('rect', { x: X0 - 3, y: CY - 4, width: st.runs.length * 3 * CW + 6, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+          continue;
+        }
+        for (var p = 0; p < slots; p++) {
+          var xx = X0 + p * CW, cl = 'fi-paper st-muted';
+          if (q.kind === 'scan' && need[j]) cl = 'fw-s2 st-s2';
+          if (q.kind === 'rec' && p === st.pos7) cl = 'fw-s2 st-s2';
+          if (q.kind === 'ins' && p === slots - 1) cl = 'fw-s1 st-s1';
+          S('rect', { x: xx + 1, y: y2, width: CW - 2, height: CH, 'class': cl });
+          var vv = shown(st.recs[p], j);
+          if (vv) T(xx + CW / 2, y2 + 15, vv, 'tx-mono tx-sm tx-mid');
+        }
+        if (q.kind === 'scan' && need[j]) S('rect', { x: X0 - 3, y: y2 - 4, width: N * CW + 6, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+        if (q.kind === 'rec') S('rect', { x: X0 + st.pos7 * CW - 2, y: y2 - 4, width: CW + 4, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+      }
+    }
+
+    ui.onChange(function () {
+      var st = state(), q = st.q;
+      if (q.kind === 'scan') {
+        var k = q.cols.length, need = N * k * B, read = N * REC;
+        var colB = q.cols.reduce(function (s, c) { return s + (c === 0 && st.useRle ? st.rleQ : N * B); }, 0);
+        roRow.set('reads all 16 records: ' + read + ' B in 1 place; the query needs ' + need + ' B (' + Math.round(100 * need / read * 10) / 10 + ' %)');
+        roCol.set('reads ' + k + (k > 1 ? ' files: ' : ' file: ') + colB + ' B in ' + k + (k > 1 ? ' places' : ' place') + (st.useRle && q.cols.indexOf(0) >= 0 ? ' (quarter as runs)' : ''));
+        var bigQ = rle.value && !cust.value ? BIGRUNS.length * 3 * B : BIG * B;
+        var bigCol = q.cols.reduce(function (s, c) { return s + (c === 0 ? bigQ : BIG * B); }, 0);
+        var extra = '';
+        if (rle.value && q.cols.indexOf(0) >= 0) extra = cust.value
+          ? ' · quarter in a random order (simulated): ' + n(bigShuffled) + ' runs = ' + n(bigShuffled * 3 * B) + ' B, kept raw'
+          : ' · quarter = the triples of p. 407, ' + BIGRUNS.map(function (r) { return '(' + r[0] + ', ' + r[1] + ', ' + r[2] + ')'; }).join(' ') + ': 48 B instead of 7,000 B';
+        roBig.set('row store ' + n(BIG * REC) + ' B · column store ' + n(bigCol) + ' B' + extra);
+      } else if (q.kind === 'rec') {
+        roRow.set('reads sale 7: ' + REC + ' B in 1 place');
+        roCol.set('reads position ' + (st.pos7 + 1) + ' of 8 files: ' + ((M - 1) * B + (st.useRle ? 3 * B : B)) + ' B in 8 places, then rebuilds the record');
+        roBig.set('one record: 1 place against 8, however long the table');
+      } else {
+        roRow.set('writes sale 17: ' + REC + ' B in 1 place');
+        roCol.set('writes 8 values into 8 files: 8 places' + (st.useRle ? ', the last quarter run grows' : ''));
+        roBig.set('one record: 1 place against 8, however long the table');
+      }
+      if (!rle.value) roQ.set(st.recs.length + ' values = ' + st.rawQ + ' B, stored as they are');
+      else if (st.useRle) roQ.set(st.runs.length + ' runs = ' + st.rleQ + ' B instead of ' + st.rawQ + ' B: ' + st.runs.map(runTxt).join(' '));
+      else roQ.set(st.runs.length + ' runs would take ' + st.rleQ + ' B, more than ' + st.rawQ + ' B raw: kept raw');
+      var t = '';
+      if (qSel.value === 'sum') t = 'The query needs qtr and price, 2 of the 8 values of every sale. The row store reads each record whole — "might read in unnecessary data" (p. 402); the column store reads two files — "only need to read in relevant data". Result: Q1 14 · Q2 23 · Q3 21 · Q4 28.';
+      else if (qSel.value === 'avg') t = 'One column of eight: the column store reads an eighth of the bytes of the row store. Result: 86 / 16 = 5.375.';
+      else if (qSel.value === 'rec') t = 'Now the record is one piece in the row store and eight pieces in the column store: one seek per file ("Increased Disk Seek Time", p. 404), then a Construct step that zips position ' + (st.pos7 + 1) + ' of every file ("tuple reconstruction", p. 405). Sale 7 = (Q3, 07-01, S2, P1, C3, 1, 5, web).';
+      else t = 'One new sale: the row store appends one piece, the column store appends to eight files — "tuple writes require multiple accesses" (p. 402), "Increased cost of Inserts" (p. 404).' + (st.useRle ? ' With the runs, one triple changes: (Q4, 12, 5) becomes (Q4, 12, 6).' : '');
+      note.set(t);
+      draw(st);
+    });
+  });
+  </script>
+
+  <p>In numbers: with \(N\) records of \(m\) columns of \(w\) bytes, a query that needs \(k\) columns reads</p>
+
+  <div class="formula">
+    \[ \begin{aligned} \text{row store:}\quad &amp; N \cdot m \cdot w \\ \text{column store:}\quad &amp; N \cdot k \cdot w \end{aligned} \]
+  </div>
+
+  <p>so the column store reads the fraction \(k/m\): 2 of 8 columns, a quarter. Page 403 lists four "Pros" by name only; their mechanisms (background):</p>
+
+  <ul>
+    <li>"Data compression": a column's values share a type and repeat (below).</li>
+    <li>"Improved Bandwidth Utilization": every byte moved belongs to a needed column.</li>
+    <li>"Improved Code Pipelining": one tight loop over an array of one type — why a NumPy operation on a whole array beats a Python loop.</li>
+    <li>"Improved cache locality": neighbouring values in memory are the ones read next.</li>
+  </ul>
+
+  <p>The "Cons" of p. 404 are the price of cutting records apart, and the widget showed each one: "Increased Disk Seek Time" (a record lives in \(m\) files), "Increased cost of Inserts" (one record, \(m\) writes), "Increases tuple reconstruction costs" (whole records must be glued back together).</p>
+
+  <p>Page 405, "Tuple Reconstruction", measures the trade (Fig. 1). The row store takes the same time whatever the query selects, because it always reads whole tuples; the column store's time grows with the bytes selected and catches up only near 125 of 148. The bullet "Large prefetch hides disk seeks in columns" answers the first con: reading each column file in large chunks turns many small jumps into a few long reads.</p>
+
+  <figure class="fig fig--plain" id="l20-fig-chart">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Elapsed time against selected bytes per tuple. The row store line is flat at about 51 seconds. The column store line rises from about 1 second at 4 bytes to about 63 seconds at 148 bytes and crosses the row store near 125 bytes. Two dotted CPU lines stay below 13 seconds.">
+      <line x1="70" y1="176.7" x2="536" y2="176.7" class="st-grid"/>
+      <line x1="70" y1="103.3" x2="536" y2="103.3" class="st-grid"/>
+      <line x1="70" y1="30" x2="536" y2="30" class="st-grid"/>
+      <line x1="70" y1="250" x2="536" y2="250" class="st-muted"/>
+      <line x1="70" y1="250" x2="70" y2="22" class="st-muted"/>
+      <line x1="456.5" y1="250" x2="456.5" y2="66" class="st-muted dash"/>
+      <line x1="70" y1="221.4" x2="530" y2="221.4" class="st-s4 sw-3 dots"/>
+      <polyline points="70,246.3 140.3,235.3 223.3,230.2 248.9,227.6 466.1,215.2 530,206" class="st-s5 sw-3 dots"/>
+      <line x1="70" y1="64.8" x2="530" y2="64.8" class="st-s4 sw-3"/>
+      <polyline points="70,246 82.8,237.2 95.6,230.9 108.3,224.3 121.1,217 133.9,210.4 140.3,208.9 223.3,171.2 248.9,152.1 466.1,58.2 478.9,50.9 491.7,42.8 504.4,34.8 517.2,27.4 530,19.7" class="st-s5 sw-3"/>
+      <polygon points="70,58.8 76,64.8 70,70.8 64,64.8" class="fi-s4"/>
+      <polygon points="223.3,58.8 229.3,64.8 223.3,70.8 217.3,64.8" class="fi-s4"/>
+      <polygon points="376.7,58.8 382.7,64.8 376.7,70.8 370.7,64.8" class="fi-s4"/>
+      <polygon points="530,58.8 536,64.8 530,70.8 524,64.8" class="fi-s4"/>
+      <polygon points="70,240 76,251 64,251" class="fi-s5"/>
+      <polygon points="140.3,202.9 146.3,213.9 134.3,213.9" class="fi-s5"/>
+      <polygon points="248.9,146.1 254.9,157.1 242.9,157.1" class="fi-s5"/>
+      <polygon points="466.1,52.2 472.1,63.2 460.1,63.2" class="fi-s5"/>
+      <polygon points="530,13.7 536,24.7 524,24.7" class="fi-s5"/>
+      <text x="10" y="14" class="tx-sm tx-muted">time (s)</text>
+      <text x="60" y="254" class="tx-sm tx-end">0</text>
+      <text x="60" y="181" class="tx-sm tx-end">20</text>
+      <text x="60" y="107" class="tx-sm tx-end">40</text>
+      <text x="60" y="34" class="tx-sm tx-end">60</text>
+      <text x="70" y="270" class="tx-sm tx-mid">4</text>
+      <text x="172.2" y="270" class="tx-sm tx-mid">36</text>
+      <text x="274.4" y="270" class="tx-sm tx-mid">68</text>
+      <text x="376.7" y="270" class="tx-sm tx-mid">100</text>
+      <text x="478.9" y="270" class="tx-sm tx-mid">132</text>
+      <text x="530" y="270" class="tx-sm tx-mid">148</text>
+      <text x="300" y="292" class="tx-sm tx-mid">selected bytes per tuple (a tuple is 148 bytes)</text>
+      <text x="90" y="54" class="tx-sm halo">row store</text>
+      <text x="448" y="40" class="tx-sm tx-end halo">crossover near 125 bytes</text>
+      <text x="332" y="138" class="tx-sm halo">column store</text>
+      <text x="534" y="194" class="tx-sm tx-end halo">column CPU</text>
+      <text x="520" y="242" class="tx-sm tx-end halo">row CPU</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The chart of p. 405, redrawn; the values are read off the slide's chart, not printed on it. The row store (teal, diamonds) needs about 51 s whatever the query selects. The column store (magenta, triangles) needs time in proportion to the bytes it selects, from about 1 s for 4 bytes, and loses only near 125 of the 148 bytes. The dotted lines are the CPU part of each time: under 13 s even for the column store, so rebuilding tuples is cheap next to the reading it saves.</figcaption>
+  </figure>
+
+  <p>On the right of the same slide, a box labelled Construct rebuilds the records. Position \(i\) of every column belongs to record \(i\): reconstruction is a zip by position, with no keys. And prodID is stored as the single box (4,1,4) — the value 4, from position 1, four times: the compression of the next two slides.</p>
+
+  <figure class="tbl-fig" id="l20-tbl-construct">
+    <figcaption>Construct (p. 405): four stored columns, zipped row by row (positions 1 to 4) into four tuples. prodID is stored as one run, (4,1,4).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>prodID</th><th>storeID</th><th>custID</th><th>price</th><th>tuple</th></tr></thead>
+        <tbody>
+          <tr><td class="num">4</td><td class="num">2</td><td class="num">2</td><td class="num">7</td><td class="num">(4, 2, 2, 7)</td></tr>
+          <tr><td class="num">4</td><td class="num">1</td><td class="num">3</td><td class="num">13</td><td class="num">(4, 1, 3, 13)</td></tr>
+          <tr><td class="num">4</td><td class="num">3</td><td class="num">3</td><td class="num">42</td><td class="num">(4, 3, 3, 42)</td></tr>
+          <tr><td class="num">4</td><td class="num">1</td><td class="num">3</td><td class="num">80</td><td class="num">(4, 1, 3, 80)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Page 406: compression "Trades I/O for CPU" — fewer bytes to read, a little decoding — and a scan waits for the disk, so the trade pays. Column stores profit most: "Higher data value locality in column stores" (neighbours belong to one attribute), "Techniques such as run length encoding far more useful", and the space saved "Can use extra space to store multiple copies of data in different sort orders", one per kind of query.</p>
+
+  <div class="def">
+    <p><dfn>Run-length encoding (RLE)</dfn> — a run of equal neighbouring values is stored as one triple (value, start_pos, run_length): the value, its first position, the number of rows.</p>
+  </div>
+
+  <aside class="margin-note">The course notes write a run with two fields, ("Q1", 200): the value and how often it repeats. The slide's third field, the start position, finds a row without adding up the runs before it.</aside>
+
+  <p>Page 407 encodes a sales table sorted by quarter (Fig. 2): Quarter collapses to four triples, Product ID to short runs, and Price stays raw — neighbouring prices rarely repeat, and the encoding is chosen per column.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l20-fig-rle">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 330" role="img" aria-label="Three raw columns of a sales table: Quarter with Q1 seven times, a gap, then Q2 four times; Product ID 1, 1, 1, 1, 1, 2, 2, then 1, 1, 1, 2; Price 5, 7, 2, 9, 6, 8, 5, then 3, 8, 1, 4. Positions 1 to 7 and 301 to 304 are numbered on the left.">
+        <text x="64" y="20" class="tx-sm tx-bold tx-mid">Quarter</text>
+        <text x="156" y="20" class="tx-sm tx-bold tx-mid">Product ID</text>
+        <text x="247" y="20" class="tx-sm tx-bold tx-mid">Price</text>
+        <rect x="36" y="30" width="56" height="20" class="fi-paper"/><rect x="128" y="30" width="56" height="20" class="fi-paper"/><rect x="222" y="30" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="52" width="56" height="20" class="fi-paper"/><rect x="128" y="52" width="56" height="20" class="fi-paper"/><rect x="222" y="52" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="74" width="56" height="20" class="fi-paper"/><rect x="128" y="74" width="56" height="20" class="fi-paper"/><rect x="222" y="74" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="96" width="56" height="20" class="fi-paper"/><rect x="128" y="96" width="56" height="20" class="fi-paper"/><rect x="222" y="96" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="118" width="56" height="20" class="fi-paper"/><rect x="128" y="118" width="56" height="20" class="fi-paper"/><rect x="222" y="118" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="140" width="56" height="20" class="fi-paper"/><rect x="128" y="140" width="56" height="20" class="fi-paper"/><rect x="222" y="140" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="162" width="56" height="20" class="fi-paper"/><rect x="128" y="162" width="56" height="20" class="fi-paper"/><rect x="222" y="162" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="206" width="56" height="20" class="fi-paper"/><rect x="128" y="206" width="56" height="20" class="fi-paper"/><rect x="222" y="206" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="228" width="56" height="20" class="fi-paper"/><rect x="128" y="228" width="56" height="20" class="fi-paper"/><rect x="222" y="228" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="250" width="56" height="20" class="fi-paper"/><rect x="128" y="250" width="56" height="20" class="fi-paper"/><rect x="222" y="250" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="272" width="56" height="20" class="fi-paper"/><rect x="128" y="272" width="56" height="20" class="fi-paper"/><rect x="222" y="272" width="50" height="20" class="fi-paper"/>
+        <text x="30" y="44" class="tx-sm tx-end tx-muted">1</text><text x="64" y="44" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="44" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="44" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="30" y="66" class="tx-sm tx-end tx-muted">2</text><text x="64" y="66" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="66" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="66" class="tx-mono tx-sm tx-mid">7</text>
+        <text x="30" y="88" class="tx-sm tx-end tx-muted">3</text><text x="64" y="88" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="88" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="88" class="tx-mono tx-sm tx-mid">2</text>
+        <text x="30" y="110" class="tx-sm tx-end tx-muted">4</text><text x="64" y="110" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="110" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="110" class="tx-mono tx-sm tx-mid">9</text>
+        <text x="30" y="132" class="tx-sm tx-end tx-muted">5</text><text x="64" y="132" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="132" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="132" class="tx-mono tx-sm tx-mid">6</text>
+        <text x="30" y="154" class="tx-sm tx-end tx-muted">6</text><text x="64" y="154" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="154" class="tx-mono tx-sm tx-mid">2</text><text x="247" y="154" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="30" y="176" class="tx-sm tx-end tx-muted">7</text><text x="64" y="176" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="176" class="tx-mono tx-sm tx-mid">2</text><text x="247" y="176" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="64" y="198" class="tx-mid">…</text><text x="156" y="198" class="tx-mid">…</text><text x="247" y="198" class="tx-mid">…</text>
+        <text x="30" y="220" class="tx-sm tx-end tx-muted">301</text><text x="64" y="220" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="220" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="220" class="tx-mono tx-sm tx-mid">3</text>
+        <text x="30" y="242" class="tx-sm tx-end tx-muted">302</text><text x="64" y="242" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="242" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="242" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="30" y="264" class="tx-sm tx-end tx-muted">303</text><text x="64" y="264" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="264" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="264" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="30" y="286" class="tx-sm tx-end tx-muted">304</text><text x="64" y="286" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="286" class="tx-mono tx-sm tx-mid">2</text><text x="247" y="286" class="tx-mono tx-sm tx-mid">4</text>
+        <text x="64" y="310" class="tx-mid">…</text><text x="156" y="310" class="tx-mid">…</text><text x="247" y="310" class="tx-mid">…</text>
+      </svg>
+      <p class="fig-label">Before: the columns as stored, position by position</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 330" role="img" aria-label="The same columns encoded. Quarter as four triples (Q1, 1, 300), (Q2, 301, 350), (Q3, 651, 500), (Q4, 1151, 600). Product ID as (1, 1, 5), (2, 6, 2), then (1, 301, 3), (2, 304, 1). Price unchanged.">
+        <text x="70" y="20" class="tx-sm tx-bold tx-mid">Quarter</text>
+        <text x="190" y="20" class="tx-sm tx-bold tx-mid">Product ID</text>
+        <text x="270" y="20" class="tx-sm tx-bold tx-mid">Price</text>
+        <rect x="10" y="30" width="120" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="58" width="120" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="86" width="120" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="114" width="120" height="24" class="fw-s1 st-s1"/>
+        <text x="70" y="46" class="tx-mono tx-sm tx-mid">(Q1, 1, 300)</text>
+        <text x="70" y="74" class="tx-mono tx-sm tx-mid">(Q2, 301, 350)</text>
+        <text x="70" y="102" class="tx-mono tx-sm tx-mid">(Q3, 651, 500)</text>
+        <text x="70" y="130" class="tx-mono tx-sm tx-mid">(Q4, 1151, 600)</text>
+        <rect x="142" y="30" width="96" height="24" class="fw-s1 st-s1"/>
+        <rect x="142" y="58" width="96" height="24" class="fw-s1 st-s1"/>
+        <text x="190" y="98" class="tx-mid">…</text>
+        <rect x="142" y="110" width="96" height="24" class="fw-s1 st-s1"/>
+        <rect x="142" y="138" width="96" height="24" class="fw-s1 st-s1"/>
+        <text x="190" y="178" class="tx-mid">…</text>
+        <text x="190" y="46" class="tx-mono tx-sm tx-mid">(1, 1, 5)</text>
+        <text x="190" y="74" class="tx-mono tx-sm tx-mid">(2, 6, 2)</text>
+        <text x="190" y="126" class="tx-mono tx-sm tx-mid">(1, 301, 3)</text>
+        <text x="190" y="154" class="tx-mono tx-sm tx-mid">(2, 304, 1)</text>
+        <rect x="252" y="30" width="36" height="20" class="fi-paper"/><rect x="252" y="52" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="74" width="36" height="20" class="fi-paper"/><rect x="252" y="96" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="118" width="36" height="20" class="fi-paper"/><rect x="252" y="140" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="162" width="36" height="20" class="fi-paper"/><rect x="252" y="206" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="228" width="36" height="20" class="fi-paper"/><rect x="252" y="250" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="272" width="36" height="20" class="fi-paper"/>
+        <text x="270" y="44" class="tx-mono tx-sm tx-mid">5</text><text x="270" y="66" class="tx-mono tx-sm tx-mid">7</text>
+        <text x="270" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="270" y="110" class="tx-mono tx-sm tx-mid">9</text>
+        <text x="270" y="132" class="tx-mono tx-sm tx-mid">6</text><text x="270" y="154" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="270" y="176" class="tx-mono tx-sm tx-mid">5</text><text x="270" y="198" class="tx-mid">…</text>
+        <text x="270" y="220" class="tx-mono tx-sm tx-mid">3</text><text x="270" y="242" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="270" y="264" class="tx-mono tx-sm tx-mid">1</text><text x="270" y="286" class="tx-mono tx-sm tx-mid">4</text>
+        <text x="270" y="310" class="tx-mid">…</text>
+        <text x="10" y="214" class="tx-sm tx-muted">each box:</text>
+        <text x="10" y="230" class="tx-sm tx-muted">(value, start_pos, run_length)</text>
+        <text x="10" y="290" class="tx-hand">1,750 rows, 4 boxes</text>
+      </svg>
+      <p class="fig-label">After: Quarter and Product ID as runs, Price unchanged</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> Run-length encoding on p. 407. The table is sorted by quarter, so Quarter is four runs: (Q1, 1, 300) reads "Q1, from position 1, 300 times", and 1,750 rows fit in four boxes. Product ID has short runs inside each quarter. Price has no runs worth encoding and stays raw.</figcaption>
+  </figure>
+
+  <p>Read one row of p. 407's table without decoding anything else:</p>
+
+  <ol class="steps" id="l20-steps-rle">
+    <li><p>A triple \((v, s, l)\) stands for \(l\) copies of \(v\) from position \(s\):</p> \[ c[i] = v \quad \text{for } s \le i \le s + l - 1 \] <p>(Q1, 1, 300) covers 1–300, (Q2, 301, 350) covers 301–650.</p></li>
+    <li><p>Each run starts where the last one ended, \(s_{j+1} = s_j + l_j\): 1 + 300 = 301, 301 + 350 = 651, 651 + 500 = 1151. The last ends at 1151 + 600 − 1 = 1750: the table has 1,750 rows.</p></li>
+    <li><p>Ask for row 304. It lies in 301–650: the quarter is Q2.</p></li>
+    <li><p>Product ID: (2, 304, 1) covers exactly 304, so the product is 2.</p></li>
+    <li><p>Price is raw: its 304th value. The slide's Q2 block starts at 301 with 3, 8, 1, 4, so the price is 4.</p></li>
+    <li><p>Zip by position: row 304 is (Q2, 2, 4) — tuple reconstruction again.</p></li>
+  </ol>
+
+  <p>Run-length encoding needs runs. Sort the widget's sixteen sales by customer and no two neighbouring quarters are alike: sixteen runs of length 1, three times the raw column — the widget's last task.</p>
+
+  <p class="memo"><mark class="key">A column store reads only the columns a query names, and pays one access per column whenever a whole record is read or written.</mark></p>
+
+  <p>Page 408 closes with a "List of Databases": Cassandra, Vertica, SybaseIQ, C-Store, BigTable, MonetDB, LucidDB. Five are column stores in the sense of pp. 401–407 (C-Store, a university prototype, lives on as Vertica — background), like Snowflake (<a href="l23.html">lesson 23</a>) and Spark's columnar files (<a href="l40.html">lesson 40</a>). Cassandra and BigTable are something else.</p>
+</section>
+
+
+<section id="l20-cassandra">
+  <h2>Cassandra: Bigtable's data model on Dynamo's ring</h2>
+
+  <p>Page 410: Cassandra was "Originally designed at Facebook" and is "Open-sourced and now within Apache foundation".</p>
+
+  <div class="story" data-year="2007–2010">
+    <p>Avinash Lakshman — a co-author of Amazon's Dynamo paper — and Prashant Malik wrote Cassandra at Facebook for the inbox search: the random reads and writes of p. 399. It was open-sourced in July 2008 and became a top-level Apache project in February 2010. The name is the Trojan prophetess nobody believed. (Background: Wikipedia, "Apache Cassandra".)</p>
+  </div>
+
+  <p>Page 411, "innovation at scale", gives the family tree. "google bigtable (2006)": "consistency model: strong", "data model: sparse map", "clones: hbase, hypertable". "amazon dynamo (2007)": "O(1) dht", "consistency model: client tune-able", "clones: riak, voldemort". In large type: "cassandra ~= bigtable + dynamo".</p>
+
+  <p>The data model comes from Bigtable, the distribution from Dynamo. A <mark class="key">sparse map</mark> is a table whose rows fill only the cells they have; empty cells cost nothing. A DHT (distributed hash table) spreads keys over machines by hashing them; O(1) means any node reaches a key's owner in one hop, because every node knows the whole ring (<a href="l22.html">lesson 22</a>). The "~=" is honest: unlike Bigtable, Cassandra has no master at all.</p>
+
+  <p>Page 412 draws the model as the "blog keyspace" (Fig. 3): "Column Families: Like SQL tables; but may be unstructured (client-specified); Can have index tables", "No schemas", "Some columns missing from some entries", "Supports get(key) and put(key, value) operations", "Often write-heavy workloads".</p>
+
+  <figure class="fig fig--plain" id="l20-fig-blog">
+    <svg class="dia" viewBox="0 0 560 452" role="img" aria-label="Three column families of the blog keyspace. users: rows jbellis and dhutch with the columns name and state, row egilmore with name only. time_ordered_blogs_by_user: each user row has one column whose name is a timestamp and whose value is a blog entry id. blog entries: three rows with the columns body, user and category; user and category carry an asterisk for secondary indexes.">
+      <text x="10" y="18" class="tx-sm tx-bold">users</text>
+      <line x1="54" y1="30" x2="54" y2="194" class="hl"/>
+      <rect x="10" y="28" width="88" height="52" class="fi-none"/>
+      <text x="54" y="59" class="tx-sm tx-mid">jbellis</text>
+      <rect x="100" y="28" width="84" height="26" class="fw-s3 st-s3"/><rect x="100" y="54" width="84" height="26" class="fi-paper"/>
+      <text x="142" y="46" class="tx-mono tx-sm tx-mid">name</text><text x="142" y="72" class="tx-sm tx-mid">jonathan</text>
+      <rect x="186" y="28" width="84" height="26" class="fw-s3 st-s3"/><rect x="186" y="54" width="84" height="26" class="fi-paper"/>
+      <text x="228" y="46" class="tx-mono tx-sm tx-mid">state</text><text x="228" y="72" class="tx-sm tx-mid">TX</text>
+      <rect x="10" y="86" width="88" height="52" class="fi-none"/>
+      <text x="54" y="117" class="tx-sm tx-mid">dhutch</text>
+      <rect x="100" y="86" width="84" height="26" class="fw-s3 st-s3"/><rect x="100" y="112" width="84" height="26" class="fi-paper"/>
+      <text x="142" y="104" class="tx-mono tx-sm tx-mid">name</text><text x="142" y="130" class="tx-sm tx-mid">daria</text>
+      <rect x="186" y="86" width="84" height="26" class="fw-s3 st-s3"/><rect x="186" y="112" width="84" height="26" class="fi-paper"/>
+      <text x="228" y="104" class="tx-mono tx-sm tx-mid">state</text><text x="228" y="130" class="tx-sm tx-mid">CA</text>
+      <rect x="10" y="144" width="88" height="52" class="fi-none"/>
+      <text x="54" y="175" class="tx-sm tx-mid">egilmore</text>
+      <rect x="100" y="144" width="84" height="26" class="fw-s3 st-s3"/><rect x="100" y="170" width="84" height="26" class="fi-paper"/>
+      <text x="142" y="162" class="tx-mono tx-sm tx-mid">name</text><text x="142" y="188" class="tx-sm tx-mid">eric</text>
+      <text x="190" y="188" class="tx-hand">no state</text>
+      <text x="290" y="18" class="tx-sm tx-bold">time_ordered_blogs_by_user</text>
+      <line x1="334" y1="30" x2="334" y2="194" class="hl"/>
+      <rect x="290" y="28" width="88" height="52" class="fi-none"/>
+      <text x="334" y="59" class="tx-sm tx-mid">jbellis</text>
+      <rect x="380" y="28" width="168" height="26" class="fw-s3 st-s3"/><rect x="380" y="54" width="168" height="26" class="fi-paper"/>
+      <text x="464" y="46" class="tx-mono tx-sm tx-mid">1289847840615</text><text x="464" y="72" class="tx-sm tx-mid tx-mono">92dbeb5</text>
+      <rect x="290" y="86" width="88" height="52" class="fi-none"/>
+      <text x="334" y="117" class="tx-sm tx-mid">dhutch</text>
+      <rect x="380" y="86" width="168" height="26" class="fw-s3 st-s3"/><rect x="380" y="112" width="168" height="26" class="fi-paper"/>
+      <text x="464" y="104" class="tx-mono tx-sm tx-mid">1289847840615</text><text x="464" y="130" class="tx-sm tx-mid tx-mono">d418a66</text>
+      <rect x="290" y="144" width="88" height="52" class="fi-none"/>
+      <text x="334" y="175" class="tx-sm tx-mid">egilmore</text>
+      <rect x="380" y="144" width="168" height="26" class="fw-s3 st-s3"/><rect x="380" y="170" width="168" height="26" class="fi-paper"/>
+      <text x="464" y="162" class="tx-mono tx-sm tx-mid">1289847844275</text><text x="464" y="188" class="tx-sm tx-mid tx-mono">6a0b483</text>
+      <text x="464" y="222" class="tx-hand tx-mid">an index table</text>
+      <text x="10" y="238" class="tx-sm tx-bold">blog entries</text>
+      <line x1="54" y1="250" x2="54" y2="414" class="hl"/>
+      <rect x="10" y="248" width="88" height="52" class="fi-none"/>
+      <text x="54" y="279" class="tx-sm tx-mid">92dbeb5</text>
+      <rect x="100" y="248" width="144" height="26" class="fw-s3 st-s3"/><rect x="100" y="274" width="144" height="26" class="fi-paper"/>
+      <text x="172" y="266" class="tx-mono tx-sm tx-mid">body</text><text x="172" y="292" class="tx-sm tx-mid">Today I …</text>
+      <rect x="246" y="248" width="108" height="26" class="fw-s3 st-s3"/><rect x="246" y="274" width="108" height="26" class="fi-paper"/>
+      <text x="300" y="266" class="tx-mono tx-sm tx-mid">user*</text><text x="300" y="292" class="tx-sm tx-mid">jbellis</text>
+      <rect x="356" y="248" width="122" height="26" class="fw-s3 st-s3"/><rect x="356" y="274" width="122" height="26" class="fi-paper"/>
+      <text x="417" y="266" class="tx-mono tx-sm tx-mid">category*</text><text x="417" y="292" class="tx-sm tx-mid">tech</text>
+      <rect x="10" y="306" width="88" height="52" class="fi-none"/>
+      <text x="54" y="337" class="tx-sm tx-mid">d418a66</text>
+      <rect x="100" y="306" width="144" height="26" class="fw-s3 st-s3"/><rect x="100" y="332" width="144" height="26" class="fi-paper"/>
+      <text x="172" y="324" class="tx-mono tx-sm tx-mid">body</text><text x="172" y="350" class="tx-sm tx-mid">I am …</text>
+      <rect x="246" y="306" width="108" height="26" class="fw-s3 st-s3"/><rect x="246" y="332" width="108" height="26" class="fi-paper"/>
+      <text x="300" y="324" class="tx-mono tx-sm tx-mid">user</text><text x="300" y="350" class="tx-sm tx-mid">dhutch</text>
+      <rect x="356" y="306" width="122" height="26" class="fw-s3 st-s3"/><rect x="356" y="332" width="122" height="26" class="fi-paper"/>
+      <text x="417" y="324" class="tx-mono tx-sm tx-mid">category</text><text x="417" y="350" class="tx-sm tx-mid">fashion</text>
+      <rect x="10" y="364" width="88" height="52" class="fi-none"/>
+      <text x="54" y="395" class="tx-sm tx-mid">6a0b483</text>
+      <rect x="100" y="364" width="144" height="26" class="fw-s3 st-s3"/><rect x="100" y="390" width="144" height="26" class="fi-paper"/>
+      <text x="172" y="382" class="tx-mono tx-sm tx-mid">body</text><text x="172" y="408" class="tx-sm tx-mid">This is …</text>
+      <rect x="246" y="364" width="108" height="26" class="fw-s3 st-s3"/><rect x="246" y="390" width="108" height="26" class="fi-paper"/>
+      <text x="300" y="382" class="tx-mono tx-sm tx-mid">user</text><text x="300" y="408" class="tx-sm tx-mid">egilmore</text>
+      <rect x="356" y="364" width="122" height="26" class="fw-s3 st-s3"/><rect x="356" y="390" width="122" height="26" class="fi-paper"/>
+      <text x="417" y="382" class="tx-mono tx-sm tx-mid">category</text><text x="417" y="408" class="tx-sm tx-mid">sports</text>
+      <text x="10" y="440" class="tx-sm">* = secondary indexes</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> Three of the five column families of the "blog keyspace" (p. 412), redrawn. Each row is a row key (on the highlighter) followed by its own columns, and every column is a name (violet strip) above a value. egilmore has no state, and nothing at all is stored for it. time_ordered_blogs_by_user is an index table: its column names are timestamps in milliseconds and its values the ids of blog entries. Left out: subscribes_to and subscribers_of, whose column names are user names with empty values.</figcaption>
+  </figure>
+
+  <p>Rows are found by a key — here user names. time_ordered_blogs_by_user is not an entity but an answer prepared in advance: "the entries of jbellis, in time order" is one row read. The asterisks mark secondary indexes on two columns: keep them in mind for section 4.</p>
+
+  <div class="pitfall"><p>"Page 412 says “column-oriented databases”, so Cassandra keeps each column in a file of its own, like Vertica." No: the label comes from the column families. A Cassandra row keeps all its columns together under its row key — "think of cassandra as row-oriented" (p. 417). Kleppmann, the course textbook, calls the label "very misleading" for this family (ch. 3, background). Keep the course's word, and say which sense you mean.</p></div>
+
+  <p>Pages 413–417 give the vocabulary, from the outside in:</p>
+
+  <div class="def">
+    <p><dfn>Keyspace</dfn> — "~= database", "typically one per application", "some settings are configurable only per keyspace" (p. 415): above all the replication, how many copies of each row are kept and where (<a href="l21.html">lesson 21</a>).</p>
+    <p><dfn>Column family</dfn> — "group records of similar kind", "not same kind, because CFs are sparse tables" (p. 416); settings: the comparator and the type, standard or super (p. 413). Examples: User, Address, Tweet, PointOfInterest, HotelRoom.</p>
+    <p><dfn>Row</dfn> — "each row is uniquely identifiable by key"; "rows group columns and super columns" (p. 417).</p>
+    <p><dfn>Column</dfn> — name, value and clock (p. 413): section 4.</p>
+  </div>
+
+  <aside class="redpen" data-page="413">
+    <p class="claim">"settings (eg, partitioner)"</p>
+    <p class="fix">The partitioner is not a keyspace setting: a Cassandra cluster has one partitioner for all its keyspaces. What a keyspace sets is its replication — the strategy and the number of copies of each row.</p>
+    <p class="because">The partitioner turns a row key into a position on the ring of nodes, and every keyspace of the cluster shares that one ring. In current Cassandra the partitioner is one line of the node configuration (background), while <code>CREATE KEYSPACE</code> takes a replication option and no partitioner (<a href="l21.html">lesson 21</a>). The exam may be matched against the printed box: know it, and name the replication when asked what a keyspace configures.</p>
+  </aside>
+
+  <aside class="margin-note">Pages 418 and 419 swap the two users: row 123 is eben on one, alison on the other. The widget follows p. 419.</aside>
+
+  <p>Page 417 is the slide of the hook: "think of cassandra as row-oriented" — one key opens a row, and its columns come back together. Page 414 draws a "Row Key" pointing to pairs of "Column Keys/Names" and "Column Values"; p. 418 shows two rows of one family with different columns; p. 419 writes them as nested maps:</p>
+
+<pre><code>// p. 419: User as nested maps
+User {
+  123 : { email: alison@foo.com,
+          icon:  [the Cassandra eye] },
+  456 : { email: eben@bar.com,
+          location: The Danger Zone }
+}</code></pre>
+
+  <p class="memo"><mark class="key">Think of a column family as a map of maps: row key → that row's columns, sorted by name, each one a name, a value and a timestamp.</mark></p>
+</section>
+
+
+<section id="l20-column">
+  <h2>A column has three parts, a super column has columns</h2>
+
+  <p>Zoom into one cell. Page 420, "a column has 3 parts":</p>
+
+  <div class="def">
+    <p><dfn>name</dfn> — "byte[]", "determines sort order", "used in queries", "indexed".</p>
+    <p><dfn>value</dfn> — "byte[]", "you don't query on column values".</p>
+    <p><dfn>timestamp</dfn> — "long (clock)", "last write wins conflict resolution".</p>
+  </div>
+
+  <p>The name is the key of the row's inner map: sorted, so a range of names is one contiguous read, and indexed inside the row, so a name is found without scanning. The value is opaque bytes — a string, a number, the eye picture of p. 418 — stored as it comes and never sorted.</p>
+
+  <p>The <mark class="key">timestamp</mark> settles disagreements between copies. One replica of row 456 holds email = eben@bar.com with timestamp 1004, another email = eben@new.com with 1010: when they are compared, 1010 wins on both. The client supplies the clock with every write (p. 428); a delete carries one too, so it can beat an older value. Simple and fast, at a price: of two concurrent writes, one is silently lost.</p>
+
+  <aside class="redpen" data-page="420">
+    <p class="claim">"you don’t query on column values"</p>
+    <p class="fix">Read it as a design rule, not as a limit of the system: Cassandra can find rows by a column value through secondary indexes — p. 412 of this deck marks two of them, "* = secondary indexes" — and CQL has <code>CREATE INDEX</code> and <code>ALLOW FILTERING</code> (<a href="l21.html">lesson 21</a>).</p>
+    <p class="because">The sentence predates secondary indexes (2011, version 0.7 — background). Each node indexes only its own rows, so a query by value asks every node, while a column family keyed by the value (p. 431) is read on one. The exam may be matched against the printed wording: in a theory answer quote it and add the nuance; in an exercise, "If any further operation is required" usually means <code>CREATE INDEX</code>.</p>
+  </aside>
+
+  <p>The sort order is set by the column family's <mark class="key">comparator</mark> (p. 421): "byte", "utf8", "long", "timeuuid", "lexicaluuid", "&lt;pluggable&gt;", "ex: lat/long" — the type of the column names. For the names 2 and 10, utf8 compares characters and puts "10" first, long compares numbers and puts 2 first; timeuuid orders time-based identifiers by time, the natural choice for a timeline.</p>
+
+  <p>Page 422 adds a level: "super columns group columns under a common name". A <mark class="key">super column</mark> has a name, "name: byte[]", and instead of a value a map of columns, "cols: Map&lt;byte[], IColumn&gt;". A column family is standard or super (the "type" of p. 413); in a super column family every row holds super columns.</p>
+
+  <p>Pages 423–424 fill one: PointOfInterest, keyed by ZIP code. Row 85255 holds the super columns Phoenix Zoo and Spring Training, row 10019 Central Park and Empire State Building; each holds phone and desc — or only desc, for Central Park: "flexible schema".</p>
+
+<pre><code>// p. 424: a super column family as nested maps
+PointOfInterest {
+  key: 85255 {
+    Phoenix Zoo { phone: 480-555-5555,
+      desc: They have animals here. },
+    Spring Training { phone: 623-333-3333,
+      desc: Fun for baseball fans. },
+  }, //end phx
+  key: 10019 {
+    Central Park { desc: Walk around. It's pretty.} ,
+    Empire State Building { phone: 212-777-7777,
+      desc: Great view from 102nd floor. }
+  } //end nyc
+}</code></pre>
+
+  <aside class="margin-note">Page 423 draws the same family with the key 10017 and other phone numbers. This lesson follows the complete version of p. 424.</aside>
+
+  <p>Page 425: "sub-column names in a SCF are not indexed", while "top level columns (SCF Name) are always indexed" — read the parenthesis as the super column names. So one sub-column costs a read of its whole super column. Super column families are "often used for denormalizing data from standard CFs": copying data to where a query reads it.</p>
+
+  <p>To ask for some of a row's columns you send a <mark class="key">slice predicate</mark>, a "data structure describing columns to return" (p. 426). Its SliceRange: "start column name", "finish column name (can be empty to stop on count)", "reverse", "count (like LIMIT)". The names are sorted, so a slice is one stretch of the row:</p>
+
+  <div class="widget" id="l20-w-map">
+    <h3 class="widget-title">The nested map: from the keyspace down to one column</h3>
+    <p class="widget-intro">The keyspace (called app here) holds three column families from the slides. Pick a row: you see its row key and its columns in the comparator's order, each with its name, clock and value. Then set the slice predicate: the columns it returns are washed and numbered in the order they come back. The User rows merge pp. 418–419; the clocks are made up, and two of the three timeline entries are added so that a slice has something to cut.</p>
+    <ol class="tasks">
+      <li>Pick User › row 123 and leave start and finish empty, count 4. Predict the order in which the four columns come back.
+        <details class="answer"><summary>What you should see</summary>
+          <p>email, icon, n, user: alphabetical, because the comparator is utf8. The order of the names decides — not the clocks, not the values. This is the insight of the widget: a read names a row key and a stretch of sorted column names, never a value.</p></details>
+      </li>
+      <li>Set start to icon and count to 2. Then switch reverse on, keeping start at icon. Predict both answers.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Forward: icon, n. Reverse: icon, email — with reverse on, start becomes the upper end of the stretch and the names are walked downwards.</p></details>
+      </li>
+      <li>Pick time_ordered_blogs_by_user › row jbellis, empty start and finish, reverse on, count 1. What comes back, and why is that the read a timeline needs?
+        <details class="answer"><summary>What you should see</summary>
+          <p>1290020640615 = e03a9d7, the newest entry. The names are timestamps compared as numbers (comparator long), so reverse with a count reads "the latest N" — what SQL writes as ORDER BY … DESC LIMIT.</p></details>
+      </li>
+      <li>Pick PointOfInterest › row 10019, set start to Empire State Building and count to 1. Predict what comes back.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The whole super column Empire State Building, desc and phone together. The slice runs over the super column names, which are indexed; the sub-columns are not, so a super column comes back whole (p. 425).</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l20-w-map', function (root, ui) {
+    var CF = {
+      User: { name: 'User', title: 'column family User · comparator utf8 · type standard', type: 'std', cmp: 'utf8', rows: {
+        '123': [{ n: 'email', v: 'alison@foo.com', t: 1001 }, { n: 'icon', v: '[the eye picture]', t: 1003 }, { n: 'n', v: '42', t: 1002 }, { n: 'user', v: 'alison', t: 1000 }],
+        '456': [{ n: 'email', v: 'eben@bar.com', t: 1004 }, { n: 'location', v: 'The Danger Zone', t: 1006 }, { n: 'nickname', v: 'The Situation', t: 1005 }, { n: 'user', v: 'eben', t: 1004 }]
+      } },
+      TL: { name: 'time_ordered_blogs_by_user', title: 'column family time_ordered_blogs_by_user · comparator long', type: 'std', cmp: 'long', rows: {
+        'jbellis': [{ n: '1289847840615', v: '92dbeb5', t: 1007 }, { n: '1289934240615', v: 'b6f1c02', t: 1012 }, { n: '1290020640615', v: 'e03a9d7', t: 1015 }]
+      } },
+      POI: { name: 'PointOfInterest', title: 'super column family PointOfInterest · type super', type: 'super', cmp: 'utf8', rows: {
+        '85255': [{ n: 'Phoenix Zoo', sub: [{ n: 'desc', v: 'They have animals here.', t: 1020 }, { n: 'phone', v: '480-555-5555', t: 1020 }] },
+                  { n: 'Spring Training', sub: [{ n: 'desc', v: 'Fun for baseball fans.', t: 1021 }, { n: 'phone', v: '623-333-3333', t: 1021 }] }],
+        '10019': [{ n: 'Central Park', sub: [{ n: 'desc', v: "Walk around. It's pretty.", t: 1022 }] },
+                  { n: 'Empire State Building', sub: [{ n: 'desc', v: 'Great view from 102nd floor.', t: 1023 }, { n: 'phone', v: '212-777-7777', t: 1023 }] }]
+      } }
+    };
+    var rowSel = ui.select('row to read (column family › row key)', [
+      { value: 'User|123', label: 'User › row 123' },
+      { value: 'User|456', label: 'User › row 456' },
+      { value: 'TL|jbellis', label: 'time_ordered_blogs_by_user › row jbellis' },
+      { value: 'POI|85255', label: 'PointOfInterest › row 85255' },
+      { value: 'POI|10019', label: 'PointOfInterest › row 10019' }
+    ], null, 'User|123');
+    var startSel = ui.select('start (column name)', [{ value: '', label: '(empty)' }], null, '');
+    var finishSel = ui.select('finish (column name)', [{ value: '', label: '(empty)' }], null, '');
+    var rev = ui.toggle('reverse', false);
+    var cnt = ui.slider({ label: 'count (like LIMIT)', min: 1, max: 4, step: 1, value: 4 });
+    var roMap = ui.readout('the map'), roCall = ui.readout('the call'), roRet = ui.readout('returns');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'row key', color: 'ink', mark: 'hl' },
+      { label: 'column name', color: 's3', mark: 'area' },
+      { label: 'returned by the slice', color: 's2', mark: 'area' }
+    ]);
+    var H = 330;
+    var svg = ui.svg(560, H, { label: 'Nested boxes: the keyspace holds a column family, which holds the chosen row — its row key on the left, then its columns sorted by name, each a name with its clock and a value; in a super column family, named groups of columns. The columns returned by the slice predicate are washed and numbered in the order they come back.' });
+
+    function current() {
+      var p = String(rowSel.value || 'User|123').split('|'), cf = CF[p[0]] || CF.User, key = cf.rows[p[1]] ? p[1] : Object.keys(cf.rows)[0];
+      var c = cf.cmp === 'long' ? function (a, b) { return Number(a) - Number(b); } : function (a, b) { return a < b ? -1 : a > b ? 1 : 0; };
+      var items = cf.rows[key].slice().sort(function (a, b) { return c(a.n, b.n); });
+      return { cf: cf, key: key, items: items, cmp: c };
+    }
+    var lastRow = null;
+    function syncNames(cur) {
+      if (lastRow === rowSel.value) return;
+      lastRow = rowSel.value;
+      [startSel, finishSel].forEach(function (sel) {
+        sel.el.textContent = '';
+        sel.el.appendChild(Course.el('option', { value: '', text: '(empty)' }));
+        cur.items.forEach(function (it) { sel.el.appendChild(Course.el('option', { value: it.n, text: it.n })); });
+        sel.el.value = '';
+      });
+    }
+    function slice(cur) {
+      var s = startSel.value || '', f = finishSel.value || '', r = rev.value, k = Math.max(1, Math.round(cnt.value)), c = cur.cmp, out = [];
+      if (s && f && (r ? c(s, f) < 0 : c(s, f) > 0)) return { err: true, out: out };
+      var list = r ? cur.items.slice().reverse() : cur.items;
+      for (var i = 0; i < list.length && out.length < k; i++) {
+        var nm = list[i].n;
+        if (s && (r ? c(nm, s) > 0 : c(nm, s) < 0)) continue;
+        if (f && (r ? c(nm, f) < 0 : c(nm, f) > 0)) break;
+        out.push(list[i]);
+      }
+      return { err: false, out: out };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function column(c, x, y) {
+      S('rect', { x: x, y: y, width: 256 - x, height: 44, 'class': 'fw-s3 st-s3' });
+      T((x + 256) / 2, y + 18, c.n, 'tx-mono tx-sm tx-mid');
+      T((x + 256) / 2, y + 38, 'clock ' + c.t, 'tx-mono tx-sm tx-mid tx-muted');
+      S('rect', { x: 256, y: y, width: 290, height: 44, 'class': 'fi-paper' });
+      T(264, y + 27, c.v, 'tx-sm');
+    }
+    function draw(cur, res) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var order = {};
+      res.out.forEach(function (it, i) { order[it.n] = i + 1; });
+      var y = 86, y0 = y, blocks = [];
+      cur.items.forEach(function (it) {
+        if (cur.cf.type === 'super') { var top = y; y += 30 + 48 * it.sub.length; blocks.push({ it: it, top: top, bottom: y - 4 }); y += 8; }
+        else { blocks.push({ it: it, top: y, bottom: y + 44 }); y += 48; }
+      });
+      var yEnd = blocks[blocks.length - 1].bottom, H = yEnd + 26;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      S('rect', { x: 4, y: 4, width: 552, height: H - 8, rx: 14, 'class': 'fi-none st-muted sw-2' });
+      T(18, 24, 'keyspace app · settings: replication', 'tx-sm');
+      S('rect', { x: 12, y: 34, width: 536, height: H - 46, rx: 10, 'class': 'fi-none' });
+      T(24, 54, cur.cf.title, 'tx-sm tx-bold');
+      T(56, 77, 'row key', 'tx-sm tx-mid tx-muted');
+      T(188, 77, 'name · clock', 'tx-sm tx-mid tx-muted');
+      T(404, 77, 'value', 'tx-sm tx-mid tx-muted');
+      S('line', { x1: 56, y1: y0 + 2, x2: 56, y2: yEnd - 2, 'class': 'hl' });
+      S('rect', { x: 18, y: y0, width: 76, height: yEnd - y0, rx: 4, 'class': 'fi-none' });
+      T(56, (y0 + yEnd) / 2 + 5, cur.key, 'tx-mono tx-sm tx-mid');
+      blocks.forEach(function (b) {
+        var k = order[b.it.n];
+        if (k) {
+          S('rect', { x: 116, y: b.top - 2, width: 436, height: b.bottom - b.top + 4, rx: 4, 'class': 'fw-s2 st-s2 sw-2 dash' });
+          S('circle', { cx: 104, cy: b.top + 20, r: 11, 'class': 'fi-paper st-s2 sw-2' });
+          T(104, b.top + 26, String(k), 'tx-sm tx-mid');
+        }
+        if (cur.cf.type === 'super') {
+          S('rect', { x: 120, y: b.top + 1, width: 428, height: b.bottom - b.top - 2, rx: 4, 'class': 'fi-none' });
+          T(128, b.top + 21, b.it.n, 'tx-sm tx-bold');
+          T(540, b.top + 21, 'super column', 'tx-sm tx-end tx-muted');
+          var yy = b.top + 30;
+          b.it.sub.forEach(function (sc) { column(sc, 134, yy); yy += 48; });
+        } else column(b.it, 122, b.top);
+      });
+    }
+    function show(it) { return it.sub ? it.n + ' {' + it.sub.map(function (s) { return s.n; }).join(', ') + '}' : it.n + ' = ' + it.v; }
+
+    ui.onChange(function () {
+      var cur = current();
+      syncNames(cur);
+      var res = slice(cur), sup = cur.cf.type === 'super';
+      roMap.set('app › ' + cur.cf.name + ' › ' + cur.key + ' → ' + cur.items.map(function (i) { return i.n; }).join(', '));
+      roCall.set('get_slice("' + cur.key + '", ' + cur.cf.name + ', SliceRange(start "' + (startSel.value || '') + '", finish "' + (finishSel.value || '') + '", reverse ' + rev.value + ', count ' + Math.round(cnt.value) + '), CL)');
+      roRet.set(res.err ? 'refused' : res.out.length ? res.out.map(show).join(' · ') : 'nothing', res.err ? 'bad' : undefined);
+      var t;
+      if (res.err) t = rev.value ? 'Cassandra refuses this slice: with reverse on, start is the upper end and must not sort before finish.' : 'Cassandra refuses this slice: with reverse off, start must not sort after finish.';
+      else {
+        t = sup ? 'The slice runs over the super column names, which are indexed; each super column comes back whole, because "sub-column names in a SCF are not indexed" (p. 425).'
+          : cur.cf.cmp === 'long' ? 'The column names are timestamps compared as numbers (comparator long): the row is a timeline, and reverse walks it from the newest end.'
+          : 'The columns come back in the order of their names (comparator utf8) — not in the order they were written, and never filtered by value.';
+        if (rev.value) t += ' Reverse on: the names are walked downwards, so start is the upper end of the stretch and finish the lower one.';
+        if (res.out.length >= Math.round(cnt.value) && res.out.length < cur.items.length) t += ' The count stops the slice after ' + Math.round(cnt.value) + ', like LIMIT.';
+      }
+      note.set(t);
+      draw(cur, res);
+    });
+  });
+  </script>
+
+  <p>Pages 427–428 list the calls of the API of the time, Thrift RPC. Every call on these slides names its rows by key — one key, a list of keys or a range — never by a value, and ends with CL, the <mark class="key">consistency level</mark>: how many replicas must answer (<a href="l22.html">lesson 22</a>). That is "tuneably consistent" in practice.</p>
+
+  <figure class="tbl-fig" id="l20-tbl-api">
+    <figcaption>The read and write API of pp. 427–428 (Thrift, Cassandra of 2010).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Call</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>get(key, path, CL)</code></td><td>one column or super column of one row, at its column path ("get the Col or SC at given ColPath"); it returns a ColumnOrSuperColumn</td></tr>
+          <tr class="is-key"><td><code>get_slice(key, parent, predicate, CL)</code></td><td>the columns of one row chosen by a slice predicate ("get Cols in one row")</td></tr>
+          <tr><td><code>multiget_slice(rowKeys, parent, predicate, CL)</code></td><td>the same slice for a list of keys: a map key → columns</td></tr>
+          <tr><td><code>get_range_slices(parent, predicate, keyRange, CL)</code></td><td>a slice of every row in a range: "range is startkey, endkey, starttoken, endtoken"</td></tr>
+          <tr><td><code>insert(key, parent, Column, CL)</code></td><td>writes one column: name, value, clock</td></tr>
+          <tr><td><code>batch_mutate(map&lt;byte[], map&lt;String, List&lt;Mutation&gt;&gt;&gt;, CL)</code></td><td>many inserts and deletions — per row key, per column family — in one call</td></tr>
+          <tr><td><code>remove(byte[], ColumnPath column_path, Clock, CL)</code></td><td>deletes a column, a super column or a row, with a clock: the deletion competes with writes by timestamp</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+<pre><code>// p. 428: write one column (name, value, clock)
+client.insert(userKeyBytes, parent,
+    new Column("band".getBytes(UTF8),
+    "Funkadelic".getBytes(), clock), CL);</code></pre>
+
+  <p>The insert is p. 420 in code: name, value, clock. There is no separate update: writing an existing column stores a new value with a newer clock, and the newer clock wins.</p>
+
+  <p>All this is the Cassandra of 2010. Current Cassandra offers the same model through CQL tables, the language of the exercise sessions and the past papers (<a href="l21.html">lesson 21</a>); Thrift was removed in version 4.0 (2021), and super columns no longer exist. Theory questions use the slides' words, exercises the CQL ones:</p>
+
+  <figure class="tbl-fig" id="l20-tbl-cql">
+    <figcaption>The slides' vocabulary and its CQL counterpart.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>On the slides (2010)</th><th>In CQL (lesson 21)</th></tr></thead>
+        <tbody>
+          <tr><td>keyspace</td><td>keyspace, <code>CREATE KEYSPACE … WITH replication = {…}</code></td></tr>
+          <tr><td>column family</td><td>table — the papers write "tables (column families)"</td></tr>
+          <tr class="is-key"><td>row key</td><td>partition key: decides on which nodes the row lives</td></tr>
+          <tr class="is-key"><td>column names sorted by the comparator</td><td>clustering columns, sorted by <code>CLUSTERING ORDER BY</code></td></tr>
+          <tr><td>column value, bytes</td><td>a regular column with a type (<code>text</code>, <code>int</code>, …)</td></tr>
+          <tr><td>timestamp (clock)</td><td>the write time of every cell: still last write wins</td></tr>
+          <tr><td>super column</td><td>gone: one more clustering column, or a user-defined type</td></tr>
+          <tr><td>slice predicate: start, finish, reverse, count</td><td>a range on a clustering column, <code>ORDER BY … DESC</code>, <code>LIMIT</code></td></tr>
+          <tr><td>get, insert, remove … with a CL</td><td><code>SELECT</code>, <code>INSERT</code>, <code>DELETE</code> in cqlsh, with a consistency level</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+</section>
+
+
+<section id="l20-queries">
+  <h2>No SELECT … WHERE: start from the queries</h2>
+
+  <p>Page 429 asks "what about… SQL?" and lists five habits: SELECT, WHERE, ORDER BY, JOIN ON, GROUP. The answer is a way of designing, not a clause.</p>
+
+  <p>Page 430: "rdbms: domain-based model — what answers do I have?"; "cassandra: query-based model — what questions do I have?"; "Start from queries, then design the data model". A relational designer models the domain — entities, relationships, normal forms (lessons <a href="l08.html">8</a>–<a href="l09.html">9</a>) — and answers later questions with joins. Cassandra finds rows only by key and does not join, so a question with no structure built for it has no efficient answer: you list the questions first.</p>
+
+  <p>Page 431, "cassandra is an index factory": the column family USER has the key UserID and the columns username, email, birth date, city, state. It answers "give me user 123" in one read, and nothing else. "How to support this query?"</p>
+
+<pre><code>-- p. 431: the query that USER, keyed by UserID, cannot answer
+SELECT * FROM User WHERE city = 'Scottsdale'</code></pre>
+
+  <p>The slide's answer: "Create a new CF called UserCity", keyed by city, whose columns are the "IDs of the users in that city". The query becomes one row read, plus a <code>multiget_slice</code> on USER for the users. UserCity "uses the <mark class="key">Valueless Column</mark> pattern": the information is in the column names, the values are empty. What an RDBMS does with an index, you do by hand, one column family per question, written together with USER — an <mark class="key">index factory</mark>.</p>
+
+  <p>In CQL (<a href="l21.html">lesson 21</a>) UserCity is a table whose partition key is the city, with the user ids as clustering values — the valueless columns:</p>
+
+<pre><code>-- UserCity of p. 431 in CQL: one partition per city
+CREATE TABLE user_city (
+  city text,
+  user_id text,
+  PRIMARY KEY ((city), user_id)
+);</code></pre>
+
+<pre><code>-- all the users of Scottsdale: one partition read
+SELECT user_id FROM user_city WHERE city = 'Scottsdale';</code></pre>
+
+  <p>Two conditions at once? Page 432: "Use an aggregate key" — <code>state:city: { user1, user2}</code> — then "Get rows between AZ: &amp; AZ; for all Arizona users" and "Get rows between AZ:Scottsdale &amp; AZ:Scottsdale1 for all Scottsdale users". Why do those bounds work?</p>
+
+  <ol class="steps" id="l20-steps-range">
+    <li><p>Four rows — AZ:Phoenix, AZ:Scottsdale, AZ:Tucson, CA:Fresno — each with its users as valueless columns. Keys compare as strings, character by character, and a prefix sorts first: AZ: comes before AZ:Phoenix.</p></li>
+    <li><p>In ASCII the colon is 58 and the semicolon 59. Every Arizona key has a colon in third place, so it sorts before AZ;. CA:Fresno sorts after AZ; because C comes after A. So AZ: to AZ; holds exactly the Arizona rows.</p></li>
+    <li><p>Likewise AZ:Scottsdale1 sorts right after AZ:Scottsdale: that range holds the one Scottsdale row.</p></li>
+    <li><p>This needs rows in key order: the order-preserving partitioner. The random one keeps rows in the order of the MD5 of their keys — AZ:Phoenix (ab66…), AZ:Tucson (f163…), CA:Fresno (f3ca…), AZ:Scottsdale (f412…) — so a Californian row sits between Arizona rows, and "the rows between AZ: and AZ;" no longer means the Arizona users.</p></li>
+  </ol>
+
+  <p>Page 433, "ORDER BY": "Columns are sorted according to CompareWith or CompareSubcolumnsWith" (the comparators of names and sub-column names); "Rows are placed according to their Partitioner: Random: MD5 of key; Order-Preserving: actual key". No ORDER BY clause: to get entries by time, make the time the column name. The last line needs a correction:</p>
+
+  <aside class="redpen" data-page="433">
+    <p class="claim">"are sorted by key, regardless of partitioner"</p>
+    <p class="fix">Rows are kept in the order of the partitioner's token: the key itself with the order-preserving partitioner, the MD5 of the key with the random one — an order unrelated to the key. Key ranges such as AZ: … AZ; (p. 432) work only with the order-preserving partitioner.</p>
+    <p class="because">Hash the keys of the stepper: CA:Fresno falls between AZ:Tucson and AZ:Scottsdale. The order-preserving partitioner pays for ranges with hot spots — all AZ: keys on the same nodes — and CQL accepts no range on the partition key: ranges go on clustering columns (<a href="l21.html">lesson 21</a>). The exam may be matched against the printed line: know it, and the correct one.</p>
+  </aside>
+
+  <p>No slide answers JOIN ON and GROUP in words; the hotel example of pp. 434–435 (Fig. 4) answers them by design. Eight relational tables tied by foreign keys, where a hotel page needs several joins, become seven column families with no foreign keys, each shaped for the reads it serves.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l20-fig-hotel">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="Before: eight relational tables — Hotel, Room, Reservation, HotelToPOI, RoomToAmenity, Guest, PointOfInterest, Amenity — joined by seven foreign-key arrows.">
+        <rect x="2" y="20" width="84" height="28" class="fi-paper sw-2"/>
+        <rect x="104" y="20" width="96" height="28" class="fi-paper sw-2"/>
+        <rect x="218" y="20" width="80" height="28" class="fi-paper sw-2"/>
+        <rect x="2" y="100" width="84" height="28" class="fi-paper sw-2"/>
+        <rect x="104" y="100" width="96" height="28" class="fi-paper sw-2"/>
+        <rect x="218" y="100" width="80" height="28" class="fi-paper sw-2"/>
+        <rect x="2" y="180" width="84" height="34" class="fi-paper sw-2"/>
+        <rect x="104" y="180" width="96" height="28" class="fi-paper sw-2"/>
+        <line x1="104" y1="34" x2="90" y2="34" marker-end="url(#arr)"/>
+        <line x1="218" y1="34" x2="204" y2="34" marker-end="url(#arr)"/>
+        <line x1="258" y1="48" x2="258" y2="96" marker-end="url(#arr)"/>
+        <line x1="44" y1="100" x2="44" y2="52" marker-end="url(#arr)"/>
+        <line x1="44" y1="128" x2="44" y2="176" marker-end="url(#arr)"/>
+        <line x1="152" y1="100" x2="152" y2="52" marker-end="url(#arr)"/>
+        <line x1="152" y1="128" x2="152" y2="176" marker-end="url(#arr)"/>
+        <text x="44" y="38" class="tx-sm tx-mid">Hotel</text>
+        <text x="152" y="38" class="tx-sm tx-mid">Room</text>
+        <text x="258" y="38" class="tx-sm tx-mid">Reservation</text>
+        <text x="44" y="118" class="tx-sm tx-mid">HotelToPOI</text>
+        <text x="152" y="118" class="tx-sm tx-mid">RoomToAmenity</text>
+        <text x="258" y="118" class="tx-sm tx-mid">Guest</text>
+        <text x="44" y="194" class="tx-sm tx-mid">PointOf</text>
+        <text x="44" y="208" class="tx-sm tx-mid">Interest</text>
+        <text x="152" y="198" class="tx-sm tx-mid">Amenity</text>
+        <text x="258" y="176" class="tx-sm tx-mid">arrows:</text>
+        <text x="258" y="192" class="tx-sm tx-mid">foreign keys</text>
+      </svg>
+      <p class="fig-label">Before (p. 434): eight tables, seven foreign keys</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="After: seven column families, no arrows — Hotel, HotelByCity, the super column family PointOfInterest, Guest, the super column families RoomAvailability and Room, and Reservation.">
+        <rect x="6" y="6" width="288" height="26" class="fi-paper"/>
+        <rect x="6" y="38" width="288" height="26" class="fi-paper"/>
+        <rect x="6" y="70" width="288" height="26" class="fi-paper"/><rect x="9" y="73" width="282" height="20" class="fi-none"/>
+        <rect x="6" y="102" width="288" height="26" class="fi-paper"/>
+        <rect x="6" y="134" width="288" height="26" class="fi-paper"/><rect x="9" y="137" width="282" height="20" class="fi-none"/>
+        <rect x="6" y="166" width="288" height="26" class="fi-paper"/><rect x="9" y="169" width="282" height="20" class="fi-none"/>
+        <rect x="6" y="198" width="288" height="26" class="fi-paper"/>
+        <text x="16" y="23" class="tx-sm">&lt;&lt;CF&gt;&gt; Hotel · key hotelID</text>
+        <text x="16" y="55" class="tx-sm">&lt;&lt;CF&gt;&gt; HotelByCity · city:state → hotel IDs</text>
+        <text x="16" y="87" class="tx-sm">&lt;&lt;SCF&gt;&gt; PointOfInterest · HotelID, poiName</text>
+        <text x="16" y="119" class="tx-sm">&lt;&lt;CF&gt;&gt; Guest · key phone</text>
+        <text x="16" y="151" class="tx-sm">&lt;&lt;SCF&gt;&gt; RoomAvailability · hotelID, date</text>
+        <text x="16" y="183" class="tx-sm">&lt;&lt;SCF&gt;&gt; Room · hotelID, roomID, amenities</text>
+        <text x="16" y="215" class="tx-sm">&lt;&lt;CF&gt;&gt; Reservation · key resID, with copies</text>
+      </svg>
+      <p class="fig-label">After (p. 435): seven column families, no foreign keys</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> The hotel example, before and after (pp. 434–435). Before: a normalised relational schema, where reading a hotel together with its rooms, amenities and nearby points of interest means joining along the arrows. After: one column family per way of reading the data, with copies instead of links; a double outline marks a super column family (&lt;&lt;SCF&gt;&gt;), whose two keys are its super column name and its row key, in the order the slide prints them.</figcaption>
+  </figure>
+
+  <figure class="tbl-fig" id="l20-tbl-hotel">
+    <figcaption>What happened to each table of the hotel (p. 434 → p. 435).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Relational (p. 434)</th><th>Cassandra (p. 435)</th><th>What changed</th></tr></thead>
+        <tbody>
+          <tr><td>Hotel</td><td>&lt;&lt;CF&gt;&gt; Hotel, row key hotelID</td><td>the same entity, found by its key</td></tr>
+          <tr class="is-key"><td>"hotels in a city": a WHERE on City</td><td>&lt;&lt;CF&gt;&gt; HotelByCity, key city:state (printed #city:state:hotelID), columns hotel1, hotel2, …</td><td>an index column family with an aggregate key and valueless columns (pp. 431–432)</td></tr>
+          <tr><td>PointOfInterest + HotelToPOI</td><td>&lt;&lt;SCF&gt;&gt; PointOfInterest, keys HotelID and poiName, columns desc, phone</td><td>the bridge table disappears: the points of interest are copied next to each hotel</td></tr>
+          <tr><td>Room + RoomToAmenity + Amenity</td><td>&lt;&lt;SCF&gt;&gt; Room, keys hotelID and roomID, columns num, type, rate, coffee, tv, hottub, …</td><td>amenities become columns a room has or lacks: a sparse table</td></tr>
+          <tr><td>— (counted from reservations)</td><td>&lt;&lt;SCF&gt;&gt; RoomAvailability, keys hotelID and date, kk = 22, qq = 14</td><td>counts kept up to date at write time (the slide does not expand kk and qq): our reading of how GROUP is answered</td></tr>
+          <tr><td>Guest (GuestID, Name, Email)</td><td>&lt;&lt;CF&gt;&gt; Guest, row key phone</td><td>the key is what the application looks guests up by</td></tr>
+          <tr class="is-key"><td>Reservation (GuestID, RoomID, StartDate, EndDate)</td><td>&lt;&lt;CF&gt;&gt; Reservation, row key resID: hotelID, roomID, phone, name, arrive, depart, rate, ccNum</td><td>the guest's phone and name and the room's rate are copied in: no join</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The price: names, phones and rates are stored twice, and the application keeps the copies in step — affordable because writes are cheap ("very fast writes", p. 438). Pages 436–437 compare Cassandra with an RDBMS:</p>
+
+  <figure class="tbl-fig" id="l20-tbl-rdbms">
+    <figcaption>"Properties wrt RDBMS (e.g., Oracle)", pp. 436–437, as printed.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Property</th><th>Cassandra</th><th>RDBMS</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>Core Architecture</td><td>Masterless (no single point of failure)</td><td>Master-slave (single points of failure)</td></tr>
+          <tr><td>High Availability</td><td>Always-on continuous availability</td><td>General replication with master-slave</td></tr>
+          <tr><td>Data Model</td><td>Dynamic; structured and unstructured data</td><td>Legacy RDBMS; Structured data</td></tr>
+          <tr><td>Scalability Model</td><td>Big data/Linear scale performance</td><td>Oracle RAC or Exadata</td></tr>
+          <tr><td>Multi-Data Center Support</td><td>Multi-directional, multi-cloud availability</td><td>Nothing specific</td></tr>
+          <tr><td>Enterprise Search</td><td>Integrated search on Cassandra data.</td><td>Handled via Oracle search</td></tr>
+          <tr><td>In-Memory Database Option</td><td>Built-in in-memory option</td><td>Columnar in-memory option</td></tr>
+          <tr class="is-key"><td>Joining</td><td>Doesn't support joining</td><td>Supports joining</td></tr>
+          <tr class="is-key"><td>Referential Integrity</td><td>Cassandra has no concept of referential integrity across tables. No cascading deletes.</td><td>Supports foreign keys in a table to reference the primary key of a another table. Supports cascading delete.</td></tr>
+          <tr class="is-key"><td>Normalization</td><td>Tables contain duplicate denormalize data.</td><td>Tables are normalized to avoid redundancy.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The rows of p. 437 are the data model in one breath: no joins, no foreign keys, duplicated data — joins and integrity checks would make nodes coordinate on every query. "Enterprise Search" and "In-Memory Database Option" describe DataStax's commercial edition, the table's source (background).</p>
+
+  <p>Page 438 closes with the checklist: "tuneably consistent", "very fast writes", "highly available", "fault tolerant", "linear, elastic scalability", "decentralized/symmetric", "~12 client languages", "Thrift RPC API", "~automatic provisioning of new nodes", "0(1) dht" (read O(1), as on p. 411), "big data" — the mechanisms of <a href="l22.html">lesson 22</a>.</p>
+
+  <div class="tip"><p>When the exam's one-point table asks which DB technology fits which entities (<a href="l05.html">lesson 5</a>), motivate a columnar row with these slides: a large, continuously growing volume of records, written often and read by key along queries known in advance — "Often write-heavy workloads" (p. 412), "very fast writes" and "linear, elastic scalability" (p. 438).</p></div>
+
+  <div class="pitfall"><p>The course notes say Cassandra "is almost exclusively used in OLAP systems with multiple Terabytes sized data" and list "Increased tuple reconstruction costs" among the ways it differs from relational tables: column-store facts carried over by mistake. The slides say "Often write-heavy workloads" (p. 412), and a Cassandra row is stored whole.</p></div>
+
+  <p class="memo"><mark class="key">Start from the queries: one column family per question, the data copied to where it is read, and no joins.</mark></p>
+
+  <p>Back to the puzzle. "The Column Oriented Database stores data in columns" (p. 401) and "think of cassandra as row-oriented" (p. 417) are both right, because "column" means two things. In Vertica or C-Store a column is a file: one attribute of every record, stored together, compressed and scanned — OLAP. In Cassandra a column is a name in a row's sorted map, stored with the rest of its row; a row can hold a huge number of them, hence "Big Column Stores". The deck and the papers ("you decide to store it in a columnar database", exam of 12 Sep 2025) call both "columnar": keep the label, and say which one you mean.</p>
+</section>
+
+
+<section id="l20-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Theory questions in the forms of the theory part — true/false, multiple choice and short open answers, where a wrong answer may cost points — and one practical exercise in the wording of the past papers, built on the hotel of pp. 434–435.</p>
+
+  <div class="exam" data-kind="mcq" id="l20-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: Cassandra stores the values of each column of a column family together, separately from the other columns, as a column-oriented database such as Vertica does.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">That is the column storage of pp. 401–407. Cassandra keeps the columns of a row together under its row key: "think of cassandra as row-oriented" (p. 417).</span></li>
+      <li data-correct>False <span class="fb">Cassandra is a wide-column store: a row, found by its key, holds all its columns together (p. 417). Storing each column apart is the analytic column store of pp. 401–407.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. Cassandra is a wide-column (column-family) store: each row is uniquely identified by its key and keeps all its columns, sorted by name, together, so it should be thought of as row-oriented. Storing each column separately is the design of column-oriented databases such as Vertica or C-Store, built for OLAP: a query reads only the columns it needs, while inserts and whole-record reads touch every column. Cassandra is called columnar because of its column families and its very wide rows, and it is built for write-heavy workloads.</p></div>
+      <div class="exam-note"><p>The trap is the word "column", shared by two different designs (section 2 and section 3). Wrong answers may carry a penalty, announced just before the exam: answer only what you can justify.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-colstore">
+    <div class="exam-q" lang="en">
+      <p>Explain how a column-oriented database stores a table and compare it with a row-oriented database: advantages, disadvantages, and the workloads each one suits.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>A row-oriented database stores each record contiguously; a column-oriented database stores each column contiguously, in its own storage. A query that needs k of the m columns therefore reads only those k columns in a column store, while a row store reads whole records and may read unnecessary data. The column layout also compresses better (the values of a column share a type and repeat, so techniques such as run-length encoding work well) and improves bandwidth utilisation, code pipelining and cache locality. Its disadvantages are increased disk seek time (a record is spread over many files), an increased cost of inserts (one write per column) and increased tuple reconstruction costs (records must be rebuilt by position). Column stores therefore suit read-mostly, read-intensive, large repositories — OLAP and data mining — while row stores suit OLTP, with frequent inserts and updates of whole records.</p></div>
+      <div class="exam-note"><p>A complete answer has four parts: the two layouts, the read argument (k of m columns), the pros and cons in the words of pp. 403–404, and the workloads. A strong extra is the chart of p. 405: the column store loses only when a query selects nearly the whole tuple.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l20-exam-rle">
+    <div class="exam-q" lang="en">
+      <p>The Quarter column of a sales table, sorted by quarter, is stored with run-length encoding as (Q1, 1, 300), (Q2, 301, 350), (Q3, 651, 500), (Q4, 1151, 600). Which statements are correct? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>(Q2, 301, 350) means that Q2 is stored at the positions from 301 to 350. <span class="fb">The third number is a length, not an end: Q2 fills the 350 positions from 301 to 650.</span></li>
+      <li data-correct>The table has 1,750 rows. <span class="fb">The last run ends at 1151 + 600 − 1 = 1750, the same as 300 + 350 + 500 + 600.</span></li>
+      <li data-correct>Position 700 holds Q3. <span class="fb">Q3 starts at 651 and covers 500 positions, up to 1150.</span></li>
+      <li>The Price column of the same table would shrink just as much with the same encoding. <span class="fb">Neighbouring prices rarely repeat: each price would become a triple, three times its raw size, which is why p. 407 leaves Price raw.</span></li>
+      <li data-correct>Sorted by customer instead, the same Quarter column would usually compress far less. <span class="fb">Runs need equal values next to each other; another sort order breaks them up.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The second, third and fifth statements. Each triple is (value, start_pos, run_length), so (Q2, 301, 350) covers the positions 301 to 650; the last run ends at 1151 + 600 − 1 = 1750; position 700 lies in the run of Q3, from 651 to 1150. Run-length encoding pays only when equal values are adjacent: the Quarter column is sorted and the prices are not, so the encoding is chosen column by column and Price stays raw.</p></div>
+      <div class="exam-note"><p>The numbers are those of p. 407, so the answer can be checked against the slide. The classic slip is reading run_length as an end position. Wrong ticks may carry a penalty: tick only what you can justify.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-model">
+    <div class="exam-q" lang="en">
+      <p>Describe the data model of Cassandra as presented in the lecture — keyspace, column family, row, column and super column. Explain why a column family is called a sparse table and what the timestamp of a column is used for.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>A keyspace is the outermost container, roughly a database and typically one per application; some settings, such as the replication, are configured per keyspace. It contains column families, the analogue of tables, which group records of a similar but not identical kind; their settings include the comparator and the type, standard or super. A column family holds rows, each uniquely identified by its row key; Cassandra should be thought of as row-oriented, because a row's columns are stored and returned together. A column has three parts: a name (bytes; it determines the sort order, is used in queries and is indexed), a value (bytes; values are not queried) and a timestamp. A super column groups columns under a common name: it has a name and a map of columns instead of a value, and its sub-column names are not indexed. A column family is a sparse table because each row stores only the columns it has: a missing column costs nothing and is not a NULL. The timestamp (clock) is supplied with every write and resolves conflicts between replicas: the last write wins.</p></div>
+      <div class="exam-note"><p>Give the containment chain in order and the three parts of a column with their properties (p. 420). "Sparse" and "last write wins" are the two whys the question asks for. If you quote the slide's example of a keyspace setting, the partitioner, add that it is in fact set for the whole cluster (red pen on p. 413).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-query">
+    <div class="exam-q" lang="en">
+      <p>Explain the difference between the domain-based model of an RDBMS and the query-based model of Cassandra. How would you support the query <code>SELECT * FROM User WHERE city = 'Scottsdale'</code> on a column family User keyed by UserID, and what does the solution cost?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>An RDBMS follows a domain-based model: you model the entities and relationships of the domain, normalise them, and answer any later question by combining tables with joins ("what answers do I have?"). Cassandra follows a query-based model: rows are found by key, column values are not queried and there are no joins, so you list the questions first and build a structure for each one ("what questions do I have?" — start from queries, then design the data model). For the query, create a second column family, UserCity, keyed by city, whose column names are the IDs of the users living there, with empty values (the Valueless Column pattern): the query becomes one row read, followed by a multiget of the users from User. This is why Cassandra is called an index factory. The cost is duplication: every user is written to both column families, and the application must keep the copies consistent, with no joins and no referential integrity to help.</p></div>
+      <div class="exam-note"><p>Two things make the answer: the why (rows found only by key, no joins) and the price (duplication, copies kept in step by the application). In CQL the same idea is a table with <code>PRIMARY KEY ((city), user_id)</code>. The exercise session's other tool is a secondary index, <code>CREATE INDEX</code>; the design question of the paper of 30 Jan 2026 rules it out with "Do not use indexes".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-hotel">
+    <div class="exam-q" lang="en">
+      <p><b>Our exercise, in the wording of the past papers: the hotel of pp. 434–435.</b> Consider the following ER diagram. Hotel (Hotel_ID, Name, Phone, Address, City, State, Zip); Room (Room_ID, Room Number, Rate); Guest (Guest_ID, Name, Phone, Email). Relationships: Has, Hotel (1, N) – Room (1, 1); Reserve, Guest (0, N) – Room (0, N), with the attributes Start Date and End Date.</p>
+      <p>Suppose you expect to record a large-scale, continuously increasing number of reservations, and therefore you decide to store them in a columnar database. Write the specification of the tables (column families) of a Cassandra deployment so that one can query the hotels of a state, the hotels of a city of a given state, and the reservations of a guest by phone number, the most recent first. Do not use indexes.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Two tables, one per access path: the hotels by location, partitioned by state and clustered by city, and the reservations by guest phone, partitioned by phone and clustered by start date, the most recent first. Each reservation carries copies of the guest, hotel and room data it shows, because Cassandra has no joins.</p>
+<pre><code>-- the keyspace (one per application)
+CREATE KEYSPACE hotels
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 3};</code></pre>
+<pre><code>-- queries 1 and 2: the hotels of a state, or of a city in it
+CREATE TABLE hotels_by_location (
+  state text,
+  city text,
+  hotel_id text,
+  name text,
+  phone text,
+  address text,
+  zip text,
+  PRIMARY KEY ((state), city, hotel_id)
+);</code></pre>
+<pre><code>-- query 3: a guest's reservations, with copies, newest first
+CREATE TABLE reservations_by_guest_phone (
+  guest_phone text,
+  start_date date,
+  reservation_id uuid,
+  end_date date,
+  guest_name text,
+  hotel_id text,
+  hotel_name text,
+  room_number int,
+  rate float,
+  PRIMARY KEY ((guest_phone), start_date, reservation_id)
+) WITH CLUSTERING ORDER BY (start_date DESC, reservation_id ASC);</code></pre>
+<pre><code>-- all the hotels of Arizona: one partition
+SELECT * FROM hotels_by_location WHERE state = 'AZ';</code></pre>
+<pre><code>-- the hotels of Scottsdale: the first clustering column fixed
+SELECT * FROM hotels_by_location
+  WHERE state = 'AZ' AND city = 'Scottsdale';</code></pre>
+<pre><code>-- a guest's reservations, the most recent first
+SELECT * FROM reservations_by_guest_phone
+  WHERE guest_phone = '+1 480 555 0101';</code></pre>
+        <p>Every reservation is one <code>INSERT</code> into <code>reservations_by_guest_phone</code>, with <code>reservation_id</code> from <code>uuid()</code> and the guest's name, the hotel's name and the room's number and rate copied in.</p>
+      </div>
+      <div class="exam-note"><p>This is pp. 431–435 in CQL. <code>hotels_by_location</code> is the aggregate key <code>state:city</code> of p. 432: the state is the partition key and the city the first clustering column, so one table answers both location questions with no key range and no order-preserving partitioner. <code>reservations_by_guest_phone</code> is the Reservation of p. 435: keyed by what the application searches, with copies instead of joins; <code>reservation_id</code> keeps two reservations of one guest on the same day apart, since an <code>INSERT</code> with an existing primary key overwrites. Past papers ask the same kind of question — the farmers' paper of 12 Sep 2025, exercise 1, is solved in <a href="l21.html">lesson 21</a>, together with the CQL rules behind every line.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l20-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A sales table has 20 columns of equal width and ten million rows. A query computes the average of one column. About what share of the row store's bytes does a column store read?</p>
+    <ul class="options">
+      <li>The same: both must read ten million rows <span class="fb">Both visit ten million rows, but the column store reads one value per row, the row store twenty.</span></li>
+      <li data-correct>One twentieth <span class="fb">\(k/m = 1/20\): only the one column the query names travels from disk.</span></li>
+      <li>One half <span class="fb">Nothing here halves: the share is the fraction of columns needed, 1 of 20.</span></li>
+      <li>Twenty times more, because the column store must rebuild the tuples <span class="fb">An average needs no tuples, so nothing is rebuilt. Reconstruction costs only when whole records are returned.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Sensor readings are stored sorted by sensor id, with 50,000 readings per sensor. Which column gains most from run-length encoding?</p>
+    <ul class="options">
+      <li>the temperature, because it is the column queried most <span class="fb">How often a column is queried does not create runs; temperatures change from reading to reading.</span></li>
+      <li>the reading time, because it always increases <span class="fb">Values that always increase never repeat: every run would have length 1.</span></li>
+      <li data-correct>the sensor id <span class="fb">The table is sorted by it, so each sensor's 50,000 equal neighbours become one triple.</span></li>
+      <li>all columns equally: run-length encoding does not depend on the data <span class="fb">It depends entirely on the data: it needs equal neighbouring values.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Two replicas of row 456 disagree: one holds email = eben@bar.com with timestamp 1004, the other email = eben@new.com with timestamp 1010. What do they hold after they are compared?</p>
+    <ul class="options">
+      <li data-correct>eben@new.com on both, because the larger timestamp wins <span class="fb">"last write wins conflict resolution" (p. 420): the clock decides, and the loser is dropped.</span></li>
+      <li>eben@bar.com on both, because it was written first <span class="fb">The rule is the last write, not the first.</span></li>
+      <li>both values, as two versions of the column <span class="fb">A column has one value; the losing write is silently discarded — the price of last write wins.</span></li>
+      <li>whichever value the faster replica holds <span class="fb">Speed decides nothing; the timestamps do.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In time_ordered_blogs_by_user the column names are millisecond timestamps (comparator long). Which slice predicate returns a user's ten latest entries?</p>
+    <ul class="options">
+      <li>start and finish empty, reverse off, count 10 <span class="fb">That walks the names upwards: the ten oldest entries.</span></li>
+      <li data-correct>start and finish empty, reverse on, count 10 <span class="fb">Reverse walks the sorted names from the newest end; count stops after ten, like LIMIT.</span></li>
+      <li>start = the newest timestamp, reverse off, count 10 <span class="fb">From the newest name upwards there is only the newest entry: one column, not ten.</span></li>
+      <li>none: Cassandra has no ORDER BY, so the entries cannot be returned in time order <span class="fb">There is no ORDER BY clause, but the names are sorted by the comparator — making time the column name is exactly how you get order (p. 433).</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">You must answer "the users in Scottsdale" and "the users in Arizona" without reading the whole User column family. Which designs from the lecture work? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>two column families, one keyed by city and one keyed by state, whose column names are the IDs of the users who live there <span class="fb">UserCity of p. 431, built twice: each question is one row read, and every user is written to both families.</span></li>
+      <li><code>SELECT * FROM User WHERE city = 'Scottsdale'</code> on the User column family keyed by UserID <span class="fb">Rows are found by key; without an index this means reading everything — what p. 431 sets out to avoid.</span></li>
+      <li data-correct>a column family keyed by state:city, read with the key range from AZ: to AZ; under the order-preserving partitioner <span class="fb">Page 432: one family answers both questions, as long as the rows are kept in key order.</span></li>
+      <li>the same state:city family under the random partitioner <span class="fb">Rows then follow the MD5 of the key: a Californian row sits between Arizona rows, and the key range no longer means Arizona (red pen on p. 433).</span></li>
+      <li>a join between User and a City column family <span class="fb">"Doesn't support joining" (p. 437).</span></li>
+    </ul>
+    <p class="q-fb">Both working designs are index factories: the data is copied into a family keyed by the value you search.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does Cassandra give up joins (p. 437)?</p>
+    <ul class="options">
+      <li>Because column values are opaque bytes that cannot be compared <span class="fb">A join compares keys, and keys can be compared; the obstacle is elsewhere.</span></li>
+      <li>Because a column family cannot store another row's key <span class="fb">It can: Reservation stores hotelID and roomID (p. 435). Nothing checks or follows them, that is all.</span></li>
+      <li>Because the CAP theorem forbids joins in AP systems <span class="fb">CAP says nothing about joins; it is about replicas during a partition.</span></li>
+      <li data-correct>Because the rows to combine would live on different nodes, and coordinating them on every query would cost the linear scalability and availability Cassandra is built for <span class="fb">So data that is read together is stored together, duplicated if needed: "Tables contain duplicate denormalize data" (p. 437).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the super column family PointOfInterest you need only the phone of the Empire State Building (row 10019). What does Cassandra read?</p>
+    <ul class="options">
+      <li>only the phone column, found through an index <span class="fb">"sub-column names in a SCF are not indexed" (p. 425).</span></li>
+      <li>the whole row 10019, Central Park included <span class="fb">Super column names are indexed, so it can go straight to Empire State Building.</span></li>
+      <li data-correct>the whole super column Empire State Building, desc and phone, and then picks the phone <span class="fb">The top level is indexed, the sub-columns are not: a super column is read whole.</span></li>
+      <li>nothing: a super column cannot be read by name <span class="fb">A column path can name the super column and even the sub-column (get, p. 427); it is the cost that differs.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l20-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A row store keeps each record in one piece, a column store each column: a query that needs \(k\) of \(m\) columns reads the share \(k/m\) of the bytes in a column store, but reading or inserting a whole record touches \(m\) places — "suitable for read-mostly, read-intensive, large data repositories" (pp. 402–405).</li>
+    <li>Column stores compress well because neighbouring values belong to one attribute; run-length encoding stores (value, start_pos, run_length) and pays only on sorted or clustered columns (pp. 406–407).</li>
+    <li>"Columnar" names two families: column-oriented stores (Vertica, C-Store, MonetDB, SybaseIQ, LucidDB) and wide-column stores (Cassandra, BigTable, HBase) — "think of cassandra as row-oriented" (p. 417).</li>
+    <li>"cassandra ~= bigtable + dynamo": Bigtable's data model (a sparse map) on Dynamo's distribution (an O(1) DHT, client-tunable consistency); by default AP and eventually consistent, "tuneably consistent" per operation.</li>
+    <li>keyspace › column family › row (by key) › column (name, value, timestamp): names sorted by the comparator and read in slices, values not queried by design, last write wins; super columns add a level of named groups whose sub-columns are not indexed.</li>
+    <li>Cassandra's model is query-based: start from the queries, build a column family per question (index factory, valueless columns, aggregate keys), get order by design (comparator, partitioner), and denormalise instead of joining — no joins, no referential integrity.</li>
+    <li>Today the same model is written in CQL (lesson 21): table, partition key, clustering columns; no super columns, no Thrift.</li>
+  </ul>
+  <aside class="cheat" id="l20-cheat">
+    <dl>
+      <dt>Row store</dt><dd>each record in one piece: easy inserts and updates, "might read in unnecessary data" (OLTP)</dd>
+      <dt>Column store</dt><dd>each column in its own piece: "only need to read in relevant data"; reads \(k/m\) of the bytes (OLAP)</dd>
+      <dt>Pros (p. 403)</dt><dd>data compression · bandwidth utilization · code pipelining · cache locality</dd>
+      <dt>Cons (p. 404)</dt><dd>disk seek time · cost of inserts · tuple reconstruction</dd>
+      <dt>Tuple reconstruction</dt><dd>position \(i\) of every column = record \(i\); "Large prefetch hides disk seeks in columns"</dd>
+      <dt>RLE triple</dt><dd>(value, start_pos, run_length): covers start_pos … start_pos + run_length − 1; next start = start + length</dd>
+      <dt>cassandra ~= bigtable + dynamo</dt><dd>sparse-map data model + O(1) DHT and client-tunable consistency</dd>
+      <dt>CAP (p. 400)</dt><dd>Cassandra: eventual (weak) consistency, availability, partition tolerance; "tuneably consistent" (p. 438)</dd>
+      <dt>Keyspace</dt><dd>~= database, one per application; sets the replication (the partitioner is one per cluster)</dd>
+      <dt>Column family</dt><dd>sparse table of similar records; comparator; type standard or super</dd>
+      <dt>Column</dt><dd>name (sorted, used in queries, indexed) · value (not queried) · timestamp (last write wins)</dd>
+      <dt>Comparator</dt><dd>order of the column names: byte, utf8, long, timeuuid, lexicaluuid, pluggable</dd>
+      <dt>Super column</dt><dd>name + map of columns; sub-column names not indexed, read whole</dd>
+      <dt>SliceRange</dt><dd>start, finish (empty = stop on count), reverse, count (like LIMIT)</dd>
+      <dt>Read / write API</dt><dd><code>get</code>, <code>get_slice</code>, <code>multiget_slice</code>, <code>get_range_slices</code>; <code>insert</code>, <code>batch_mutate</code>, <code>remove</code> — key first, CL last</dd>
+      <dt>Query-based model</dt><dd>"Start from queries, then design the data model": index factory, valueless columns, aggregate keys</dd>
+      <dt>ORDER BY (p. 433)</dt><dd>columns by the comparator; rows by the partitioner's token — key order only with order-preserving</dd>
+      <dt>vs RDBMS (pp. 436–437)</dt><dd>masterless; no joins; no referential integrity; duplicated, denormalised data</dd>
+      <dt>In CQL</dt><dd><code>PRIMARY KEY ((city), user_id)</code>: row key → partition key, sorted names → clustering columns</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l20-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://cassandra.apache.org/doc/stable/cassandra/developing/data-modeling/data-modeling_logical.html" target="_blank" rel="noopener">Logical data modeling</a>
+      <span class="res-by">Apache Cassandra documentation</span>
+      <p class="res-why">A hotel domain like that of pp. 434–435, modelled from its queries into CQL tables such as <code>hotels_by_poi</code> and <code>available_rooms_by_hotel_date</code>. Read it next to section 5: the same "index factory", in the notation of the exercise sessions.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=UuHw3SQMrog" target="_blank" rel="noopener">F2023 #05 – Storage Models &amp; Database Compression</a>
+      <span class="res-by">Andy Pavlo, CMU Intro to Database Systems</span>
+      <p class="res-why">A university lecture on row versus column layout and on compression — run-length, dictionary, bit-packing — that turns the four pros and three cons of pp. 403–404 into page layouts.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/" target="_blank" rel="noopener">Bigtable: A Distributed Storage System for Structured Data</a>
+      <span class="res-by">Chang et al., Google, OSDI 2006</span>
+      <p class="res-why">The "sparse map" of p. 411 in its original words: rows, column families and timestamps. Section 2, on the data model, is enough.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.cornell.edu/projects/ladis2009/papers/lakshman-ladis2009.pdf" target="_blank" rel="noopener">Cassandra – A Decentralized Structured Storage System</a>
+      <span class="res-by">Avinash Lakshman, Prashant Malik, LADIS 2009</span>
+      <p class="res-why">Six pages by the two authors: the data model of this lesson and the ring of the next ones, with the inbox search that Cassandra was built for.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You can now draw a Cassandra row the way the slides do. The exercise sessions and the past papers write it in CQL: which part of <code>PRIMARY KEY ((…), …)</code> decides where a row lives, which part decides its order, and which WHERE clauses does Cassandra refuse?</p>
+</aside>
+
+</main>
+</body>
+</html>

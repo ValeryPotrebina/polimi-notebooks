@@ -1,0 +1,1379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Keeping an in-memory database alive; caching and memcached · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the text field of the topology widget (the toolkit has no text input); tokens only */
+.l19-keyinput { width: 100%; min-height: 2.5rem; padding: 0.3rem 0.6rem; font-family: var(--f-mono); font-size: var(--t-sm); color: var(--ink); background: var(--paper); border: 1.5px solid var(--line-2); border-radius: var(--radius); }
+.l19-keyinput:focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l19">
+
+<header class="lesson-head">
+  <h1>Keeping an in-memory database alive; caching and memcached</h1>
+  <p class="lede">After this lesson you will say what Redis does so that a crash or a dead machine costs little — snapshots, logs, slaves, Sentinel, Cluster and its 16384 slots — and when a cache that forgets on purpose, like memcached, is worth having at all.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>Two programs keep all their data in RAM, and you pull the plug on both. The slide of the first is a list of machinery for surviving exactly that: snapshots on disk, a log of every write, copies on other machines, and automatic ways to put a copy in charge when a machine dies (p. 359). The slide of the second reads like a confession: "No persistency (if your server goes down, data in memcached is gone)", "No redundancy / fail-over", "No replication (single item in cache lives on one server only)" (p. 381).</p>
+  <p>Yet four slides earlier the second program is "used by Netlog, Facebook, Flickr, Wikipedia, Twitter, YouTube" (p. 377). Which of the two is badly designed?</p>
+  <p>Neither — and the reason sits in a single word of the definition of a cache. By the end of the lesson you will know that word, the four kinds of machinery the first program needs, and the one ratio that decides whether the second is worth having at all.</p>
+</div>
+
+
+<section id="l19-axes">
+  <h2>Four ways to keep RAM from forgetting</h2>
+
+  <p>Redis answers from memory, which is why it is fast (<a href="l17.html">lesson 17</a>). Memory has two weaknesses: it forgets everything when the process or the machine stops, and one machine has only so much of it. The lecture is frank about the price of fixing the first: "increased persistency will tend to increase latency and decrease throughput" (p. 349).</p>
+
+  <p>Page 359, "Scaling Redis", answers with four headings, and each one guards against a different accident (Fig. 1):</p>
+
+  <div class="def">
+    <p><dfn>Persistence</dfn> — "Redis provides two mechanisms to deal with persistence: Redis database snapshots (RDB) and append-only files (AOF)." Against: the process stops and the RAM is wiped.</p>
+    <p><dfn>Replication</dfn> — an instance known as the <mark class="key">master</mark> "ensures that one or more instances … the slaves, become exact copies of the master. Clients can connect to the master or to the slaves. Slaves are read only by default." Against: a whole machine is lost.</p>
+    <p><dfn>Partitioning</dfn> — "Breaking up data and distributing it across different hosts in a cluster", in one of three layers: the client ("Partitioning on client-side code"), a proxy ("An extra layer that proxies all redis queries and performs partitioning", e.g. Twemproxy) or a query router ("instances will make sure to forward the query to the right node", e.g. Redis Cluster). Against: the data outgrows one machine.</p>
+    <p><dfn>Failover</dfn> — "Manual", "Automatic with Redis Sentinel (for master-slave topology)" or "Automatic with Redis Cluster (for cluster topology)". Against: the master dies and nobody accepts writes.</p>
+  </div>
+
+  <aside class="margin-note">Since version 5, Redis calls a slave a replica (the command is REPLICAOF). The slides say slave, and so does this lesson.</aside>
+
+  <figure class="fig fig--plain" id="l19-fig-axes">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="Four accidents and the answer of page 359 to each: RAM wiped, answered by persistence (Redis writes an RDB or AOF file to disk); machine lost, answered by replication (a master copies its data to a slave); too much data, answered by partitioning (three machines each hold a part); master dies, answered by failover (a slave is promoted to master)">
+      <line x1="204" y1="40" x2="282" y2="40" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="158" y="26" width="44" height="28" class="fi-paper"/>
+      <line x1="165" y1="33" x2="195" y2="33" class="st-muted"/>
+      <line x1="165" y1="40" x2="195" y2="40" class="st-muted"/>
+      <line x1="165" y1="47" x2="195" y2="47" class="st-muted"/>
+      <path d="M290 20 H312 L322 30 V60 H290 Z" class="fi-paper"/>
+      <path d="M312 20 V30 H322 Z" class="fi-soft"/>
+      <text x="20" y="45" class="tx-sm">RAM wiped</text>
+      <text x="180" y="72" class="tx-sm tx-mid">Redis</text>
+      <text x="306" y="78" class="tx-sm tx-mid">RDB · AOF</text>
+      <text x="430" y="45" class="tx-bold">persistence</text>
+
+      <line x1="204" y1="105" x2="282" y2="105" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="158" y="91" width="44" height="28" class="fi-paper st-s6 dash sw-3"/>
+      <line x1="165" y1="98" x2="195" y2="98" class="st-muted"/>
+      <line x1="165" y1="105" x2="195" y2="105" class="st-muted"/>
+      <line x1="165" y1="112" x2="195" y2="112" class="st-muted"/>
+      <rect x="284" y="91" width="44" height="28" class="fi-paper"/>
+      <line x1="291" y1="98" x2="321" y2="98" class="st-muted"/>
+      <line x1="291" y1="105" x2="321" y2="105" class="st-muted"/>
+      <line x1="291" y1="112" x2="321" y2="112" class="st-muted"/>
+      <text x="20" y="110" class="tx-sm">machine lost</text>
+      <text x="180" y="137" class="tx-sm tx-mid">master</text>
+      <text x="306" y="137" class="tx-sm tx-mid">slave</text>
+      <text x="430" y="110" class="tx-bold">replication</text>
+
+      <rect x="158" y="156" width="44" height="28" class="fi-paper"/>
+      <line x1="165" y1="163" x2="195" y2="163" class="st-muted"/>
+      <line x1="165" y1="170" x2="195" y2="170" class="st-muted"/>
+      <line x1="165" y1="177" x2="195" y2="177" class="st-muted"/>
+      <rect x="228" y="156" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="163" x2="265" y2="163" class="st-muted"/>
+      <line x1="235" y1="170" x2="265" y2="170" class="st-muted"/>
+      <line x1="235" y1="177" x2="265" y2="177" class="st-muted"/>
+      <rect x="298" y="156" width="44" height="28" class="fi-paper"/>
+      <line x1="305" y1="163" x2="335" y2="163" class="st-muted"/>
+      <line x1="305" y1="170" x2="335" y2="170" class="st-muted"/>
+      <line x1="305" y1="177" x2="335" y2="177" class="st-muted"/>
+      <text x="20" y="175" class="tx-sm">too much data</text>
+      <text x="180" y="202" class="tx-sm tx-mid">part 1</text>
+      <text x="250" y="202" class="tx-sm tx-mid">part 2</text>
+      <text x="320" y="202" class="tx-sm tx-mid">part 3</text>
+      <text x="430" y="175" class="tx-bold">partitioning</text>
+
+      <line x1="204" y1="235" x2="282" y2="235" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="158" y="221" width="44" height="28" class="fi-paper"/>
+      <line x1="165" y1="228" x2="195" y2="228" class="st-muted"/>
+      <line x1="165" y1="235" x2="195" y2="235" class="st-muted"/>
+      <line x1="165" y1="242" x2="195" y2="242" class="st-muted"/>
+      <line x1="160" y1="217" x2="200" y2="253" class="st-bad sw-3"/>
+      <line x1="160" y1="253" x2="200" y2="217" class="st-bad sw-3"/>
+      <rect x="284" y="221" width="44" height="28" class="fi-paper st-s6 dash sw-3"/>
+      <line x1="291" y1="228" x2="321" y2="228" class="st-muted"/>
+      <line x1="291" y1="235" x2="321" y2="235" class="st-muted"/>
+      <line x1="291" y1="242" x2="321" y2="242" class="st-muted"/>
+      <text x="20" y="240" class="tx-sm">master dies</text>
+      <text x="243" y="225" class="tx-sm tx-mid halo">promote</text>
+      <text x="180" y="267" class="tx-sm tx-mid">master</text>
+      <text x="306" y="267" class="tx-sm tx-mid">slave, now master</text>
+      <text x="430" y="240" class="tx-bold">failover</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The four headings of p. 359, each against its own accident. A dashed ochre outline marks the master: the copy that takes the writes.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Persistence survives a restart, replication survives a lost machine, partitioning survives growth, failover keeps the writes going when the master dies.</mark></p>
+
+  <h3>Snapshot or log?</h3>
+
+  <p>The slide only names the two; the mechanics are from the Redis documentation. An <abbr title="Redis database">RDB</abbr> snapshot is a photograph: every few minutes, or sooner when many keys change, Redis writes a point-in-time copy of the whole dataset into one compact file. An <abbr title="append-only file">AOF</abbr> is a ledger: every write command is appended to a log, which Redis replays at restart.</p>
+
+  <p>A crash therefore costs different amounts (Fig. 2). The snapshot loses everything written since it was taken — minutes. The log loses only what had not reached the disk: about a second with the default policy (one flush per second), nothing if the file is synced after every write. That last setting is the "increased persistency" of p. 349: every write waits for the disk. In exchange, a snapshot is smaller and faster to reload than a log of every command. With both switched on, Redis restarts from the log, the more complete of the two.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l19-fig-persist">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="RDB: eight writes, a snapshot after the fourth, a crash after the eighth; after the restart only the four writes before the snapshot are back, the last four are lost">
+        <text x="20" y="24" class="tx-sm">writes before the crash</text>
+        <rect x="20" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="150" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="176" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="202" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <line x1="118" y1="28" x2="118" y2="62" class="sw-2 dash"/>
+        <line x1="236" y1="36" x2="252" y2="52" class="st-bad sw-3"/>
+        <line x1="236" y1="52" x2="252" y2="36" class="st-bad sw-3"/>
+        <text x="118" y="78" class="tx-sm tx-mid">snapshot</text>
+        <text x="244" y="78" class="tx-sm tx-mid">crash</text>
+        <line x1="20" y1="96" x2="270" y2="96" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="276" y="112" class="tx-sm tx-muted tx-end">time</text>
+        <text x="20" y="130" class="tx-sm">after the restart</text>
+        <rect x="20" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <rect x="150" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <rect x="176" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <rect x="202" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <text x="170" y="188" class="tx-hand tx-mid">lost</text>
+      </svg>
+      <p class="fig-label">RDB: a snapshot every few minutes</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="AOF: the same eight writes, each appended to the log, and the same crash; after the restart the log is replayed and seven writes are back, only the last one, written in the last second, is lost">
+        <text x="20" y="24" class="tx-sm">writes, each appended to the log</text>
+        <rect x="20" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="150" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="176" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="202" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <line x1="236" y1="36" x2="252" y2="52" class="st-bad sw-3"/>
+        <line x1="236" y1="52" x2="252" y2="36" class="st-bad sw-3"/>
+        <text x="244" y="78" class="tx-sm tx-mid">crash</text>
+        <line x1="20" y1="96" x2="270" y2="96" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="276" y="112" class="tx-sm tx-muted tx-end">time</text>
+        <text x="20" y="130" class="tx-sm">after the restart: the log replayed</text>
+        <rect x="20" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="150" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="176" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="202" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <text x="200" y="188" class="tx-hand tx-mid">lost: last 1 s</text>
+      </svg>
+      <p class="fig-label">AOF: a log of every write</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> The same eight writes and the same crash. Left: the restart reloads the last snapshot, and everything written after it is gone. Right: the restart replays the log; with the default policy (flush once a second) at most the last second is lost. The slide names the two files; the mechanics are from the Redis documentation.</figcaption>
+  </figure>
+</section>
+
+
+<section id="l19-topologies">
+  <h2>Four topologies on one two-by-two</h2>
+
+  <p>Page 360 lists four arrangements, each with its promise in brackets (the rendering jumbles the words): "I. Standalone", "II. Sentinel (automatic failover)", "III. Twemproxy (distribute data)", "IV. Cluster (automatic failover and distribute data)". Two capabilities, four combinations.</p>
+
+  <h3>I · Standalone: copies, and nobody to promote them</h3>
+
+  <p>Page 361 draws three shapes: a master alone, a master with slaves, and slaves of slaves ("multi-level"). The slaves give "data redundancy, reads offloading and save-to-disk offloading": a copy if the master's machine dies, more machines for reads, and a machine that writes the snapshots and logs instead of the master. "Clients can connect to the Master for read/write operations or to the Slaves for read operations." Then the line that matters: "There is no automatic failover."</p>
+
+  <p>Why read-only slaves? One machine orders the writes, so the copies never disagree about them. The copying is asynchronous (from the Redis documentation): the master answers before the slaves have the write, so a slave promoted after a crash may lack the last writes.</p>
+
+  <h3>II · Sentinel: a watchdog that promotes</h3>
+
+  <p>"Redis Sentinel provides a reliable automatic failover in a master/slave topology, automatically promoting a slave to master if the existing master fails" (p. 362). The figure puts a Sentinel on each of three servers, watching the master and the slaves and talking to each other. Why several? So that one Sentinel with a broken cable cannot depose a healthy master: the Redis documentation asks for at least three, and a failover needs the vote of a majority of them. The second bullet: "Sentinel does not distribute data across nodes" — every slave still holds the whole dataset.</p>
+
+  <h3>III · Twemproxy: a proxy that splits</h3>
+
+  <p>"Twemproxy works as a proxy between the clients and many Redis instances" — the second picture runs three of them behind a load balancer — and "Is able to automatically distribute data among different standalone Redis instances" (p. 363). It "Supports consistent hashing": servers and keys are hashed onto the same circle, and a key belongs to the first server point after it, clockwise; when a server joins or leaves, only the keys next to its points move, about one in n for n servers, where "hash mod the number of servers" would move almost all. Twemproxy "is a project from Twitter and is not part of redis"; "Multi-key commands and transactions are not supported" — such a command may need several servers — and there is no failover: a dead instance takes its keys with it.</p>
+
+  <details class="why">
+    <summary>"Not supported" — really none of them?</summary>
+    <p>Twemproxy's own notes are finer: it splits <code>MGET</code>, <code>MSET</code> and <code>DEL</code> by server (<code>MSET</code> is then not atomic); <code>SINTER</code> or <code>RPOPLPUSH</code> work only when all their keys hash to one server, which hash tags arrange; <code>MULTI</code>/<code>EXEC</code> transactions do not work at all. At the exam, give the slide's sentence.</p>
+  </details>
+
+  <h3>IV · Cluster: slots with owners</h3>
+
+  <p>"Redis Cluster distributes data across different Redis instances and perform automatic failover if any problem happens to any master instance" (p. 364). "All nodes are directly connected with a service channel": they check on each other and agree on who is alive. "The keyspace is divided into hash slots. Different nodes will hold a subset of hash slots." The figure adds the numbers — "Slots 0-6000", "Slots 6001-12000", "Slots 12001-16383": 16384 <mark class="key">hash slots</mark> in all, each owned by one master. Which slot a key falls into is fixed by a formula of the Redis Cluster specification:</p>
+
+  <div class="formula">
+    \[ \text{slot}(k) = \text{CRC16}(k) \bmod 16384 \]
+    <dl class="legend">
+      <dt>\(k\)</dt><dd>the key, as a string</dd>
+      <dt>CRC16</dt><dd>a 16-bit checksum of the key's bytes, a number from 0 to 65535</dd>
+    </dl>
+  </div>
+
+  <p>Key <code>foo</code> lands in slot 12182, so in the slide's cluster it lives on master C. When a master fails, one of its slaves is promoted and takes over its range of slots; the formula never changes, so every key keeps its slot. The last bullet: "Multi-key commands are only allowed for keys in the same hash slot." A command that needs two keys must run on one machine, atomically. <code>user:42:name</code> and <code>user:42:city</code> land in slots 6755 and 8210 — both on master B, yet the command is refused, because slots, not machines, are the unit that moves between masters:</p>
+
+<pre><code>redis> MGET user:42:name user:42:city
+(error) CROSSSLOT Keys in request don't hash to the same slot</code></pre>
+
+  <p>The way out is a <mark class="key">hash tag</mark>: when a key contains <code>{…}</code>, only the part inside the first pair of braces is hashed. <code>{user:42}:name</code> and <code>{user:42}:city</code> both hash <code>user:42</code> and share slot 15880:</p>
+
+<pre><code>redis> MSET {user:42}:name "Ada" {user:42}:city "Milano"
+OK</code></pre>
+
+  <aside class="redpen" data-page="364">
+    <p class="claim">"Master C" → "Slave B1" · "Slave A2" → "Slave A22" · "Slave B1" → "Slave B11", "Slave B12" (labels of the figure "Redis Cluster")</p>
+    <p class="fix">Master C's slave should be labelled C1: "Slave B1" repeats the label of Master B's slave. And in Redis Cluster every slave copies a master directly: slaves of slaves, the "multi-level" picture of p. 361, belong to the standalone topology.</p>
+    <p class="because">A node becomes a slave with <code>CLUSTER REPLICATE</code>, and the Redis documentation requires that "The specified node ID is a master". When a master fails, one of its own slaves takes over its slots, as the widget's Cluster setting shows. The exam may show the figure as printed: recognise it, and draw masters with direct slaves.</p>
+  </aside>
+
+  <p>Now kill some masters yourself. The widget shows <strong>one insight</strong>: copies are not failover, and failover is not distribution — only Cluster has both.</p>
+
+  <div class="widget" id="l19-w-topo">
+    <h3 class="widget-title">Kill the master: the four topologies, one key</h3>
+    <p class="widget-intro">Pick a topology and the keys of one command (or type your own). The drawing shows which machine answers your first key; below it, where the keys fall: in a hash slot of the Cluster, or on the ring of the proxy. Then kill the master that holds your key and read what still works. Slots are computed by the widget with CRC16, as Redis Cluster does; the proxy's ring is a simplified illustration, hashed with CRC16 too, with two points per master.</p>
+    <ol class="tasks">
+      <li>Start with "I · standalone: master-slave" and press <em>Kill the master that holds your key</em>. Before you look: can clients still read? Can they write?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Reads, yes: the slaves still answer from their copies, which may miss the last writes. Writes, no: "Slaves are read only by default" (p. 359) and "There is no automatic failover" (p. 361). Press <em>Promote a slave by hand</em>: writes come back, after an outage as long as it takes a human to notice. That is the "Manual" failover of p. 359.</p></details>
+      </li>
+      <li>Switch to "II · Sentinel" and kill the master again. Predict who takes over, and whether the readout "the data" changes.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Slave 1 becomes master with nobody pressing a button: the Sentinels agree that the master is down and promote it, and slave 2 starts copying the new master. "The data" still says every key is on one master: "Sentinel does not distribute data across nodes" (p. 362).</p></details>
+      </li>
+      <li>"III · Twemproxy" with the key <code>foo</code>: kill the master that holds it. Which keys become unreachable, and does anything take over?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only the keys of that one master — on this ring, <code>foo</code> (position 44950) belongs to master 2. The other two masters keep answering, and nobody takes over: Twemproxy distributes data but has no failover. Distribution and failover are two separate capabilities, which is the whole point of the two-by-two below.</p></details>
+      </li>
+      <li>"IV · Cluster" with <code>user:42:name user:42:city</code>. Predict whether a command on both keys runs. Then choose the pair with <code>{user:42}</code> and kill the master that holds it.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Refused: slots 6755 and 8210 are different, although both sit on master B. With the hash tag both keys hash <code>user:42</code>, slot 15880, and the command runs. Killing master C promotes its slave C1, which now owns slots 12001–16383: the slots are re-owned, and the key's slot does not move.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l19-w-topo', function (root, ui) {
+    /* CRC16-XMODEM on the UTF-8 bytes of the key: the hash of the Redis Cluster specification
+       (checked: "123456789" -> 0x31C3, foo -> slot 12182, hello -> 866, somekey -> 11058) */
+    function utf8(s) {
+      var out = [], i, c, c2, cp;
+      for (i = 0; i < s.length; i++) {
+        c = s.charCodeAt(i);
+        if (c < 0x80) out.push(c);
+        else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+        else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+          c2 = s.charCodeAt(++i); cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+          out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+        } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+      return out;
+    }
+    function crc16(s) {
+      var b = utf8(s), crc = 0, i, k;
+      for (i = 0; i < b.length; i++) {
+        crc ^= b[i] << 8;
+        for (k = 0; k < 8; k++) { crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1); crc &= 0xffff; }
+      }
+      return crc;
+    }
+    function hashPart(key) {
+      var s = key.indexOf('{');
+      if (s < 0) return key;
+      var e = key.indexOf('}', s + 1);
+      if (e < 0 || e === s + 1) return key;
+      return key.substring(s + 1, e);
+    }
+    function slotOf(key) { return crc16(hashPart(key)) % 16384; }
+    var RANGES = ['0–6000', '6001–12000', '12001–16383'], NAMES = ['A', 'B', 'C'];
+    function shardOf(slot) { return slot <= 6000 ? 0 : slot <= 12000 ? 1 : 2; }
+    /* the proxy's ring, cut open: two points per master (an illustration; Twemproxy's default ring has many more) */
+    var RING = [[9000, 0], [21000, 1], [33000, 2], [41000, 0], [52000, 1], [61000, 2]];
+    function ringOwner(pos) { for (var i = 0; i < RING.length; i++) if (RING[i][0] >= pos) return RING[i]; return RING[0]; }
+
+    var dead = -1, promoted = false, hint = '';
+    function fresh() { dead = -1; promoted = false; hint = ''; }
+
+    var topo = ui.select('topology (p. 360)', [
+      { value: 'single', label: 'I · standalone: master only' },
+      { value: 'ms', label: 'I · standalone: master-slave' },
+      { value: 'sentinel', label: 'II · Sentinel' },
+      { value: 'twem', label: 'III · Twemproxy' },
+      { value: 'cluster', label: 'IV · Cluster' }
+    ], function () { fresh(); }, 'ms');
+    var input;
+    var pre = ui.select('keys of one command', [
+      { value: 'foo', label: 'foo' },
+      { value: 'user:42:name user:42:city', label: 'user:42:name user:42:city' },
+      { value: '{user:42}:name {user:42}:city', label: '{user:42}:name {user:42}:city' },
+      { value: 'hello', label: 'hello' },
+      { value: 'own', label: 'your own: type them below' }
+    ], function (v) { if (v !== 'own') input.value = v; hint = ''; }, 'foo');
+    input = Course.el('input', { type: 'text', id: 'l19-w-topo-keys', 'class': 'l19-keyinput', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off' });
+    input.value = 'foo';
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide' }, [
+      Course.el('label', { 'for': 'l19-w-topo-keys' }, [Course.el('span', { 'class': 'ctl-label', text: 'or type your own keys, separated by spaces' })]),
+      input
+    ]));
+    input.addEventListener('input', function () { pre.value = 'own'; hint = ''; ui.changed(); });
+
+    function keys() { return input.value.split(/\s+/).filter(function (k) { return k.length > 0; }).slice(0, 4); }
+    function sharded() { return topo.value === 'twem' || topo.value === 'cluster'; }
+    function ownerIndex(k) {
+      if (k == null) return 0;
+      if (topo.value === 'cluster') return shardOf(slotOf(k));
+      if (topo.value === 'twem') return ringOwner(crc16(k))[1];
+      return 0;
+    }
+
+    ui.button('Kill the master that holds your key', function () {
+      if (dead >= 0) { hint = 'One dead master at a time here: press Start over to bring it back.'; return; }
+      dead = ownerIndex(keys()[0]); promoted = false; hint = '';
+    }, { kind: 'primary' });
+    ui.button('Promote a slave by hand', function () {
+      if (topo.value === 'ms' && dead >= 0) { promoted = true; hint = ''; }
+      else if (topo.value === 'ms') hint = 'The master is alive: there is nothing to promote yet.';
+      else if (topo.value === 'single') hint = 'There is no slave to promote: the master is alone.';
+      else if (topo.value === 'twem') hint = 'The masters behind this proxy have no slaves, and Twemproxy never promotes anything: it only distributes data.';
+      else hint = 'No need: in this topology the promotion is automatic.';
+    });
+    ui.button('Start over', function () { fresh(); }, { kind: 'ghost', icon: 'refresh' });
+
+    var roW = ui.readout('writes (SET)'), roR = ui.readout('reads (GET)'), roF = ui.readout('failover'), roD = ui.readout('the data'), roK = ui.readout('your keys');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'request from the client', color: 's2', mark: 'line' },
+      { label: 'data copied master → slave', color: 's1', mark: 'line' },
+      { label: 'the machine that takes the writes', color: 's6', mark: 'dash' },
+      { label: 'hash slots (Cluster)', color: 's3', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 312, { label: 'The Redis instances of the chosen topology: the client, the masters and slaves, the proxy or the cluster nodes; the request for your key goes to the machine that answers it; below, where the keys fall: in a hash slot of the cluster or on the ring of the proxy' });
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function machine(cx, cy, o) {
+      S('rect', { x: cx - 22, y: cy - 14, width: 44, height: 28, 'class': 'fi-paper' + (o.master ? ' st-s6 dash sw-3' : '') });
+      [-7, 0, 7].forEach(function (d) { S('line', { x1: cx - 15, y1: cy + d, x2: cx + 15, y2: cy + d, 'class': 'st-muted' }); });
+      if (o.dead) {
+        S('line', { x1: cx - 20, y1: cy - 18, x2: cx + 20, y2: cy + 18, 'class': 'st-bad sw-3' });
+        S('line', { x1: cx - 20, y1: cy + 18, x2: cx + 20, y2: cy - 18, 'class': 'st-bad sw-3' });
+      }
+      if (o.label) T(o.lx != null ? o.lx : cx, o.ly != null ? o.ly : cy + 30, o.label, 'tx-sm' + (o.anchor != null ? o.anchor : ' tx-mid') + (o.halo ? ' halo' : ''));
+    }
+    function client(x, y) { S('rect', { x: x, y: y, width: 36, height: 24, rx: 6, 'class': 'fi-paper' }); }
+    function arrow(x1, y1, x2, y2, cls, mk) { S('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': cls, 'marker-end': 'url(#' + mk + ')' }); }
+    function curve(d, cls, mk) { S('path', { d: d, 'class': cls + ' fi-none', 'marker-end': 'url(#' + mk + ')' }); }
+    function sentinel(cx, cy) { S('circle', { cx: cx, cy: cy, r: 11, 'class': 'fi-paper st-ink' }); T(cx, cy + 5, 'S', 'tx-sm tx-mid tx-bold'); }
+    function labelRows(xs) {
+      /* staggered labels above a strip: two rows, so that close positions do not collide */
+      var last = [-1e9, -1e9];
+      return xs.map(function (x) {
+        if (x - last[0] >= 62) { last[0] = x; return 0; }
+        if (x - last[1] >= 62) { last[1] = x; return 1; }
+        return -1;
+      });
+    }
+
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var t = topo.value, ks = st.keys;
+      if (t === 'single') {
+        client(16, 98); T(34, 140, 'client', 'tx-sm tx-mid');
+        arrow(54, 110, 224, 110, 'st-s2 sw-2' + (dead >= 0 ? ' dash' : ''), 'arr-s2');
+        T(140, 98, 'SET · GET', 'tx-sm tx-mid halo');
+        machine(250, 110, { master: dead < 0, dead: dead >= 0, label: dead >= 0 ? 'master: down' : 'master' });
+        T(280, 272, 'no partitioning: every key lives on the one master', 'tx-sm tx-mid');
+      } else if (t === 'ms' || t === 'sentinel') {
+        var newM = dead >= 0 && (t === 'sentinel' || promoted);
+        client(16, 98); T(34, 140, 'client', 'tx-sm tx-mid');
+        if (dead < 0) {
+          arrow(218, 76, 182, 162, 'st-s1 sw-2', 'arr-s1');
+          arrow(242, 76, 318, 162, 'st-s1 sw-2', 'arr-s1');
+          arrow(54, 104, 204, 66, 'st-s2 sw-2', 'arr-s2');
+          T(124, 74, 'SET', 'tx-sm tx-mid halo');
+        } else if (newM) {
+          curve('M 186 166 Q 250 118 314 164', 'st-s1 sw-2', 'arr-s1');
+          arrow(54, 116, 146, 172, 'st-s2 sw-2', 'arr-s2');
+          T(84, 160, 'SET', 'tx-sm tx-mid halo');
+        } else {
+          arrow(54, 104, 204, 66, 'st-s2 sw-2 dash', 'arr-s2');                 /* dashed: refused */
+          T(124, 74, 'SET', 'tx-sm tx-mid halo');
+          arrow(54, 116, 146, 172, 'st-s2 sw-2', 'arr-s2');                      /* solid: the slave still answers */
+          T(84, 160, 'GET', 'tx-sm tx-mid halo');
+        }
+        machine(230, 60, { master: dead < 0, dead: dead >= 0, label: dead >= 0 ? 'master: down' : 'master', ly: 36 });
+        machine(170, 180, { master: newM, label: newM ? 'slave 1, now master' : 'slave 1', ly: 212 });
+        machine(330, 180, { label: 'slave 2', ly: 212 });
+        if (t === 'sentinel') {
+          sentinel(282, 60); sentinel(222, 180); sentinel(382, 180);
+          T(440, 40, 'S: a Sentinel', 'tx-sm tx-mid');
+          T(440, 58, 'on each server', 'tx-sm tx-mid');
+        }
+        T(280, 272, 'no partitioning: every key on the master, full copies on the slaves', 'tx-sm tx-mid');
+      } else if (t === 'twem') {
+        var own = st.owner;
+        client(16, 98); T(34, 140, 'client', 'tx-sm tx-mid');
+        arrow(54, 110, 104, 110, 'st-s2 sw-2', 'arr-s2');
+        T(80, 86, 'SET · GET', 'tx-sm tx-mid');
+        machine(130, 110, { label: 'Twemproxy', ly: 142 });
+        [46, 110, 174].forEach(function (y, i) {
+          if (i === own && ks.length) arrow(154, 110, 276, y, 'st-s2 sw-2' + (dead === i ? ' dash' : ''), 'arr-s2');
+          else S('line', { x1: 154, y1: 110, x2: 276, y2: y, 'class': 'st-muted' });
+          machine(300, y, { master: dead !== i, dead: dead === i, label: 'master ' + (i + 1) + (dead === i ? ': down' : ''), lx: 332, ly: y + 5, anchor: '' });
+        });
+        /* the ring, cut open */
+        var px = function (p) { return 40 + p / 65535 * 480; };
+        S('line', { x1: 40, y1: 262, x2: 520, y2: 262, 'class': 'st-muted dash sw-2' });
+        if (ks.length) {
+          var p0 = crc16(ks[0]), o0 = ringOwner(p0);
+          if (o0[0] >= p0) { if (px(o0[0]) - px(p0) > 16) arrow(px(p0) + 6, 262, px(o0[0]) - 8, 262, 'st-s2 sw-2', 'arr-s2'); }
+          else { arrow(px(p0) + 6, 262, 524, 262, 'st-s2 sw-2', 'arr-s2'); if (px(o0[0]) - 36 > 16) arrow(36, 262, px(o0[0]) - 8, 262, 'st-s2 sw-2', 'arr-s2'); }
+        }
+        RING.forEach(function (r) {
+          S('rect', { x: px(r[0]) - 6, y: 256, width: 12, height: 12, 'class': 'fi-paper sw-2' + (dead === r[1] ? ' st-bad' : '') });
+          T(px(r[0]), 286, 'M' + (r[1] + 1), 'tx-sm tx-mid');
+        });
+        var pos = ks.map(function (k) { return crc16(k); });
+        var uniq = pos.filter(function (p, i) { return pos.indexOf(p) === i; }).sort(function (a, b) { return a - b; });
+        var rows = labelRows(uniq.map(px));
+        uniq.forEach(function (p, i) {
+          S('circle', { cx: px(p), cy: 262, r: 5, 'class': 'fi-s3' });
+          if (rows[i] >= 0) T(px(p), rows[i] === 0 ? 246 : 232, String(p), 'tx-mono tx-sm tx-mid');
+        });
+        T(280, 306, 'the ring cut open: positions 0–65535, two points per master', 'tx-sm tx-mid tx-muted');
+      } else {
+        /* Cluster: three masters with their slot ranges, one direct slave each, all on the service channel */
+        var ownC = st.owner, COLS = [182, 312, 442];
+        S('rect', { x: 110, y: 32, width: 426, height: 164, rx: 10, 'class': 'st-muted dash fi-none' });
+        T(323, 212, 'service channel: every node linked to every node', 'tx-sm tx-mid');
+        client(16, 38); T(34, 80, 'client', 'tx-sm tx-mid');
+        COLS.forEach(function (cx, i) {
+          var down = dead === i;
+          arrow(cx, 114, cx, 129, 'st-s1 sw-2' + (down ? ' dash' : ''), 'arr-s1');
+          machine(cx, 58, { master: !down, dead: down });
+          T(cx, 90, down ? NAMES[i] + ': down' : 'master ' + NAMES[i], 'tx-sm tx-mid');
+          T(cx, 106, down ? 'no slots' : RANGES[i], 'tx-mono tx-sm tx-mid');
+          machine(cx, 146, { master: down, label: down ? NAMES[i] + '1: ' + RANGES[i] : 'slave ' + NAMES[i] + '1', ly: 178 });
+        });
+        if (ks.length) {
+          var cxo = COLS[ownC];
+          if (dead === ownC) curve('M 34 38 V 22 H ' + (cxo - 46) + ' V 146 H ' + (cxo - 26), 'st-s2 sw-2', 'arr-s2');
+          else curve('M 34 38 V 22 H ' + cxo + ' V 42', 'st-s2 sw-2', 'arr-s2');
+          T(84, 14, 'SET · GET', 'tx-sm tx-mid');
+        }
+        /* the 16384 slots */
+        var sx = function (s) { return 40 + s / 16383 * 480; };
+        [[0, 6000], [6001, 12000], [12001, 16383]].forEach(function (r, i) {
+          S('rect', { x: sx(r[0]), y: 262, width: sx(r[1]) - sx(r[0]), height: 20, 'class': 'fw-s3 st-s3' });
+          T((sx(r[0]) + sx(r[1])) / 2, 277, dead === i ? NAMES[i] + '1 (was ' + NAMES[i] + ')' : NAMES[i], 'tx-sm tx-mid');
+        });
+        var sl = ks.map(slotOf);
+        var us = sl.filter(function (s, i) { return sl.indexOf(s) === i; }).sort(function (a, b) { return a - b; });
+        var rws = labelRows(us.map(sx));
+        us.forEach(function (s, i) {
+          S('path', { d: 'M ' + (sx(s) - 5) + ' 252 L ' + (sx(s) + 5) + ' 252 L ' + sx(s) + ' 260 Z', 'class': 'fi-s3' });   /* a key's position: fi-s3, as on the proxy's ring */
+          if (rws[i] >= 0) T(sx(s), rws[i] === 0 ? 246 : 232, String(s), 'tx-mono tx-sm tx-mid');
+        });
+        T(280, 302, 'hash slots 0–16383: slot = CRC16(key) mod 16384', 'tx-sm tx-mid tx-muted');
+      }
+    }
+
+    function state() {
+      var ks = keys(), t = topo.value, k0 = ks[0];
+      var st = { keys: ks, owner: ownerIndex(k0) };
+      var W, R, F, D, K, toneW, toneR, toneK, msg;
+      if (t === 'single') {
+        D = 'every key on one master';
+        K = ks.length ? 'all on the master: no partitioning' : '—';
+        if (dead < 0) { W = 'accepted by the master'; R = 'answered by the master'; F = 'none: nothing to fail over to'; msg = 'One machine holds everything. Kill it and see what is left.'; }
+        else { W = 'refused: the only master is down'; R = 'refused'; toneW = toneR = 'bad'; F = 'none: someone must restart the master'; msg = 'Everything is down until the master restarts — and without RDB or AOF it comes back empty.'; }
+      } else if (t === 'ms' || t === 'sentinel') {
+        D = t === 'sentinel' ? 'every key on the master, full copies on 2 slaves: no distribution' : 'every key on the master, full copies on 2 slaves';
+        K = ks.length ? 'on the master and on every slave' : '—';
+        if (dead < 0) {
+          W = 'accepted by the master'; R = 'answered by the master or by a slave';
+          F = t === 'sentinel' ? 'automatic: 3 Sentinels watch the master' : 'none: “There is no automatic failover” (p. 361)';
+          msg = t === 'sentinel' ? 'Three Sentinels watch the master. Kill it.' : 'The slaves copy every write of the master. Now kill the master.';
+        } else if (t === 'sentinel') {
+          W = 'accepted by slave 1, promoted by the Sentinels'; toneW = 'good'; R = 'answered by slave 1 (new master) or slave 2';
+          F = 'automatic: the Sentinels agreed, promoted slave 1 and re-pointed slave 2';
+          msg = 'The Sentinels saw the master go silent, agreed that it is down, and by a majority vote promoted slave 1; slave 2 now copies slave 1, and clients ask the Sentinels for the new address. Writes the old master had not yet copied are lost (replication is asynchronous).';
+        } else if (promoted) {
+          W = 'accepted by slave 1, promoted by hand'; toneW = 'good'; R = 'answered by slave 1 or slave 2';
+          F = 'manual: an operator promoted slave 1';
+          msg = 'Writes are back — after an outage as long as it took a human to notice. An operator also had to re-point slave 2 and the clients.';
+        } else {
+          W = 'refused: the master is down and slaves are read only'; toneW = 'bad'; R = 'answered by the slaves (their copies may miss the last writes)';
+          F = 'none yet: press Promote a slave by hand'; toneR = 'key';
+          msg = '“Slaves are read only by default” (p. 359) and “There is no automatic failover” (p. 361): reads survive, writes wait for a human.';
+        }
+      } else if (t === 'twem') {
+        D = 'split over 3 masters by consistent hashing';
+        if (ks.length) {
+          K = ks.map(function (k) { var p = crc16(k); return k + ': ring ' + p + ' → master ' + (ringOwner(p)[1] + 1); }).join(' · ');
+        } else K = 'type a key';
+        F = 'none: Twemproxy only distributes data';
+        if (dead < 0) {
+          W = 'routed by the proxy to the master of each key'; R = W;
+          msg = 'The proxy hashes each key onto the ring and sends it to the first master point clockwise (to the right, wrapping around).';
+        } else {
+          var hit = ks.some(function (k) { return ringOwner(crc16(k))[1] === dead; });
+          W = hit ? 'refused for the keys of master ' + (dead + 1) + '; the others still work' : 'your keys still work: their masters are alive';
+          R = W; toneW = toneR = hit ? 'bad' : '';
+          msg = 'Master ' + (dead + 1) + ' is down and nobody takes over: its keys are unreachable until it returns. The other masters keep answering — distribution without failover.';
+        }
+      } else {
+        D = '16384 slots split over 3 masters, each with a slave';
+        if (ks.length) {
+          var sl = ks.map(slotOf);
+          K = ks.map(function (k, i) { return k + ': slot ' + sl[i] + ' (' + NAMES[shardOf(sl[i])] + ')'; }).join(' · ');
+          if (ks.length > 1) {
+            var same = sl.every(function (s) { return s === sl[0]; });
+            K += same ? ' · one slot: a multi-key command runs' : ' · different slots: a multi-key command is refused (CROSSSLOT)';
+            toneK = same ? 'good' : 'bad';
+          }
+        } else K = 'type a key';
+        if (dead < 0) {
+          W = 'sent to the master that owns the slot'; R = 'sent to the owner of the slot';
+          F = 'automatic: built into the cluster';
+          msg = ks.length > 1 ? 'Each key lives in slot CRC16(key) mod 16384. Multi-key commands only for keys in the same slot (p. 364).' : 'Each key lives in slot CRC16(key) mod 16384; the slide’s figure gives master A slots 0–6000, B 6001–12000, C 12001–16383.';
+        } else {
+          W = 'accepted by ' + NAMES[dead] + '1, the new owner of slots ' + RANGES[dead]; toneW = 'good'; R = W;
+          F = 'automatic: slave ' + NAMES[dead] + '1 elected and promoted';
+          msg = 'The nodes noticed over the service channel that master ' + NAMES[dead] + ' is down; its slave ' + NAMES[dead] + '1 was promoted and now owns slots ' + RANGES[dead] + '. The formula did not change: every key keeps its slot, only the slot changed owner.';
+        }
+      }
+      st.W = W; st.R = R; st.F = F; st.D = D; st.K = K; st.toneW = toneW; st.toneR = toneR; st.toneK = toneK; st.msg = msg;
+      return st;
+    }
+
+    ui.onChange(function () {
+      var st = state();
+      roW.set(st.W, st.toneW || undefined);
+      roR.set(st.R, st.toneR || undefined);
+      roF.set(st.F);
+      roD.set(st.D);
+      roK.set(st.K, st.toneK || undefined);
+      note.set(hint || st.msg);
+      draw(st);
+    });
+  });
+  </script>
+
+  <figure class="tbl-fig" id="l19-tbl-2x2">
+    <figcaption>The four topologies of p. 360 on two separate questions.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>every master holds all the data</th><th>data distributed over masters</th></tr></thead>
+        <tbody>
+          <tr><th>no automatic failover</th><td>I · Standalone (master only, master-slave, multi-level)</td><td>III · Twemproxy (consistent hashing; no multi-key commands or transactions)</td></tr>
+          <tr><th>automatic failover</th><td>II · Sentinel (slaves promoted by vote)</td><td>IV · Cluster (16384 slots; multi-key only within one slot)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>"Redis is highly available." The advantages slide (p. 365) lists "Availability" and "Fault-Tolerance" — true only for the bottom row of the table: of a standalone deployment p. 361 says "There is no automatic failover."</p></div>
+</section>
+
+
+<section id="l19-cache">
+  <h2>When a cache pays</h2>
+
+  <p>Back to the hook's second program. The slides define a cache with Wikipedia (p. 367): "A cache is a collection of data duplicating original values stored elsewhere or computed earlier, where the original data is expensive to fetch (owing to longer access time) or to compute, compared to the cost of reading the cache" — a term they credit to IBM, in the 1960s. Its anatomy (p. 368) is the key-value store of lesson 17 cut to the bone: "simple key/value storage" and three operations, save, get, delete.</p>
+
+  <p>The vocabulary of p. 369, with what each name means:</p>
+
+  <div class="def">
+    <p><dfn>Storage cost</dfn> — the memory spent on holding the copies.</p>
+    <p><dfn>Retrieval cost</dfn> — the price of one look into the cache: "network load / algorithm load", a hop to another server or the work of the lookup itself.</p>
+    <p><dfn>Invalidation</dfn> — "keeping data up to date / removing irrelevant data": throwing away copies whose original has changed.</p>
+    <p><dfn>Replacement policy</dfn> — which entry to evict when the cache is full: "FIFO/LFU/LRU/MRU/RANDOM vs. Belady's algorithm". FIFO evicts the oldest entry, LFU the least frequently used, LRU the least recently used, MRU the most recently used, RANDOM any entry. Belady's algorithm (Laszlo Belady, IBM, 1966) evicts the entry that will be needed again furthest in the future: the best possible choice, and impossible in practice, because it needs to know the future. It is the yardstick for the others, the way the Bayes classifier of statistics is for real classifiers: optimal, and out of reach without information you do not have.</p>
+    <p><dfn>Cold cache / warm cache</dfn> — just started and empty, so nearly every request misses; or filled with the entries the requests keep asking for.</p>
+  </div>
+
+  <aside class="margin-note">The slide writes "hits / hits + misses", without brackets. Its own worked line, 45/(45+10), shows what is meant.</aside>
+
+  <p>A request that finds its key is a <mark class="key">cache hit</mark>; one that does not is a miss, and goes to the original. Page 370 takes 45 hits and 10 misses:</p>
+
+  \[ \begin{aligned} h &amp;= \frac{\text{hits}}{\text{hits} + \text{misses}} \\ &amp;= \frac{45}{45 + 10} \approx 0.818 \end{aligned} \]
+  \[ \text{miss ratio} = 1 - h \approx 0.182 \]
+
+  <p>The slide rounds them to "82% hit ratio" and "18% miss ratio".</p>
+
+  <h3>More hits than misses?</h3>
+
+  <p>Page 371, "When to cache?", gives a principle and a shortcut: "caches are only efficient when the benefits of faster access outweigh the overhead of checking and keeping your cache up to date" — "more cache hits then cache misses". The derivation below, not on the slides, turns the principle into a number. Call \(t_c\) the cost of one look into the cache and \(t_o\) the cost of the original, the database query:</p>
+
+  <ol class="steps" id="l19-steps-breakeven">
+    <li><p>A hit costs only the look: \(t_c\). A miss costs the look and then the trip to the original: \(t_c + t_o\).</p></li>
+    <li><p>A fraction \(h\) of the requests hit and \(1 - h\) miss, so the average request costs</p> \[ T = h\,t_c + (1-h)(t_c + t_o) . \]</li>
+    <li><p>Collect \(t_c\), which every request pays:</p> \[ T = t_c + (1-h)\,t_o . \]</li>
+    <li><p>Without the cache every request costs \(t_o\). The cache pays when \(T \lt t_o\):</p> \[ t_c + (1-h)\,t_o \lt t_o \iff h \gt \frac{t_c}{t_o} . \]</li>
+    <li><p>So the break-even hit ratio is \(h^* = t_c / t_o\): the price of a look, measured in trips to the original. "More hits than misses", \(h \gt 0.5\), is the same rule only when a look costs half a trip. (Writing the copies and invalidating them adds to \(t_c\): the "keeping your cache up to date" of the slide.)</p></li>
+  </ol>
+
+  <aside class="redpen" data-page="371">
+    <p class="claim">"more cache hits then cache misses"</p>
+    <p class="fix">Not the condition. A cache pays when its hit ratio exceeds the break-even \(t_c / t_o\), the cost of a look over the cost of the original. "More hits than misses" is the special case of a look costing half a trip to the original.</p>
+    <p class="because">With \(t_c = 1\) ms in front of a 200 ms query, a hit ratio of 0.3 already pays: \(1 + 0.7 \times 200 = 141\) ms instead of 200 ms. With \(t_c = 1.5\) ms in front of a 2 ms query, even 0.7 loses: \(1.5 + 0.3 \times 2 = 2.1\) ms. Try both in the widget below. The bullet above it on the same slide states the real principle; the exam may quote the shortcut as printed, so know both and say which one is the condition.</p>
+  </aside>
+
+  <div class="widget" id="l19-w-cache">
+    <h3 class="widget-title">A cache in front of a database: hits, misses and stale reads</h3>
+    <p class="widget-intro">A stream of 3000 requests for the profiles of 100 users (the <code>getUserData</code> of p. 386), ten per second; about 2 in 100 are writes, a user changing a preference. The skew sets how much the popular users dominate. The plot shows the average time per read, computed from the simulated hit ratio and your two costs; the strip shows the first and the last 60 reads. Nothing here is a number of the slides: the stream is simulated, and the costs are yours.</p>
+    <ol class="tasks">
+      <li>Set the skew to 0: all users equally popular. Before looking, will the hit ratio be above or below 0.5 — and will the cache still pay at \(t_c = 1\) ms, \(t_o = 50\) ms?
+        <details class="answer"><summary>What you should see</summary>
+          <p>About 0.2 (0.198): far fewer hits than misses. The cache still pays: \(1 + 0.802 \times 50 \approx 41\) ms instead of 50 ms, because the break-even is \(1/50 = 0.02\). This is the insight of the widget: "more hits than misses" was never the condition, \(h \gt t_c / t_o\) is. The first row of the strip shows the cold start: an empty cache misses almost everything.</p></details>
+      </li>
+      <li>Skew 1.2 gives more hits than misses (\(h \approx 0.70\)). Now make the database fast and the cache far: \(t_o = 2\) ms, \(t_c = 1.5\) ms. Predict the verdict.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The cache loses: \(1.5 + 0.296 \times 2 \approx 2.09\) ms against 2 ms. The break-even is \(1.5 / 2 = 0.75\), above the 0.70 this cache reaches — more hits than misses, and still slower than no cache at all.</p></details>
+      </li>
+      <li>Press <em>Back to the defaults</em>, set the skew to 1.0 and the size to 10. Rank FIFO, LRU, LFU, MRU, RANDOM and Belady before you try them.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Belady 0.611, LFU 0.513, LRU 0.379, FIFO 0.336, RANDOM 0.332, MRU 0.144. Belady is the ceiling: it knows the future. In this stream the popularity never changes, so LFU, which keeps the most popular users, comes closest. MRU throws away exactly the entry just used — the worst choice when the same users come back. (In real traffic popularity drifts, and LRU follows it better than LFU.)</p></details>
+      </li>
+      <li>Set the size to 40 (skew 1.0, LRU, TTL "never expires") and read the stale hits. Then set the TTL to 10 s; then switch to event-based invalidation.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Never expiring: \(h \approx 0.75\), but 1182 stale hits, 40 % of all reads — popular users stay cached for ever and their changes never show. TTL 10 s: 149 stale hits (5 %), but \(h\) drops to 0.64. Event-based: zero stale hits with \(h \approx 0.735\). A shorter TTL buys freshness with hits and never reaches zero; deleting on every write reaches zero at the price of one miss after each write.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l19-w-cache', function (root, ui) {
+    var M = 100, N = 3000, PER_S = 10, P_WRITE = 0.02;
+    var TTLS = [1, 2, 5, 10, 20, 30, 60, 120, Infinity];
+    /* one fixed stream of random numbers: the skew changes only which user each request asks for */
+    var base = (function () {
+      var r = Course.rng(19), out = [];
+      for (var i = 0; i < N; i++) out.push({ u: r.random(), w: r.random() < P_WRITE });
+      return out;
+    })();
+    var reqs = null, reqsS = null;
+    function streamFor(s) {
+      var wts = [], tot = 0, k, i;
+      for (k = 1; k <= M; k++) { var p = Math.pow(k, -s); wts.push(p); tot += p; }
+      var cdf = [], acc = 0;
+      for (k = 0; k < M; k++) { acc += wts[k] / tot; cdf.push(acc); }
+      cdf[M - 1] = 1;
+      var out = base.map(function (b) { var j = 0; while (j < M - 1 && cdf[j] < b.u) j++; return { k: j, w: b.w }; });
+      var last = {};
+      for (i = N - 1; i >= 0; i--) {                 // next READ of the same user, for Belady
+        out[i].next = last[out[i].k] == null ? Infinity : last[out[i].k];
+        if (!out[i].w) last[out[i].k] = i;
+      }
+      return out;
+    }
+    function simulate(rq, C, policy, mode, ttl) {
+      var r = Course.rng(7), list = [], where = {}, ver = [], i;
+      for (i = 0; i < M; i++) ver.push(0);
+      var reads = 0, hits = 0, stale = 0, log = [];
+      function drop(idx) {
+        delete where[list[idx].k];
+        list.splice(idx, 1);
+        for (var j = idx; j < list.length; j++) where[list[j].k] = j;
+      }
+      function victim() {
+        if (policy === 'random') return Math.floor(r.random() * list.length);
+        var best = 0, j, e, b;
+        for (j = 1; j < list.length; j++) {
+          e = list[j]; b = list[best];
+          if (policy === 'fifo' && e.ins < b.ins) best = j;
+          else if (policy === 'lru' && e.last < b.last) best = j;
+          else if (policy === 'mru' && e.last > b.last) best = j;
+          else if (policy === 'lfu' && (e.cnt < b.cnt || (e.cnt === b.cnt && e.last < b.last))) best = j;
+          else if (policy === 'opt' && e.next > b.next) best = j;
+        }
+        return best;
+      }
+      for (i = 0; i < N; i++) {
+        var q = rq[i], t = i / PER_S;
+        if (q.w) {
+          ver[q.k]++;
+          if (mode === 'event' && where[q.k] != null) drop(where[q.k]);
+          continue;
+        }
+        reads++;
+        var idx = where[q.k], e = idx == null ? null : list[idx], res;
+        if (e && (mode === 'event' || t - e.setT < ttl)) {
+          hits++;
+          res = e.ver < ver[q.k] ? 'stale' : 'hit';
+          if (res === 'stale') stale++;
+          e.last = i; e.cnt++; e.next = q.next;
+        } else {
+          res = 'miss';
+          if (e) { e.ver = ver[q.k]; e.setT = t; e.ins = i; e.last = i; e.cnt++; e.next = q.next; }
+          else {
+            if (list.length >= C) drop(victim());
+            list.push({ k: q.k, ver: ver[q.k], setT: t, ins: i, last: i, cnt: 1, next: q.next });
+            where[q.k] = list.length - 1;
+          }
+        }
+        log.push(res);
+      }
+      return { reads: reads, hits: hits, misses: reads - hits, stale: stale, h: reads ? hits / reads : 0, log: log };
+    }
+
+    var skew = ui.slider({ label: 'popularity skew s (0: all 100 users equally popular)', min: 0, max: 1.5, step: 0.1, value: 1 });
+    var size = ui.slider({ label: 'cache size (entries, for 100 users)', min: 1, max: 40, step: 1, value: 20 });
+    var pol = ui.select('replacement policy (p. 369)', [
+      { value: 'fifo', label: 'FIFO: evict the oldest entry' },
+      { value: 'lru', label: 'LRU: evict the least recently used' },
+      { value: 'lfu', label: 'LFU: evict the least frequently used' },
+      { value: 'mru', label: 'MRU: evict the most recently used' },
+      { value: 'random', label: 'RANDOM: evict any entry' },
+      { value: 'opt', label: 'Belady: evict the one needed latest (knows the future)' }
+    ], null, 'lru');
+    var mode = ui.select('invalidation', [
+      { value: 'ttl', label: 'time-based: keep until the TTL runs out (p. 388)' },
+      { value: 'event', label: 'event-based: delete the entry on every write (p. 390)' }
+    ], null, 'ttl');
+    var ttl = ui.slider({ label: 'TTL (time-based only)', min: 0, max: 8, step: 1, value: 8, format: function (v) { var x = TTLS[Math.round(v)]; return x === Infinity ? 'never expires' : x + ' s'; } });
+    var tc = ui.slider({ label: 'one look into the cache, t<sub>c</sub>', min: 0.1, max: 5, step: 0.1, value: 1, format: function (v) { return v.toFixed(1) + ' ms'; } });
+    var to = ui.slider({ label: 'one database query, t<sub>o</sub>', min: 1, max: 200, step: 1, value: 50, format: function (v) { return Math.round(v) + ' ms'; } });
+    ui.button('Back to the defaults', function () {
+      skew.set(1, true); size.set(20, true); pol.value = 'lru'; mode.value = 'ttl'; ttl.set(8, true); tc.set(1, true); to.set(50, true);
+    }, { kind: 'ghost', icon: 'refresh' });
+
+    var roN = ui.readout('reads, hits, misses (simulated)');
+    var roH = ui.readout('hit ratio h = hits / (hits + misses)');
+    var roS = ui.readout('stale hits: an old copy served');
+    var roT = ui.readout('time per read, computed: t<sub>c</sub> + (1 − h)·t<sub>o</sub>');
+    var roB = ui.readout('break-even h* = t<sub>c</sub> / t<sub>o</sub>');
+    var note = ui.note('');
+
+    var plot = ui.plot({ x: [0, 1], y: [0, 57], xLabel: 'hit ratio h', yLabel: 'time per read (ms)', aspect: 2, label: 'Average time per read as a function of the hit ratio: a horizontal line without the cache, a falling line with the cache, the break-even ratio, the ratio 0.5, and the point of the simulated cache' });
+    var strip = ui.svg(560, 120, { label: 'The first 60 and the last 60 reads of the simulated stream, each drawn as a hit, a stale hit or a miss' });
+    ui.legend([
+      { label: 'no cache: every read costs t<sub>o</sub>', color: 's4', mark: 'line' },
+      { label: 'with the cache: t<sub>c</sub> + (1 − h)·t<sub>o</sub>', color: 's5', mark: 'line' },
+      { label: 'break-even h*', color: 'soft', mark: 'dash' },
+      { label: '“more hits than misses”: h = 0.5', color: 'muted', mark: 'dash' },
+      { label: 'this simulated cache', color: 'ink', mark: 'hl' }
+    ]);
+
+    var st = null;
+    function run() {
+      var s = Math.round(skew.value * 10) / 10;
+      if (s !== reqsS) { reqs = streamFor(s); reqsS = s; }
+      return simulate(reqs, Math.max(1, Math.round(size.value)), pol.value, mode.value, TTLS[Math.round(ttl.value)]);
+    }
+    function ms(x) { return (x < 10 ? x.toFixed(2) : x.toFixed(1)) + ' ms'; }
+
+    plot.draw(function (g) {
+      if (!st) return;
+      var a = tc.value, b = to.value, h = st.h, hs = a / b;
+      g.hline(b, { color: 's4', width: 2.5 });
+      g.line(function (x) { return a + (1 - x) * b; }, { color: 's5', width: 2.5 });
+      g.vline(0.5, { color: 'muted', dash: true });
+      if (hs <= 1) g.vline(hs, { color: 'soft', dash: true });
+      var y = a + (1 - h) * b;
+      g.circle(h, y, 9, { px: true, color: 'key', alpha: 0.6, stroke: false });
+      g.points([[h, y]], { color: 'ink', r: 4.5 });
+    });
+
+    function drawStrip() {
+      while (strip.firstChild) strip.removeChild(strip.firstChild);
+      function S(tag, a) { return Course.svg(tag, a, strip); }
+      var CLS = { hit: 'fi-s2', stale: 'fw-bad st-bad sw-2', miss: 'fi-paper st-muted' };
+      [[st.log.slice(0, 60), 18, 'first 60 reads: the cache starts cold'], [st.log.slice(-60), 64, 'last 60 reads: warm']].forEach(function (row) {
+        S('text', { x: 20, y: row[1], 'class': 'tx-sm', text: row[2] });
+        row[0].forEach(function (res, i) { S('rect', { x: 20 + i * 8.6, y: row[1] + 8, width: 7, height: 16, 'class': CLS[res] }); });
+      });
+      [['hit', 'hit', 20], ['stale', 'stale hit (old copy)', 110], ['miss', 'miss (database)', 300]].forEach(function (l) {
+        S('rect', { x: l[2], y: 100, width: 7, height: 14, 'class': CLS[l[0]] });
+        S('text', { x: l[2] + 14, y: 112, 'class': 'tx-sm', text: l[1] });
+      });
+    }
+
+    ui.onChange(function () {
+      st = run();
+      var a = tc.value, b = to.value, h = st.h, T = a + (1 - h) * b, hs = a / b;
+      roN.set(st.reads + ' reads: ' + st.hits + ' hits, ' + st.misses + ' misses');
+      roH.set(h.toFixed(3) + ' · miss ratio ' + (1 - h).toFixed(3));
+      roS.set(st.stale ? st.stale + ', ' + (100 * st.stale / st.reads).toFixed(1) + ' % of the reads' : '0: every hit was fresh', st.stale ? 'bad' : 'good');
+      roT.set(a.toFixed(1) + ' + ' + (1 - h).toFixed(3) + ' × ' + Math.round(b) + ' = ' + ms(T) + ' (no cache: ' + Math.round(b) + ' ms)');
+      if (hs >= 1) roB.set(hs.toFixed(2) + ': no hit ratio can pay', 'bad');
+      else if (h > hs) roB.set(hs.toFixed(3) + ' · this cache pays: ' + (b / T).toFixed(2) + '× faster', 'good');
+      else roB.set(hs.toFixed(3) + ' · this cache is slower than none', 'bad');
+      var pn = { fifo: 'FIFO evicts the entry stored first.', lru: 'LRU evicts the entry unused for longest — memcached’s policy (p. 382).', lfu: 'LFU evicts the entry asked for least often.', mru: 'MRU evicts the entry used last.', random: 'RANDOM evicts any entry.', opt: 'Belady evicts the entry whose next read is furthest away: it reads the future, so only a simulator can run it (p. 369).' }[pol.value];
+      var mn = mode.value === 'event' ? ' Event-based: “Store forever, and expire on certain events” (p. 390); the TTL is ignored.' : (TTLS[Math.round(ttl.value)] === Infinity ? ' Time-based with no expiry: a copy stays until it is evicted, however old.' : ' Time-based: “You can’t trust that data coming from cache is correct” (p. 388).');
+      note.set(pn + mn);
+      plot.setView({ x: [0, 1], y: [0, (a + b) * 1.12] });
+      drawStrip();
+    });
+  });
+  </script>
+
+  <h3>Where caches live</h3>
+
+  <p>Caches sit wherever something slow stands behind something fast. Page 372 lists hardware ("cpu, hdd"), operating systems ("ram"), the "web stack", applications — even "your own short term vs long term memory". The web stack holds a ladder of them (p. 373): browser cache, DNS cache, Content Delivery Networks, proxy servers and, in the application, "full output caching" and the data caching of section 5. Along the ladder (p. 374), "the closer to the original request(er), the faster" — "but probably also the harder to get it right", since "the closer to the requester the more parameters the cache depends on": a copy in your browser depends on you, your cookies, your language; one next to the database serves every user.</p>
+</section>
+
+
+<section id="l19-memcached">
+  <h2>Memcached: a cache that forgets on purpose</h2>
+
+  <p>Memcached is the cache of the slides: a "Free &amp; open source, high-performance, distributed memory object caching system", "Generic in nature, intended for use in speeding up dynamic web applications by alleviating database load", a "key/value dictionary" (p. 376). It was "Developed by Brad Fitzpatrick for LiveJournal in 2003" (p. 377).</p>
+
+  <div class="story" data-year="2003–2004"><p>LiveJournal then ran on about 70 machines for 2.5 million accounts. In his 2004 article in Linux Journal, Fitzpatrick wrote that he wanted "a global hash table that all Web processes on all machines could access simultaneously", and reported servers up 4–5 months at a time, averaging 7,000 queries per second.</p></div>
+
+  <p>"Technically" (p. 378): "It's a server", reached by "Client access over TCP or UDP". "Servers can run in pools": "eg. 3 servers with 64GB mem each give you a single pool of 192GB storage for caching". And the design decision: "Servers are independent, clients manage the pool". No server knows the others; the client library hashes the key and picks the server (Fig. 3) — the client layer of partitioning from p. 359. Each key has one home, so every server added adds its whole memory.</p>
+
+  <figure class="fig fig--plain" id="l19-fig-pool">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="A client sends get('user_42') to server 2 of three independent memcached servers of 64 GB each; the client, not the servers, decides where a key lives; together the three form one pool of 192 GB">
+      <line x1="58" y1="104" x2="276" y2="52" class="st-muted"/>
+      <line x1="58" y1="116" x2="276" y2="178" class="st-muted"/>
+      <line x1="58" y1="110" x2="274" y2="115" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <rect x="20" y="98" width="36" height="24" rx="6" class="fi-paper"/>
+      <rect x="278" y="36" width="44" height="28" class="fi-paper"/>
+      <line x1="285" y1="43" x2="315" y2="43" class="st-muted"/>
+      <line x1="285" y1="50" x2="315" y2="50" class="st-muted"/>
+      <line x1="285" y1="57" x2="315" y2="57" class="st-muted"/>
+      <rect x="278" y="101" width="44" height="28" class="fi-paper"/>
+      <line x1="285" y1="108" x2="315" y2="108" class="st-muted"/>
+      <line x1="285" y1="115" x2="315" y2="115" class="st-muted"/>
+      <line x1="285" y1="122" x2="315" y2="122" class="st-muted"/>
+      <rect x="278" y="166" width="44" height="28" class="fi-paper"/>
+      <line x1="285" y1="173" x2="315" y2="173" class="st-muted"/>
+      <line x1="285" y1="180" x2="315" y2="180" class="st-muted"/>
+      <line x1="285" y1="187" x2="315" y2="187" class="st-muted"/>
+      <text x="38" y="142" class="tx-sm tx-mid">client</text>
+      <text x="166" y="100" class="tx-mono tx-sm tx-mid halo">get('user_42')</text>
+      <text x="334" y="55" class="tx-sm">server 1 · 64 GB</text>
+      <text x="334" y="120" class="tx-sm">server 2 · 64 GB</text>
+      <text x="334" y="185" class="tx-sm">server 3 · 64 GB</text>
+      <text x="300" y="228" class="tx-sm tx-mid tx-bold">3 × 64 GB = one pool of 192 GB</text>
+      <text x="30" y="30" class="tx-hand">the client picks the server</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> A memcached pool as p. 378 describes it. The servers never talk to each other: the client library hashes the key and sends the request to the one server that holds it.</figcaption>
+  </figure>
+
+  <p>What deserves a place in it (pp. 379–380): data that is in "high demand (used often)", "expensive (hard to compute)" and "common", shared across users — "Best: All three". The typical tenants: "user sessions (often)", "user data (often, shared)", "homepage data (eg. often, shared, expensive)".</p>
+
+  <h3>Its principles are its limits</h3>
+
+  <p>Page 381 opens with one strength, "Fast network access (memcached servers close to other application servers)", then four refusals: "No persistency (if your server goes down, data in memcached is gone)", "No redundancy / fail-over", "No replication (single item in cache lives on one server only)", "No authentication (not in shared environments)". Page 382 adds limits and two more refusals: "1 key is maximum 1MB", "keys are strings of 250 characters (in application typically MD5 of user readable string)", "No enumeration of keys (thus no list of valid keys in cache at certain moment)", "No active clean-up (only clean up when more space needed, LRU: Least Recently Used )".</p>
+
+  <aside class="redpen" data-page="382">
+    <p class="claim">"1 key is maximum 1MB"</p>
+    <p class="fix">The 1 MB limit (the default) is on the item — the value stored under a key. The key itself is limited to 250 characters, as the next bullet says.</p>
+    <p class="because">As printed, the two bullets contradict each other: 250 characters cannot weigh 1 MB. Memcached's protocol caps keys at 250 characters and, by default, items at 1 MB. The exam may quote the printed sentence: recognise it, and remember that a key is limited to 250 characters.</p>
+  </aside>
+
+  <p>Read the list against p. 359: by design, memcached lacks three of the four kinds of machinery of section 1 — persistence, replication, failover — and keeps only the simplest form of the fourth, partitioning done by the client. It does not need the other three: every value in it duplicates something stored elsewhere, so a dead server costs time — its keys miss until reloaded from the database — not data. Its client API (p. 383) is the small vocabulary of any key-value store: <code>add</code>, <code>set</code>, <code>get</code>, <code>getMulti</code>, <code>delete</code>, <code>increment</code>, <code>decrement</code>, <code>flush</code>, plus <code>addServer</code> to grow the pool and <code>getStats</code> to watch it.</p>
+
+  <h3>Memcached and Redis side by side</h3>
+
+  <p>Page 365 lists Redis's advantages: "Performance", "Availability", "Fault-Tolerance", "Scalability (adaptability)", "Portability"; "Support for complex data types and structures", "Atomic operations and Transactions", "Pipelining (send multiple commands at once)", "LUA scripting support", "LRU eviction of keys", "Keys with limited time-to-live"; and an open-source server, simple to set up, with clients in many languages. Against memcached's principles:</p>
+
+  <figure class="tbl-fig" id="l19-tbl-vs">
+    <figcaption>What memcached refuses and what Redis offers, page by page.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>memcached</th><th>Redis</th></tr></thead>
+        <tbody>
+          <tr><th>values</th><td>a "key/value dictionary" of opaque items, at most 1 MB each (pp. 376, 382)</td><td>data structures: strings, hashes, lists, sets, sorted sets… (p. 354)</td></tr>
+          <tr><th>persistence</th><td>"No persistency" (p. 381)</td><td>RDB snapshots and AOF log (p. 359)</td></tr>
+          <tr><th>replication</th><td>"No replication": one server per item (p. 381)</td><td>master → read-only slaves (p. 359)</td></tr>
+          <tr><th>failover</th><td>"No redundancy / fail-over" (p. 381)</td><td>manual, Sentinel or Cluster (p. 359)</td></tr>
+          <tr><th>partitioning</th><td>"clients manage the pool" (p. 378)</td><td>client, proxy (Twemproxy) or Cluster (p. 359)</td></tr>
+          <tr><th>clean-up</th><td>LRU, only when space is needed (p. 382)</td><td>"LRU eviction of keys", "Keys with limited time-to-live" (p. 365)</td></tr>
+          <tr><th>speed (Fig. 4)</th><td class="num">80,000</td><td class="num">80,000; pipelined 250,000</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The last row is the chart of Redis's advantages slide (p. 365), redrawn in Fig. 4. It prints no unit and no description of the benchmark, and comes from a vendor's blog (redislabs.com): read it for orders of magnitude.</p>
+
+  <figure class="fig fig--plain" id="l19-fig-bench">
+    <svg class="dia" viewBox="0 0 560 262" role="img" aria-label="Bar chart of page 365, values as printed: Redis pipelined 250,000; Redis 80,000; Memcached 80,000; Couchbase Memcached 44,000; VoltDB/MemSQL/HANA 17,000; Cassandra 12,000; MongoDB 3,500; Riak/Dynamo 2,700; MySQL 900; no unit is printed">
+      <line x1="214" y1="8" x2="214" y2="226" class="st-ink"/>
+      <rect x="214" y="15" width="256" height="14" class="fi-s1"/>
+      <rect x="214" y="39" width="82" height="14" class="fi-s1"/>
+      <rect x="214" y="63" width="82" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="87" width="45" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="111" width="17" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="135" width="12" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="159" width="4" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="183" width="3" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="207" width="1" height="14" class="fw-s1 st-s1"/>
+      <text x="206" y="26" class="tx-sm tx-end">Redis pipelined</text>
+      <text x="206" y="50" class="tx-sm tx-end">Redis</text>
+      <text x="206" y="74" class="tx-sm tx-end">Memcached</text>
+      <text x="206" y="98" class="tx-sm tx-end">Couchbase Memcached</text>
+      <text x="206" y="122" class="tx-sm tx-end">VoltDB/MemSQL/HANA</text>
+      <text x="206" y="146" class="tx-sm tx-end">Cassandra</text>
+      <text x="206" y="170" class="tx-sm tx-end">MongoDB</text>
+      <text x="206" y="194" class="tx-sm tx-end">Riak/Dynamo</text>
+      <text x="206" y="218" class="tx-sm tx-end">MySQL</text>
+      <text x="476" y="26" class="tx-mono tx-sm">250,000</text>
+      <text x="302" y="50" class="tx-mono tx-sm">80,000</text>
+      <text x="302" y="74" class="tx-mono tx-sm">80,000</text>
+      <text x="265" y="98" class="tx-mono tx-sm">44,000</text>
+      <text x="237" y="122" class="tx-mono tx-sm">17,000</text>
+      <text x="232" y="146" class="tx-mono tx-sm">12,000</text>
+      <text x="224" y="170" class="tx-mono tx-sm">3,500</text>
+      <text x="223" y="194" class="tx-mono tx-sm">2,700</text>
+      <text x="221" y="218" class="tx-mono tx-sm">900</text>
+      <text x="430" y="64" class="tx-hand">3 times more</text>
+      <text x="214" y="250" class="tx-sm tx-muted">no unit printed on the slide</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The chart of p. 365, "NoSQL &amp; SQL response performance comparison", values as printed; solid bars are Redis. The slide also prints the response time of each figure: under 1 ms for Redis and Memcached, under 20 ms for Couchbase Memcached, 10–50 ms for VoltDB/MemSQL/HANA and Cassandra, under 100 ms for MongoDB and Riak/Dynamo, over 100 ms for MySQL.</figcaption>
+  </figure>
+
+  <p>Two facts to take from it. Redis and Memcached tie at 80,000: memcached's refusals buy simplicity, not speed. And "Redis pipelined" reaches 250,000, three times as much. Pipelining, "send multiple commands at once" (p. 365), removes waiting: instead of one network round trip per command, the client sends a batch and collects the replies together. Page 393 makes the same point for reads: even a hit costs a trip to the memcached server, so use multiget, "fetch multiple keys from memcached in one single call" — the "result is array of items". Redis's <code>MGET</code> does the same. In PHP it is the <code>getMulti</code> of p. 383 (the line is ours):</p>
+
+<pre><code>&lt;?php
+// multiget: three keys, one round trip; returns an array of the items found
+$users = $cache-&gt;getMulti(array('user_1', 'user_2', 'user_3'));
+?&gt;</code></pre>
+</section>
+
+
+<section id="l19-aside">
+  <h2>Cache-aside in code, and the two hard things</h2>
+
+  <p>The slides show memcached at work in PHP. The first program caches a whole page, the "full output caching" of p. 373 (p. 384):</p>
+
+<pre><code>&lt;?php
+// p. 384: prints the page, built only on a miss
+$html = $cache-&gt;get('mypage');
+if (!$html)
+{
+  ob_start();
+  echo "&lt;html&gt;";
+  // all the fancy stuff goes here
+  echo "&lt;/html&gt;";
+  $html = ob_get_contents();
+  ob_end_clean();
+  $cache-&gt;set('mypage', $html);
+}
+echo $html;
+?&gt;</code></pre>
+
+  <p>Read it aloud: ask the cache for <code>'mypage'</code>; if nothing comes back, build the page (PHP's output buffer, <code>ob_start</code> … <code>ob_get_contents</code>, captures everything echoed in between), store it under the key, print it. The next visitor gets the stored copy. This shape — look in the cache; on a miss compute or fetch, store, return — is called <mark class="key">cache-aside</mark> (the name is not on the slides; Fig. 5).</p>
+
+  <figure class="fig fig--plain" id="l19-fig-aside">
+    <svg class="dia" viewBox="0 0 560 220" role="img" aria-label="Cache-aside: get(key) asks the cache; on a hit the value is returned; on a miss the application queries the database, stores the result with set(key, value) and returns it; the next get of the same key is a hit">
+      <line x1="126" y1="55" x2="174" y2="55" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="264" y1="55" x2="364" y2="55" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="220" y1="77" x2="220" y2="126" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="307" y1="145" x2="340" y2="145" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="430" y1="128" x2="430" y2="74" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="24" y="40" width="100" height="30" class="fi-paper sw-2"/>
+      <polygon points="220,35 262,55 220,75 178,55" class="fi-paper sw-2"/>
+      <rect x="370" y="40" width="120" height="30" class="fi-paper sw-2"/>
+      <rect x="135" y="130" width="170" height="30" class="fi-paper sw-2"/>
+      <rect x="345" y="130" width="170" height="30" class="fi-paper sw-2"/>
+      <text x="74" y="60" class="tx-mono tx-mid">get(key)</text>
+      <text x="220" y="60" class="tx-sm tx-mid">hit?</text>
+      <text x="430" y="60" class="tx-sm tx-mid">return value</text>
+      <text x="220" y="150" class="tx-sm tx-mid">query the database</text>
+      <text x="430" y="150" class="tx-mono tx-mid">set(key, value)</text>
+      <text x="314" y="45" class="tx-sm tx-mid halo">hit</text>
+      <text x="232" y="106" class="tx-sm">miss</text>
+      <text x="442" y="106" class="tx-sm">store a copy</text>
+      <text x="300" y="200" class="tx-hand">the next get(key) is a hit</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> Cache-aside, the pattern of every PHP example of the slides: the application, not the cache, goes to the database on a miss and stores what it found.</figcaption>
+  </figure>
+
+  <p>Caching a whole page is fast but fragile: the page depends on everything shown on it. Page 385 moves the cache "on a lower level", to data caching: "easier to find all dependencies", the "ideal solution for offloading database queries", because "the database is almost always the biggest bottleneck in backend performance problems". The slide's code caches one user's row (p. 386; the key in <code>set</code> is restored, see the red pen):</p>
+
+<pre><code>&lt;?php
+// p. 386: the row of user $UID, from the cache if there
+function getUserData($UID)
+{
+  $key = 'user_' . $UID;
+  $userData = $cache-&gt;get($key);
+  if (!$userData)
+  {
+    $queryResult = Database::query(
+      "SELECT * FROM USERS WHERE uid = " . (int) $UID);
+    $userData = $queryResult-&gt;getRow();
+    $cache-&gt;set($key, $userData);
+  }
+  return $userData;
+}
+?&gt;</code></pre>
+
+  <p>The key is the user's business key, prefixed: <code>'user_' . $UID</code>. On a miss one query by primary key runs — <code>(int)</code> lets only a number reach the SQL — and the row is stored.</p>
+
+  <aside class="redpen" data-page="386">
+    <p class="claim">"<code>$cache-&gt;set($userData);</code>"</p>
+    <p class="fix">It must be <code>$cache-&gt;set($key, $userData);</code> — the key is missing.</p>
+    <p class="because">The PHP client stores an item under a key, <code>set(key, value)</code>, exactly as p. 384 calls it: <code>$cache-&gt;set('mypage', $html)</code>. Without the key nothing is stored under <code>'user_' . $UID</code>, the next <code>get($key)</code> misses again, and every call goes to the database: a cache with a hit ratio of zero. (Both slides also assume a <code>$cache</code> object created elsewhere; inside a PHP function it must be passed in or declared global.) The exam may be matched against the printed line: spot the missing key.</p>
+  </aside>
+
+  <h3>The two hard things</h3>
+
+  <p>Page 387 is one quote on a blackboard: "There are only two hard things in Computer Science: cache invalidation and naming things." — Phil Karlton. For the first, the slides give two strategies (Fig. 6).</p>
+
+  <p><b>Time-based</b> (pp. 388–389): "Caching for a certain amount of time", "eg. 10 minutes"; "don't delete caches"; "thus: You can't trust that data coming from cache is correct". It is "Great for summaries", an "Overview", "Pages where it's not that big a problem if data is a little bit out of date (eg. search results)", and "Good for quick and dirty optimizations". In Redis this is the TTL of <a href="l18.html">lesson 18</a>: <code>SET key value EX 600</code>.</p>
+
+  <p><b>Event-based</b> (pp. 390–392): "Store forever, and expire on certain events" — "store userdata for ever", and "when user changes any of his preferences, throw cache away". The read side keeps the query result with no expiry, and can be told to invalidate instead (p. 391):</p>
+
+<pre><code>&lt;?php
+// p. 391: the row of user $UID, or drop its cached copy
+function getUserData($UID, $invalidateCache = false)
+{
+  $db = DB::getInstance();
+  $db-&gt;prepare("SELECT * FROM USERS WHERE uid = {UID}");
+  $db-&gt;assignInt('UID', $UID);
+  $db-&gt;setCacheTTL(0); // cache forever
+  if ($invalidateCache)
+  {
+    return $db-&gt;invalidateCache();
+  }
+  $db-&gt;execute(); return $db-&gt;getRow();
+}
+?&gt;</code></pre>
+
+  <p>and the write side throws the copy away after every update (p. 392):</p>
+
+<pre><code>&lt;?php
+// p. 392: update the row, then drop its cached copy
+function updateUserData($UID, $data)
+{
+  $db = DB::getInstance();
+  $db-&gt;prepare("UPDATE USERS SET ... WHERE uid = {UID}");
+  ...
+  getUserData($UID, true); // invalidate cache
+  return $result;
+}
+?&gt;</code></pre>
+
+  <p>The cache lives inside a database wrapper (<code>setCacheTTL(0)</code>, "cache forever"; <code>invalidateCache()</code>) that the slides do not show: read the pattern, not the API. After an update the next read misses and reloads the fresh row: the old copy is gone as soon as the write drops it, at the price of a delete per write and a miss after it. In the widget of section 3, a TTL traded stale reads for misses and never reached zero; deleting on write reached zero and kept nearly the whole hit ratio.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l19-fig-inval">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Time-based: the database changes from v1 to v2 at the write, but the cached v1 lives until its TTL ends, so the two reads in between get the old value; after the expiry a miss loads v2">
+        <text x="12" y="52" class="tx-sm">database</text>
+        <text x="12" y="102" class="tx-sm">cache</text>
+        <text x="12" y="153" class="tx-sm">reads</text>
+        <line x1="150" y1="16" x2="150" y2="34" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="24" class="tx-sm">write</text>
+        <rect x="76" y="40" width="74" height="18" class="fw-s1 st-s1"/>
+        <rect x="150" y="40" width="136" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="53" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="218" y="53" class="tx-mono tx-sm tx-mid">v2</text>
+        <rect x="80" y="90" width="156" height="18" class="fw-s1 st-s1"/>
+        <rect x="150" y="90" width="86" height="18" class="fw-bad"/>
+        <rect x="248" y="90" width="38" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="103" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="267" y="103" class="tx-mono tx-sm tx-mid">v2</text>
+        <line x1="80" y1="116" x2="236" y2="116" class="st-muted"/>
+        <line x1="80" y1="112" x2="80" y2="120" class="st-muted"/>
+        <line x1="236" y1="112" x2="236" y2="120" class="st-muted"/>
+        <text x="158" y="132" class="tx-sm tx-mid">TTL: 10 min</text>
+        <circle cx="100" cy="150" r="6" class="fi-s2"/>
+        <circle cx="130" cy="150" r="6" class="fi-s2"/>
+        <circle cx="172" cy="150" r="6" class="fi-s2 st-bad sw-2"/>
+        <circle cx="210" cy="150" r="6" class="fi-s2 st-bad sw-2"/>
+        <circle cx="252" cy="150" r="6" class="fi-paper st-muted sw-2"/>
+        <circle cx="278" cy="150" r="6" class="fi-s2"/>
+        <text x="191" y="182" class="tx-hand tx-mid">stale</text>
+        <line x1="76" y1="200" x2="282" y2="200" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="288" y="216" class="tx-sm tx-muted tx-end">time</text>
+      </svg>
+      <p class="fig-label">Time-based: a 10-minute TTL</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Event-based: the write deletes the cached v1 at once; the next read misses and loads v2; no read gets an old value">
+        <text x="12" y="52" class="tx-sm">database</text>
+        <text x="12" y="102" class="tx-sm">cache</text>
+        <text x="12" y="153" class="tx-sm">reads</text>
+        <line x1="150" y1="16" x2="150" y2="34" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="24" class="tx-sm">write</text>
+        <rect x="76" y="40" width="74" height="18" class="fw-s1 st-s1"/>
+        <rect x="150" y="40" width="136" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="53" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="218" y="53" class="tx-mono tx-sm tx-mid">v2</text>
+        <rect x="80" y="90" width="70" height="18" class="fw-s1 st-s1"/>
+        <line x1="144" y1="85" x2="156" y2="113" class="sw-2"/>
+        <line x1="144" y1="113" x2="156" y2="85" class="sw-2"/>
+        <rect x="172" y="90" width="114" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="103" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="229" y="103" class="tx-mono tx-sm tx-mid">v2</text>
+        <text x="150" y="132" class="tx-sm tx-mid">deleted on the write</text>
+        <circle cx="100" cy="150" r="6" class="fi-s2"/>
+        <circle cx="130" cy="150" r="6" class="fi-s2"/>
+        <circle cx="172" cy="150" r="6" class="fi-paper st-muted sw-2"/>
+        <circle cx="210" cy="150" r="6" class="fi-s2"/>
+        <circle cx="252" cy="150" r="6" class="fi-s2"/>
+        <circle cx="278" cy="150" r="6" class="fi-s2"/>
+        <text x="200" y="182" class="tx-hand tx-mid">no stale read</text>
+        <line x1="76" y1="200" x2="282" y2="200" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="288" y="216" class="tx-sm tx-muted tx-end">time</text>
+      </svg>
+      <p class="fig-label">Event-based: delete on every write</p>
+    </div>
+    <figcaption><b>Fig. 6.</b> The same write, two strategies. Filled dots are hits, a red ring is a hit on an old copy, a hollow dot is a miss. Left: the copy lives out its TTL, so for the rest of it readers get the old value (p. 388). Right: the write deletes the copy; the next read misses and loads the new value (p. 390).</figcaption>
+  </figure>
+
+  <p>The deck closes with three tips (p. 394): be careful when security matters — remember "no authentication" (SASL authentication was then in the works); "Caching is not an excuse not to do database tuning. (Remember cold cache?)" — after a restart every request misses and the database takes the whole load; and write unit tests for your caching code, because "Debugging problems related to out-of-date cache data is hard and boring. Very boring."</p>
+
+  <p>Back to the hook. The word is <em>duplicating</em>: a cache holds "data duplicating original values stored elsewhere" (p. 367). When memcached loses a server, the originals are still in the database: the loss is time — a cold cache, a database under full load — never data. Redis, used as a database, may hold the only copy, so a crash would be a real loss: hence snapshots, logs, slaves, Sentinel and Cluster. Neither program is badly designed; they answer different questions. And whether a cache is worth having is one ratio: its hit ratio against the break-even \(t_c / t_o\).</p>
+</section>
+
+
+<section id="l19-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Theory questions in the forms the readme of the past papers names — multiple choice, true or false, open answers; wrong answers may carry a penalty, announced just before the exam — then a computation the slides make themselves, and one practical exercise worded like the Redis exercises of the past papers.</p>
+
+  <div class="exam" data-kind="mcq" id="l19-exam-topo">
+    <div class="exam-q" lang="en">
+      <p>Which Redis topology provides both automatic failover and the distribution of data across nodes?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Standalone master-slave <span class="fb">Slaves give redundancy and read offloading, but "There is no automatic failover" (p. 361), and every slave holds all the data.</span></li>
+      <li>Sentinel <span class="fb">Automatic failover only: "Sentinel does not distribute data across nodes" (p. 362).</span></li>
+      <li>Twemproxy <span class="fb">It distributes data by consistent hashing but has no failover: a dead instance's keys are unreachable.</span></li>
+      <li data-correct>Cluster <span class="fb">"Cluster (automatic failover and distribute data)" (p. 360): hash slots spread the data, and a slave is promoted when its master fails (p. 364).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Redis Cluster. Its keyspace is divided into 16384 hash slots shared among the masters, and if a master fails one of its slaves is promoted automatically. Sentinel gives only automatic failover, Twemproxy only data distribution, and the standalone topology neither.</p></div>
+      <div class="exam-note"><p>The two-by-two of p. 360 is the whole question. The trap to avoid is Sentinel: it is about availability, never about distribution.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l19-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Redis Sentinel distributes data across the nodes of a master/slave topology. <span class="fb">False: "Sentinel does not distribute data across nodes" (p. 362).</span></li>
+      <li data-correct>In Redis Cluster, multi-key commands are only allowed for keys in the same hash slot. <span class="fb">True, verbatim from p. 364; hash tags put related keys in one slot.</span></li>
+      <li data-correct>By default, Redis slaves are read only. <span class="fb">True: "Slaves are read only by default" (p. 359).</span></li>
+      <li>In the standalone master-slave topology, a slave is promoted automatically when the master fails. <span class="fb">False: "There is no automatic failover" (p. 361); that is Sentinel's job.</span></li>
+      <li data-correct>In memcached a single item lives on one server only, and is lost if that server goes down. <span class="fb">True: "No replication (single item in cache lives on one server only)" and "No persistency" (p. 381).</span></li>
+      <li>Twemproxy is part of Redis and performs automatic failover. <span class="fb">False twice: "Twemproxy is a project from Twitter and is not part of redis" (p. 363), and it only distributes data.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: the second, the third and the fifth. Sentinel provides automatic failover without distributing data; the standalone topology has no automatic failover; Twemproxy is an external proxy from Twitter that distributes data and has no failover.</p></div>
+      <div class="exam-note"><p>With a possible penalty for wrong answers, tick only what a slide sentence supports. Each false statement here swaps one capability of the two-by-two for another.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l19-exam-persist">
+    <div class="exam-q" lang="en">
+      <p>Redis keeps its data in memory. Describe the two mechanisms it provides for persistence, what each of them can lose in a crash, and the trade-off between persistence and performance.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Redis provides Redis database snapshots (RDB) and append-only files (AOF). An RDB snapshot is a point-in-time copy of the whole dataset, written to disk periodically: it is compact and fast to reload, but everything written after the last snapshot is lost in a crash, typically minutes of data. The AOF appends every write command to a log that is replayed at restart: it loses at most what was not yet flushed to disk (about one second with the default once-per-second flush, nothing if the file is synced after every write), but the file is larger and slower to replay. Both can be enabled together. In general, increased persistency tends to increase latency and decrease throughput — syncing after every write makes each write wait for the disk. Redis is therefore not a replacement for relational databases or document stores: it is best used for rapidly changing data whose size is foreseeable and fits mostly in memory, often next to such a store.</p></div>
+      <div class="exam-note"><p>The slides give the two names (p. 359) and the trade-off sentence (p. 349); the rest of the answer explains them, as a theory answer should. Three things to earn: both mechanisms, what each loses, and the persistence-versus-latency trade-off.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="81.8" data-tol="0.5" data-unit="%" id="l19-exam-ratio">
+    <div class="exam-q" lang="en">
+      <p>A cache served 45 cache hits and 10 cache misses. What is its hit ratio, in percent?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Hit ratio = hits / (hits + misses) = 45 / (45 + 10) = 0.818, about 82 %. The miss ratio is 1 − 0.818, about 18 %.</p></div>
+      <div class="exam-note"><p>The numbers of p. 370, which prints 82 % and 18 %. Write the brackets: the slide's "hits / hits + misses", read literally, is not a ratio. If a question goes on to ask whether such a cache pays, the answer depends on the hit ratio against \(t_c / t_o\), not on 82 % being above 50 %.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l19-exam-memcached">
+    <div class="exam-q" lang="en">
+      <p>Memcached offers no persistence, no replication, no fail-over and no authentication. Explain why it is nevertheless widely used, and compare it with Redis.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Memcached is a free and open-source, high-performance, distributed in-memory key/value cache, intended to speed up dynamic web applications by alleviating database load. Its servers are independent: the client manages the pool and sends each key to one server (for example three servers of 64 GB form one 192 GB pool). Items are at most 1 MB, keys at most 250 characters; keys cannot be enumerated, and space is reclaimed with LRU only when needed. It can do without persistence, replication and fail-over because it is a cache: every item duplicates data whose original is stored elsewhere, usually in the database, so losing a server costs time — the next requests miss and reload from the database — but not data. Redis instead offers persistence (RDB snapshots, AOF), replication to read-only slaves, automatic failover (Sentinel, Cluster), partitioning by proxy or by Cluster, and values that are data structures. In the benchmark shown in the lecture the two are equally fast (80,000 each). Memcached fits a pure cache; Redis fits data that must survive or needs structures.</p></div>
+      <div class="exam-note"><p>The point the examiner looks for is the link between the "No"s and being a cache. A list of features without that "why" answers only half the question.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l19-exam-hospital">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise in the style of the past papers' Redis exercises.</b> Consider the ER model of a hospital heating management system (the scenario of the Exam of 30 Jan 2026): Hospital (Hospital_ID, Name) has Departments (Department_ID, Specialty, N_Beds, Head_Physician_ID), Buildings and Heating Systems; Persons (P_ID, Email) work for Departments with a Role. A dashboard shows, for each Department, a summary page computed by a slow query over its floors and heaters.</p>
+      <p>Consider the Department entity and write the Redis commands for the following operations. (a) Cache the summary of Department "D7" under a key, so that it expires after 10 minutes. (b) Check how long the cached summary will remain valid. (c) The Head Physician of "D7" changes: invalidate the cached summary immediately. (d) The dashboard runs on a Redis Cluster: store the Specialty "Cardiology" and the N_Beds 24 of "D7" under two keys that a single command can read together, and read them.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>SET department:D7:summary "Cardiology - 3 floors - 24 beds - 2 heaters" EX 600
+TTL department:D7:summary
+DEL department:D7:summary
+MSET {department:D7}:specialty "Cardiology" {department:D7}:n_beds 24
+MGET {department:D7}:specialty {department:D7}:n_beds</code></pre>
+        <p>(a) A time-based invalidation: 10 minutes = 600 seconds (equivalently <code>SET</code> followed by <code>EXPIRE department:D7:summary 600</code>). (b) <code>TTL</code> returns the remaining seconds, at most 600, and -2 once the key has expired. (c) An event-based invalidation: <code>DEL</code> returns 1, and the next read misses and recomputes the summary. (d) The hash tag <code>{department:D7}</code> makes both keys hash the same string, so they share a hash slot and the multi-key commands are allowed; <code>MGET</code> returns "Cardiology" and "24".</p>
+      </div>
+      <div class="exam-note"><p>The exercise is ours, built on the past papers' Redis wording ("Create a key-value pair … with TTL equal to …", "check its lifespan"). Three ideas are checked: TTL in seconds, invalidation on the event as an explicit <code>DEL</code>, and the same-slot rule of Redis Cluster with its hash tag — without the braces, <code>MGET</code> on two keys in different slots is refused.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l19-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A standalone master-slave deployment: the master crashes at 3 a.m. What do the clients experience until someone intervenes?</p>
+    <ul class="options">
+      <li>A slave is promoted within seconds and writes resume <span class="fb">That needs Sentinel or Cluster; the standalone topology waits for a human.</span></li>
+      <li>Everything fails, reads included <span class="fb">"Clients can connect … to the Slaves for read operations" (p. 361), and the slaves are still alive.</span></li>
+      <li data-correct>Reads keep working on the slaves; writes fail <span class="fb">Slaves are read only by default (p. 359), and "There is no automatic failover" (p. 361): the copies answer reads, nobody accepts writes.</span></li>
+      <li>Writes go to the slaves and are copied back when the master returns <span class="fb">Slaves are read only by default, and nothing queues writes for a dead master.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">You need automatic failover. Which topologies give it to you? Select all that apply.</p>
+    <ul class="options">
+      <li>Twemproxy <span class="fb">It distributes data, nothing more: a dead instance takes its keys with it.</span></li>
+      <li data-correct>Sentinel <span class="fb">"automatically promoting a slave to master if the existing master fails" (p. 362).</span></li>
+      <li>Master-slave multi-level <span class="fb">More copies, same standalone topology: "There is no automatic failover" (p. 361).</span></li>
+      <li data-correct>Cluster <span class="fb">It "perform[s] automatic failover if any problem happens to any master instance" (p. 364).</span></li>
+    </ul>
+    <p class="q-fb">Failover and distribution are two separate questions; only Cluster answers yes to both.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In a Redis Cluster, <code>user:42:name</code> is in slot 6755 and <code>user:42:city</code> in slot 8210 — both owned by master B. Does a command on both keys run?</p>
+    <ul class="options">
+      <li>Yes, because both keys live on the same master <span class="fb">The rule is about slots: "Multi-key commands are only allowed for keys in the same hash slot" (p. 364). Slots can be moved to different masters one by one.</span></li>
+      <li data-correct>No: the keys are in different slots; a hash tag such as <code>{user:42}</code> in both names would put them in one slot <span class="fb">With the tag, only <code>user:42</code> is hashed, and both keys share slot 15880.</span></li>
+      <li>No: multi-key commands are never allowed in Redis Cluster <span class="fb">They are allowed when all the keys hash to one slot — that is what hash tags are for.</span></li>
+      <li>Yes, but only if the cluster has exactly one master <span class="fb">The check is on slots, not on machines, whatever the number of masters.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A look into the cache costs \(t_c = 2\) ms, a database query \(t_o = 10\) ms, and the hit ratio is 0.3. What does the cache do to the average read?</p>
+    <ul class="options">
+      <li>It makes it slower, since there are fewer hits than misses <span class="fb">The condition is \(h \gt t_c / t_o\), here 0.2, not \(h \gt 0.5\): the red pen of p. 371.</span></li>
+      <li>It saves \(0.3 \times 10 = 3\) ms per read <span class="fb">This forgets that every read pays the look \(t_c\), hits and misses alike.</span></li>
+      <li>Nothing can be said without the size of the cache <span class="fb">The size acts through the hit ratio; once \(h\) is given, \(t_c\) and \(t_o\) decide.</span></li>
+      <li data-correct>It makes it slightly faster: \(2 + 0.7 \times 10 = 9\) ms instead of 10 ms <span class="fb">The break-even is \(t_c / t_o = 0.2\), and 0.3 is above it.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can memcached afford "No persistency" and "No replication"?</p>
+    <ul class="options">
+      <li>Its servers run in pools, so one of them always has a second copy <span class="fb">The pool shares out the keys, it does not copy them: "single item in cache lives on one server only" (p. 381).</span></li>
+      <li data-correct>Every item is a copy of data stored elsewhere: a lost server costs time, not data <span class="fb">A cache is "a collection of data duplicating original values stored elsewhere" (p. 367); the misses reload from the database.</span></li>
+      <li>The client keeps a copy of every item it reads <span class="fb">The client only decides which server holds a key; it stores nothing.</span></li>
+      <li>It writes everything to disk anyway <span class="fb">"No persistency (if your server goes down, data in memcached is gone)" (p. 381).</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">User data is cached with time-based invalidation, TTL 10 minutes. A user changes their name. Which statements are true? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>For up to 10 minutes, some readers may see the old name <span class="fb">"You can't trust that data coming from cache is correct" (p. 388).</span></li>
+      <li>The cache notices the change and refreshes the entry at once <span class="fb">That is event-based invalidation (p. 390), which this setup does not do.</span></li>
+      <li data-correct>The cached entry is not deleted when the name changes <span class="fb">"don't delete caches" (p. 388): the entry just lives out its TTL.</span></li>
+      <li>A shorter TTL would make stale reads impossible <span class="fb">It narrows the window and costs hits; it never closes the window — the widget still showed stale hits at 10 s.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Belady's algorithm is on the replacement-policy slide (p. 369), yet no real cache runs it. Why?</p>
+    <ul class="options">
+      <li>It takes too long to compute <span class="fb">The rule is simple; what is missing is the information, the future requests.</span></li>
+      <li>It does worse than LRU <span class="fb">It does better than every other policy — in the widget it was the ceiling.</span></li>
+      <li data-correct>It evicts the entry needed again furthest in the future, which only a simulation can know <span class="fb">It is the optimum, used as a yardstick for FIFO, LFU, LRU, MRU and RANDOM.</span></li>
+      <li>It works only for CPU caches <span class="fb">It applies to any cache; it was proposed in 1966 for the memory of a computer, and the widget runs it on a cache of user profiles.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l19-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Page 359 keeps an in-memory database alive with four kinds of machinery: persistence (RDB snapshots, AOF log), replication (master to read-only slaves), partitioning (in the client, a proxy such as Twemproxy, or a query router such as Redis Cluster) and failover (manual, Sentinel, Cluster).</li>
+    <li>A snapshot loses what was written after it, minutes; the log loses at most what was not yet flushed, about a second by default; more persistence means more latency and less throughput (p. 349).</li>
+    <li>The topologies sit on a two-by-two: Standalone has neither automatic failover nor distribution, Sentinel only failover, Twemproxy only distribution, Cluster both — with 16384 hash slots, slot = CRC16(key) mod 16384, and multi-key commands only within one slot (hash tags put keys together).</li>
+    <li>A cache duplicates values stored elsewhere. Hit ratio = hits / (hits + misses), 45/55 ≈ 82 % on p. 370; the cache pays when the hit ratio exceeds \(t_c / t_o\) — "more hits than misses" is only a rule of thumb. FIFO, LFU, LRU, MRU and RANDOM are judged against Belady's optimum, which needs the future.</li>
+    <li>Memcached (Fitzpatrick, LiveJournal, 2003) is a pool of independent servers that the client manages; it refuses persistence, redundancy and fail-over, replication, authentication, key enumeration and active clean-up, caps items at 1 MB and keys at 250 characters, and evicts with LRU. Being a cache is what lets it refuse.</li>
+    <li>Cache-aside: <code>get</code>; on a miss, query the database, <code>set(key, value)</code>, return. Invalidate by time (a TTL: simple, but stale reads are possible) or by event (store forever, delete on every write); fetch many keys in one round trip with multiget or pipelining.</li>
+  </ul>
+  <aside class="cheat" id="l19-cheat">
+    <dl>
+      <dt>Persistence (p. 359)</dt><dd>RDB: point-in-time snapshot of the dataset · AOF: append-only log of every write, replayed at restart</dd>
+      <dt>Persistence vs speed (p. 349)</dt><dd>more persistence → more latency, less throughput</dd>
+      <dt>Replication</dt><dd>master → slaves, exact copies; clients write to the master, read from either; slaves read only by default</dd>
+      <dt>Partitioning layers</dt><dd>client · proxy (Twemproxy) · query router (Redis Cluster)</dd>
+      <dt>Failover</dt><dd>manual · Sentinel (master-slave) · Cluster</dd>
+      <dt>I · Standalone</dt><dd>master only / master-slave / multi-level; no automatic failover</dd>
+      <dt>II · Sentinel</dt><dd>automatic failover; does not distribute data</dd>
+      <dt>III · Twemproxy</dt><dd>distributes data by consistent hashing; no failover; no multi-key commands or transactions; not part of Redis</dd>
+      <dt>IV · Cluster</dt><dd>failover + distribution; 16384 hash slots; service channel; multi-key only within one slot</dd>
+      <dt>Hash slot</dt><dd>\(\text{slot}(k) = \text{CRC16}(k) \bmod 16384\)</dd>
+      <dt>Hash tag</dt><dd><code>MSET {user:42}:name "Ada" {user:42}:city "Milano"</code> → only <code>user:42</code> is hashed: one slot</dd>
+      <dt>Cache (p. 367)</dt><dd>data duplicating original values stored elsewhere or computed earlier</dd>
+      <dt>Hit ratio (p. 370)</dt><dd>hits / (hits + misses); 45/(45+10) ≈ 82 %; miss ratio = 1 − hit ratio</dd>
+      <dt>Break-even</dt><dd>\(T = t_c + (1-h)\,t_o\); the cache pays iff \(h \gt t_c / t_o\)</dd>
+      <dt>Replacement (p. 369)</dt><dd>FIFO · LFU · LRU · MRU · RANDOM vs Belady: evict the entry needed furthest in the future (optimal, needs the future)</dd>
+      <dt>Cold / warm cache</dt><dd>empty, nearly every request misses / filled with what the requests ask for</dd>
+      <dt>Memcached</dt><dd>Fitzpatrick, LiveJournal, 2003; client-managed pool (3 × 64 GB = 192 GB); no persistency, redundancy / fail-over, replication, authentication, key enumeration, active clean-up; item ≤ 1 MB, key ≤ 250 characters; LRU</dd>
+      <dt>Cache-aside</dt><dd><code>get(key)</code>; miss → query the database → <code>set(key, value)</code> → return</dd>
+      <dt>Invalidation</dt><dd>time-based: TTL, e.g. 10 min, stale reads possible (<code>SET key value EX 600</code>) · event-based: store forever, delete on write (<code>DEL key</code>)</dd>
+      <dt>Multiget / pipelining</dt><dd>many keys or commands in one round trip: <code>getMulti</code>, <code>MGET</code>; Redis 80,000 → pipelined 250,000 (p. 365)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l19-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.linuxjournal.com/article/7451" target="_blank" rel="noopener">Distributed Caching with Memcached</a>
+      <span class="res-by">Brad Fitzpatrick, Linux Journal, 2004</span>
+      <p class="res-why">Memcached explained by its author, a year after he wrote it for LiveJournal: the "global hash table" he wanted for all the web processes, spread over many independent servers — the pool of p. 378.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://codeahoy.com/2017/08/11/caching-strategies-and-how-to-choose-the-right-one/" target="_blank" rel="noopener">Caching Strategies and How to Choose the Right One</a>
+      <span class="res-by">Umer Mansoor, codeahoy</span>
+      <p class="res-why">One diagram per pattern: cache-aside, the shape of the slides' PHP code, next to read-through, write-through and write-back, and what can go wrong with each. Read it next to section 5.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/" target="_blank" rel="noopener">Redis persistence</a>
+      <span class="res-by">Redis documentation</span>
+      <p class="res-why">RDB and AOF in full, with the advantages and the risks of each, the flush policies, and what happens when both are on — the mechanics behind the two names of p. 359.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://redis.io/tutorials/operate/redis-at-scale/scalability/" target="_blank" rel="noopener">Running Redis at Scale: Scalability</a>
+      <span class="res-by">Redis tutorials</span>
+      <p class="res-why">Why a fixed 16384 slots instead of "hash mod the number of shards", how resharding moves slots, and a hands-on six-node cluster — topology IV of p. 364, built.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Myp8z0ybdzM" target="_blank" rel="noopener">Cache Consistency: Memcached at Facebook</a>
+      <span class="res-by">Robert Morris, MIT 6.824, lecture 16</span>
+      <p class="res-why">Cache-aside at the largest scale, and everything that goes wrong with invalidation: why a write deletes the cached copy instead of updating it, and what a cold cache does to a database.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Redis Cluster still has masters and slaves, and a key still opens one value. What if no node were special, and one key opened a whole row of columns?</p>
+</aside>
+
+</main>
+</body>
+</html>

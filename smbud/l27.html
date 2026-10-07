@@ -1,0 +1,1551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Meaning as coordinates: embeddings, similarity and the search for neighbours · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l27">
+
+<header class="lesson-head">
+  <h1>Meaning as coordinates: embeddings, similarity and the search for neighbours</h1>
+  <p class="lede">After this lesson you will explain how an embedding turns a sentence or an image into a point, compute and compare cosine similarity, Euclidean distance and inner product, and say how K-D trees, R-trees, LSH, HNSW and IVFPQ find the nearest neighbours of a query — and what each of them gives up.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>Page 656 of the lecture compares one new sentence, "Rainy days make me sad", with ten stored ones. First, with a score of 0.764: "Rainy days can be gloomy." No surprise, two words in common. Second, with 0.419: "Colds are unpleasant." It shares not a single word with the query. Last, with 0.034: "Success is rewarding."</p>
+  <p>An inverted index, the structure behind keyword search (<a href="l24.html#l24-index">lesson 24</a>), could never put "Colds are unpleasant" second: it finds documents by the words they contain. Something on that page reads meaning. And a vector database must produce such a ranking over millions of items in milliseconds, although comparing the query with every stored point "for large datasets is computationally prohibitive" (p. 658).</p>
+  <p>Two questions, then. How does a machine see that a sad rainy day and an unpleasant cold belong together? And how does it find the best match without looking at everything? You will answer both by the end of the lesson — and learn the price of the second answer.</p>
+</div>
+
+
+<section id="l27-points">
+  <h2>From things to points</h2>
+
+  <p>"Vector databases are gaining popularity due to the rise of AI and ML applications", page 640 begins: "In particular, applications that use LLM + RAG (Retrieval Augmented Generation)". In retrieval-augmented generation a language model, before it answers, fetches the stored passages closest in meaning to the question and reads them. Page 641 widens the picture: vector databases allow "more efficient and semantically rich data retrieval", "enhancing search and recommendation systems". Fetching the closest items fast is the subject of this lesson.</p>
+
+  <div class="def">
+    <p><dfn>Vector database</dfn> — "A vector database stores data as high-dimensional vector representations. It enables contextual search and discovery of data, going beyond keyword matching" (p. 645). Vector DBs "organize the vectors by their semantic similarity, allowing for efficient and meaningful data retrieval based on context" (p. 646).</p>
+  </div>
+
+  <p>Vector search is also a feature of databases you already know. The chart of page 644 separates "Dedicated vector databases" from "Databases that support vector search", and the second group includes Neo4j, Cassandra, Elasticsearch, MongoDB and Redis — the graph, column-family, search, document and key-value databases you practise in this course.</p>
+
+  <h3>A vector is a list of numbers — and an arrow</h3>
+
+  <p>"In mathematics and physics, a vector is a quantity with both magnitude and direction. In vector databases, vectors represent various attributes of an object" (p. 647). Page 648 turns a house into four of them: 3 bathrooms, 1 bedroom, an area of 130 and a price of 340000, the vector \((3, 1, 130, 340000)\). The exercise session adds two words: a vector "is a list of numbers that represent magnitude and direction", and "When most values are non-zero, it is referred to as a dense vector" (p. 1685). A <mark class="key">vector space</mark> is "a mathematical set of vectors that can be added together and scaled", continuous "when values can take on any real number" (p. 1686).</p>
+
+  <details class="why">
+    <summary>Can you compare two houses with these raw numbers?</summary>
+    <p>Not yet. Raise the price of the house by 5000 and the new vector is 5000 away from it. Keep the price and change everything else — 1 bathroom, 4 bedrooms, an area of 250 — and the new vector is only 120.05 away. The price, the largest number, swamps every other coordinate. Hand-made attribute vectors must be standardised first (z-scores, as before a PCA in Applied Statistics). The vectors of an embedding model, below, do not have this problem: every coordinate is on the model's own scale, none is a price or an area.</p>
+  </details>
+
+  <h3>Embedding: similar things, nearby points</h3>
+
+  <div class="def">
+    <p><dfn>Embedding</dfn> — "Vectorization / embedding is the process of converting data (such as text or images) into dense numerical vectors that capture their semantics, using an embedding model" (p. 1684). In the lecture's words, "Embedding is a technique to transform text, images, or any other data into vectors" (p. 649).</p>
+  </div>
+
+  <p>What makes embeddings useful is a property of space: they "represent data (like text, images, audio, or graphs) as vectors of numbers so that similar items are close together in this vector space" (p. 1687). The drawing on that page turns three portraits into three points in one corner of a plane and two fruits into two points in another.</p>
+
+  <p>What does one coordinate do? The session borrows Google's food example (p. 1688; Fig. 1). On a single axis, "sandwichness", five dishes line up from borscht to shawarma; by sandwichness alone an apple strudel would fall between the hot dog and the shawarma. Add "dessertness" and it rises away from them. A third axis, "liquidness", pulls the borscht away from the salad and lifts tangyuan, sweet dumplings served in soup, high on two axes at once. Every new dimension separates things the previous ones confused.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l27-fig-food">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="One axis, sandwichness: borscht, salad, pizza, hot dog, apple strudel and shawarma in one row; the strudel lies between the hot dog and the shawarma">
+        <text x="150" y="36" class="tx-hand tx-mid">strudel or sandwich?</text>
+        <line x1="150" y1="130" x2="284" y2="130" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="130" x2="16" y2="130" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="203" y1="123" x2="211" y2="98" class="st-muted"/>
+        <line x1="229" y1="137" x2="237" y2="163" class="st-muted"/>
+        <circle cx="47" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="94" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="134" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="179" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="201" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="228" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <text x="47" y="114" class="tx-sm tx-mid">borscht</text>
+        <text x="94" y="154" class="tx-sm tx-mid">salad</text>
+        <text x="134" y="114" class="tx-sm tx-mid">pizza</text>
+        <text x="179" y="154" class="tx-sm tx-mid">hot dog</text>
+        <text x="214" y="90" class="tx-sm tx-mid">apple strudel</text>
+        <text x="240" y="178" class="tx-sm tx-mid">shawarma</text>
+        <text x="18" y="216" class="tx-sm tx-muted">less sandwich-y</text>
+        <text x="282" y="216" class="tx-sm tx-muted tx-end">more sandwich-y</text>
+      </svg>
+      <p class="fig-label">Before: one dimension</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Two axes, sandwichness and dessertness: the sandwiches stay in a row under the horizontal axis, the borscht on the left, while the apple strudel rises high above them">
+        <line x1="150" y1="150" x2="284" y2="150" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="150" x2="16" y2="150" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="150" x2="150" y2="16" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="150" x2="150" y2="234" class="st-muted" marker-end="url(#arr-muted)"/>
+        <circle cx="201" cy="150" r="6" class="st-muted dash"/>
+        <line x1="201" y1="142" x2="201" y2="78" class="sw-2 dash" marker-end="url(#arr)"/>
+        <circle cx="45" cy="168" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="94" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="134" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="179" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="228" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="201" cy="66" r="6" class="fi-s1 st-paper sw-2"/>
+        <text x="158" y="22" class="tx-sm tx-muted">dessertness</text>
+        <text x="284" y="140" class="tx-sm tx-muted tx-end">sandwichness</text>
+        <text x="214" y="48" class="tx-sm tx-mid">apple strudel</text>
+        <text x="212" y="114" class="tx-hand">lifted</text>
+        <text x="45" y="200" class="tx-sm tx-mid halo">borscht</text>
+        <text x="134" y="200" class="tx-sm tx-mid halo">pizza</text>
+        <text x="228" y="200" class="tx-sm tx-mid halo">shawarma</text>
+        <text x="94" y="219" class="tx-sm tx-mid halo">salad</text>
+        <text x="179" y="219" class="tx-sm tx-mid halo">hot dog</text>
+      </svg>
+      <p class="fig-label">After: two dimensions</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> The food example of p. 1688 (taken by the session from Google's Machine Learning Crash Course), redrawn. Before: on the sandwichness axis alone, the apple strudel lands between the hot dog and the shawarma. After: a dessertness axis lifts it away from the sandwiches. The slide's one-axis panel shows only the five other dishes; the strudel is placed there at its sandwichness in the slide's second panel.</figcaption>
+  </figure>
+
+  <p>Real embedding dimensions have no such names: the embedding model "often is black box", says the drawing on page 1684. You cannot read the meaning of the 17th coordinate; you can only measure which points are near which. That is enough: embedding lets vector databases "find relevant information through vector similarity, rather than exact text matches" (p. 653).</p>
+
+  <p class="memo"><mark class="key">An embedding turns meaning into position: similar items get nearby coordinates, so "similar" becomes "near".</mark></p>
+</section>
+
+
+<section id="l27-encoders">
+  <h2>Where the coordinates come from</h2>
+
+  <p>The session names two decisions before any model is built (p. 1689). First, "decide what ‘similar’ means for the data at hand (words in similar contexts, images of the same object, etc.)". The slide adds that "In Deep Learning, this is automatically inferred": you do not hand-craft the features, but the notion of similarity is still fixed — by the pairs the model is trained on. Second, "choose the number of dimensions": "more dimensions capture more detail but are slower and heavier; fewer dimensions are faster but less precise".</p>
+
+  <p>Then "build an <mark class="key">encoder</mark> model that converts the data into vectors (e.g., BERT for text, CNN/ViT for images)" and "Train the encoder using metric learning so that similar items are clustered together, and dissimilar ones are separated" (p. 1690). You know the machinery from AN2DL: a contrastive or triplet loss pulls an anchor towards its positive example and pushes it away from the negatives, and the vector is the network's last hidden representation, without the classification head.</p>
+
+  <ul>
+    <li><strong>Images, CNN.</strong> Convolutional networks "capture the semantic meaning of images by processing them through their convolutional layers"; the named families are VGG, ResNet, Inception and EfficientNet (p. 1692).</li>
+    <li><strong>Images, ViT.</strong> "An image is divided into fixed-size patches, which are fed into a transformer encoder. Using self-attention, it learns relationships between patches across the entire image" (p. 1693).</li>
+    <li><strong>Text.</strong> Word embeddings place "similar words close to each other"; text/document embeddings "represent longer text units such as sentences, paragraphs, or entire documents" (p. 1694). Page 649 lists models: OpenAI's text-embedding-ada-002 and its siblings, Sentence Transformers such as all-MiniLM-L6-v2 and all-mpnet-base-v1, services such as Google Vertex AI and Elasticsearch. In the session's Vectorization notebook, all-MiniLM-L6-v2 turns four sentences into "four 384-dimensional embeddings".</li>
+    <li><strong>Text and images together, CLIP.</strong> It "projects text and image embeddings into the same embedding space, so ‘a photo of a dog’ and a real dog image should be closer" (p. 1695). Page 650, "Multi-modal vectorization", sends text, video and audio embeddings into one vector database.</li>
+  </ul>
+
+  <p>The pipeline that uses them has three steps (p. 1691, Fig. 2): convert the data into embeddings, "Store embeddings in a vector database for fast retrieval", then apply them to "semantic search, retrieval-augmented generation (RAG), classification, clustering, and recommendations". A query must be embedded by the same model as the stored data; otherwise the two sets of coordinates mean different things.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-pipeline">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="Text, an image and audio go into an embedding model, which outputs vectors; the vectors are stored in a vector database, where a query vector finds its three nearest stored vectors">
+      <line x1="88" y1="68" x2="139" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="88" y1="140" x2="139" y2="140" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="88" y1="212" x2="139" y2="168" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="266" y1="140" x2="284" y2="140" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="368" y1="140" x2="392" y2="140" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="24" y="48" width="60" height="40" class="fi-paper"/>
+      <line x1="32" y1="60" x2="76" y2="60" class="st-muted"/>
+      <line x1="32" y1="68" x2="76" y2="68" class="st-muted"/>
+      <line x1="32" y1="76" x2="64" y2="76" class="st-muted"/>
+      <rect x="24" y="120" width="60" height="40" class="fi-paper"/>
+      <polyline points="28,154 44,136 56,148 66,140 80,154" class="st-muted"/>
+      <circle cx="70" cy="130" r="4" class="st-muted"/>
+      <rect x="24" y="192" width="60" height="40" class="fi-paper"/>
+      <path d="M30 212 q6 -12 12 0 t12 0 t12 0 t12 0" class="st-muted"/>
+      <polygon points="144,96 154,86 262,86 252,96" class="fi-paper"/>
+      <polygon points="252,96 262,86 262,174 252,184" class="fi-paper"/>
+      <rect x="144" y="96" width="108" height="88" class="fi-paper sw-2"/>
+      <rect x="290" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="302" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="314" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="326" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="338" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="350" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="290" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="302" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="314" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="326" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="338" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="350" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="290" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="302" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="314" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="326" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="338" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="350" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="398" y="44" width="150" height="200" rx="10" class="fi-paper sw-2"/>
+      <circle cx="424" cy="100" r="5" class="fi-s1"/>
+      <circle cx="436" cy="90" r="5" class="fi-s1"/>
+      <circle cx="430" cy="114" r="5" class="fi-s1"/>
+      <circle cx="446" cy="104" r="5" class="fi-s1"/>
+      <circle cx="500" cy="96" r="5" class="fi-s1"/>
+      <circle cx="516" cy="106" r="5" class="fi-s1"/>
+      <circle cx="504" cy="120" r="5" class="fi-s1"/>
+      <circle cx="476" cy="138" r="5" class="fi-s1"/>
+      <circle cx="494" cy="152" r="5" class="fi-s1"/>
+      <circle cx="510" cy="176" r="5" class="fi-s1"/>
+      <circle cx="502" cy="194" r="5" class="fi-s1"/>
+      <circle cx="522" cy="208" r="5" class="fi-s1"/>
+      <circle cx="460" cy="184" r="5" class="fi-s1"/>
+      <circle cx="450" cy="214" r="5" class="fi-s1"/>
+      <circle cx="472" cy="206" r="5" class="fi-s1"/>
+      <circle cx="460" cy="184" r="9" class="st-s3 sw-2 dash"/>
+      <circle cx="450" cy="214" r="9" class="st-s3 sw-2 dash"/>
+      <circle cx="472" cy="206" r="9" class="st-s3 sw-2 dash"/>
+      <path d="M434 190 l12 12 M446 190 l-12 12" class="st-s2 sw-3"/>
+      <text x="200" y="24" class="tx-sm tx-bold tx-mid">1 · embed</text>
+      <text x="330" y="24" class="tx-sm tx-bold tx-mid">2 · store</text>
+      <text x="473" y="24" class="tx-sm tx-bold tx-mid">3 · search</text>
+      <text x="204" y="66" class="tx-hand tx-mid">often a black box</text>
+      <text x="54" y="104" class="tx-sm tx-mid">text</text>
+      <text x="54" y="176" class="tx-sm tx-mid">image</text>
+      <text x="54" y="248" class="tx-sm tx-mid">audio</text>
+      <text x="198" y="136" class="tx-sm tx-mid">embedding</text>
+      <text x="198" y="154" class="tx-sm tx-mid">model</text>
+      <text x="198" y="206" class="tx-sm tx-mid tx-muted">BERT, CNN, ViT</text>
+      <text x="198" y="224" class="tx-sm tx-mid tx-muted">or CLIP</text>
+      <text x="326" y="192" class="tx-sm tx-mid">vectors</text>
+      <text x="473" y="66" class="tx-sm tx-bold tx-mid">vector database</text>
+      <text x="440" y="172" class="tx-sm tx-mid halo">query</text>
+      <text x="500" y="234" class="tx-sm tx-mid">3 nearest</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The three steps of p. 1691, with the several media of p. 650. An embedding model turns each item into a vector (all-MiniLM-L6-v2 gives 384 numbers); the database stores the vectors; a query, embedded by the same model, gets back its nearest stored vectors — here the 3 circled ones.</figcaption>
+  </figure>
+
+  <h3>Looking at the space</h3>
+
+  <p>Page 651 embeds sentences such as 'Sunsets are breathtaking' "using models like paraphrase-MiniLM" and gives the process: "Take a sentence", "Transform it into (numerical) vector representation", "Possibly reduce dimensionality if needed / wanted". Page 652 does it to ten sentences — "sentences to 32 dimensions vectors, and then PCA to top 2 principal components" — and the plot (Fig. 3) puts "Colds are unpleasant.", "Mosquitoes are annoying." and "Traffic jams are frustrating." on the left, "Laughter brings joy.", "Music is uplifting." and "Success is rewarding." on the right.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-pca">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Ten sentences projected on the first two principal components: the negative ones (colds, mosquitoes, traffic jams, failure, rainy days) on the left, the positive ones (laughter, music, success, sunsets) on the right, kindness in the middle; colds and mosquitoes almost coincide">
+      <circle cx="409" cy="41" r="5" class="fi-s1"/>
+      <circle cx="184" cy="148" r="5" class="fi-s1"/>
+      <circle cx="80" cy="180" r="5" class="fi-s1"/>
+      <circle cx="94" cy="191" r="5" class="fi-s1"/>
+      <circle cx="499" cy="207" r="5" class="fi-s1"/>
+      <circle cx="450" cy="223" r="5" class="fi-s1"/>
+      <circle cx="144" cy="252" r="5" class="fi-s1"/>
+      <circle cx="283" cy="255" r="5" class="fi-s1"/>
+      <circle cx="234" cy="259" r="5" class="fi-s1"/>
+      <circle cx="495" cy="264" r="5" class="fi-s1"/>
+      <text x="20" y="22" class="tx-sm tx-muted">PC 2 ↑</text>
+      <text x="545" y="296" class="tx-sm tx-muted tx-end">PC 1 →</text>
+      <text x="419" y="46" class="tx-sm">sunsets</text>
+      <text x="194" y="152" class="tx-sm">rainy days</text>
+      <text x="72" y="172" class="tx-sm tx-end">colds</text>
+      <text x="104" y="198" class="tx-sm">mosquitoes</text>
+      <text x="134" y="257" class="tx-sm tx-end">traffic jams</text>
+      <text x="290" y="238" class="tx-sm tx-mid">kindness</text>
+      <text x="234" y="284" class="tx-sm tx-mid">failure</text>
+      <text x="489" y="203" class="tx-sm tx-end">laughter</text>
+      <text x="440" y="240" class="tx-sm tx-end">music</text>
+      <text x="485" y="269" class="tx-sm tx-end">success</text>
+      <text x="40" y="110" class="tx-hand">negative</text>
+      <text x="430" y="120" class="tx-hand">positive</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The PCA plot of p. 652, redrawn: positions read off the slide's chart, labels shortened. Negative sentences lie to the left on PC 1, positive ones to the right; "Kindness is contagious." sits in the middle. "Colds" and "mosquitoes" almost coincide: the text below explains why that proves less than it seems.</figcaption>
+  </figure>
+
+  <p>This is the PCA of Applied Statistics: the two directions of largest variance. It is also only a projection. "Colds are unpleasant." and "Mosquitoes are annoying." almost overlap in the plot, yet against "Rainy days make me sad" they score 0.419 and 0.296, because the scores are computed in all the dimensions. The session's Visualization notebook draws the same kind of plot for three different models.</p>
+</section>
+
+
+<section id="l27-similarity">
+  <h2>How close is close: three ways to compare vectors</h2>
+
+  <p>"Metrics like Cosine and Euclidean distances are used to measure the similarity between two vectors" (p. 654). The two squares on that page show the difference. The Euclidean distance is the length of the segment between two points; the cosine looks only at the angle between the two arrows drawn from the origin.</p>
+
+  <div class="formula">
+    \[ \text{similarity}(A,B) = \cos\theta = \frac{A\cdot B}{\norm{A}\,\norm{B}} \]
+    \[ = \frac{\sum_{i=1}^{n} A_i B_i}{\sqrt{\sum_{i=1}^{n} A_i^2 \, \sum_{i=1}^{n} B_i^2}} \]
+    \[ d(A,B) = \norm{A - B} \]
+    \[ = \sqrt{\textstyle\sum_{i=1}^{n} (A_i - B_i)^2} \]
+    <dl class="legend">
+      <dt>\(A, B\)</dt><dd>two non-zero vectors with \(n\) components \(A_i\), \(B_i\)</dd>
+      <dt>\(A\cdot B\)</dt><dd>the inner (dot) product, \(\sum_i A_i B_i\)</dd>
+      <dt>\(\norm{A}\)</dt><dd>the length of \(A\), \(\sqrt{\sum_i A_i^2}\)</dd>
+      <dt>\(\theta\)</dt><dd>the angle between the two vectors</dd>
+      <dt>\(d(A,B)\)</dt><dd>the Euclidean distance between their tips</dd>
+    </dl>
+  </div>
+
+  <p>The cosine depends on the angle only (p. 655, p. 1696; Fig. 4): close to 1 when the two arrows point the same way, 0 when they are orthogonal, −1 when they are opposite. The <mark class="key">inner product</mark> is the numerator alone, so it grows with the lengths as well.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-angles">
+    <svg class="dia" viewBox="0 0 560 230" role="img" aria-label="Three pairs of arrows A and B from an origin: a small angle, cosine close to 1, similar; a right angle, cosine 0, orthogonal; a straight angle, cosine minus 1, opposite">
+      <line x1="15" y1="120" x2="175" y2="120" class="st-muted"/>
+      <line x1="95" y1="175" x2="95" y2="40" class="st-muted"/>
+      <line x1="200" y1="120" x2="360" y2="120" class="st-muted"/>
+      <line x1="280" y1="175" x2="280" y2="40" class="st-muted"/>
+      <line x1="385" y1="120" x2="545" y2="120" class="st-muted"/>
+      <line x1="465" y1="175" x2="465" y2="40" class="st-muted"/>
+      <path d="M121 109.5 A28 28 0 0 0 112.2 97.9" class="sw-2"/>
+      <polyline points="290.9,114.9 285.8,104 274.9,109.1" class="sw-2"/>
+      <path d="M485.7 112.5 A22 22 0 0 0 444.3 127.5" class="sw-2"/>
+      <line x1="95" y1="120" x2="139.3" y2="63.3" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="95" y1="120" x2="165.5" y2="91.5" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="280" y1="120" x2="249.6" y2="54.7" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="280" y1="120" x2="348.9" y2="87.9" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="465" y1="120" x2="403" y2="142.6" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="465" y1="120" x2="527" y2="97.4" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="148" y="54" class="tx-sm tx-mid">A</text>
+      <text x="178" y="88" class="tx-sm tx-mid">B</text>
+      <text x="133" y="100" class="tx-sm tx-mid">θ</text>
+      <text x="242" y="44" class="tx-sm tx-mid">A</text>
+      <text x="361" y="84" class="tx-sm tx-mid">B</text>
+      <text x="294" y="96" class="tx-sm tx-mid">θ</text>
+      <text x="392" y="156" class="tx-sm tx-mid">A</text>
+      <text x="540" y="94" class="tx-sm tx-mid">B</text>
+      <text x="465" y="88" class="tx-sm tx-mid">θ</text>
+      <text x="95" y="202" class="tx-mono tx-mid">cos θ ≈ 1</text>
+      <text x="280" y="202" class="tx-mono tx-mid">cos θ = 0</text>
+      <text x="465" y="202" class="tx-mono tx-mid">cos θ = −1</text>
+      <text x="95" y="222" class="tx-sm tx-mid">similar</text>
+      <text x="280" y="222" class="tx-sm tx-mid">orthogonal</text>
+      <text x="465" y="222" class="tx-sm tx-mid">opposite</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The three cases of p. 655 and p. 1696. Only the angle counts: stretching A or B changes neither \(\theta\) nor its cosine.</figcaption>
+  </figure>
+
+  <p>The session's Comparison notebook works it out on two arrows, \(A = (2, 1)\) and \(B = (0, 2)\):</p>
+
+  <div class="formula">
+    \[ A\cdot B = 2\cdot 0 + 1\cdot 2 = 2 \]
+    \[ \norm{A} = \sqrt{2^2 + 1^2} = \sqrt{5} \approx 2.236 \]
+    \[ \norm{B} = \sqrt{0^2 + 2^2} = 2 \]
+    \[ \cos\theta = \frac{2}{2.236 \cdot 2} \approx 0.447 \]
+    \[ \theta = \arccos 0.447 \approx 63.4^\circ \]
+  </div>
+
+  <p>Positive and well below 1: the arrows are 63° apart, nearer to orthogonal than to identical. The other two measures of the same pair are the inner product, 2, and the Euclidean distance between the tips:</p>
+
+  \[ \norm{A - B} = \sqrt{(2-0)^2 + (1-2)^2} \]
+  \[ = \sqrt{5} \approx 2.236 \]
+
+  <p>Three numbers, three different scales. The notebook's code, without its plotting cell:</p>
+
+<pre><code>import numpy as np
+
+vec1 = np.array([2, 1])
+vec2 = np.array([0, 2])
+
+def cosine_similarity(vec1, vec2):
+    dot_product = np.dot(vec1, vec2)
+    norm_vec1 = np.linalg.norm(vec1)
+    norm_vec2 = np.linalg.norm(vec2)
+    similarity = dot_product / (norm_vec1 * norm_vec2)
+    return similarity
+
+similarity_score = cosine_similarity(vec1, vec2)
+print(f"Cosine Similarity between vec1 and vec2: {similarity_score:.4f}")
+# prints: Cosine Similarity between vec1 and vec2: 0.4472</code></pre>
+
+  <p>Now read the table of page 656 with these tools. Its column holds the cosine similarity of "Rainy days make me sad" with each stored sentence, already sorted: 0.764286 for "Rainy days can be gloomy.", an angle of 40°; 0.418937 for "Colds are unpleasant.", 65°; down to 0.033636 for "Success is rewarding.", 88° — almost orthogonal. The stored vectors are not of length 1 (one coordinate printed in the table is 1.2116411), and the cosine does not care: it divides the lengths away.</p>
+
+  <aside class="redpen" data-page="656">
+    <p class="claim">"Distance Calculation" … "What’s the distance wrt the other sentences? Which is the best match?"</p>
+    <p class="fix">The column answering the question is a cosine similarity, not a distance. The best match is the largest value, "Rainy days can be gloomy." with 0.764286. As a distance you would use the cosine distance \(1 - \cos\theta\) — 0.236 for that sentence — and then the best match is the smallest value.</p>
+    <p class="because">A cosine is 1 for arrows pointing the same way and falls as the angle grows (p. 655), so the table reads from the top: its last line, 0.033636, is the worst match, not the closest. Page 654 also speaks of "Cosine and Euclidean distances". The exam may use the slide's wording: say which quantity you rank by, and remember that for a similarity the best is the maximum.</p>
+  </aside>
+
+  <h3>Why cosine — and when the metrics disagree</h3>
+
+  <p>The slide's reason: "Cosine similarity is commonly used due to its efficiency" (p. 654). On vectors of length 1 it is indeed a single inner product. Two further reasons are given outside the slides: the cosine ignores length, so a long text and a short one on the same topic still point the same way; and the metric should match the one the embedding model was trained with.</p>
+
+  <p>Ignoring length matters, because the metrics can disagree. Take \(a = (1, 1)\), \(b = (2, 2)\), \(c = (1, 0)\). By cosine, the nearest neighbour of \(a\) is \(b\): same direction, cosine 1. By Euclidean distance it is \(c\), 1 away, while \(b\) is 1.414 away. Normalise the three vectors to length 1 and the disagreement disappears, for a reason worth deriving once:</p>
+
+  <ol class="steps" id="l27-steps-unit">
+    <li><p>Write the squared distance as the inner product of the difference with itself:</p> \[ \norm{A - B}^2 = (A - B)\cdot(A - B) \]</li>
+    <li><p>Expand it like \((a - b)^2\); the inner product distributes and \(A\cdot B = B\cdot A\):</p> \[ \norm{A - B}^2 = \norm{A}^2 + \norm{B}^2 - 2\,A\cdot B \]</li>
+    <li><p>Normalise: divide every vector by its length, so that \(\norm{A} = \norm{B} = 1\):</p> \[ \norm{A - B}^2 = 2 - 2\,A\cdot B \]</li>
+    <li><p>With lengths 1 the denominator of the cosine is 1, so the inner product <em>is</em> the cosine:</p> \[ A\cdot B = \cos\theta \] \[ \norm{A - B} = \sqrt{2 - 2\cos\theta} \]</li>
+    <li><p>Read it: the distance shrinks exactly when the cosine grows. Sorting by smallest Euclidean distance, by largest inner product or by largest cosine gives the same list. For the best match of page 656 the unit-length distance would be \(\sqrt{2 - 2 \cdot 0.764} \approx 0.687\), still first.</p></li>
+  </ol>
+
+  <p>That is why FAISS can run a cosine search with an inner-product index on normalised vectors, and why an inner-product search — the <code>"metric_type": "IP"</code> printed in the Zilliz call of the exam of 11 Feb 2025 (<a href="l28.html#l28-fill">lesson 28</a>) — ranks exactly like a cosine search once the vectors have length 1. Try the three metrics on one query:</p>
+
+  <div class="widget" id="l27-w-space">
+    <h3 class="widget-title">Three metrics, one query: who are the nearest neighbours?</h3>
+    <p class="widget-intro">Each dot is a review of one restaurant as a toy 2-D vector: its direction says what the review is about (food, service, prices, the room), and its length varies, as the lengths of raw embeddings do. The positions are made up for this widget, not computed by a model. Drag the query, choose the metric and k; the shaded region holds exactly the k nearest, and hovering a dot shows its text. The one thing to see: the metrics disagree while the lengths differ, and agree once every vector has length 1.</p>
+    <ol class="tasks">
+      <li>Start with cosine similarity and k = 3. Before switching to Euclidean distance, predict: will the same three reviews win?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only "The pasta was perfect." stays. Cosine picked the three closest in direction, "Fresh fish, great sauce." (2.5°), "The pasta was perfect." (3.0°) and "Best tiramisu in Milan." (5.0°), whatever their length. Euclidean distance wants tips near the query's tip: "The pasta was perfect." (0.16), "Risotto a bit salty." (0.25), "Gnocchi melt in the mouth." (0.38). The cone has become a disc.</p></details>
+      </li>
+      <li>Switch to inner product. Which kind of vector do you expect at the top?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Long vectors pointing roughly the right way: "Pizza crust was burnt." (2.38), "Best tiramisu in Milan." (2.19) — and "We waited an hour." (2.00), a review about the service, 38° away, which gets in because it is the longest vector of all. The inner product rewards length; its region is a half-plane.</p></details>
+      </li>
+      <li>Turn on "normalise every vector to length 1". What happens to the three rankings?
+        <details class="answer"><summary>What you should see</summary>
+          <p>They coincide: "Fresh fish, great sauce.", "The pasta was perfect.", "Best tiramisu in Milan." under all three metrics, and the readout says yes. Every dot now sits on the unit circle, where the disc, the cone and the half-plane cut the same arc: \(\norm{A-B}^2 = 2 - 2\cos\theta\) and \(A\cdot B = \cos\theta\).</p></details>
+      </li>
+      <li>Normalisation off. Drag the query outward along its own direction until it is about twice as long. Which metric changes its neighbours?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only Euclidean distance, which now prefers the long vectors: at exactly twice the start, (2.24, 0.56), it lists "Best tiramisu in Milan.", "Pizza crust was burnt." and "Fresh fish, great sauce.". The cosine looks at the angle only, and the inner product multiplies every score by the same factor, so its order stays.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-space', function (root, ui) {
+    /* toy 2-D vectors of restaurant reviews: [text, direction in degrees, length] — made up for the widget, not computed by a model */
+    var REVIEWS = [
+      ['The pasta was perfect.', 11, 1.0], ['Best tiramisu in Milan.', 19, 1.9], ['The soup was cold.', 7, 0.6],
+      ['Risotto a bit salty.', 25, 1.25], ['Fresh fish, great sauce.', 16.5, 1.55], ['Pizza crust was burnt.', 3.5, 2.1],
+      ['Gnocchi melt in the mouth.', 21.5, 0.8], ['The waiter was rude.', 55, 1.7], ['Staff were very kind.', 63, 1.0],
+      ['We waited an hour.', 52, 2.2], ['Friendly, quick service.', 66, 0.7], ['Nobody took our order.', 58, 1.3],
+      ['The host remembered us.', 69, 1.9], ['Too expensive for what it is.', 100, 1.6], ['Fair prices.', 108, 0.6],
+      ['The bill had a mistake.', 96, 1.1], ['Great value lunch menu.', 112, 1.8], ['Wine list overpriced.', 104, 0.9],
+      ['Lovely terrace.', 145, 1.2], ['Music far too loud.', 156, 1.8], ['Cosy and quiet.', 150, 0.7],
+      ['Tables too close together.', 141, 1.5], ['Great view of the Duomo.', 161, 1.0]
+    ];
+    var P = REVIEWS.map(function (r) { var a = r[1] * Math.PI / 180; return { t: r[0], x: r[2] * Math.cos(a), y: r[2] * Math.sin(a) }; });
+    var q = { x: 1.12, y: 0.28 };
+
+    var metric = ui.select('rank the reviews by', [
+      { value: 'cos', label: 'cosine similarity (largest first)' },
+      { value: 'euc', label: 'Euclidean distance (smallest first)' },
+      { value: 'ip', label: 'inner product (largest first)' }
+    ], null, 'cos');
+    var kS = ui.slider({ label: 'k, the number of neighbours', min: 1, max: 5, step: 1, value: 3 });
+    var normT = ui.toggle('normalise every vector to length 1', false);
+
+    function len(p) { return Math.hypot(p.x, p.y); }
+    function unit(p) { var n = Math.max(len(p), 1e-9); return { x: p.x / n, y: p.y / n }; }
+    function clamp1(v) { return Math.max(-1, Math.min(1, v)); }
+    function score(m, a, p) {
+      var dot = a.x * p.x + a.y * p.y;
+      if (m === 'cos') return dot / (Math.max(len(a), 1e-9) * Math.max(len(p), 1e-9));
+      if (m === 'ip') return dot;
+      return -Math.hypot(a.x - p.x, a.y - p.y);            /* larger = nearer, for one sort order */
+    }
+    function ranking(m, a, pts) {
+      return pts.map(function (p, i) { return { i: i, s: score(m, a, p) }; }).sort(function (u, v) { return v.s - u.s; });
+    }
+    function state() {
+      var nrm = normT.value, k = Math.max(1, Math.min(5, Math.round(kS.value)));
+      var qq = nrm ? unit(q) : { x: q.x, y: q.y }, pts = nrm ? P.map(unit) : P;
+      var R = { cos: ranking('cos', qq, pts), euc: ranking('euc', qq, pts), ip: ranking('ip', qq, pts) };
+      return { nrm: nrm, k: k, qq: qq, pts: pts, R: R, top: R[metric.value].slice(0, k) };
+    }
+
+    var plot = ui.plot({
+      x: [-2.2, 2.4], y: [-0.4, 2.2], equalAspect: true, aspect: 1.55, xLabel: 'x_1', yLabel: 'x_2',
+      label: 'Twenty-three review vectors in a plane, a draggable query and the region that holds its k nearest neighbours under the chosen metric',
+      hover: function (p) {
+        var s = state(), best = -1, bd = 13;
+        s.pts.forEach(function (pt, i) { var a = plot.toPx(pt.x, pt.y), d = Math.hypot(a.x - p.px, a.y - p.py); if (d < bd) { bd = d; best = i; } });
+        return best < 0 ? null : { text: P[best].t, x: s.pts[best].x, y: s.pts[best].y };
+      }
+    });
+    plot.draw(function (g) {
+      var s = state(), m = metric.value, last = s.top[s.top.length - 1], R = 9;
+      var phi = Math.atan2(s.qq.y, s.qq.x), L = Math.max(len(s.qq), 1e-9), ux = s.qq.x / L, uy = s.qq.y / L;
+      var region = { color: 's2', alpha: 0.13, dash: true, width: 1.5 };
+      if (m === 'euc') g.circle(s.qq.x, s.qq.y, -last.s, region);
+      else if (m === 'cos') {
+        var d = Math.acos(clamp1(last.s)), cone = [[0, 0]];
+        for (var j = 0; j <= 60; j++) { var t = phi - d + 2 * d * j / 60; cone.push([R * Math.cos(t), R * Math.sin(t)]); }
+        g.poly(cone, region);
+      } else {
+        var b = last.s / L, bx = ux * b, by = uy * b;          /* the boundary {x : u·x = b}, u = q / |q| */
+        g.poly([[bx - uy * R, by + ux * R], [bx + uy * R, by - ux * R], [bx + uy * R + ux * R, by - ux * R + uy * R], [bx - uy * R + ux * R, by + ux * R + uy * R]], region);
+      }
+      if (s.nrm) {
+        g.circle(0, 0, 1, { fill: false, color: 'muted', dash: true, width: 1.5 });
+        g.points(P, { color: 'muted', r: 2.4, ring: false });
+        g.points([q], { shape: 'cross', color: 'muted', r: 5 });
+      }
+      g.line([[0, 0], [s.qq.x, s.qq.y]], { color: 'soft', dash: true, width: 1.25 });
+      g.points(s.pts, { color: 's1', r: 4.5 });
+      s.top.forEach(function (r) {
+        var p = s.pts[r.i];
+        g.circle(p.x, p.y, 9, { px: true, fill: false, color: 's3', dash: true, width: 2 });
+      });
+      g.points([s.qq], { shape: 'cross', color: 's2', r: 7 });
+      var qx = g.px(s.qq.x), qy = g.py(s.qq.y);
+      s.top.forEach(function (r, j) {            /* rank numbers last, on the side of the dot away from the query cross */
+        var p = s.pts[r.i], left = g.px(p.x) < qx - 1, below = g.py(p.y) > qy;
+        g.text(p.x, p.y, String(j + 1), { dx: left ? -12 : 10, dy: below ? 14 : -12, align: left ? 'right' : 'left', size: 11.5, weight: 700 });
+      });
+    });
+    plot.draggable([q], { r: 10 });
+    ui.legend([
+      { label: 'review vector', color: 's1', mark: 'dot' },
+      { label: 'query', color: 's2', mark: 'cross' },
+      { label: 'the k nearest (numbered)', color: 's3', mark: 'ring' },
+      { label: 'region holding the k nearest', color: 's2', mark: 'area' },
+      { label: 'unit circle, when normalised', color: 'muted', mark: 'dash' }
+    ]);
+    var roList = ui.readout('the k nearest under this metric');
+    var roAgree = ui.readout('do the three metrics agree?');
+    ui.note('The shaded region is a cone around the query’s direction for the cosine, a disc around its tip for the Euclidean distance, and a half-plane at right angles to it for the inner product.');
+    ui.onChange(function () {
+      var s = state(), m = metric.value;
+      roList.set(s.top.map(function (r, j) {
+        var v = m === 'euc' ? Course.fmt(-r.s, 2) : m === 'cos' ? Course.fmt(r.s, 3) + ' (' + Course.fmt(Math.acos(clamp1(r.s)) * 180 / Math.PI, 1) + '°)' : Course.fmt(r.s, 2);
+        return (j + 1) + ' · ' + P[r.i].t + ' — ' + v;
+      }).join('<br>'));
+      function ids(mm) { return s.R[mm].slice(0, s.k).map(function (r) { return r.i; }); }
+      function shared(a, b) { return a.filter(function (x) { return b.indexOf(x) >= 0; }).length; }
+      var c = ids('cos'), se = shared(c, ids('euc')), si = shared(c, ids('ip'));
+      if (se === s.k && si === s.k) roAgree.set('yes: the same ' + (s.k === 1 ? 'review' : s.k + ' reviews') + ' under all three', 'key');
+      else roAgree.set('no: Euclidean shares ' + se + ' of ' + s.k + ' with cosine, inner product ' + si + ' of ' + s.k);
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l27-exact">
+  <h2>Exact search, and why it stops working</h2>
+
+  <p>Finding the k stored vectors most similar to a query is <mark class="key">k-nearest-neighbour search</mark>. Without an index it means "computing the distance from the query to each point in the database" (p. 658): \(n\) vectors of \(d\) numbers cost \(n \cdot d\) multiplications per query. A million 384-dimensional vectors make \(3.84 \times 10^8\) of them, for every single query. Hence: "Let’s create indexes with tree-based exact vector search techniques" (p. 658).</p>
+
+  <h3>K-D trees: cut the space in halves</h3>
+
+  <p>"k-d trees are a special case of binary space partitioning trees": "a binary tree in which every node is a k-dimensional point. Every non-leaf node implicitly generates splitting hyperplane that divides the space into two parts. The split is on the median value" (p. 659). Each cut is perpendicular to one axis, and the axis changes with the depth: the cube of page 659 is cut first by a red plane on the first coordinate, then by green planes on the second, then by blue ones on the third. Cutting at the median puts half of the points on each side, so the tree stays balanced.</p>
+
+  <p>Page 660 grows such a tree over records with three attributes — Name, Age, Salary — and cycles through them level by level. Its inner nodes keep only the split value and the records sit in the leaves, a common variant of the definition. Follow a query record down it, Ivan, 61, $55k (Fig. 5): four comparisons reach one leaf out of twenty.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-kdtree">
+    <svg class="dia" viewBox="0 0 560 352" role="img" aria-label="The K-D tree of page 660 searched for Ivan, 61, 55k: Ivan is before Kevin, so left; 61 is at least 60, so right; 55k is below 80k, so left; Ivan is after Charlie, so right, reaching the leaf David, 68, 40k; four sibling subtrees with 9, 5, 3 and 2 records are skipped">
+      <line x1="300" y1="44" x2="190" y2="86" class="hl"/>
+      <line x1="190" y1="114" x2="300" y2="156" class="hl"/>
+      <line x1="300" y1="184" x2="210" y2="226" class="hl"/>
+      <line x1="210" y1="254" x2="330" y2="296" class="hl"/>
+      <line x1="300" y1="44" x2="190" y2="86" class="sw-2"/>
+      <line x1="190" y1="114" x2="300" y2="156" class="sw-2"/>
+      <line x1="300" y1="184" x2="210" y2="226" class="sw-2"/>
+      <line x1="210" y1="254" x2="330" y2="296" class="sw-2"/>
+      <line x1="300" y1="44" x2="450" y2="86" class="st-muted dash"/>
+      <line x1="190" y1="114" x2="80" y2="156" class="st-muted dash"/>
+      <line x1="300" y1="184" x2="480" y2="226" class="st-muted dash"/>
+      <line x1="210" y1="254" x2="90" y2="296" class="st-muted dash"/>
+      <rect x="240" y="16" width="120" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="140" y="86" width="100" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="230" y="156" width="140" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="140" y="226" width="140" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="240" y="296" width="180" height="28" rx="4" class="fw-s1 st-s1 sw-2"/>
+      <rect x="405" y="86" width="90" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <rect x="16" y="156" width="128" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <rect x="420" y="226" width="120" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <rect x="45" y="296" width="90" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <text x="16" y="34" class="tx-sm tx-bold">query: Ivan, 61, $55k</text>
+      <text x="300" y="35" class="tx-mono tx-sm tx-mid">Name: Kevin</text>
+      <text x="190" y="105" class="tx-mono tx-sm tx-mid">Age: 60</text>
+      <text x="300" y="175" class="tx-mono tx-sm tx-mid">Salary: $80k</text>
+      <text x="210" y="245" class="tx-mono tx-sm tx-mid">Name: Charlie</text>
+      <text x="330" y="315" class="tx-mono tx-sm tx-mid">David · 68 · $40k</text>
+      <text x="450" y="105" class="tx-mono tx-sm tx-mid tx-muted">Age: 47</text>
+      <text x="80" y="175" class="tx-mono tx-sm tx-mid tx-muted">Salary: $50k</text>
+      <text x="480" y="245" class="tx-mono tx-sm tx-mid tx-muted">Name: Alice</text>
+      <text x="90" y="315" class="tx-mono tx-sm tx-mid tx-muted">Age: 73</text>
+      <text x="450" y="134" class="tx-sm tx-mid tx-muted">+9 records</text>
+      <text x="80" y="204" class="tx-sm tx-mid tx-muted">+5 records</text>
+      <text x="480" y="274" class="tx-sm tx-mid tx-muted">+3 records</text>
+      <text x="90" y="344" class="tx-sm tx-mid tx-muted">+2 records</text>
+      <text x="238" y="64" class="tx-sm tx-end halo">Ivan &lt; Kevin</text>
+      <text x="262" y="128" class="tx-sm halo">61 ≥ 60</text>
+      <text x="238" y="202" class="tx-sm tx-end halo">55k &lt; 80k</text>
+      <text x="284" y="266" class="tx-sm halo">Ivan &gt; Charlie</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> The K-D tree of p. 660, searched for Ivan, 61, $55k (the query is ours). Name at the root, then Age, then Salary, then Name again: each level cuts on the next attribute. Four comparisons reach David's leaf; the dashed branches, 19 of the 20 records, are never opened.</figcaption>
+  </figure>
+
+  <p>For a nearest-neighbour query the leaf is only a first candidate. The search then climbs back and looks into a sibling subtree whenever its splitting plane is closer to the query than the best candidate so far: the true neighbour may lie just across a cut.</p>
+
+  <p>Page 661 gives the cost together with its condition: "Complexity of search (and other operations): O(log n)", under the hypothesis \(n \gg 2^k\), where \(n\) is the number of vectors and \(k\) their dimensionality. Careful: on this slide \(k\) is the number of dimensions (the \(d\) above), not the \(k\) of k-nearest neighbours. The O(log n) is the cost to expect when the hypothesis holds; in the worst case the search visits every leaf. The tree needs many points in every cell for its cuts to rule anything out. Table 1 shows what the condition asks for.</p>
+
+  <figure class="tbl-fig" id="l27-tbl-2k">
+    <figcaption>Table 1. The hypothesis of p. 661, \(n \gg 2^k\), for a few dimensionalities \(k\). 384 is the size of the all-MiniLM-L6-v2 vectors of the session's notebook.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>dimensions \(k\)</th><th>\(2^k\)</th><th>enough vectors?</th></tr></thead>
+        <tbody>
+          <tr><td class="num">2</td><td class="num">4</td><td>easily</td></tr>
+          <tr><td class="num">10</td><td class="num">1 024</td><td>easily</td></tr>
+          <tr><td class="num">20</td><td class="num">\(1.05 \times 10^{6}\)</td><td>needs many millions</td></tr>
+          <tr><td class="num">32</td><td class="num">\(4.3 \times 10^{9}\)</td><td>hardly ever</td></tr>
+          <tr><td class="num">128</td><td class="num">\(3.4 \times 10^{38}\)</td><td>never</td></tr>
+          <tr class="is-key"><td class="num">384</td><td class="num">\(3.9 \times 10^{115}\)</td><td>never</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>No collection will ever hold \(10^{115}\) vectors. For embeddings the last line of the slide applies: "With high-dimensional data, most of the points in the tree will be evaluated and the efficiency is no better than exhaustive search" (p. 661).</p>
+
+  <h3>R-trees: boxes inside boxes</h3>
+
+  <p>The R stands for rectangle. The idea of page 662 is "to group nearby objects and represent them with their minimum bounding rectangle in the next higher level of the tree", which gives the pruning rule: "a query that does not intersect the bounding rectangle also cannot intersect any of the contained objects". At the leaves each rectangle is one object; higher up, each covers more of them — "an increasingly coarse approximation of the data set" (Fig. 6).</p>
+
+  <figure class="fig fig--plain" id="l27-fig-rtree">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Left: rectangles R1 and R2, inside them R3, R4, R5, R6 with two objects each, and a query rectangle Q inside R3. Right: the tree; the search opens R1 and R3 only, while R2 with R5 and R6, and R4, are skipped">
+      <rect x="24" y="36" width="156" height="150" class="sw-2 dash"/>
+      <rect x="150" y="128" width="124" height="126" class="sw-2 dash"/>
+      <rect x="38" y="62" width="70" height="60" class="st-s3 sw-2"/>
+      <rect x="112" y="118" width="60" height="58" class="st-s3 sw-2"/>
+      <rect x="184" y="154" width="50" height="46" class="st-s3 sw-2"/>
+      <rect x="206" y="204" width="60" height="44" class="st-s3 sw-2"/>
+      <rect x="48" y="98" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="86" y="104" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="128" y="150" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="152" y="158" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="196" y="182" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="216" y="176" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="220" y="230" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="246" y="226" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="66" y="68" width="34" height="28" class="fw-s2 st-s2 sw-2 dash"/>
+      <text x="30" y="52" class="tx-sm">R1</text>
+      <text x="268" y="146" class="tx-sm tx-end">R2</text>
+      <text x="42" y="80" class="tx-sm halo">R3</text>
+      <text x="118" y="136" class="tx-sm halo">R4</text>
+      <text x="188" y="170" class="tx-sm halo">R5</text>
+      <text x="210" y="221" class="tx-sm halo">R6</text>
+      <text x="83" y="87" class="tx-sm tx-mid tx-bold">Q</text>
+      <line x1="402" y1="56" x2="360" y2="110" class="hl"/>
+      <line x1="338" y1="136" x2="320" y2="190" class="hl"/>
+      <line x1="402" y1="56" x2="360" y2="110" class="sw-2"/>
+      <line x1="338" y1="136" x2="320" y2="190" class="sw-2"/>
+      <line x1="446" y1="56" x2="494" y2="110" class="st-muted dash"/>
+      <line x1="382" y1="136" x2="370" y2="190" class="st-muted dash"/>
+      <line x1="472" y1="136" x2="460" y2="190" class="st-muted dash"/>
+      <line x1="516" y1="136" x2="520" y2="190" class="st-muted dash"/>
+      <rect x="380" y="30" width="44" height="26" class="fi-paper sw-2"/>
+      <rect x="424" y="30" width="44" height="26" class="fi-paper sw-2"/>
+      <rect x="316" y="110" width="44" height="26" class="fi-paper st-s3 sw-2"/>
+      <rect x="360" y="110" width="44" height="26" class="fi-paper st-s3 sw-2"/>
+      <rect x="450" y="110" width="44" height="26" class="fi-paper st-muted dash"/>
+      <rect x="494" y="110" width="44" height="26" class="fi-paper st-muted dash"/>
+      <rect x="300" y="190" width="40" height="24" class="fi-paper sw-2"/>
+      <rect x="350" y="190" width="40" height="24" class="fi-paper st-muted dash"/>
+      <rect x="440" y="190" width="40" height="24" class="fi-paper st-muted dash"/>
+      <rect x="500" y="190" width="40" height="24" class="fi-paper st-muted dash"/>
+      <rect x="306" y="197" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="323" y="197" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="356" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="373" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="446" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="463" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="506" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="523" y="197" width="10" height="10" class="st-muted"/>
+      <text x="402" y="48" class="tx-sm tx-mid">R1</text>
+      <text x="446" y="48" class="tx-sm tx-mid">R2</text>
+      <text x="338" y="128" class="tx-sm tx-mid">R3</text>
+      <text x="382" y="128" class="tx-sm tx-mid">R4</text>
+      <text x="472" y="128" class="tx-sm tx-mid tx-muted">R5</text>
+      <text x="516" y="128" class="tx-sm tx-mid tx-muted">R6</text>
+      <text x="490" y="254" class="tx-hand tx-mid">skipped</text>
+    </svg>
+    <figcaption><b>Fig. 6.</b> A two-level R-tree drawn for this lesson (p. 663 shows a larger one, with up to three entries per page). The query Q intersects R1 and, inside it, only R3: R2 and R4 are skipped with everything they contain — the rule of p. 662.</figcaption>
+  </figure>
+
+  <p>An R-tree is balanced and "Organizes data in pages"; each page has a maximum and a minimum filling, and the slide reports the "Best performance with min filling around 40%" (p. 663). Building a good one is the hard part: it must stay balanced, its rectangles must not "cover too much empty space", and they must "not overlap too much (so that during search, fewer subtrees need to be processed)". The M-tree variant uses "circles / spheres" instead of rectangles.</p>
+
+  <p>Both trees hit the same wall: "For high-dimensional data, also tree-based exact vector search techniques such as the k-d tree and R-tree do not perform well enough because of the curse of dimensionality". For the R-tree the wall looks like this: in hundreds of dimensions a box around even a few points spans most of the range of most coordinates, so the boxes overlap and almost every query intersects almost every box. So "Vector databases use Approximate Nearest Neighbor algorithms" (p. 665).</p>
+
+  <p class="memo"><mark class="key">Exact trees prune by geometry; in hundreds of dimensions almost nothing can be pruned, and the search falls back to a scan.</mark></p>
+</section>
+
+
+<section id="l27-ann">
+  <h2>Approximate search: hashes and graphs</h2>
+
+  <p>An <mark class="key">approximate nearest neighbour</mark> (ANN) search returns vectors that are very probably the nearest. HNSW, page 670 says, "sacrifices a small amount of accuracy to achieve much faster search times". The distances HNSW computes are exact; what it may do is miss a vector it never looked at (IVFPQ, at the end of the lesson, adds a second error: distances estimated from compressed codes). The usual measure is recall, the share of the true nearest neighbours that the search returns. Page 666 lists four such algorithms: LSH, HNSW, IVFADC and IVFPQ — the last two are in fact one method (section 6).</p>
+
+  <h3>LSH: a hash that wants collisions</h3>
+
+  <p>"locality-sensitive hashing (LSH) is a fuzzy hashing technique that hashes similar input items into the same ‘buckets’ with high probability"; "The number of buckets is much smaller than the universe of possible input items"; and the key sentence: "It differs from conventional hashing techniques in that hash collisions are maximized, not minimized" (p. 667). Compare the CRC16 hash of Redis Cluster (<a href="l19.html#l19-topologies">lesson 19</a>), built to spread keys evenly over the slots. A query is hashed, and only the items of its bucket are compared exactly. Since a long vector becomes a short bucket code, "LSH can be seen as a way to reduce the dimensionality of high-dimensional data".</p>
+
+  <p>One classic family for the cosine makes "with high probability" precise (background, not on the slides): draw a random hyperplane through the origin and record on which side a vector falls — one bit. A few such cuts give every vector a short code, and the code is its bucket (Fig. 7).</p>
+
+  <figure class="fig fig--plain" id="l27-fig-lsh">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Three random lines through the origin cut the plane into six sectors with 3-bit codes. The query q and the vector a fall in sector 100 and share a bucket; b, close to q but across a cut, falls in 110; c falls in 111">
+      <line x1="44" y1="171" x2="276" y2="109" class="st-s3 sw-2 dash"/>
+      <line x1="119" y1="253" x2="201" y2="27" class="st-s3 sw-2 dash"/>
+      <line x1="229" y1="238" x2="91" y2="42" class="st-s3 sw-2 dash"/>
+      <line x1="160" y1="140" x2="231" y2="102" class="st-muted"/>
+      <line x1="160" y1="140" x2="206" y2="85" class="st-muted"/>
+      <line x1="160" y1="140" x2="168" y2="62" class="st-muted"/>
+      <line x1="160" y1="140" x2="83" y2="119" class="st-muted"/>
+      <circle cx="160" cy="140" r="3" class="fi-ink"/>
+      <circle cx="231" cy="102" r="5" class="fi-s1"/>
+      <circle cx="168" cy="62" r="5" class="fi-s1"/>
+      <circle cx="83" cy="119" r="5" class="fi-s1"/>
+      <path d="M200 79 l12 12 M212 79 l-12 12" class="st-s2 sw-3"/>
+      <rect x="330" y="59" width="56" height="22" class="fw-s2 st-s2 sw-2"/>
+      <rect x="330" y="99" width="56" height="22" class="fi-paper sw-2"/>
+      <rect x="330" y="139" width="56" height="22" class="fi-paper sw-2"/>
+      <line x1="392" y1="70" x2="424" y2="70" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="110" x2="424" y2="110" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="150" x2="424" y2="150" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <text x="216" y="82" class="tx-sm">q</text>
+      <text x="241" y="106" class="tx-sm">a</text>
+      <text x="157" y="60" class="tx-sm tx-end">b</text>
+      <text x="73" y="116" class="tx-sm tx-end">c</text>
+      <text x="256" y="60" class="tx-mono tx-sm tx-mid">100</text>
+      <text x="145" y="29" class="tx-mono tx-sm tx-mid">110</text>
+      <text x="47" y="87" class="tx-mono tx-sm tx-mid">111</text>
+      <text x="79" y="214" class="tx-mono tx-sm tx-mid">011</text>
+      <text x="173" y="239" class="tx-mono tx-sm tx-mid">001</text>
+      <text x="265" y="178" class="tx-mono tx-sm tx-mid">000</text>
+      <text x="330" y="40" class="tx-sm tx-bold">bucket → vectors</text>
+      <text x="358" y="75" class="tx-mono tx-sm tx-mid">100</text>
+      <text x="358" y="115" class="tx-mono tx-sm tx-mid">110</text>
+      <text x="358" y="155" class="tx-mono tx-sm tx-mid">111</text>
+      <text x="432" y="75" class="tx-mono tx-sm">q, a</text>
+      <text x="432" y="115" class="tx-mono tx-sm">b</text>
+      <text x="432" y="155" class="tx-mono tx-sm">c</text>
+      <text x="440" y="214" class="tx-hand tx-mid">q meets a, not b</text>
+    </svg>
+    <figcaption><b>Fig. 7.</b> Random-hyperplane LSH with three cuts (background, not on the slides). Each dashed cut through the origin gives one bit — on which side of it a vector lies — so the plane falls into sectors with 3-bit codes: the buckets. The query q and its neighbour a share bucket 100 and are compared; b, only 34° from q, lies across a cut in bucket 110 and is never compared. That is why an LSH index keeps several tables with different cuts.</figcaption>
+  </figure>
+
+  <p>Two vectors at angle \(\theta\) get the same bit with probability \(1 - \theta / 180^\circ\). For the rainy-day pair at 40° that is 0.78; with 8 such bits as the bucket code, they share a bucket with probability \(0.78^8 \approx 0.13\), two orthogonal sentences with \(0.5^8 \approx 0.004\). One code alone would miss the good pair most of the time, so an LSH index keeps several tables with different random hyperplanes and looks into the query's bucket in each: with 20 tables the rainy-day pair meets at least once with probability 0.94, the orthogonal pair with 0.08.</p>
+
+  <h3>HNSW: a skip list made of graphs</h3>
+
+  <p>Hierarchical Navigable Small World is "an efficient algorithm for approximate nearest neighbor (ANN) search in high-dimensional spaces" (p. 668). Two ideas meet in its name. "Navigable Small-World Graphs" are "graphs where most nodes can be reached from any other in a small number of hops": every vector is a node, linked to vectors near it. The "Hierarchical Structure" organises the graph "into multiple layers, each containing fewer nodes than the layer below", and the lowest layer holds all the data.</p>
+
+  <p>Page 669 explains the search with a skip list, "looking for 11" (Fig. 8). The top layer has few nodes and long links, so one hop jumps over most of the data; when the next hop would overshoot, the search drops a layer and continues with shorter hops.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-skiplist">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="A skip list with layers 3 to 0 over the keys 3, 5, 7, 11, 14, 19, 21 between start and end. Looking for 11: in layer 3 from start to 5, then 5 to end overshoots; drop to layer 2, 5 to 19 overshoots; drop to layer 1, 5 to 11, found">
+      <line x1="107" y1="40" x2="191" y2="40" class="hl"/>
+      <line x1="219" y1="40" x2="527" y2="40" class="hl"/>
+      <line x1="219" y1="80" x2="415" y2="80" class="hl"/>
+      <line x1="219" y1="120" x2="303" y2="120" class="hl"/>
+      <rect x="81" y="27" width="26" height="26" class="fw-key"/>
+      <rect x="529" y="27" width="26" height="26" class="fw-key"/>
+      <rect x="81" y="27" width="26" height="146"/>
+      <rect x="529" y="27" width="26" height="146"/>
+      <rect x="193" y="27" width="26" height="26" class="fw-key"/>
+      <rect x="193" y="67" width="26" height="26" class="fw-key"/>
+      <rect x="193" y="107" width="26" height="26" class="fw-key"/>
+      <rect x="193" y="147" width="26" height="26"/>
+      <rect x="417" y="67" width="26" height="26" class="fw-key"/>
+      <rect x="417" y="107" width="26" height="26"/>
+      <rect x="417" y="147" width="26" height="26"/>
+      <rect x="305" y="107" width="26" height="26" class="fw-key sw-3"/>
+      <rect x="305" y="147" width="26" height="26"/>
+      <rect x="137" y="147" width="26" height="26"/>
+      <rect x="249" y="147" width="26" height="26"/>
+      <rect x="361" y="147" width="26" height="26"/>
+      <rect x="473" y="147" width="26" height="26"/>
+      <line x1="107" y1="40" x2="191" y2="40" marker-end="url(#arr)"/>
+      <line x1="219" y1="40" x2="527" y2="40" marker-end="url(#arr)"/>
+      <line x1="107" y1="80" x2="191" y2="80" marker-end="url(#arr)"/>
+      <line x1="219" y1="80" x2="415" y2="80" marker-end="url(#arr)"/>
+      <line x1="443" y1="80" x2="527" y2="80" marker-end="url(#arr)"/>
+      <line x1="107" y1="120" x2="191" y2="120" marker-end="url(#arr)"/>
+      <line x1="219" y1="120" x2="303" y2="120" marker-end="url(#arr)"/>
+      <line x1="331" y1="120" x2="415" y2="120" marker-end="url(#arr)"/>
+      <line x1="443" y1="120" x2="527" y2="120" marker-end="url(#arr)"/>
+      <line x1="107" y1="160" x2="135" y2="160" marker-end="url(#arr)"/>
+      <line x1="163" y1="160" x2="191" y2="160" marker-end="url(#arr)"/>
+      <line x1="219" y1="160" x2="247" y2="160" marker-end="url(#arr)"/>
+      <line x1="275" y1="160" x2="303" y2="160" marker-end="url(#arr)"/>
+      <line x1="331" y1="160" x2="359" y2="160" marker-end="url(#arr)"/>
+      <line x1="387" y1="160" x2="415" y2="160" marker-end="url(#arr)"/>
+      <line x1="443" y1="160" x2="471" y2="160" marker-end="url(#arr)"/>
+      <line x1="499" y1="160" x2="527" y2="160" marker-end="url(#arr)"/>
+      <line x1="206" y1="54" x2="206" y2="65" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="206" y1="94" x2="206" y2="105" class="sw-2" marker-end="url(#arr)"/>
+      <text x="6" y="45" class="tx-sm">layer 3</text>
+      <text x="6" y="85" class="tx-sm">layer 2</text>
+      <text x="6" y="125" class="tx-sm">layer 1</text>
+      <text x="6" y="165" class="tx-sm">layer 0</text>
+      <text x="94" y="196" class="tx-mono tx-mid">start</text>
+      <text x="150" y="196" class="tx-mono tx-mid">3</text>
+      <text x="206" y="196" class="tx-mono tx-mid">5</text>
+      <text x="262" y="196" class="tx-mono tx-mid">7</text>
+      <text x="318" y="196" class="tx-mono tx-mid tx-bold">11</text>
+      <text x="374" y="196" class="tx-mono tx-mid">14</text>
+      <text x="430" y="196" class="tx-mono tx-mid">19</text>
+      <text x="486" y="196" class="tx-mono tx-mid">21</text>
+      <text x="542" y="196" class="tx-mono tx-mid">end</text>
+      <text x="420" y="234" class="tx-hand tx-mid">looking for 11</text>
+    </svg>
+    <figcaption><b>Fig. 8.</b> The skip list of p. 669, redrawn. Layer 3 (the entry layer): start → 5, then 5 → end overshoots, so drop at 5. Layer 2: 5 → 19 overshoots, drop again. Layer 1: 5 → 11, found. Highlighted boxes are the ones the search looks at; it never walks the bottom row, which holds everything.</figcaption>
+  </figure>
+
+  <p>In HNSW the layers hold vectors, and "overshoot" becomes "no linked node is closer to the query". The search starts at an entry point in the top layer and moves to whichever linked node is closest to the query; when none is closer it descends a layer from where it stands, "refining the result by looking at more nodes" (p. 669), down to layer 0, where it may keep several candidates at once (the parameter <code>ef</code> of the HNSW paper; background). New vectors arrive "in a probabilistic manner": "the algorithm randomly selects a level in the hierarchy where the point should be placed. It then connects the new point to its closest neighbors at that level" (p. 670) — and, the slide leaves this out, at every level below it too, down to layer 0.</p>
+
+  <aside class="redpen" data-page="668">
+    <p class="claim">"The highest layer consists of the most representative points (like hubs), and as you go down the hierarchy, more detailed points are added, eventually representing all the data at the lowest level."</p>
+    <p class="fix">Nobody chooses representative points. When a vector is inserted, its top layer is drawn at random, with a probability that shrinks layer after layer; the vector is placed in that layer and in every layer below it, linked to its nearest neighbours in each. The upper layers are a thinning random sample of the data; layer 0 holds all of it.</p>
+    <p class="because">Page 670 itself says that "the algorithm randomly selects a level in the hierarchy where the point should be placed"; in the HNSW paper the level is \(\lfloor -\ln(u)\, m_L \rfloor\), with \(u\) drawn uniformly from (0, 1) and \(m_L\) a fixed constant, so each layer up keeps only a fraction of the one below. In the widget below (at N = 400), the single node of the top layer sits at the right edge of the cloud: it was not picked as a hub, it drew the highest level. The exam may quote the slide's sentence; know it, and know that the layers are random.</p>
+  </aside>
+
+  <div class="widget" id="l27-w-hnsw">
+    <h3 class="widget-title">An HNSW walk against brute force</h3>
+    <p class="widget-intro">N points of a 2-D cloud, indexed by HNSW as in the paper: up to 4 links per node in the upper layers and 8 in layer 0, the level of each point drawn at random. The plot shows the graph of the layer the search is in; the rest of the data are small grey dots. Press Search to watch the walk hop by hop, from the entry point down to layer 0; a ring marks every vector whose distance to the query has been computed. Pick a preset query or click the plot to place your own. The one thing to see: the walk computes a few dozen distances where brute force computes N — and once in a while it stops at a near neighbour that is not the nearest.</p>
+    <ol class="tasks">
+      <li>Query A, N = 400, ef = 1. Before pressing Search: how many of the 400 distances will the walk need? Then watch where it starts and how long its hops are.
+        <details class="answer"><summary>What you should see</summary>
+          <p>32. It starts at the only node of the top layer (layer 5, the entry point), makes long hops while the layers are sparse and short ones in layer 0, and ends on the true nearest neighbour. Brute force would compute 400 distances.</p></details>
+      </li>
+      <li>Watch the line "200 test queries" while you move N from 100 to 1000. Brute force grows tenfold; how much does the walk grow?
+        <details class="answer"><summary>What you should see</summary>
+          <p>From 20.1 to 33.1 distances per query on average (ef = 1), finding the true nearest 95.5 % and 96.5 % of the time. Ten times the data costs about 13 more distances, not ten times as many: the slow, roughly logarithmic growth the layers are there for (the averages wobble a little from one N to the next, because each N builds a new random graph).</p></details>
+      </li>
+      <li>Query B with N = 400 and ef = 1: does the walk end at the true nearest neighbour? Then set ef = 2 and search again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. After 27 distances it stops at the 4th nearest vector, because no node linked to it is closer to the query: a local minimum of a greedy walk. With ef = 2, layer 0 keeps two candidates at a time and the walk finds the true nearest with 38 distances. Over the 200 test queries, ef = 1, 2, 4 find it 96.5 %, 98.5 % and 100 % of the time, at 30.3, 31.9 and 35.2 distances.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-hnsw', function (root, ui) {
+    /* the point cloud shared with l27-w-ivf: points of a 10 x 6 plane, five blobs and a uniform background */
+    function cloud(seed, n) {
+      var r = Course.rng(seed), C = [[2.0, 1.6], [3.4, 4.4], [5.6, 2.6], [7.8, 4.6], [8.3, 1.4]], out = [];
+      while (out.length < n) {
+        var p;
+        if (r.random() < 0.3) p = [r.uniform(0.2, 9.8), r.uniform(0.2, 5.8)];
+        else { var c = C[Math.floor(r.random() * C.length)]; p = [r.normal(c[0], 0.75), r.normal(c[1], 0.6)]; }
+        if (p[0] > 0.15 && p[0] < 9.85 && p[1] > 0.15 && p[1] < 5.85) out.push(p);
+      }
+      return out;
+    }
+    var ALL = cloud(27, 1000), TQ = cloud(2027, 200), M = 4, M0 = 8, EFC = 16;
+    function d2(a, b) { var dx = a[0] - b[0], dy = a[1] - b[1]; return dx * dx + dy * dy; }
+    function byDist(a, b) { return a[0] - b[0]; }
+    function nearest(pts, q) { var b = 0, bd = Infinity; for (var i = 0; i < pts.length; i++) { var d = d2(q, pts[i]); if (d < bd) { bd = d; b = i; } } return b; }
+    function rankOf(pts, q, id) { var d = d2(q, pts[id]), r = 1; for (var i = 0; i < pts.length; i++) if (d2(q, pts[i]) < d) r++; return r; }
+    function ordinal(n) { var t = n % 100, s = (t >= 11 && t <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'); return n + s; }
+
+    /* HNSW (Malkov and Yashunin): random levels, greedy layers, the neighbour-selection heuristic */
+    function build(pts) {
+      var r = Course.rng(7), mL = 1 / Math.log(M), n = pts.length, level = [], links = [], entry = -1, top = -1;
+      function lim(lc) { return lc === 0 ? M0 : M; }
+      function searchLayer(q, eps, ef, lc) {
+        var visited = {}, Cn = [], Wn = [];
+        eps.forEach(function (e) { visited[e] = 1; var d = d2(q, pts[e]); Cn.push([d, e]); Wn.push([d, e]); });
+        Cn.sort(byDist); Wn.sort(byDist);
+        while (Cn.length) {
+          var c = Cn.shift(), f = Wn[Wn.length - 1];
+          if (c[0] > f[0]) break;
+          var nb = links[c[1]][lc] || [];
+          for (var i = 0; i < nb.length; i++) {
+            var e = nb[i]; if (visited[e]) continue; visited[e] = 1;
+            var de = d2(q, pts[e]); f = Wn[Wn.length - 1];
+            if (de < f[0] || Wn.length < ef) {
+              Cn.push([de, e]); Cn.sort(byDist);
+              Wn.push([de, e]); Wn.sort(byDist);
+              if (Wn.length > ef) Wn.pop();
+            }
+          }
+        }
+        return Wn;
+      }
+      function select(cand, m) {
+        var s = cand.slice().sort(byDist), R = [], Wd = [];
+        for (var i = 0; i < s.length && R.length < m; i++) {
+          var e = s[i], ok = true;
+          for (var j = 0; j < R.length; j++) if (d2(pts[e[1]], pts[R[j][1]]) < e[0]) { ok = false; break; }
+          if (ok) R.push(e); else Wd.push(e);
+        }
+        while (R.length < m && Wd.length) R.push(Wd.shift());
+        return R.map(function (e) { return e[1]; });
+      }
+      var order = [], i, j, t;
+      for (i = 0; i < n; i++) order.push(i);
+      for (i = n - 1; i > 0; i--) { j = Math.floor(r.random() * (i + 1)); t = order[i]; order[i] = order[j]; order[j] = t; }
+      order.forEach(function (id) {
+        var u = r.random(); if (u <= 0) u = 1e-12;
+        var l = Math.floor(-Math.log(u) * mL), lc;
+        level[id] = l; links[id] = []; for (lc = 0; lc <= l; lc++) links[id][lc] = [];
+        if (entry < 0) { entry = id; top = l; return; }
+        var q = pts[id], ep = [entry], Wl;
+        for (lc = top; lc > l; lc--) { Wl = searchLayer(q, ep, 1, lc); ep = [Wl[0][1]]; }
+        for (lc = Math.min(top, l); lc >= 0; lc--) {
+          Wl = searchLayer(q, ep, EFC, lc);
+          var nbs = select(Wl, M);
+          links[id][lc] = nbs.slice();
+          nbs.forEach(function (e) {
+            var le = links[e][lc]; le.push(id);
+            if (le.length > lim(lc)) links[e][lc] = select(le.map(function (x) { return [d2(pts[e], pts[x]), x]; }), lim(lc));
+          });
+          ep = Wl.map(function (w) { return w[1]; });
+        }
+        if (l > top) { top = l; entry = id; }
+      });
+      return { pts: pts, level: level, links: links, entry: entry, top: top };
+    }
+    /* a search that records one frame per expanded node: the layer, the node, the hop, the distances so far */
+    function trace(h, q, ef) {
+      var pts = h.pts, count = 0, seen = [], mark = {}, frames = [], parent = {};
+      function dist(e) { count++; if (!mark[e]) { mark[e] = 1; seen.push(e); } return d2(q, pts[e]); }
+      function layer(eps, efl, lc) {
+        var visited = {}, Cn = [], Wn = [], prev = eps[0][1];
+        eps.forEach(function (e) { visited[e[1]] = 1; Cn.push(e.slice()); Wn.push(e.slice()); });
+        while (Cn.length) {
+          Cn.sort(byDist); var c = Cn.shift(); Wn.sort(byDist);
+          if (c[0] > Wn[Wn.length - 1][0]) break;
+          var nb = h.links[c[1]][lc] || [], fresh = 0;
+          for (var i = 0; i < nb.length; i++) {
+            var e = nb[i]; if (visited[e]) continue; visited[e] = 1;
+            var de = dist(e); fresh++; parent[lc + ':' + e] = c[1];
+            Wn.sort(byDist);
+            if (de < Wn[Wn.length - 1][0] || Wn.length < efl) {
+              Cn.push([de, e]); Wn.push([de, e]); Wn.sort(byDist);
+              if (Wn.length > efl) Wn.pop();
+            }
+          }
+          var from = parent[lc + ':' + c[1]], hop = (c[1] !== prev && from != null) ? [from, c[1]] : null;
+          if (fresh || hop) frames.push({ layer: lc, cur: c[1], hop: hop, nSeen: seen.length, count: count });
+          prev = c[1];
+        }
+        Wn.sort(byDist);
+        return Wn;
+      }
+      var ep = h.entry, cur = [[dist(ep), ep]];
+      frames.push({ layer: h.top, cur: ep, hop: null, nSeen: seen.length, count: count });
+      for (var lc = h.top; lc >= 1; lc--) {
+        var Wl = layer(cur, 1, lc); cur = [Wl[0]];
+        frames.push({ layer: lc - 1, cur: Wl[0][1], hop: null, nSeen: seen.length, count: count });
+      }
+      var W0 = layer(cur, ef, 0);
+      return { frames: frames, result: W0[0][1], count: count, seen: seen };
+    }
+
+    var PRE = { a: [5.0, 3.2], b: [6.05, 1.15] };
+    var S = { N: 400, ef: 1, q: PRE.a.slice(), h: null, tr: null, idx: 0, nn: 0, rank: 1, stats: [] };
+    function retrace() {
+      S.tr = trace(S.h, S.q, S.ef); S.idx = 0;
+      S.nn = nearest(S.h.pts, S.q); S.rank = rankOf(S.h.pts, S.q, S.tr.result);
+    }
+    function rebuild() {
+      var pts = ALL.slice(0, S.N);
+      S.h = build(pts);
+      var truth = TQ.map(function (q) { return nearest(pts, q); });
+      S.stats = [];
+      for (var ef = 1; ef <= 8; ef++) {
+        var hit = 0, cnt = 0;
+        for (var i = 0; i < TQ.length; i++) { var t = trace(S.h, TQ[i], ef); cnt += t.count; if (t.result === truth[i]) hit++; }
+        S.stats[ef] = { recall: hit / TQ.length, avg: cnt / TQ.length };
+      }
+      retrace();
+    }
+    rebuild();
+    function frame() { return S.tr.frames[Math.min(S.idx, S.tr.frames.length - 1)]; }
+    function finished() { return S.idx >= S.tr.frames.length - 1; }
+
+    var player;
+    var qSel = ui.select('query', [
+      { value: 'a', label: 'A · in the middle of the cloud' },
+      { value: 'b', label: 'B · a hard one' },
+      { value: 'own', label: 'your own: click the plot' }
+    ], function (v) { if (PRE[v]) { S.q = PRE[v].slice(); retrace(); } player.reset(); }, 'a');
+    ui.slider({ label: 'N, the number of vectors', min: 100, max: 1000, step: 100, value: 400,
+      onInput: function (v) { S.N = Math.round(v); rebuild(); player.reset(); } });
+    ui.slider({ label: 'ef, candidates kept in layer 0', min: 1, max: 8, step: 1, value: 1,
+      onInput: function (v) { S.ef = Math.round(v); retrace(); player.reset(); } });
+    player = ui.player({ ms: 650, label: 'Search', stepLabel: 'One hop',
+      onTick: function (i, api) { if (!finished()) S.idx++; if (finished()) api.stop(); },
+      onReset: function () { S.idx = 0; } });
+
+    var plot = ui.plot({ x: [0, 10], y: [0, 6], equalAspect: true, aspect: 1.6, axes: false,
+      label: 'An HNSW index over 2-D points: the links of the layer being searched, the hops of the walk and the vectors whose distance was computed' });
+    plot.draw(function (g) {
+      var h = S.h, pts = h.pts, F = frame(), lc = F.layer, c = g.ctx, v = g.view, i, j, L;
+      c.save();
+      c.beginPath(); c.rect(g.px(v.x0), g.py(v.y1), g.px(v.x1) - g.px(v.x0), g.py(v.y0) - g.py(v.y1)); c.clip();
+      c.beginPath();
+      for (i = 0; i < pts.length; i++) {
+        if (h.level[i] < lc) continue;
+        L = h.links[i][lc] || [];
+        for (j = 0; j < L.length; j++) {
+          if (L[j] < i && (h.links[L[j]][lc] || []).indexOf(i) >= 0) continue;     /* each mutual link once */
+          c.moveTo(g.px(pts[i][0]), g.py(pts[i][1])); c.lineTo(g.px(pts[L[j]][0]), g.py(pts[L[j]][1]));
+        }
+      }
+      c.strokeStyle = g.colors.s3; c.globalAlpha = lc === 0 ? 0.32 : 0.6; c.lineWidth = lc === 0 ? 1 : 1.4; c.stroke();
+      c.restore();
+      g.points(pts, { color: 'muted', r: 1.8, ring: false });
+      var lay = [];
+      for (i = 0; i < pts.length; i++) if (h.level[i] >= lc) lay.push(pts[i]);
+      g.points(lay, { color: 's1', r: lc === 0 ? 2.8 : 4.5, ring: lc !== 0 });
+      g.points(S.tr.seen.slice(0, F.nSeen).map(function (id) { return pts[id]; }), { shape: 'ring', color: 's2', r: 6 });
+      for (var k = 0; k <= S.idx && k < S.tr.frames.length; k++) {
+        var hop = S.tr.frames[k].hop; if (!hop) continue;
+        var a = pts[hop[0]], b = pts[hop[1]];
+        g.arrow(a[0], a[1], b[0], b[1], { color: 'ink', width: 1.6, head: 7, highlight: k === S.idx });
+      }
+      var cu = pts[F.cur];
+      g.circle(cu[0], cu[1], 10, { px: true, fill: false, color: 'ink', width: 2 });
+      if (S.idx === 0) g.text(cu[0], cu[1], 'entry point', { dx: -14, dy: -14, align: 'right', size: 11.5 });
+      if (finished()) {
+        var res = pts[S.tr.result];
+        g.circle(res[0], res[1], 13, { px: true, fill: false, color: 's3', dash: true, width: 2.5 });
+        if (S.tr.result !== S.nn) { var tn = pts[S.nn]; g.circle(tn[0], tn[1], 13, { px: true, fill: false, color: 'bad', width: 2.5 }); }
+      }
+      g.points([S.q], { shape: 'cross', color: 's2', r: 7 });
+    });
+    plot.onPointer({ down: function (p) {
+      if (!p.inside) return;
+      S.q = [Course.clamp(p.x, 0, 10), Course.clamp(p.y, 0, 6)];
+      qSel.value = 'own'; retrace(); player.reset();
+    } });
+    ui.legend([
+      { label: 'vector', color: 'muted', mark: 'dot' },
+      { label: 'node of the current layer', color: 's1', mark: 'dot' },
+      { label: 'link of the current layer', color: 's3', mark: 'line' },
+      { label: 'query', color: 's2', mark: 'cross' },
+      { label: 'distance computed', color: 's2', mark: 'ring' },
+      { label: 'hop of the walk', color: 'ink', mark: 'hl' },
+      { label: 'result', color: 's3', mark: 'dash' },
+      { label: 'true nearest, if missed', color: 'bad', mark: 'ring' }
+    ]);
+    var roLayer = ui.readout('layer'), roCount = ui.readout('distances computed'), roRes = ui.readout('result'), roStats = ui.readout('200 test queries, this N and ef');
+    ui.onChange(function () {
+      var F = frame(), h = S.h, nl = 0;
+      for (var i = 0; i < h.level.length; i++) if (h.level[i] >= F.layer) nl++;
+      roLayer.set(F.layer + (F.layer === h.top ? ' (entry layer)' : F.layer === 0 ? ' (every vector)' : '') + ' · ' + nl + (nl === 1 ? ' node' : ' nodes'));
+      roCount.set(F.count + ' · brute force: ' + h.pts.length);
+      if (!finished()) roRes.set(player.running ? 'searching…' : 'press Search or One hop');
+      else if (S.tr.result === S.nn) roRes.set('the true nearest neighbour', 'good');
+      else roRes.set('the ' + ordinal(S.rank) + ' nearest: the true nearest was missed', 'bad');
+      var st = S.stats[S.ef];
+      roStats.set('true nearest found ' + Course.fmt(100 * st.recall, 1) + ' % · ' + Course.fmt(st.avg, 1) + ' distances on average · brute force: ' + h.pts.length);
+    });
+  });
+  </script>
+
+  <p>Page 671 lists four advantages: "Scalability", up to "millions or even billions of vectors"; "Speed", because the hierarchy "significantly reduces the number of comparisons needed to find a similar vector"; "Adaptability", "dynamic insertion and deletion of data points"; and "Memory Efficiency" — the one that does not hold.</p>
+
+  <aside class="redpen" data-page="671">
+    <p class="claim">"Memory Efficiency: The algorithm is designed to use memory efficiently, allowing it to handle large-scale datasets without requiring excessive computational resources."</p>
+    <p class="fix">HNSW saves comparisons, not memory. It keeps every full vector plus a list of links for each node in each of its layers, so it needs more memory than the vectors alone (the brute-force index) and far more than the compressed codes of IVFPQ. Its real advantage is the "Speed" bullet. Page 666 makes the same slip: "with minimal memory usage".</p>
+    <p class="because">The arithmetic: a 384-dimensional vector of 4-byte numbers takes 1536 bytes, and HNSW adds its links on top (the widget keeps up to 8 per node in layer 0); a product-quantization code of the same vector can take 48 bytes. The Faiss guidelines for choosing an index recommend HNSW when plenty of RAM is available, and Pinecone's comparison of Flat, LSH, HNSW and IVF measures HNSW as the largest index. The exam may list the slide's four labels as printed; know which one does not hold, and why.</p>
+  </aside>
+
+  <div class="story" data-year="2016">
+    <p>Yu. A. Malkov and D. A. Yashunin posted HNSW in March 2016 from the Institute of Applied Physics of the Russian Academy of Sciences, in Nizhny Novgorod. Its "small world" goes back to Stanley Milgram's experiment of the 1960s, in which people in Nebraska tried to pass a letter to a stranger in Massachusetts through acquaintances, and to Jon Kleinberg's note of 2000 in Nature, which showed when such greedy forwarding with only local knowledge finds the short chains. That is what the walk does, among vectors.</p>
+  </div>
+</section>
+
+
+<section id="l27-ivfpq">
+  <h2>Cells and codes: IVFPQ</h2>
+
+  <p>The Inverted File with Product Quantization "Combines coarse quantization (to partition the vector space) and product quantization (to compress vectors)" (p. 672). Two independent ideas: the first reduces how many vectors a query meets, the second how much each of them costs to store and to compare.</p>
+
+  <h3>Coarse quantization: cells and an inverted file</h3>
+
+  <aside class="margin-note">Page 673 says the inverted index maps "data points (or vectors) to a set of representative clusters". The search uses it the other way round: from a centroid to the list of its vectors.</aside>
+
+  <p>"The entire dataset is divided into clusters using a clustering algorithm like k-means. Each vector is assigned to its nearest cluster center (called a coarse centroid)", and the centroids become the "bins" of the space (p. 673). It is the k-means of Applied Statistics. Around each centroid lies the region of points nearer to it than to any other centroid, a Voronoi cell — the polygons drawn on page 673. For each centroid the index keeps the list of its vectors: an <mark class="key">inverted file</mark>, like the term-to-documents lists of an inverted index (Fig. 9). "During a search, instead of searching the entire dataset, the algorithm only searches within the relevant clusters".</p>
+
+  <figure class="fig fig--plain" id="l27-fig-ivf">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="Three k-means cells with centroids c1, c2, c3 and the inverted file: c1 lists vectors 4, 9, 12; c2 lists 1, 6, 15; c3 lists 2, 7, 21. The query lies in the cell of c2 near its border, so only the list of c2 is read, and its true nearest neighbour 21, in the cell of c3, is missed">
+      <polygon points="116.6,30 280,30 280,131 151.7,124.8" class="fw-s2 st-none"/>
+      <rect x="20" y="30" width="260" height="190" class="st-muted"/>
+      <polyline points="116.6,30 151.7,124.8 111.4,220" class="st-muted sw-2"/>
+      <line x1="151.7" y1="124.8" x2="280" y2="131" class="st-muted sw-2"/>
+      <path d="M75 117 l8 8 l-8 8 l-8 -8 z" class="fi-s3"/>
+      <path d="M210 67 l8 8 l-8 8 l-8 -8 z" class="fi-s3"/>
+      <path d="M205 172 l8 8 l-8 8 l-8 -8 z" class="fi-s3"/>
+      <circle cx="45" cy="70" r="5" class="fi-s1"/>
+      <circle cx="100" cy="95" r="5" class="fi-s1"/>
+      <circle cx="65" cy="180" r="5" class="fi-s1"/>
+      <circle cx="170" cy="50" r="5" class="fi-s1"/>
+      <circle cx="255" cy="60" r="5" class="fi-s1"/>
+      <circle cx="190" cy="108" r="5" class="fi-s1"/>
+      <circle cx="165" cy="195" r="5" class="fi-s1"/>
+      <circle cx="250" cy="200" r="5" class="fi-s1"/>
+      <circle cx="232" cy="148" r="5" class="fi-s1"/>
+      <path d="M219 118 l12 12 M231 118 l-12 12" class="st-s2 sw-3"/>
+      <rect x="330" y="61" width="56" height="22" class="fi-paper sw-2"/>
+      <rect x="330" y="101" width="56" height="22" class="fw-s2 st-s2 sw-2"/>
+      <rect x="330" y="141" width="56" height="22" class="fi-paper sw-2"/>
+      <line x1="392" y1="72" x2="424" y2="72" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="112" x2="424" y2="112" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="152" x2="424" y2="152" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <text x="53" y="63" class="tx-mono tx-sm">4</text>
+      <text x="108" y="88" class="tx-mono tx-sm">9</text>
+      <text x="73" y="173" class="tx-mono tx-sm">12</text>
+      <text x="178" y="43" class="tx-mono tx-sm">1</text>
+      <text x="263" y="53" class="tx-mono tx-sm">6</text>
+      <text x="198" y="101" class="tx-mono tx-sm">15</text>
+      <text x="173" y="188" class="tx-mono tx-sm">2</text>
+      <text x="258" y="193" class="tx-mono tx-sm">7</text>
+      <text x="241" y="163" class="tx-mono tx-sm">21</text>
+      <text x="86" y="130" class="tx-sm">c₁</text>
+      <text x="222" y="70" class="tx-sm">c₂</text>
+      <text x="217" y="184" class="tx-sm">c₃</text>
+      <text x="330" y="44" class="tx-sm tx-bold">inverted file</text>
+      <text x="358" y="77" class="tx-mid">c₁</text>
+      <text x="358" y="117" class="tx-mid">c₂</text>
+      <text x="358" y="157" class="tx-mid">c₃</text>
+      <text x="432" y="77" class="tx-mono tx-sm">4 · 9 · 12</text>
+      <text x="432" y="117" class="tx-mono tx-sm">1 · 6 · 15</text>
+      <text x="432" y="157" class="tx-mono tx-sm">2 · 7 · 21</text>
+      <text x="440" y="206" class="tx-hand tx-mid">one list is read</text>
+    </svg>
+    <figcaption><b>Fig. 9.</b> The inverted file of p. 673 on a toy plane. k-means gives three cells, each with its coarse centroid c₁, c₂, c₃ (diamonds); the index keeps, for every centroid, the list of the vectors in its cell — centroid → vectors, as an inverted index keeps term → documents. The query (cross) is compared with the three centroids and reads only the list of the nearest one, c₂. Its true nearest neighbour, 21, lies just across the border, in the list of c₃, and is missed.</figcaption>
+  </figure>
+
+  <p>The lower drawing of page 673 shades the "Filtered Cell" and puts the "Query Vector" right on its border. That is the risk: the query's true nearest neighbour may lie in the next cell, which is never opened. Searching more cells — <code>nprobe</code> of them, in FAISS's vocabulary — buys back the recall, at the price of more distances.</p>
+
+  <div class="widget" id="l27-w-ivf">
+    <h3 class="widget-title">IVF: open nprobe cells out of sixteen</h3>
+    <p class="widget-intro">The same 400 points as the HNSW widget at N = 400, clustered by k-means into 16 cells; the diamonds are the coarse centroids. A search compares the query with the 16 centroids, opens the nprobe cells whose centroids are nearest (shaded), and compares the query with every vector inside them; the vectors of the other cells stay grey. Pick a preset query or click the plot to place your own. The one thing to see: more cells probed means more recall and more distances — and probing every cell is brute force with extra work.</p>
+    <ol class="tasks">
+      <li>Query A with nprobe = 1: how many distances, and is the result the true nearest neighbour?
+        <details class="answer"><summary>What you should see</summary>
+          <p>52 = 16 centroids + the 36 vectors of the query's cell, and yes: the true nearest neighbour lies inside that cell.</p></details>
+      </li>
+      <li>Query B lies near the border of its cell. Predict the result with nprobe = 1, then raise nprobe to 2.
+        <details class="answer"><summary>What you should see</summary>
+          <p>With one cell it returns the 2nd nearest vector after 32 distances (16 + 16): the true nearest sits across the border, in a cell that was never opened — the "Query Vector" on the edge of the "Filtered Cell" of p. 673. With nprobe = 2 the neighbouring cell is opened too, and the true nearest is found with 49 distances.</p></details>
+      </li>
+      <li>Set nprobe = 16 and compare the count with brute force.
+        <details class="answer"><summary>What you should see</summary>
+          <p>416: all 400 vectors plus the 16 centroids. The recall is perfect and the index costs more than no index. Over the 200 test queries, nprobe = 1, 2, 3 find the true nearest 92.5 %, 100 % and 100 % of the time, at 43.0, 68.5 and 90.7 distances: in this 2-D toy, one extra cell is enough.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-ivf', function (root, ui) {
+    function cloud(seed, n) {               /* the same cloud as l27-w-hnsw (seed 27): its first 400 points */
+      var r = Course.rng(seed), C = [[2.0, 1.6], [3.4, 4.4], [5.6, 2.6], [7.8, 4.6], [8.3, 1.4]], out = [];
+      while (out.length < n) {
+        var p;
+        if (r.random() < 0.3) p = [r.uniform(0.2, 9.8), r.uniform(0.2, 5.8)];
+        else { var c = C[Math.floor(r.random() * C.length)]; p = [r.normal(c[0], 0.75), r.normal(c[1], 0.6)]; }
+        if (p[0] > 0.15 && p[0] < 9.85 && p[1] > 0.15 && p[1] < 5.85) out.push(p);
+      }
+      return out;
+    }
+    function d2(a, b) { var dx = a[0] - b[0], dy = a[1] - b[1]; return dx * dx + dy * dy; }
+    var pts = cloud(27, 400), TQ = cloud(2027, 200), K = 16;
+
+    /* k-means with k-means++ seeding: the coarse quantizer */
+    function kmeans(k, seed, iters) {
+      var r = Course.rng(seed), C = [pts[Math.floor(r.random() * pts.length)].slice()], assign = [], i, j, it;
+      while (C.length < k) {
+        var D = pts.map(function (p) { var m = Infinity; C.forEach(function (c) { m = Math.min(m, d2(p, c)); }); return m; });
+        var tot = D.reduce(function (s, v) { return s + v; }, 0), u = r.random() * tot, acc = 0, pick = pts.length - 1;
+        for (i = 0; i < D.length; i++) { acc += D[i]; if (acc >= u) { pick = i; break; } }
+        C.push(pts[pick].slice());
+      }
+      function assignAll() {
+        pts.forEach(function (p, i) { var b = 0, bd = Infinity; C.forEach(function (c, j) { var d = d2(p, c); if (d < bd) { bd = d; b = j; } }); assign[i] = b; });
+      }
+      for (it = 0; it < iters; it++) {
+        assignAll();
+        var S = C.map(function () { return [0, 0, 0]; });
+        pts.forEach(function (p, i) { var s = S[assign[i]]; s[0] += p[0]; s[1] += p[1]; s[2]++; });
+        C = C.map(function (c, j) { return S[j][2] ? [S[j][0] / S[j][2], S[j][1] / S[j][2]] : c; });
+      }
+      assignAll();
+      var lists = C.map(function () { return []; });
+      assign.forEach(function (a, i) { lists[a].push(i); });          /* the inverted file: centroid -> its vectors */
+      return { C: C, assign: assign, lists: lists };
+    }
+    /* the Voronoi cell of centroid j inside the plane, clipped by the bisector of every other centroid */
+    function cell(C, j) {
+      var poly = [[0, 0], [10, 0], [10, 6], [0, 6]];
+      for (var k = 0; k < C.length && poly.length; k++) {
+        if (k === j) continue;
+        var a = C[j], b = C[k], nx = b[0] - a[0], ny = b[1] - a[1], cc = (b[0] * b[0] + b[1] * b[1] - a[0] * a[0] - a[1] * a[1]) / 2, out = [];
+        for (var i = 0; i < poly.length; i++) {
+          var P = poly[i], Q = poly[(i + 1) % poly.length], fp = nx * P[0] + ny * P[1] - cc, fq = nx * Q[0] + ny * Q[1] - cc;
+          if (fp <= 0) out.push(P);
+          if ((fp < 0 && fq > 0) || (fp > 0 && fq < 0)) { var t = fp / (fp - fq); out.push([P[0] + t * (Q[0] - P[0]), P[1] + t * (Q[1] - P[1])]); }
+        }
+        poly = out;
+      }
+      return poly;
+    }
+    var IV = kmeans(K, 11, 30), cells = IV.C.map(function (c, j) { return cell(IV.C, j); });
+    function nearest(q) { var b = 0, bd = Infinity; for (var i = 0; i < pts.length; i++) { var d = d2(q, pts[i]); if (d < bd) { bd = d; b = i; } } return b; }
+    function rankOf(q, id) { var d = d2(q, pts[id]), r = 1; for (var i = 0; i < pts.length; i++) if (d2(q, pts[i]) < d) r++; return r; }
+    function ordinal(n) { var t = n % 100, s = (t >= 11 && t <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'); return n + s; }
+    function search(q, nprobe) {
+      var order = IV.C.map(function (c, j) { return [d2(q, c), j]; }).sort(function (a, b) { return a[0] - b[0]; });
+      var probed = order.slice(0, nprobe).map(function (o) { return o[1]; }), best = -1, bd = Infinity, cand = 0;
+      probed.forEach(function (j) { IV.lists[j].forEach(function (i) { cand++; var d = d2(q, pts[i]); if (d < bd) { bd = d; best = i; } }); });
+      return { probed: probed, result: best, cand: cand, count: K + cand };
+    }
+    var STATS = [];
+    (function () {
+      var truth = TQ.map(nearest);
+      for (var p = 1; p <= K; p++) {
+        var hit = 0, cnt = 0;
+        for (var i = 0; i < TQ.length; i++) { var s = search(TQ[i], p); cnt += s.count; if (s.result === truth[i]) hit++; }
+        STATS[p] = { recall: hit / TQ.length, avg: cnt / TQ.length };
+      }
+    })();
+
+    var PRE = { a: [5.0, 3.2], b: [6.45, 4.25] }, q = PRE.a.slice();
+    var qSel = ui.select('query', [
+      { value: 'a', label: 'A · inside a cell' },
+      { value: 'b', label: 'B · near the border of a cell' },
+      { value: 'own', label: 'your own: click the plot' }
+    ], function (v) { if (PRE[v]) q = PRE[v].slice(); }, 'a');
+    var nprobe = ui.slider({ label: 'nprobe, the cells searched', min: 1, max: K, step: 1, value: 1 });
+    function now() { var np = Math.max(1, Math.min(K, Math.round(nprobe.value))); var s = search(q, np); s.np = np; s.nn = nearest(q); return s; }
+
+    var plot = ui.plot({ x: [0, 10], y: [0, 6], equalAspect: true, aspect: 1.6, axes: false,
+      label: 'Sixteen k-means cells over 400 points, the query, the cells opened by the search and the vectors it compares' });
+    plot.draw(function (g) {
+      var s = now(), open = {};
+      s.probed.forEach(function (j) { open[j] = 1; });
+      cells.forEach(function (poly, j) { if (open[j]) g.poly(poly, { color: 's2', alpha: 0.15, stroke: false }); });
+      cells.forEach(function (poly) { g.poly(poly, { fill: false, color: 'muted', width: 1.2 }); });
+      g.points(pts, {
+        color: function (p, i) { return open[IV.assign[i]] ? 's1' : 'muted'; },
+        r: function (p, i) { return open[IV.assign[i]] ? 3.4 : 2.2; }, ring: false
+      });
+      g.points(IV.C, { shape: 'diamond', color: 's3', r: 5 });
+      var res = pts[s.result];
+      g.circle(res[0], res[1], 12, { px: true, fill: false, color: 's3', dash: true, width: 2.5 });
+      if (s.result !== s.nn) { var t = pts[s.nn]; g.circle(t[0], t[1], 12, { px: true, fill: false, color: 'bad', width: 2.5 }); }
+      g.points([q], { shape: 'cross', color: 's2', r: 7 });
+    });
+    plot.onPointer({ down: function (p) { if (!p.inside) return; q = [Course.clamp(p.x, 0, 10), Course.clamp(p.y, 0, 6)]; qSel.value = 'own'; } });
+    ui.legend([
+      { label: 'vector compared', color: 's1', mark: 'dot' },
+      { label: 'vector not compared', color: 'muted', mark: 'dot' },
+      { label: 'coarse centroid', color: 's3', mark: 'diamond' },
+      { label: 'query', color: 's2', mark: 'cross' },
+      { label: 'cell opened by the search', color: 's2', mark: 'area' },
+      { label: 'result', color: 's3', mark: 'dash' },
+      { label: 'true nearest, if missed', color: 'bad', mark: 'ring' }
+    ]);
+    var roCount = ui.readout('distances computed'), roRes = ui.readout('result'), roStats = ui.readout('200 test queries at this nprobe');
+    ui.onChange(function () {
+      var s = now(), st = STATS[s.np];
+      roCount.set(K + ' centroids + ' + s.cand + ' vectors = ' + s.count + ' · brute force: ' + pts.length);
+      if (s.result === s.nn) roRes.set('the true nearest neighbour', 'good');
+      else roRes.set('the ' + ordinal(rankOf(q, s.result)) + ' nearest: the true nearest was missed', 'bad');
+      roStats.set('true nearest found ' + Course.fmt(100 * st.recall, 1) + ' % · ' + Course.fmt(st.avg, 1) + ' distances on average');
+    });
+  });
+  </script>
+
+  <h3>Product quantization: four bytes instead of 512</h3>
+
+  <p>"Product quantization works by dividing each vector into smaller sub-vectors and then quantizing each sub-vector separately" (p. 674). Each sub-space gets its own <mark class="key">codebook</mark>, a small set of centroids learned by k-means, and each sub-vector is replaced by the number of its nearest centroid. With 256 centroids per codebook that number fits in one byte (the usual choice; the slide says only "with fewer bits"). Fig. 10 does it to a 128-dimensional vector of 4-byte numbers.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-pq">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="A vector of 128 numbers, 512 bytes, is cut into four sub-vectors of 32 numbers; each sub-vector is replaced by the number of its nearest centroid, giving a code of four bytes, 128 times smaller, whose decoding only approximates the vector">
+      <rect x="40" y="34" width="480" height="30" class="fw-s1 st-s1 sw-2"/>
+      <line x1="160" y1="30" x2="160" y2="68" class="sw-2 dash"/>
+      <line x1="280" y1="30" x2="280" y2="68" class="sw-2 dash"/>
+      <line x1="400" y1="30" x2="400" y2="68" class="sw-2 dash"/>
+      <line x1="100" y1="92" x2="100" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="220" y1="92" x2="220" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="340" y1="92" x2="340" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="460" y1="92" x2="460" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="70" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="190" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="310" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="430" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <line x1="100" y1="146" x2="100" y2="184" marker-end="url(#arr)"/>
+      <line x1="220" y1="146" x2="220" y2="184" marker-end="url(#arr)"/>
+      <line x1="340" y1="146" x2="340" y2="184" marker-end="url(#arr)"/>
+      <line x1="460" y1="146" x2="460" y2="184" marker-end="url(#arr)"/>
+      <rect x="70" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <rect x="190" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <rect x="310" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <rect x="430" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <text x="280" y="22" class="tx-sm tx-mid">one vector: 128 numbers × 4 bytes = 512 bytes</text>
+      <text x="100" y="84" class="tx-sm tx-mid tx-muted">32 numbers</text>
+      <text x="220" y="84" class="tx-sm tx-mid tx-muted">32 numbers</text>
+      <text x="340" y="84" class="tx-sm tx-mid tx-muted">32 numbers</text>
+      <text x="460" y="84" class="tx-sm tx-mid tx-muted">32 numbers</text>
+      <text x="100" y="134" class="tx-mid">u₁</text>
+      <text x="220" y="134" class="tx-mid">u₂</text>
+      <text x="340" y="134" class="tx-mid">u₃</text>
+      <text x="460" y="134" class="tx-mid">u₄</text>
+      <text x="100" y="207" class="tx-mono tx-mid">17</text>
+      <text x="220" y="207" class="tx-mono tx-mid">203</text>
+      <text x="340" y="207" class="tx-mono tx-mid">5</text>
+      <text x="460" y="207" class="tx-mono tx-mid">88</text>
+      <text x="64" y="207" class="tx-sm tx-end">c₁</text>
+      <text x="184" y="207" class="tx-sm tx-end">c₂</text>
+      <text x="304" y="207" class="tx-sm tx-end">c₃</text>
+      <text x="424" y="207" class="tx-sm tx-end">c₄</text>
+      <text x="280" y="248" class="tx-sm tx-mid tx-bold">code: 4 bytes, 128 times smaller</text>
+      <text x="280" y="270" class="tx-sm tx-mid">decoded: close to the vector, not equal</text>
+    </svg>
+    <figcaption><b>Fig. 10.</b> Product quantization as drawn on p. 674, with numbers. A 128-dimensional vector of 4-byte numbers (512 bytes) is cut into 4 sub-vectors of 32 numbers, u₁ … u₄; each becomes the number of its nearest centroid in its own codebook of 256, c₁ … c₄ (the four numbers are made up for the drawing).</figcaption>
+  </figure>
+
+  <p>Four bytes of 256 values each give \(256^4 \approx 4.3 \times 10^9\) different codes from only \(4 \times 256 = 1024\) stored sub-centroids: that Cartesian product is the "product" in the name. The price is the slide's NOTE: "the reconstructed vector is not identical to the original vector" (p. 674), so distances computed on codes are estimates.</p>
+
+  <p>The search runs in two steps (p. 675). "Coarse Search": the algorithm "first identifies the relevant clusters (coarse centroids) where similar vectors are likely to be found". "Refined Search": inside them, "product quantization is used to compare the query vector with the compressed representations of the vectors in those clusters". Two sources of error follow — a neighbour in an unopened cell, a distance misjudged through its code — so IVFPQ "may not find the exact nearest neighbors". Its advantages (p. 676) mirror the two ideas: "Memory Efficiency" from the codes, "Fast Search" from the cells, "Scalability", and "Customizable Accuracy" through parameters "like the number of clusters or the precision of quantization".</p>
+
+  <aside class="redpen" data-page="666">
+    <p class="claim">"Inverted File with Approximate Distance Calculation (IVFADC): utilizes an inverted index structure to index high-dimensional vectors."</p>
+    <p class="fix">In the paper that introduced it — Jégou, Douze and Schmid, "Product Quantization for Nearest Neighbor Search", 2011 — ADC stands for Asymmetric Distance Computation. And IVFADC is not a second algorithm next to IVFPQ: it is the paper's name for the same method, an inverted file plus product quantization, which FAISS implements as <code>IndexIVFPQ</code>.</p>
+    <p class="because">"Asymmetric" names the trick of the Refined Search of p. 675: the query keeps its exact numbers while the stored vectors are compared through their codes. The slide lists IVFADC and IVFPQ as two bullets and spells ADC "Approximate Distance Calculation", and the exam may quote it so: know that wording, and that the correct reading is one method with Asymmetric Distance Computation.</p>
+  </aside>
+
+  <figure class="tbl-fig" id="l27-tbl-indexes">
+    <figcaption>Table 2. The search methods of this lesson side by side (pp. 658–676; the memory remarks are background).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>method</th><th>exact?</th><th>how it organises the vectors</th><th>what it pays</th></tr></thead>
+        <tbody>
+          <tr><td>brute force</td><td>yes</td><td>not at all: the query meets every vector</td><td>\(n \cdot d\) operations per query</td></tr>
+          <tr><td>K-D tree</td><td>yes</td><td>binary tree of axis-aligned median cuts</td><td>fast only while \(n \gg 2^k\)</td></tr>
+          <tr><td>R-tree</td><td>yes</td><td>nested minimum bounding rectangles, balanced pages</td><td>overlap and empty space; fails in high dimension</td></tr>
+          <tr><td>LSH</td><td>no</td><td>buckets of a hash that makes similar vectors collide</td><td>misses neighbours hashed elsewhere</td></tr>
+          <tr class="is-key"><td>HNSW</td><td>no</td><td>layers of navigable small-world graphs</td><td>memory for the links; may stop short of the nearest</td></tr>
+          <tr><td>IVFPQ</td><td>no</td><td>k-means cells plus product-quantized codes</td><td>misses in unopened cells; estimated distances</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>The rainy day, solved</h3>
+
+  <p>Back to page 656. "Colds are unpleasant." came second because an encoder trained, as page 1690 asks, to cluster similar items placed it 65° from "Rainy days make me sad", while an unrelated sentence such as "Success is rewarding." sits at 88°. The inverted index never had a chance: the two sentences share no word. And a real vector database would not compare the query with every stored sentence: an HNSW walk or a few IVF cells meet a few dozen candidates — 32 instead of 400 in the widget. The price is the word "approximate": now and then the true best match lies just outside what the search looked at.</p>
+</section>
+
+
+<section id="l27-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Theory questions in the forms the readme of the past papers names — multiple choice, true or false, open answers; wrong answers may carry a penalty, announced just before the exam — and one practical item in the style of the past papers' "Which DB technology" table.</p>
+
+  <div class="exam" data-kind="mcq" id="l27-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Cosine similarity always takes values between 0 and 1. <span class="fb">False: it ranges from −1 (opposite vectors) through 0 (orthogonal) to 1 (same direction) (p. 655). Only vectors without negative components stay within [0, 1].</span></li>
+      <li data-correct>Locality-sensitive hashing differs from conventional hashing in that hash collisions are maximized, not minimized. <span class="fb">True, almost verbatim from p. 667: similar items should land in the same bucket.</span></li>
+      <li>A K-D tree answers nearest-neighbour queries in O(log n) whatever the dimensionality of the vectors. <span class="fb">False: only under the hypothesis \(n \gg 2^k\) (p. 661); with high-dimensional data "the efficiency is no better than exhaustive search".</span></li>
+      <li data-correct>If all vectors are normalised to unit length, ranking by Euclidean distance gives the same order as ranking by cosine similarity. <span class="fb">True: on unit vectors \(\norm{A-B}^2 = 2 - 2\cos\theta\), a decreasing function of the cosine.</span></li>
+      <li>HNSW guarantees to return the exact nearest neighbour. <span class="fb">False: "HNSW does not guarantee an exact nearest neighbor search" (p. 670); a greedy walk can stop at a local minimum.</span></li>
+      <li>In IVFPQ, the vector reconstructed from its product-quantization code is identical to the original vector. <span class="fb">False: "the reconstructed vector is not identical to the original vector" (p. 674); quantization is lossy.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: the second and the fourth. Cosine similarity ranges from −1 to 1; the O(log n) of a K-D tree holds only when n ≫ 2^k; HNSW and IVFPQ are approximate methods, and product quantization loses information.</p></div>
+      <div class="exam-note"><p>With a possible penalty for wrong answers, tick only what a slide sentence supports. Each false statement here bends one: a wrong range, a dropped condition ("whatever the dimensionality"), or "approximate" turned into "exact".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.447" data-tol="0.002" id="l27-exam-cos">
+    <div class="exam-q" lang="en">
+      <p>Compute the cosine similarity between the vectors \(A = (2, 1)\) and \(B = (0, 2)\), to three decimals. Are the two vectors similar, orthogonal or opposite?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>\(A\cdot B = 2\cdot 0 + 1\cdot 2 = 2\); \(\norm{A} = \sqrt{5} \approx 2.236\); \(\norm{B} = 2\).</p>
+        \[ \cos\theta = \frac{A\cdot B}{\norm{A}\,\norm{B}} = \frac{2}{2.236 \cdot 2} \approx 0.447 \]
+        <p>The angle is about 63°: the vectors are moderately similar. The cosine is positive, so they are not opposite (cosine −1), and it is clearly above 0, so they are not orthogonal, but it is well below 1, the value of vectors pointing the same way.</p>
+      </div>
+      <div class="exam-note"><p>The vectors of the session's Comparison notebook, which prints 0.4472. The usual slips: forgetting a square root in a norm, or dividing by the sum of the lengths instead of their product.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-embedding">
+    <div class="exam-q" lang="en">
+      <p>Explain what an embedding is and why a vector database can retrieve documents that a keyword search based on an inverted index would miss. Use the query "Rainy days make me sad" as an example.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Vectorization or embedding is the process of converting data, such as text or images, into dense numerical vectors that capture their semantics, using an embedding model: an encoder (BERT for text, CNNs or ViTs for images, CLIP for both) trained with metric learning so that similar items are close together and dissimilar ones far apart. A vector database stores these high-dimensional vectors; a query is embedded with the same model, and the database returns the stored vectors most similar to it, typically by cosine similarity, which compares the directions of the vectors. An inverted index only finds documents that contain the query's terms. "Colds are unpleasant." shares no word with "Rainy days make me sad", yet in the lecture's example its cosine similarity with the query is 0.419, the second best after "Rainy days can be gloomy." (0.764), because both sentences express discomfort. Vector search is contextual search that goes beyond keyword matching.</p></div>
+      <div class="exam-note"><p>A complete answer has four parts: the definition, the role of the model (it creates the meaning; the database stores and compares), the similarity measure, and the contrast with keyword matching — with an example that has no shared word.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-trees">
+    <div class="exam-q" lang="en">
+      <p>Why do vector databases not rely on K-D trees or R-trees to find the nearest neighbours of embedding vectors? What do they use instead, and at what price?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>A K-D tree is a binary tree whose nodes split the space with axis-aligned hyperplanes at the median, cycling through the dimensions. Its search costs O(log n) only under the hypothesis n ≫ 2^k, where k is the dimensionality; embeddings have hundreds of dimensions (2^384 ≈ 3.9 × 10^115), so the hypothesis never holds, and a nearest-neighbour search must examine most of the tree: "the efficiency is no better than exhaustive search". An R-tree groups nearby objects into minimum bounding rectangles and skips every subtree whose rectangle the query does not intersect; in high dimension the rectangles overlap and cover much empty space, so little can be skipped. This is the curse of dimensionality. Vector databases therefore use Approximate Nearest Neighbor algorithms — LSH, HNSW, IVFPQ — which are much faster but may miss the true nearest neighbour: they sacrifice a small amount of accuracy for speed.</p></div>
+      <div class="exam-note"><p>A complete answer names the hypothesis \(n \gg 2^k\) with its meaning, the phrase "curse of dimensionality", and the trade-off of ANN. Naming the R-tree's pruning rule shows you know what stops working.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-hnsw-ivfpq">
+    <div class="exam-q" lang="en">
+      <p>Compare HNSW and IVFPQ: how each organizes the vectors, how a query is answered, and what each trades for speed.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>HNSW builds a navigable small-world graph in which every vector is a node linked to its near neighbours, organized in layers, each with fewer nodes than the layer below; layer 0 contains all the vectors. The top layer of a new vector is chosen at random, and the vector is linked to its closest neighbours in that layer and in the layers below. A query starts at the entry point in the top layer, moves greedily to the linked node closest to the query, and descends a layer whenever no neighbour is closer, until layer 0. It needs few comparisons but stores the full vectors plus the links, and the result is approximate. IVFPQ first partitions the space with k-means (coarse quantization): every vector is filed in the inverted list of its nearest coarse centroid. Product quantization then compresses each vector by cutting it into sub-vectors and replacing each with the id of its nearest centroid in a small codebook. A query first finds the nearest centroids and searches only those clusters (coarse search), then compares itself with the compressed codes inside them (refined search). It is memory-efficient and fast but approximate twice, since the true neighbour may sit in a cluster that was not searched and distances computed on codes are estimates; its accuracy is tuned through the number of clusters searched and the precision of the quantization.</p></div>
+      <div class="exam-note"><p>A good answer keeps the two indexes in parallel — structure, search, trade-off. It also avoids two slide slips: the upper HNSW layers are random, not "representative points", and HNSW is fast, not small.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-which-db">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise in the style of the past papers' "Which DB technology" table.</b> Consider the ER model of a system tracking Formula 1 races (the scenario of the Exam of 11 Feb 2025): Person (Personal_ID, Name, Surname, Birth_Date, Gender) with the subtypes Spectator (Favourite_Team), Team Member and Team Owner (Total_Assets, Biography (Textual)), an ISA hierarchy (T, E); Team Member has the subtypes Engineer and Mechanic (Role_Description (Textual)) and Pilot (Championships_Won, Career (Textual)), an ISA hierarchy (P, E); Team, Race, Track and Ticket complete the model.</p>
+      <p>The organizers want a "find similar pilots" feature: given a free-text description such as "a young driver who wins on wet tracks", return the pilots whose career is most similar in meaning, even when it uses different words. Which DB technology would be the best to store the entities and attributes involved? Fill in one row of the table ENTITIES / REL. · DB TYPE · MOTIVATION, and say what is stored for each pilot.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th>ENTITIES / REL.</th><th>DB TYPE</th><th>MOTIVATION</th></tr></thead>
+            <tbody>
+              <tr><td>Pilot (Career), and in the same way Team Owner (Biography), Engineer and Mechanic (Role_Description)</td><td>Vector database (e.g. Milvus / Zilliz)</td><td>The textual attributes are converted by an embedding model into dense vectors that capture their meaning; the database indexes them (e.g. with HNSW) and returns the k vectors most similar to the embedded description, by cosine similarity: semantic search beyond keyword matching.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For each pilot: Personal_ID, Name and Championships_Won as scalar fields (to identify and filter the results), the Career text or a reference to it, and the embedding of the Career (for example 384 numbers with all-MiniLM-L6-v2). The description in the query is embedded with the same model.</p>
+      </div>
+      <div class="exam-note"><p>The exercise is ours; the table itself is worth 1 point on the papers of 6 Jun 2024, 24 Jun 2024, 6 Sep 2024, 21 Jan 2025 and 13 Jun 2025 (the last one prints "Jan. 21, 2025" in its header). A good row names one DB family and gives a motivation tied to the data or to the query. For text the real choice is keyword against meaning: a condition such as "the career includes the words Champion and Car", the Elasticsearch exercise of the same 11 Feb 2025 paper, belongs to a search engine; "similar in meaning" belongs to a vector database.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l27-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A query \(q = (1, 0)\) and two stored vectors: \(a = (2, 0)\), twice as long as \(q\) in the same direction, and \(b = (0.87, 0.5)\), of length 1 and 30° away. Which metric ranks \(b\) above \(a\)?</p>
+    <ul class="options">
+      <li>Cosine similarity <span class="fb">The cosine of \(a\) is 1 (same direction), that of \(b\) is 0.87: \(a\) wins.</span></li>
+      <li data-correct>Euclidean distance <span class="fb">\(\norm{q - a} = 1\) but \(\norm{q - b} \approx 0.52\): the tip of \(b\) is nearer.</span></li>
+      <li>Inner product <span class="fb">\(q\cdot a = 2\) and \(q\cdot b = 0.87\): the longer vector wins.</span></li>
+      <li>All three <span class="fb">Cosine and inner product prefer \(a\); only the Euclidean distance looks at where the tips are.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">All the vectors of a collection are normalised to length 1. Which statements are now true? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>The inner product of two vectors equals their cosine similarity <span class="fb">The denominator \(\norm{A}\,\norm{B}\) is 1.</span></li>
+      <li>The Euclidean distance equals \(1 - \cos\theta\) <span class="fb">It is \(\sqrt{2 - 2\cos\theta}\); \(1 - \cos\theta\) is the cosine distance, a different number with the same order.</span></li>
+      <li data-correct>Sorting by Euclidean distance gives the same order as sorting by cosine similarity <span class="fb">The distance is a decreasing function of the cosine.</span></li>
+      <li>Every pair of vectors now has cosine similarity 1 <span class="fb">Normalising changes lengths, not directions: the angles, and their cosines, stay as they were.</span></li>
+    </ul>
+    <p class="q-fb">This is why a cosine search can run on an inner-product index: normalise first.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A K-D tree is built over \(10^9\) embedding vectors of 384 dimensions. What does the hypothesis of page 661 tell you?</p>
+    <ul class="options">
+      <li>A search takes about \(\log_2 10^9 \approx 30\) steps <span class="fb">That is the cost under the hypothesis, which does not hold here.</span></li>
+      <li>Choosing the median more carefully would make the tree efficient <span class="fb">The median already balances the tree; the problem is the number of dimensions, not the cuts.</span></li>
+      <li>K-D trees work only up to 3 dimensions <span class="fb">They work for any \(k\) as long as \(n \gg 2^k\): for \(k = 10\), a few hundred thousand points suffice.</span></li>
+      <li data-correct>\(n \gg 2^k\) fails by far, so the search degrades towards evaluating most points <span class="fb">\(2^{384} \approx 3.9 \times 10^{115}\), against \(10^9\) vectors: "no better than exhaustive search".</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Which nodes make up the top layer of an HNSW index?</p>
+    <ul class="options">
+      <li>The most representative points, chosen as hubs <span class="fb">That is the wording of p. 668, corrected in the red pen: nobody chooses them.</span></li>
+      <li>The centroids of a k-means clustering <span class="fb">Centroids belong to IVF; HNSW layers contain actual vectors.</span></li>
+      <li data-correct>The vectors whose randomly drawn level reached that layer <span class="fb">"the algorithm randomly selects a level in the hierarchy" (p. 670): the upper layers are a thinning random sample.</span></li>
+      <li>The first vectors inserted <span class="fb">The entry point changes whenever a new vector draws a higher level than the current top.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An IVF index is searched with nprobe = 1, and the query lies close to the border of its cell. What can happen?</p>
+    <ul class="options">
+      <li data-correct>The true nearest neighbour lies in the next cell, is never compared, and a farther vector is returned <span class="fb">Query B of the widget: the 2nd nearest after 32 distances; nprobe = 2 finds the true one.</span></li>
+      <li>The search fails with an error <span class="fb">It always returns something: the nearest among the vectors it compared.</span></li>
+      <li>The index opens all the cells automatically <span class="fb">It opens exactly nprobe cells; raising nprobe is your decision.</span></li>
+      <li>Nothing can go wrong: a k-means cell always contains its query's nearest neighbour <span class="fb">Cells are built from the stored vectors, not around queries; near a border the nearest neighbour may be on the other side.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A 128-dimensional vector of 4-byte numbers is product-quantized into 4 sub-vectors, each encoded with a codebook of 256 centroids. How much does its code take, and what is lost?</p>
+    <ul class="options">
+      <li>4 bytes; nothing is lost <span class="fb">The size is right, but "the reconstructed vector is not identical to the original vector" (p. 674).</span></li>
+      <li data-correct>4 bytes; the decoded vector only approximates the original <span class="fb">One byte per sub-vector (256 values), against 512 bytes: 128 times smaller, and lossy.</span></li>
+      <li>128 bytes; nothing is lost <span class="fb">128 is the number of dimensions; each sub-vector shrinks to one byte.</span></li>
+      <li>32 bytes; the order of the sub-vectors <span class="fb">32 is the length of a sub-vector; the order of the codes is kept.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The CRC16 of Redis Cluster spreads keys over 16384 slots. A locality-sensitive hash, by contrast, …</p>
+    <ul class="options">
+      <li>spreads similar items over different buckets, to balance the load <span class="fb">That is what a conventional hash does; LSH does the opposite on purpose.</span></li>
+      <li>maps every item into its own bucket <span class="fb">"The number of buckets is much smaller than the universe of possible input items" (p. 667).</span></li>
+      <li>is a cryptographic hash, so that two items never share a bucket <span class="fb">Cryptographic hashes avoid collisions; LSH wants them for similar items.</span></li>
+      <li data-correct>puts similar items into the same bucket with high probability: its collisions are wanted <span class="fb">"hash collisions are maximized, not minimized" (p. 667); a query then compares only the items of its bucket.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l27-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A vector database stores data as high-dimensional vectors and retrieves by similarity, beyond keyword matching (p. 645); Neo4j, Cassandra, Elasticsearch, MongoDB and Redis all support vector search (p. 644).</li>
+    <li>An embedding model — an encoder such as BERT, a CNN, a ViT or CLIP, trained with metric learning — converts data into dense vectors so that similar items are close; you decide what "similar" means and how many dimensions to pay for (pp. 1684–1695).</li>
+    <li>Cosine similarity compares directions (1 similar, 0 orthogonal, −1 opposite), Euclidean distance compares positions, the inner product mixes direction and length; on unit vectors all three rank alike, since \(\norm{A-B}^2 = 2 - 2\cos\theta\). For a similarity the best match is the largest value: 0.764 on p. 656.</li>
+    <li>Exact search costs \(n \cdot d\) per query. K-D trees (median cuts, cycling dimensions) give O(log n) only if \(n \gg 2^k\), with \(k\) the number of dimensions; R-trees prune with minimum bounding rectangles; both fail in high dimension, the curse of dimensionality (p. 665).</li>
+    <li>ANN algorithms trade a little accuracy for speed: LSH makes similar items collide in a bucket; HNSW walks greedily down layers of navigable small-world graphs, with random levels; IVFPQ searches only the k-means cells nearest the query and compares compressed product-quantization codes.</li>
+    <li>Know the slides' wording and its corrections: the best match of the "Distance Calculation" table is the largest cosine; the top HNSW layer is a random sample, not "representative points"; HNSW is fast but not memory-efficient; IVFADC's ADC is Asymmetric Distance Computation, the same method as IVFPQ.</li>
+  </ul>
+  <aside class="cheat" id="l27-cheat">
+    <dl>
+      <dt>Vector database (p. 645)</dt><dd>stores data as high-dimensional vector representations; contextual search beyond keyword matching</dd>
+      <dt>Embedding (p. 1684)</dt><dd>data → dense numerical vector capturing its semantics, made by an embedding model; similar items close (p. 1687)</dd>
+      <dt>Encoders (pp. 1690–1695)</dt><dd>BERT (text) · CNN, ViT (images) · CLIP (text and images in one space); trained with metric learning</dd>
+      <dt>Pipeline (p. 1691)</dt><dd>embed → store in a vector DB → semantic search, RAG, classification, clustering, recommendations</dd>
+      <dt>Inner product</dt><dd>\(A\cdot B = \sum_i A_i B_i\)</dd>
+      <dt>Cosine similarity</dt><dd>\(\cos\theta = \frac{A\cdot B}{\norm{A}\,\norm{B}}\) in [−1, 1]: 1 similar · 0 orthogonal · −1 opposite</dd>
+      <dt>Euclidean distance</dt><dd>\(\norm{A-B} = \sqrt{\sum_i (A_i - B_i)^2}\)</dd>
+      <dt>Unit vectors</dt><dd>\(\norm{A-B}^2 = 2 - 2\cos\theta\) and \(A\cdot B = \cos\theta\): the same ranking</dd>
+      <dt>Worked cosine</dt><dd>(2, 1) and (0, 2): 2 / (√5 · 2) ≈ 0.447, about 63°</dd>
+      <dt>Brute force</dt><dd>\(n \cdot d\) multiplications per query</dd>
+      <dt>K-D tree (1975)</dt><dd>binary tree, axis-aligned median splits, dimensions cycle; O(log n) if \(n \gg 2^k\) (\(k\) = dimensions)</dd>
+      <dt>R-tree (1984)</dt><dd>minimum bounding rectangles; a query that misses the rectangle skips the subtree; balanced pages, min filling ≈ 40 %; M-trees use spheres</dd>
+      <dt>ANN</dt><dd>approximate nearest neighbour: much faster, may miss the true nearest; quality = recall</dd>
+      <dt>LSH</dt><dd>similar items → same bucket with high probability; collisions maximized</dd>
+      <dt>HNSW</dt><dd>layers of navigable small-world graphs; greedy from the top entry point down to layer 0; random level per new vector; fast, memory-hungry</dd>
+      <dt>IVFPQ</dt><dd>coarse quantization (k-means cells, inverted file) + product quantization (sub-vectors → codebook ids); coarse search, then refined search; nprobe cells</dd>
+      <dt>PQ size</dt><dd>128 floats = 512 bytes → 4 sub-vectors × 1 byte = 4 bytes; decoded ≠ original</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l27-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://developers.google.com/machine-learning/crash-course/embeddings/embedding-space" target="_blank" rel="noopener">Embeddings: embedding space and static embeddings</a>
+      <span class="res-by">Google Machine Learning Crash Course</span><span class="res-dur">10 min</span>
+      <p class="res-why">The page the exercise session cites on p. 1688: the food example in one, two and three dimensions, with short check-yourself exercises.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.pinecone.io/learn/vector-similarity/" target="_blank" rel="noopener">Vector Similarity Explained</a>
+      <span class="res-by">Pinecone</span>
+      <p class="res-why">Euclidean distance, dot product and cosine side by side, with the rule the slides leave out: use the metric your embedding model was trained with. Read it next to section 3.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://hnsw-visualizer.divakarnaidumahanthi.workers.dev/" target="_blank" rel="noopener">HNSW Explorer</a>
+      <span class="res-by">an open-source visualiser of the HNSW paper</span>
+      <p class="res-why">Insert points and watch which layer each lands in, then step through a search and count its distance computations — the widget of section 5 with every parameter exposed.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=QvKMwLjdK-s" target="_blank" rel="noopener">HNSW for Vector Search Explained and Implemented with Faiss</a>
+      <span class="res-by">James Briggs</span><span class="res-dur">35 min</span>
+      <p class="res-why">The video linked on p. 666: the layered graph first, then an implementation in which M and ef move recall and speed on real data.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.pinecone.io/learn/series/faiss/vector-indexes/" target="_blank" rel="noopener">Nearest Neighbor Indexes for Similarity Search</a>
+      <span class="res-by">Pinecone, "Faiss: The Missing Manual"</span>
+      <p class="res-why">Flat, LSH, HNSW and IVF measured on the same data — recall, query time and memory — which is Table 2 with numbers, and the evidence that HNSW is the largest index.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You now know how a vector database finds neighbours. Who packages these indexes — FAISS, a library; Pinecone, a managed service; Milvus, a database with collections and filters — and what did the exam ask about them in three blank lines of a <code>client.search</code> call?</p>
+</aside>
+
+</main>
+</body>
+</html>

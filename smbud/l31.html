@@ -1,0 +1,1483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hadoop and HDFS: blocks, replicas, one very important server, YARN · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the DataNodes and racks of the placement sandbox can be pressed (mouse, touch, keyboard); tokens only */
+main[data-lesson="l31"] .l31-hit { cursor: pointer; }
+main[data-lesson="l31"] .l31-hit:focus { outline: none; }
+main[data-lesson="l31"] .l31-hit:focus-visible > rect:first-child { stroke: var(--ink) !important; stroke-width: 3 !important; stroke-dasharray: none; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l31">
+
+<header class="lesson-head">
+  <h1>Hadoop and HDFS: blocks, replicas, one very important server, YARN</h1>
+  <p class="lede">After this lesson you will draw HDFS from memory — the NameNode, the DataNodes, blocks with three replicas on two racks — follow a read and a write message by message, say what happens when a DataNode or the NameNode dies, and explain what YARN split out of the JobTracker.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>A hospital heating management system has logged every sensor reading for ten years: one file of 1 TB. Copy it into a Hadoop cluster and the disks of the cluster fill up by 3 TB. That is not a bug. It is the default.</p>
+  <p>One machine of the cluster knows where every piece of the file lives. Yet when a hundred analysts read the whole file at the same time, not one byte of it passes through that machine.</p>
+  <p>Two questions for the end of the lesson. Why pay for every byte three times? And how can the most important server of the cluster be the one that never touches the data — and why is exactly that what lets the cluster grow to thousands of machines?</p>
+</div>
+
+
+<section id="l31-what">
+  <h2>Hadoop: cheap machines that are expected to fail</h2>
+
+  <p>In <a href="l30.html">lesson 30</a> MapReduce cut a job into map and reduce tasks spread over many machines. Hadoop is the system that runs it. The slide calls it a "Software platform to easily process vast amounts of data" that includes "MapReduce – offline computing engine", "HDFS – Hadoop distributed file system" and "Hbase – online data access" (p. 835). Offline means batch: you submit a job and collect the result later. HBase, a separate Apache project that adds random access on top of HDFS, belongs to <a href="l32.html">lesson 32</a>.</p>
+
+  <p>"Hadoop implements Google's MapReduce, using HDFS", and its "target is to run on clusters of the order of thousands of nodes" (p. 836); HDFS "is a file system written in Java based on the Google's GFS" (p. 846). Fig. 1 redraws the picture of p. 836, how the two halves fit: "MapReduce divides applications into many small blocks of work"; HDFS cuts a file into blocks and copies each block to several machines; each map task runs on a machine that already holds its block — "MapReduce can then process the data where it is located."</p>
+
+  <figure class="fig fig--plain" id="l31-fig-does">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="A data file is cut into blocks 1, 2 and 3; each block is copied to two of the three nodes of a compute cluster; on every node a map task reads the block stored there; the three maps feed one reduce, which writes the results file">
+      <path d="M20,100 H50 L60,110 V156 H20 Z" class="fi-paper sw-2"/>
+      <path d="M50,100 V110 H60 Z" class="fi-soft"/>
+      <line x1="27" y1="122" x2="53" y2="122" class="st-muted"/>
+      <line x1="27" y1="132" x2="53" y2="132" class="st-muted"/>
+      <line x1="27" y1="142" x2="53" y2="142" class="st-muted"/>
+      <text x="40" y="180" class="tx-mono tx-sm tx-mid">data</text>
+      <rect x="96" y="14" width="334" height="238" class="st-muted dash"/>
+      <text x="108" y="34" class="tx-sm">compute cluster</text>
+      <line x1="62" y1="116" x2="106" y2="84" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="62" y1="128" x2="106" y2="148" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="62" y1="140" x2="106" y2="214" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="110" y="48" width="206" height="58" class="fi-paper"/>
+      <text x="118" y="66" class="tx-sm">node 1</text>
+      <rect x="120" y="78" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="143" y="75" width="24" height="24" class="hl"/>
+      <rect x="146" y="78" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="129" y="91.5" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="155" y="91.5" class="tx-mono tx-sm tx-mid">1</text>
+      <line x1="168" y1="87" x2="222" y2="87" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="226" y="72" width="80" height="30" class="fi-paper sw-2"/>
+      <text x="266" y="92" class="tx-mono tx-mid">map</text>
+      <rect x="110" y="116" width="206" height="58" class="fi-paper"/>
+      <text x="118" y="134" class="tx-sm">node 2</text>
+      <rect x="120" y="146" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="143" y="143" width="24" height="24" class="hl"/>
+      <rect x="146" y="146" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="129" y="159.5" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="155" y="159.5" class="tx-mono tx-sm tx-mid">2</text>
+      <line x1="168" y1="155" x2="222" y2="155" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="226" y="140" width="80" height="30" class="fi-paper sw-2"/>
+      <text x="266" y="160" class="tx-mono tx-mid">map</text>
+      <rect x="110" y="184" width="206" height="58" class="fi-paper"/>
+      <text x="118" y="202" class="tx-sm">node 3</text>
+      <rect x="120" y="214" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="143" y="211" width="24" height="24" class="hl"/>
+      <rect x="146" y="214" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="129" y="227.5" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="155" y="227.5" class="tx-mono tx-sm tx-mid">3</text>
+      <line x1="168" y1="223" x2="222" y2="223" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="226" y="208" width="80" height="30" class="fi-paper sw-2"/>
+      <text x="266" y="228" class="tx-mono tx-mid">map</text>
+      <line x1="306" y1="87" x2="336" y2="140" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="306" y1="155" x2="336" y2="155" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="306" y1="223" x2="336" y2="170" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="340" y="140" width="80" height="30" class="fi-paper sw-2"/>
+      <text x="380" y="160" class="tx-mono tx-mid">reduce</text>
+      <line x1="420" y1="155" x2="466" y2="155" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M470,130 H500 L510,140 V186 H470 Z" class="fi-paper sw-2"/>
+      <path d="M500,130 V140 H510 Z" class="fi-soft"/>
+      <line x1="477" y1="152" x2="503" y2="152" class="st-muted"/>
+      <line x1="477" y1="162" x2="503" y2="162" class="st-muted"/>
+      <line x1="477" y1="172" x2="503" y2="172" class="st-muted"/>
+      <text x="490" y="210" class="tx-mono tx-sm tx-mid">results</text>
+      <text x="110" y="280" class="tx-hand">each map runs where its block is</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> "What does it do?" (p. 836), redrawn. The file is cut into blocks, and every block is stored on more than one node ("multiple replicas of data blocks for reliability"); each map reads the copy on its own node (highlighted), so the input never crosses the network; the reduce combines the maps' output.</figcaption>
+  </figure>
+
+  <div class="story" data-year="2003–2006">
+    <p>Google described its file system in a paper in 2003 and MapReduce in another in 2004. Doug Cutting and Mike Cafarella read both and rebuilt the two ideas inside Nutch, their open-source web-search project; in January 2006 that code was carved out as a project of its own — named after the toy elephant of Cutting's son.</p>
+  </div>
+
+  <h3>Four features, two questions</h3>
+  <p>The four features of p. 835 come in pairs. <b>Scalable</b> — "It can reliably store and process petabytes" — and <b>Economical</b> — "clusters of commonly available computers (in thousands)" — answer the question "how do you afford petabytes?": with many ordinary machines instead of one big one, the scaling out of <a href="l03.html#l03-scale">lesson 3</a>. <b>Efficient</b> — "it can process it in parallel on the nodes where the data is located" — and <b>Reliable</b> — "It automatically maintains multiple copies of data and automatically redeploys computing tasks based on failures" — answer "how do you make thousands of ordinary machines usable?".</p>
+
+  <h3>Six assumptions, six design decisions</h3>
+  <p>"Hadoop: Assumptions" (p. 837) is the key to the rest of this lesson: every sentence forces a decision.</p>
+
+  <figure class="tbl-fig" id="l31-tbl-assume">
+    <figcaption>The six assumptions of p. 837 and what HDFS does about each one.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Assumption (p. 837)</th><th>Design decision</th></tr></thead>
+        <tbody>
+          <tr><td>"Hardware <em>will</em> fail."</td><td>three replicas of every block, heartbeats, re-replication, checksums (section 3)</td></tr>
+          <tr><td>"Processing will be run in batches: High throughput as opposed to low latency."</td><td>whole blocks read front to back as streams; random reads are not what HDFS is built for (p. 847)</td></tr>
+          <tr><td>"A typical file in HDFS is gigabytes to terabytes in size."</td><td>huge blocks (64 MB on the slides); millions of files, not billions</td></tr>
+          <tr><td>"It should provide high aggregate data bandwidth and scale to hundreds of nodes in a single cluster."</td><td>clients read and write the DataNodes directly, never through the master (section 4)</td></tr>
+          <tr><td>"Applications need a write-once-read-many access model."</td><td>no update in place, only appends: the copies of a block never disagree</td></tr>
+          <tr><td>"Moving Computation is Cheaper than Moving Data."</td><td>block locations are exposed, so each map task runs where its block is (Fig. 1)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Why assume failure? With thousands of commodity machines something is always broken, so failure is the normal state and recovery must be automatic. Why is moving computation cheaper? A map task is a few kilobytes of code, its input block 64 MB, and the network is the scarce resource of a cluster.</p>
+
+  <h3>RDBMS vs. Hadoop</h3>
+  <figure class="tbl-fig" id="l31-tbl-rdbms">
+    <figcaption>"RDBMS vs. Hadoop" (p. 840), as printed.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>RDBMS</th><th>Hadoop</th></tr></thead>
+        <tbody>
+          <tr><td>Data size</td><td>Gigabytes</td><td>Petabytes</td></tr>
+          <tr><td>Access</td><td>Interactive &amp; Batch</td><td>Batch</td></tr>
+          <tr><td>Updates</td><td>Read &amp; write many times</td><td>Write once, read many times</td></tr>
+          <tr><td>Integrity</td><td>High</td><td>Low</td></tr>
+          <tr><td>Scaling</td><td>Non Linear</td><td>Linear</td></tr>
+          <tr><td>Data representation</td><td>Structured</td><td>Unstructured, semi-structured</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two rows need care. "Integrity: Low" does not mean that Hadoop loses data — HDFS checksums every block (section 3). It means Hadoop enforces no schema, keys, constraints or transactions: integrity is the application's job. "Scaling: Linear" means that twice the machines give about twice the throughput, because every machine stores and processes its own share.</p>
+
+  <p class="memo"><mark class="key">Hadoop assumes failure and moves the program to the data; every design decision of HDFS follows from the six assumptions.</mark></p>
+</section>
+
+
+<section id="l31-hdfs">
+  <h2>HDFS: blocks, replicas and the NameNode's two maps</h2>
+
+  <p>HDFS is "Responsible for storing data on the cluster": "Data files are split into blocks and distributed across the nodes in the cluster", and "Each block is replicated multiple times" (p. 845). "Different blocks from the same file will be stored on different machines" (p. 848), and "Default replication is 3-fold" (p. 849).</p>
+
+  <figure class="fig fig--plain" id="l31-fig-replicas">
+    <svg class="dia" viewBox="0 0 560 196" role="img" aria-label="An input file of five blocks is spread over five nodes A to E; every node stores three blocks and every block is stored on three nodes; block 2 lives on nodes A, B and D">
+      <rect x="50" y="36" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="50" y="58" width="18" height="18" class="fw-key st-s1 sw-2"/>
+      <rect x="50" y="80" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="50" y="102" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="50" y="124" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <text x="59" y="49.5" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="59" y="71.5" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="59" y="93.5" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="59" y="115.5" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="59" y="137.5" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="59" y="168" class="tx-sm tx-mid">input file</text>
+      <line x1="96" y1="89" x2="140" y2="89" class="sw-2" marker-end="url(#arr)"/>
+      <text x="190" y="24" class="tx-sm tx-mid">node A</text>
+      <text x="274" y="24" class="tx-sm tx-mid">node B</text>
+      <text x="358" y="24" class="tx-sm tx-mid">node C</text>
+      <text x="442" y="24" class="tx-sm tx-mid">node D</text>
+      <text x="522" y="24" class="tx-sm tx-mid">node E</text>
+      <rect x="170" y="34" width="40" height="84" class="fi-paper"/>
+      <rect x="254" y="34" width="40" height="84" class="fi-paper"/>
+      <rect x="338" y="34" width="40" height="84" class="fi-paper"/>
+      <rect x="422" y="34" width="40" height="84" class="fi-paper"/>
+      <rect x="502" y="34" width="40" height="84" class="fi-paper"/>
+      <rect x="181" y="42" width="18" height="18" class="fw-key st-s1 sw-2 dash"/>
+      <rect x="181" y="66" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="181" y="90" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="190" y="55.5" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="190" y="79.5" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="190" y="103.5" class="tx-mono tx-sm tx-mid">5</text>
+      <rect x="265" y="42" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="265" y="66" width="18" height="18" class="fw-key st-s1 sw-2 dash"/>
+      <rect x="265" y="90" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="274" y="55.5" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="274" y="79.5" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="274" y="103.5" class="tx-mono tx-sm tx-mid">5</text>
+      <rect x="349" y="42" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="349" y="66" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="349" y="90" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="358" y="55.5" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="358" y="79.5" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="358" y="103.5" class="tx-mono tx-sm tx-mid">4</text>
+      <rect x="433" y="42" width="18" height="18" class="fw-key st-s1 sw-2 dash"/>
+      <rect x="433" y="66" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="433" y="90" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="442" y="55.5" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="442" y="79.5" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="442" y="103.5" class="tx-mono tx-sm tx-mid">5</text>
+      <rect x="513" y="42" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="513" y="66" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="513" y="90" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="522" y="55.5" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="522" y="79.5" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="522" y="103.5" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="250" y="168" class="tx-hand">any two nodes can fail</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> "HDFS Data Distribution" (p. 849): five blocks, three copies each, fifteen copies on five nodes — three per node. Follow block 2 (yellow, magenta on the slide): A, B and D.</figcaption>
+  </figure>
+
+  <details class="answer"><summary>Check yourself: which nodes of Fig. 2 can fail together without losing data?</summary>
+    <p>Any two: every block has three copies on three different nodes, so two failures always leave one. Three may be too many: A, B and D together hold every copy of blocks 2 and 5. Three replicas protect against any two simultaneous failures, not against three.</p>
+  </details>
+
+  <p>The arithmetic, for a 200 MB file of the hospital's readings, <code>readings.csv</code>, with the slides' 64 MB blocks:</p>
+
+  <div class="formula">
+    \[ n = \left\lceil \frac{S}{B} \right\rceil \]
+    \[ \text{disk} = r \cdot S \]
+    <dl class="legend">
+      <dt>\(S\)</dt><dd>size of the file</dd>
+      <dt>\(B\)</dt><dd>block size: 64 MB on the slides, 128 MB since Hadoop 2</dd>
+      <dt>\(r\)</dt><dd>replication factor, 3 by default</dd>
+      <dt>\(n\)</dt><dd>number of blocks; the last one holds only what is left</dd>
+    </dl>
+  </div>
+
+  <p>200 / 64 = 3.1, so 4 blocks: three of 64 MB and a last one of 8 MB, which takes 8 MB of disk, not 64 — HDFS does not pad the last block (Apache documentation, not on the slides). With r = 3 the cluster stores 12 block replicas and 600 MB. The hook's 1 TB file: 16,384 blocks, 49,152 replicas, 3 TB.</p>
+
+  <p>"Goals of HDFS" (p. 850) puts numbers on the assumptions: a "Very Large Distributed File System" of "10K nodes, 100 million files, 10PB" that "Assumes Commodity Hardware" — "Files are replicated to handle hardware failure", "Detect failures and recover from them" — and is "Optimized for Batch Processing", with "Data locations exposed so that computations can move to where data resides".</p>
+
+  <h3>Four decisions on one slide</h3>
+  <p>"Distributed File System" (p. 851) names them:</p>
+  <ul>
+    <li>"Single Namespace for entire cluster": one directory tree, however many machines.</li>
+    <li>"Data Coherency": "Write-once-read-many access model", "Client can only append to existing files". If nobody can overwrite a block, its three copies can never disagree, and the DataNodes need no protocol to keep them consistent.</li>
+    <li>"Files are broken up into blocks": "Typically 64MB block size", "Each block replicated on multiple DataNodes".</li>
+    <li>"Intelligent Client": "Client can find location of blocks", "Client accesses data directly from DataNode" — the subject of section 4.</li>
+  </ul>
+
+  <p>Why such big blocks? HDFS "works best with a smaller number of large files" — "Millions as opposed to billions of files", "Typically 100MB or more per file" — and is "Optimized for streaming reads of large files and not random reads" (p. 847). The first reason is the disk; the argument below is a back-of-envelope one from Tom White's book, not from the slides.</p>
+
+  <ol class="steps" id="l31-steps-block">
+    <li><p>A disk first seeks — it moves its head to the block — and then streams the bytes. Typical figures: seek time \(t_s \approx 10\ \text{ms}\), transfer rate \(v \approx 100\ \text{MB/s}\).</p></li>
+    <li><p>Reading one block of size \(B\) takes</p> \[ t = t_s + \frac{B}{v} , \] <p>and only the second term moves data.</p></li>
+    <li><p>Ask the seek to cost at most 1 % of the transfer:</p> \[ t_s \le 0.01\,\frac{B}{v} \] \[ B \ge 100\, t_s\, v . \]</li>
+    <li><p>With the typical figures:</p> \[ B \ge 100 \times 0.01\ \text{s} \times 100\ \text{MB/s} \] \[ B \ge 100\ \text{MB} . \]</li>
+    <li><p>Check the defaults: a 64 MB block streams in 0.64 s, so the 10 ms seek is 1.5 % of the read; at 128 MB it is 0.8 %. A 4 KB block, the size an ordinary file system uses, streams in 0.04 ms: the disk would spend 99.6 % of its time seeking.</p></li>
+  </ol>
+
+  <h3>The NameNode, the one very important server</h3>
+  <p>"The NameNode keeps track of which blocks make up a file and where they are stored" (p. 848). It "Manages File System Namespace": it "Maps a file name to a set of blocks" and "Maps a block to the DataNodes where it resides"; it also does "Cluster Configuration Management" and runs the "Replication Engine for Blocks" (p. 854). Two maps, then: <code>readings.csv → blk 1, blk 2, blk 3, blk 4</code> and <code>blk 1 → dn 1, dn 6, dn 5</code>.</p>
+
+  <p>"NameNode Metadata" (p. 855): "The entire metadata is in main memory", with "No demand paging of metadata". It holds the "List of files", the "List of Blocks for each file", the "List of DataNodes for each block" and "File attributes, e.g. creation time, replication factor", plus "A Transaction Log" that "Records file creations, file deletions etc".</p>
+
+  <p>Memory is the second reason for few, large files. Every request starts with a lookup that must never wait for a disk, so the whole namespace lives in RAM. Tom White's rule of thumb (background) is about 150 bytes per file, directory or block: the 1 TB file in 64 MB blocks costs about 2.5 MB; the "100 million files" of p. 850, one block each, are 200 million objects, about 30 GB; the same terabyte as a billion 1 KB files would cost about 300 GB (computed).</p>
+
+  <h3>The DataNode, a block server</h3>
+  <p>A DataNode is "A Block Server" (p. 856): it "Stores data in the local file system (e.g. ext3)", "Stores metadata of a block (e.g. CRC)" and "Serves data and metadata to Clients". Its "Block Report" "Periodically sends a report of all existing blocks to the NameNode", and it "Facilitates Pipelining of Data": it "Forwards data to other specified DataNodes". It knows blocks, never files: only the NameNode knows that blk 2 belongs to <code>readings.csv</code>. The block reports are how the NameNode learns its second map, which it rebuilds from them at every start (Apache documentation).</p>
+
+  <figure class="fig fig--plain" id="l31-fig-arch">
+    <svg class="dia" viewBox="0 0 560 336" role="img" aria-label="HDFS architecture: a client exchanges only metadata operations with the NameNode, which keeps the metadata table; the NameNode sends block operations to a DataNode; a client reads a block from a DataNode of rack 1; a DataNode of rack 1 replicates a block to a DataNode of rack 2; a second client writes to a DataNode in each rack">
+      <text x="16" y="46" class="tx-sm">metadata ops</text>
+      <line x1="78" y1="94" x2="208" y2="46" class="st-s3 sw-2 dash" marker-end="url(#arr-s3)"/>
+      <rect x="214" y="16" width="124" height="40" class="fi-paper st-s6 sw-3 dash"/>
+      <text x="276" y="41" class="tx-mid">NameNode</text>
+      <line x1="338" y1="36" x2="352" y2="36" class="st-s3 sw-2"/>
+      <rect x="352" y="10" width="200" height="54" class="fw-s3 st-s3"/>
+      <text x="362" y="30" class="tx-sm tx-bold">Metadata</text>
+      <text x="362" y="52" class="tx-mono tx-sm">/home/foo/data, 3</text>
+      <rect x="60" y="96" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="104" y="113" class="tx-sm">client</text>
+      <line x1="300" y1="58" x2="408" y2="192" class="sw-2" marker-end="url(#arr)"/>
+      <text x="372" y="122" class="tx-sm halo">block ops</text>
+      <rect x="8" y="186" width="244" height="78" class="st-muted dash"/>
+      <rect x="368" y="186" width="164" height="78" class="st-muted dash"/>
+      <rect x="16" y="196" width="68" height="60" class="fi-paper"/>
+      <rect x="96" y="196" width="68" height="60" class="fi-paper"/>
+      <rect x="176" y="196" width="68" height="60" class="fi-paper"/>
+      <rect x="376" y="196" width="68" height="60" class="fi-paper"/>
+      <rect x="456" y="196" width="68" height="60" class="fi-paper"/>
+      <rect x="24" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="48" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="24" y="230" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="104" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="104" y="230" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="184" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="208" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="384" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="408" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="384" y="230" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="464" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="488" y="206" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="464" y="230" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <line x1="50" y1="194" x2="72" y2="124" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="68" y="176" class="tx-sm halo">read</text>
+      <line x1="244" y1="226" x2="372" y2="226" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="309" y="216" class="tx-sm tx-mid halo">replication</text>
+      <text x="130" y="284" class="tx-sm tx-mid">rack 1 · DataNodes</text>
+      <text x="450" y="284" class="tx-sm tx-mid">rack 2 · DataNodes</text>
+      <rect x="282" y="300" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="326" y="317" class="tx-sm">client</text>
+      <line x1="290" y1="298" x2="214" y2="260" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="310" y1="298" x2="398" y2="260" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="226" y="320" class="tx-sm">write</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> "HDFS Architecture" (p. 853), redrawn; every box under a rack label is a DataNode, every square a block. Only metadata travels between a client and the NameNode (violet, dashed); data travels between clients and DataNodes and from DataNode to DataNode (blue). The NameNode gives orders — "Block ops" — and never carries a block.</figcaption>
+  </figure>
+
+  <p>The arrows of Fig. 3 are the division of labour. Between a client and the NameNode travel only "Metadata ops". Data travels between clients and DataNodes ("Read", "Write"). The NameNode sends "Block ops" to the DataNodes — copy this block, delete that one — and DataNodes copy blocks to each other ("Replication"), across racks. The deck's closing "HDFS Summary" (p. 888) says it in one line: "HDFS clients talk to the NameNode for metadata-related activities, and to DataNodes to read and write files".</p>
+
+  <p class="memo"><mark class="key">The NameNode knows where every block is and stores none of them; the DataNodes store every block and know nothing about files.</mark></p>
+</section>
+
+
+<section id="l31-alive">
+  <h2>Keeping every block alive</h2>
+
+  <p>"Hardware will fail" is answered by four mechanisms: where the copies go, heartbeats with the replication engine, checksums, and the rebalancer. One failure they do not cover in HDFS 1: that of the NameNode itself.</p>
+
+  <h3>Where the copies go</h3>
+  <p>"Block Placement" (p. 857): "One replica on local node", "Second replica on a remote rack", "Third replica on same remote rack", "Additional replicas are randomly placed"; and "Clients read from nearest replicas". A rack is a cabinet of machines behind one switch and one power line, so it can fail as a whole.</p>
+
+  <p>If the three holders of a block failed independently, each with probability \(p\), losing the block would take all three: \(p^3\) — the independence of your Applied Statistics course's Bernoulli trials, and exactly what a rack failure breaks. Hence two racks. Why not three? Two already survive the loss of either rack, and the write pipeline of section 4 goes local node → remote rack → same remote rack, crossing the slow link between racks once per block; a third rack would cross it twice.</p>
+
+  <div class="pitfall"><p>"The three replicas go to three different racks." No: the local node, then two nodes of one remote rack (p. 857).</p></div>
+
+  <h3>Heartbeats and the replication engine</h3>
+  <p>"DataNodes send hearbeat to the NameNode", "Once every 3 seconds", and the "NameNode uses heartbeats to detect DataNode failure" (p. 858): silence is the signal. The "Replication Engine" (p. 859) then acts: "NameNode detects DataNode failures", "Chooses new DataNodes for new replicas", "Balances disk usage", "Balances communication traffic to DataNodes". By default a DataNode is declared dead only after about ten minutes of silence (Apache defaults, not on the slides): a short network hiccup must not trigger terabytes of copying.</p>
+
+  <div class="widget" id="l31-w-place">
+    <h3 class="widget-title">Placement sandbox: kill a rack, watch the copies come back</h3>
+    <p class="widget-intro">A file is written from dn 1 and its blocks are placed by the rule of p. 857: local node, a node of a remote rack, another node of that rack, extra copies at random. The number under each block is how many live copies it has. Switch DataNodes off with the menu, or press a DataNode or a rack name in the drawing; then press <em>Replication engine</em>, which does what the NameNode does once heartbeats stop. (Where HDFS picks a node of a rack at random, the widget takes the emptiest one, and its random choices use a fixed seed, so that every run is the same.)</p>
+    <ol class="tasks">
+      <li>Keep the settings: 200 MB, 64 MB blocks, r = 3, two racks of three DataNodes. Before you look, predict the number of blocks, of replicas and the disk used — and on which racks the copies of block 1 sit. Then switch the block size to 128 MB.
+        <details class="answer"><summary>What you should see</summary>
+          <p>4 blocks (3 × 64 MB + 8 MB), 12 replicas, 600 MB. Block 1 lives on dn 1 (rack 1, the writer's own node) and on dn 6 and dn 5 (both rack 2); every block has one copy on rack 1 and two on rack 2, and dn 2 and dn 3 hold nothing. The rack-to-rack readout says 4: one crossing per block. With 128 MB blocks: 2 blocks (128 + 72 MB), 6 replicas — and still 600 MB, because disk is r × file size whatever the block size.</p></details>
+      </li>
+      <li>Which rack can burn without losing data? Predict, then switch off rack 2, look, and press <em>Replication engine</em>. Then choose rack 1 instead.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Either rack. Without rack 2 every block keeps one copy, on dn 1: four blocks under-replicated, none missing. The engine makes 8 new copies on dn 2 and dn 3, the only live nodes, and every block is back to 3. Without rack 1 every block keeps its two copies on rack 2, and the engine adds one more on rack 2. This is the insight of the widget: one copy on the writer's rack plus two on a remote rack survive the loss of any one rack.</p></details>
+      </li>
+      <li>Set racks to 1 — a cluster where nobody configured the racks — with r = 3, and switch off rack 1. Then go back to two racks and choose "every DataNode that holds block 1".
+        <details class="answer"><summary>What you should see</summary>
+          <p>With one rack, the rack-to-rack readout drops to 0 and the rack failure leaves 0 copies of every block: all four missing, and the engine can do nothing. With two racks, losing the three holders of block 1 (dn 1, dn 5, dn 6) leaves block 1 with no copy — what <code>hdfs fsck / -list-corruptfileblocks</code> would report — while blocks 2–4 keep one copy each and are repaired. Three replicas survive any two failures, not three.</p></details>
+      </li>
+      <li>Set r = 1 and switch off dn 1. Then set r = 4 with three racks and count the rack-to-rack copies.
+        <details class="answer"><summary>What you should see</summary>
+          <p>With r = 1 every block lives only on the writer's node: one failure, four missing blocks. With r = 4 the fourth copy goes to a random node, which may sit on yet another rack: the counter grows above one crossing per block. Every extra copy buys safety with disk and network.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l31-w-place', function (root, ui) {
+    var SEED = 31, ESEED = 77, X0 = 76, PITCH = 120, NW = 112, NH = 72, BAND = 84, TOP = 74;
+    var bsel = ui.select('block size', [
+      { value: '64', label: '64 MB (the slides, Hadoop 1)' },
+      { value: '128', label: '128 MB (Hadoop 2 and 3)' }
+    ], null, '64');
+    var size = ui.slider({ label: 'file size', min: 8, max: 512, step: 8, value: 200, format: function (v) { return v + ' MB'; } });
+    var rep = ui.slider({ label: 'replication factor r', min: 1, max: 4, step: 1, value: 3 });
+    var racks = ui.slider({ label: 'racks', min: 1, max: 3, step: 1, value: 2 });
+    var per = ui.slider({ label: 'DataNodes per rack', min: 2, max: 4, step: 1, value: 3 });
+    var fail = ui.select('switch off', [
+      { value: 'none', label: 'nothing' },
+      { value: 'dn1', label: 'dn 1, the writer’s own node' },
+      { value: 'rack1', label: 'rack 1, the writer’s rack' },
+      { value: 'rack2', label: 'rack 2' },
+      { value: 'b1', label: 'every DataNode that holds block 1' }
+    ], null, 'none');
+    ui.button('Replication engine', function () { runEngine(); }, { kind: 'primary' });
+    ui.button('Start over', function () { fail.value = 'none'; sig = ''; }, { kind: 'ghost', icon: 'refresh' });
+
+    var roBlocks = ui.readout('blocks'), roDisk = ui.readout('live replicas · disk they use'),
+        roHealth = ui.readout('block health'), roCross = ui.readout('rack-to-rack copies while writing', { digits: 0 });
+    var note = ui.note('');
+    ui.legend([
+      { label: 'block replica on a DataNode', color: 's1', mark: 'square' },
+      { label: 'dn 1: the client writing the file runs here', color: 's2', mark: 'dash' },
+      { label: 'copy just made by the replication engine', color: 's1', mark: 'hl' },
+      { label: 'switched off', color: 'muted', mark: 'dash' }
+    ]);
+    var svg = ui.svg(560, 242, { label: 'A file cut into numbered blocks above a cluster of racks of DataNodes; each DataNode shows the block replicas it stores; switched-off DataNodes are greyed; the number under each block of the file is how many live copies it has' });
+
+    var nodes = [], holders = [], sizes = [], made = [], sig = '', last = '', focusKey = null, crossW = 0;
+
+    function S(tag, a, p) { return Course.svg(tag, a, p || svg); }
+    function T(x, y, s, cls, p) { return S('text', { x: x, y: y, 'class': cls || '', text: s }, p); }
+    function listOf(a) { return a.map(function (b) { return b + 1; }).join(', '); }
+    function live(h) { return h.filter(function (x) { return nodes[x].alive; }); }
+    function aliveCount() { return nodes.filter(function (n) { return n.alive; }).length; }
+    function pickLeast(cand, load, rng) {
+      var m = Infinity;
+      cand.forEach(function (c) { if (load[c] < m) m = load[c]; });
+      var ties = cand.filter(function (c) { return load[c] === m; });
+      return ties.length === 1 ? ties[0] : rng.pick(ties);
+    }
+    /* the placement rule of p. 857, with dn 1 (index 0) as the writer */
+    function place() {
+      var rng = Course.rng(SEED), N = nodes.length, r = rep.value, load = [], out = [];
+      for (var i = 0; i < N; i++) load.push(0);
+      for (var b = 0; b < sizes.length; b++) {
+        var h = [0], c, k;
+        if (r >= 2 && N > 1) {
+          c = []; for (k = 0; k < N; k++) if (h.indexOf(k) < 0 && nodes[k].rack !== nodes[0].rack) c.push(k);
+          if (!c.length) for (k = 0; k < N; k++) if (h.indexOf(k) < 0) c.push(k);
+          h.push(pickLeast(c, load, rng));
+        }
+        if (r >= 3 && h.length === 2) {
+          c = []; for (k = 0; k < N; k++) if (h.indexOf(k) < 0 && nodes[k].rack === nodes[h[1]].rack) c.push(k);
+          if (!c.length) for (k = 0; k < N; k++) if (h.indexOf(k) < 0) c.push(k);
+          if (c.length) h.push(pickLeast(c, load, rng));
+        }
+        while (h.length < r && h.length >= 3) {
+          c = []; for (k = 0; k < N; k++) if (h.indexOf(k) < 0) c.push(k);
+          if (!c.length) break;
+          h.push(rng.pick(c));
+        }
+        h.forEach(function (x) { load[x]++; });
+        out.push(h);
+      }
+      return out;
+    }
+    function status() {
+      var st = { under: [], missing: [], over: [], down: [] }, r = rep.value;
+      holders.forEach(function (h, b) {
+        var l = live(h).length;
+        if (l === 0) st.missing.push(b); else if (l < r) st.under.push(b); else if (l > r) st.over.push(b);
+      });
+      nodes.forEach(function (n, i) { if (!n.alive) st.down.push(i); });
+      return st;
+    }
+    function rebuild() {
+      var R = racks.value, K = per.value, B = +bsel.value, S0 = size.value, n = Math.max(1, Math.ceil(S0 / B));
+      nodes = [];
+      for (var i = 0; i < R * K; i++) nodes.push({ rack: Math.floor(i / K), alive: true });
+      sizes = [];
+      for (var b = 0; b < n; b++) sizes.push(b < n - 1 ? B : S0 - (n - 1) * B);
+      holders = place();
+      /* rack-to-rack hops of the write pipelines, counted once at placement: the engine's later copies are not writes */
+      crossW = 0;
+      holders.forEach(function (h) { for (var k = 1; k < h.length; k++) if (nodes[h[k]].rack !== nodes[h[k - 1]].rack) crossW++; });
+      made = []; last = '';
+      var p = fail.value;
+      if (p === 'dn1') { nodes[0].alive = false; last = 'dn 1 switched off.'; }
+      else if (p === 'rack1') { nodes.forEach(function (x) { if (x.rack === 0) x.alive = false; }); last = 'Rack 1 switched off.'; }
+      else if (p === 'rack2') {
+        if (R < 2) last = 'This cluster has only one rack: there is no rack 2 to switch off.';
+        else { nodes.forEach(function (x) { if (x.rack === 1) x.alive = false; }); last = 'Rack 2 switched off.'; }
+      }
+      else if (p === 'b1') { holders[0].forEach(function (x) { nodes[x].alive = false; }); last = 'Switched off every holder of block 1: ' + holders[0].map(function (x) { return 'dn ' + (x + 1); }).join(', ') + '.'; }
+    }
+    function runEngine() {
+      var rng = Course.rng(ESEED), N = nodes.length, r = rep.value, load = [], mk = [], dr = [], i;
+      for (i = 0; i < N; i++) load.push(0);
+      holders.forEach(function (h) { live(h).forEach(function (x) { load[x]++; }); });
+      var ar = {}; nodes.forEach(function (n) { if (n.alive) ar[n.rack] = 1; });
+      var nRacks = Object.keys(ar).length;
+      holders.forEach(function (h, b) {
+        var l = live(h);
+        if (!l.length) return;
+        while (l.length < r) {
+          var cand = [];
+          for (var k = 0; k < N; k++) if (nodes[k].alive && h.indexOf(k) < 0) cand.push(k);
+          if (!cand.length) break;
+          var rk = {}; l.forEach(function (x) { rk[nodes[x].rack] = 1; });
+          if (Object.keys(rk).length === 1) {
+            var off = cand.filter(function (c) { return !rk[nodes[c].rack]; });
+            if (off.length) cand = off;
+          }
+          var t = pickLeast(cand, load, rng);
+          h.push(t); l.push(t); load[t]++; mk.push({ b: b, n: t });
+        }
+        while (l.length > r) {
+          var best = -1;
+          l.forEach(function (x) {
+            var rk2 = {};
+            l.forEach(function (y) { if (y !== x) rk2[nodes[y].rack] = 1; });
+            if (Object.keys(rk2).length < Math.min(2, nRacks)) return;
+            if (best < 0 || load[x] > load[best] || (load[x] === load[best] && x > best)) best = x;
+          });
+          if (best < 0) best = l[l.length - 1];
+          h.splice(h.indexOf(best), 1); l.splice(l.indexOf(best), 1); load[best]--; dr.push({ b: b, n: best });
+        }
+      });
+      made = mk;
+      if (!mk.length && !dr.length) last = 'Replication engine: nothing it can do.';
+      else last = 'Replication engine: ' + (mk.length ? mk.length + ' new cop' + (mk.length === 1 ? 'y' : 'ies') + ', copied from surviving replicas (highlighted)' : '') +
+        (mk.length && dr.length ? '; ' : '') + (dr.length ? dr.length + ' extra cop' + (dr.length === 1 ? 'y' : 'ies') + ' deleted' : '') + '.';
+    }
+    function toggleNode(i) {
+      nodes[i].alive = !nodes[i].alive; made = [];
+      last = 'dn ' + (i + 1) + (nodes[i].alive ? ' is back, with the copies it had.' : ' switched off.');
+    }
+    function toggleRack(r) {
+      var mine = nodes.filter(function (n) { return n.rack === r; }), anyAlive = mine.some(function (n) { return n.alive; });
+      mine.forEach(function (n) { n.alive = !anyAlive; }); made = [];
+      last = 'Rack ' + (r + 1) + (anyAlive ? ' switched off.' : ' is back, with the copies it had.');
+    }
+    function bind(g, fn) {
+      g.addEventListener('click', function () { fn(); ui.changed(); });
+      g.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); focusKey = g.getAttribute('data-key'); fn(); ui.changed(); }
+      });
+    }
+    function isNew(b, i) { for (var k = 0; k < made.length; k++) if (made[k].b === b && made[k].n === i) return true; return false; }
+    function draw() {
+      var R = racks.value, K = per.value, H = TOP + R * BAND;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      T(8, 34, 'file', 'tx-sm');
+      T(8, 60, 'copies', 'tx-sm');
+      sizes.forEach(function (sz, b) {
+        var x = 84 + b * 30, lc = live(holders[b]).length;
+        S('rect', { x: x, y: 20, width: 18, height: 18, 'class': 'fw-s1 st-s1 sw-2' });
+        T(x + 9, 33.5, String(b + 1), 'tx-mono tx-sm tx-mid');
+        if (!lc) {
+          S('line', { x1: x - 3, y1: 17, x2: x + 21, y2: 41, 'class': 'st-bad sw-2' });
+          S('line', { x1: x + 21, y1: 17, x2: x - 3, y2: 41, 'class': 'st-bad sw-2' });
+        }
+        T(x + 9, 60, String(lc), 'tx-sm tx-mid' + (lc ? '' : ' tx-bad'));
+      });
+      for (var r = 0; r < R; r++) {
+        var top = TOP + r * BAND;
+        if (r > 0) S('line', { x1: 4, y1: top - 6, x2: 556, y2: top - 6, 'class': 'st-grid' });
+        var rackDead = nodes.every(function (n) { return n.rack !== r || !n.alive; });
+        var rg = S('g', { tabindex: '0', role: 'button', 'aria-label': 'rack ' + (r + 1) + (rackDead ? ': switch it on' : ': switch it off'), 'data-key': 'r' + r, 'class': 'l31-hit' });
+        S('rect', { x: 2, y: top, width: 66, height: NH, 'class': 'fi-paper st-none' }, rg);
+        T(8, top + 40, 'rack ' + (r + 1), 'tx-sm tx-bold', rg);
+        if (rackDead) T(8, top + 62, 'off', 'tx-sm tx-bad', rg);
+        bind(rg, (function (rr) { return function () { toggleRack(rr); }; })(r));
+        for (var j = 0; j < K; j++) {
+          var i = r * K + j, n = nodes[i], x = X0 + j * PITCH;
+          var g = S('g', { tabindex: '0', role: 'button', 'aria-label': 'dn ' + (i + 1) + (n.alive ? ': switch it off' : ': switch it on'), 'data-key': 'n' + i, 'class': 'l31-hit' });
+          S('rect', { x: x, y: top, width: NW, height: NH, 'class': 'fi-paper ' + (!n.alive ? 'st-muted dash' : i === 0 ? 'st-s2 sw-2 dash' : '') }, g);
+          T(x + 6, top + 16, 'dn ' + (i + 1), 'tx-sm', g);
+          if (!n.alive) T(x + 62, top + 16, 'off', 'tx-sm tx-bad', g);
+          var mine = [];
+          holders.forEach(function (h, b) { if (h.indexOf(i) >= 0) mine.push(b); });
+          mine.forEach(function (b, k) {
+            var sx = x + 8 + (k % 4) * 25, sy = top + 24 + Math.floor(k / 4) * 24;
+            if (isNew(b, i)) S('rect', { x: sx - 3, y: sy - 3, width: 24, height: 24, 'class': 'hl' }, g);
+            S('rect', { x: sx, y: sy, width: 18, height: 18, 'class': n.alive ? 'fw-s1 st-s1 sw-2 dash' : 'st-muted dash' }, g);
+            T(sx + 9, sy + 13.5, String(b + 1), 'tx-mono tx-sm tx-mid' + (n.alive ? '' : ' tx-muted'), g);
+          });
+          bind(g, (function (ii) { return function () { toggleNode(ii); }; })(i));
+        }
+      }
+      if (focusKey) {
+        var f = svg.querySelector('[data-key="' + focusKey + '"]');
+        focusKey = null;
+        if (f && f.focus) f.focus();
+      }
+    }
+
+    ui.onChange(function () {
+      var s = [bsel.value, size.value, rep.value, racks.value, per.value, fail.value].join('|');
+      if (s !== sig) { sig = s; rebuild(); }
+      var B = +bsel.value, n = sizes.length, lastS = sizes[n - 1], st = status(), r = rep.value;
+      roBlocks.set(n === 1 ? '1 (' + lastS + ' MB)' : lastS === B ? n + ' (' + n + ' × ' + B + ' MB)' : n + ' (' + (n - 1) + ' × ' + B + ' MB + ' + lastS + ' MB)');
+      var reps = 0, disk = 0;
+      holders.forEach(function (h, b) { var l = live(h).length; reps += l; disk += l * sizes[b]; });
+      roDisk.set(reps + ' · ' + disk + ' MB');
+      if (st.missing.length) roHealth.set('missing: block ' + listOf(st.missing) + (st.under.length ? ' · under-replicated: ' + listOf(st.under) : ''), 'bad');
+      else if (st.under.length) roHealth.set('under-replicated: block ' + listOf(st.under));
+      else if (st.over.length) roHealth.set('over-replicated: block ' + listOf(st.over));
+      else roHealth.set('every block has ' + r + ' cop' + (r === 1 ? 'y' : 'ies'), 'good');
+      roCross.set(crossW);
+      var parts = [];
+      if (last) parts.push(last);
+      if (st.missing.length) parts.push('Block ' + listOf(st.missing) + ': every copy sits on a switched-off DataNode. The data is gone and the replication engine has nothing to copy from — <code>hdfs fsck / -list-corruptfileblocks</code> would list it.');
+      else if (st.under.length && st.down.length) parts.push('Nothing is lost: every block still has a live copy. In a real cluster the NameNode notices the missing heartbeats and starts the replication engine by itself; here, press <em>Replication engine</em>.');
+      if (st.over.length) parts.push('Some blocks now have more than r copies: a DataNode came back with its old ones. The replication engine deletes the extras.');
+      if (aliveCount() < r) parts.push('Only ' + aliveCount() + ' DataNode' + (aliveCount() === 1 ? ' is' : 's are') + ' on: no block can have more copies than that.');
+      if (racks.value === 1 && r > 1 && !st.down.length) parts.push('One rack only: every copy shares one switch and one power line. HDFS puts every node in <code>/default-rack</code> when nobody maps the racks.');
+      if (!parts.length) parts.push('Each block: one copy on dn 1, the writer’s node, then copies on a remote rack. Press a DataNode or a rack name to switch it off.');
+      note.set(parts.join(' '));
+      draw();
+    });
+  });
+  </script>
+
+  <h3>Checksums and the rebalancer</h3>
+  <p>Failure also means silent corruption. "Data Correctness" (p. 860): "Use Checksums to validate data", "Use CRC32". At "File Creation" the "Client computes checksum per 512 bytes" and the "DataNode stores the checksum"; at "File access" the "Client retrieves the data and checksum from DataNode", and "If Validation fails, Client tries other replicas". That is the second job of the three copies. The price is a 4-byte CRC32 per 512 bytes: 4 / 512 ≈ 0.8 % more disk (computed).</p>
+
+  <p>The "Rebalancer" (p. 863; the Apache tool is called the balancer) has the "Goal: % disk full on DataNodes should be similar". It is "Usually run when new DataNodes are added", the "Cluster is online when Rebalancer is active", and the "Rebalancer is throttled to avoid network congestion". A new node arrives empty, and since map tasks go where the blocks are, a node without blocks gets no work until the rebalancer moves some onto it.</p>
+
+  <h3>The failure that is not routine</h3>
+  <p>A dead DataNode is routine. A dead NameNode is not: it is "A single point of failure in HDFS 1" (p. 861). HDFS 1 protects the namespace, not the service: the "Transaction Log stored in multiple directories", "A directory on the local file system" and "A directory on a remote file system (NFS/CIFS)". If the machine burns, the namespace can be loaded on another one — after an outage.</p>
+
+  <p>The transaction log only grows: every change is appended to it, while the FsImage — the saved snapshot of the namespace — is not rewritten as the NameNode runs. A long log means a slow restart. The "Secondary NameNode" (p. 864) keeps it short, as Fig. 4 shows: it "Copies FsImage and Transaction Log from Namenode to a temporary directory", "Merges FSImage and Transaction Log into a new FSImage in temporary directory", "Uploads new FSImage to the NameNode", and then the "Transaction Log on NameNode is purged". (The Apache documentation calls the log the EditLog.)</p>
+
+  <figure class="fig fig--pair fig--plain" id="l31-fig-checkpoint">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="Before the checkpoint: the NameNode holds an FsImage and a long transaction log; the Secondary NameNode copies both (step 1) and merges them into a new FsImage (step 2)">
+        <text x="78" y="18" class="tx-sm tx-bold tx-mid">NameNode</text>
+        <rect x="14" y="28" width="128" height="160" class="fi-paper st-s6 sw-3 dash"/>
+        <path d="M58,42 H88 L98,52 V92 H58 Z" class="fi-paper sw-2"/>
+        <path d="M88,42 V52 H98 Z" class="fi-soft"/>
+        <text x="78" y="110" class="tx-sm tx-mid">FsImage</text>
+        <rect x="22" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="35" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="48" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="61" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="74" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="87" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="100" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="113" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="126" y="124" width="11" height="20" class="fw-s3 st-s3"/>
+        <text x="78" y="164" class="tx-sm tx-mid">transaction log</text>
+        <text x="232" y="18" class="tx-sm tx-bold tx-mid">Secondary NameNode</text>
+        <rect x="176" y="28" width="112" height="160" class="fi-paper"/>
+        <line x1="144" y1="70" x2="172" y2="70" class="sw-2" marker-end="url(#arr)"/>
+        <text x="158" y="62" class="tx-sm tx-mid">1</text>
+        <path d="M186,42 H208 L216,50 V80 H186 Z" class="fi-paper sw-2"/>
+        <path d="M208,42 V50 H216 Z" class="fi-soft"/>
+        <rect x="224" y="52" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="237" y="52" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="250" y="52" width="11" height="20" class="fw-s3 st-s3"/>
+        <rect x="263" y="52" width="11" height="20" class="fw-s3 st-s3"/>
+        <line x1="222" y1="88" x2="222" y2="118" class="sw-2" marker-end="url(#arr)"/>
+        <text x="234" y="108" class="tx-sm">2 merge</text>
+        <path d="M202,124 H232 L242,134 V170 H202 Z" class="fw-key sw-2"/>
+        <path d="M232,124 V134 H242 Z" class="fi-soft"/>
+        <text x="222" y="184" class="tx-sm tx-mid">new FsImage</text>
+      </svg>
+      <p class="fig-label">Before: the log keeps growing</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="After the checkpoint: the Secondary NameNode uploads the new FsImage to the NameNode (step 3), and the NameNode's transaction log is purged; the Secondary NameNode is not a standby">
+        <text x="78" y="18" class="tx-sm tx-bold tx-mid">NameNode</text>
+        <rect x="14" y="28" width="128" height="160" class="fi-paper st-s6 sw-3 dash"/>
+        <path d="M58,42 H88 L98,52 V92 H58 Z" class="fw-key sw-2"/>
+        <path d="M88,42 V52 H98 Z" class="fi-soft"/>
+        <text x="78" y="110" class="tx-sm tx-mid">new FsImage</text>
+        <rect x="22" y="124" width="11" height="20" class="st-muted dash"/>
+        <text x="78" y="164" class="tx-sm tx-mid">log purged</text>
+        <text x="232" y="18" class="tx-sm tx-bold tx-mid">Secondary NameNode</text>
+        <rect x="176" y="28" width="112" height="160" class="fi-paper"/>
+        <path d="M212,42 H242 L252,52 V88 H212 Z" class="fw-key sw-2"/>
+        <path d="M242,42 V52 H252 Z" class="fi-soft"/>
+        <line x1="174" y1="70" x2="146" y2="70" class="sw-2" marker-end="url(#arr)"/>
+        <text x="160" y="62" class="tx-sm tx-mid">3</text>
+        <text x="232" y="106" class="tx-sm tx-mid">upload</text>
+        <text x="232" y="218" class="tx-hand tx-mid">not a standby</text>
+      </svg>
+      <p class="fig-label">After: a fresh FsImage, an empty log</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> The checkpoint of p. 864 in three steps: copy (1), merge (2), upload (3). The NameNode keeps serving clients throughout; the Secondary NameNode never does.</figcaption>
+  </figure>
+
+  <div class="pitfall"><p>"The Secondary NameNode takes over when the NameNode dies." No. It is a checkpointer: its copy of the namespace lags behind and it cannot serve clients. At best its last FsImage is a recent backup. A real standby arrives with Hadoop 2 (section 5).</p></div>
+
+  <p class="memo"><mark class="key">Three copies on two racks, a heartbeat every 3 seconds and the replication engine make a dead DataNode a non-event; the NameNode is the one machine HDFS 1 cannot lose.</mark></p>
+</section>
+
+
+<section id="l31-paths">
+  <h2>Reading and writing: the NameNode stays out of the way</h2>
+
+  <p>"Data Retrieval" (p. 866) takes two moves: the client "Communicates with the NameNode to determine which blocks make up a file and on which data nodes those blocks are stored", "Then communicated directly with the data nodes to read the data". Writing uses a pipeline, "Data Pieplining" on p. 862: "Client retrieves a list of DataNodes on which to place replicas of a block", "Client writes block to the first DataNode", "The first DataNode forwards the data to the next node in the Pipeline", "When all replicas are written, the Client moves on to write the next block in file". The client uploads each block once, not three times.</p>
+
+  <p>The widget plays the two diagrams of the slides (pp. 867–868). Their boxes are Java classes of the HDFS client library: DistributedFileSystem talks to the NameNode, FSDataInputStream and FSDataOutputStream move the bytes in packets. The application itself only calls open or create, read or write, and close.</p>
+
+  <div class="widget" id="l31-w-path">
+    <h3 class="widget-title">A read and a write, one numbered arrow at a time</h3>
+    <p class="widget-intro">The numbered arrows of pp. 867–868, lit one per step; the line under the controls says what each message carries. The bars below the drawing come from an idealised model, computed, not from the slides: 20 DataNodes, every machine with a 100 MB/s network link, and many clients at work at once. The switch asks what would happen if every byte went through the NameNode.</p>
+    <ol class="tasks">
+      <li>With <em>read a file</em>, press <em>Next</em> through the seven steps. Before step 2, predict what the NameNode sends back: the blocks, or something else? At which steps does the NameNode appear at all?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only at step 2, and only with metadata: which blocks make up the file and, for each block, the DataNodes that hold a copy (blk 1 → dn 1 and dn 2, blk 2 → dn 2 and dn n, blk 3 → dn n and dn 1). Steps 4–6 stream the blocks straight from the DataNodes, one block after another, each from one of its holders; step 7 closes the stream. One question, then direct streams.</p></details>
+      </li>
+      <li>Choose <em>write a file</em> and go to step 4. Predict how many times the client sends block 1, and to whom; then step to 5 and to 7.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Once, to datanode 1. Datanode 1 forwards it to datanode 2 and datanode 2 to datanode 3 — the pipeline of p. 862 — and at step 5 the acknowledgements travel back 3 → 2 → 1 → client. The NameNode only ever sees metadata: it creates the file (2), hands out the list of DataNodes for each block (inside step 3, p. 862) and marks the file complete (7).</p></details>
+      </li>
+      <li>Keep 20 clients and read. Predict the total read rate if every byte went through the NameNode; then flip the switch. Try 1 and 40 clients both ways.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Direct: 2000 MB/s, the NameNode link at ≈ 0 %, every DataNode link busy. Through the NameNode: 100 MB/s whatever the number of clients — one machine's link carries everything, saturated, and the 20 DataNodes idle at 5 %. With 1 client both routes give 100 MB/s, the client's own link, but that one client already fills the NameNode's link; with 40 clients the direct route stays at 2000 MB/s, the limit of 20 DataNode links. This is the insight of the widget: metadata and data take separate paths on purpose, so bandwidth grows with the number of DataNodes ("Scaling: Linear", p. 840).</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l31-w-path', function (root, ui) {
+    var D = 20, L = 100;
+    var READ = [
+      '<b>1 · open()</b> — the application, the HDFS client, opens <code>readings.csv</code> through DistributedFileSystem, the Hadoop library running in its own JVM.',
+      '<b>2 · get block locations (RPC)</b> — DistributedFileSystem asks the NameNode which blocks make up the file and which DataNodes hold each. The answer is metadata only: for every block, the DataNodes that hold a copy.',
+      '<b>3 · read()</b> — the client reads from an FSDataInputStream, which now knows where every block is.',
+      '<b>4 · read()</b> — the stream connects to the nearest DataNode holding block 1 and receives the block in packets.',
+      '<b>5 · read()</b> — at the end of block 1 the stream switches, by itself, to a DataNode holding block 2.',
+      '<b>6 · read()</b> — and so on to the last block, on DataNode n. The NameNode has not seen a single byte.',
+      '<b>7 · close()</b> — the client closes the stream.'
+    ];
+    var WRITE = [
+      '<b>1 · create()</b> — the application asks DistributedFileSystem to create <code>readings.csv</code>.',
+      '<b>2 · create()</b> — DistributedFileSystem asks the NameNode to add the file to the namespace. It has no blocks yet.',
+      '<b>3 · write()</b> — the client writes into an FSDataOutputStream, which cuts the data into packets; for each block the client gets from the NameNode a list of DataNodes for its replicas (p. 862).',
+      '<b>4 · write packet</b> — the packets go to datanode 1 only; datanode 1 forwards them to datanode 2, and datanode 2 to datanode 3: the pipeline.',
+      '<b>5 · ack packet</b> — acknowledgements travel back along the pipeline, 3 → 2 → 1 → client. When all replicas are written, the next block starts.',
+      '<b>6 · close()</b> — the client closes the stream; the last packets are flushed.',
+      '<b>7 · complete()</b> — DistributedFileSystem tells the NameNode that the file is complete.'
+    ];
+    var st = null;
+    var op = ui.select('operation', [{ value: 'read', label: 'read a file (p. 867)' }, { value: 'write', label: 'write a file (p. 868)' }], function () { if (st) st.go(0); }, 'read');
+    st = ui.stepper({ steps: 7 });
+    var via = ui.toggle('route every byte through the NameNode', false);
+    var cl = ui.slider({ label: 'clients at work at once', min: 1, max: 40, step: 1, value: 20 });
+    var roRate = ui.readout('total data rate'), roNN = ui.readout('NameNode link'), roDN = ui.readout('DataNode links (average)');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'data: packets of a block', color: 's1', mark: 'line' },
+      { label: 'metadata request to the NameNode', color: 's3', mark: 'dash' },
+      { label: 'call inside the client', color: 'ink', mark: 'line' },
+      { label: 'acknowledgement', color: 'ink', mark: 'dash' },
+      { label: 'the step now', color: 'ink', mark: 'hl' },
+      { label: 'NameNode, the coordinator', color: 's6', mark: 'dash' }
+    ]);
+    var svg = ui.svg(560, 440, { label: 'The client node with HDFS client, DistributedFileSystem and an FSData stream, the NameNode with its block table, and three DataNodes; numbered arrows show the read or the write operation step by step; two bars show how busy the NameNode link and the DataNode links are' });
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function box(x, y, w, h, cls) { return S('rect', { x: x, y: y, width: w, height: h, 'class': cls || 'fi-paper' }); }
+    function file(x, y) { S('rect', { x: x, y: y, width: 18, height: 18, 'class': 'fw-s1 st-s1 sw-2' }); }
+
+    /* the arrows of each step: [x1, y1, x2, y2, kind]; kind: ink, s1 (data), s3 (metadata), ack; label = where its number goes */
+    var GEO = {
+      read: [
+        { segs: [[104, 80, 176, 50, 'ink']], lab: [134, 51] },
+        { segs: [[300, 44, 370, 44, 's3']], lab: [335, 30] },
+        { segs: [[104, 96, 176, 122, 'ink']], lab: [146, 94] },
+        { segs: [[94, 288, 204, 164, 's1']], lab: [128, 226] },
+        { segs: [[280, 288, 238, 164, 's1']], lab: [280, 226] },
+        { segs: [[466, 288, 272, 164, 's1']], lab: [390, 226] },
+        { segs: [[104, 112, 176, 150, 'ink']], lab: [124, 142] }
+      ],
+      write: [
+        { segs: [[104, 80, 176, 50, 'ink']], lab: [134, 51] },
+        { segs: [[300, 44, 370, 44, 's3']], lab: [335, 30] },
+        { segs: [[104, 96, 176, 122, 'ink']], lab: [146, 94] },
+        { segs: [[212, 164, 86, 288, 's1'], [168, 312, 204, 312, 's1'], [354, 312, 390, 312, 's1']], lab: [126, 226] },
+        { segs: [[118, 288, 232, 164, 'ack'], [390, 334, 356, 334, 'ack'], [204, 334, 170, 334, 'ack']], lab: [198, 226] },
+        { segs: [[104, 112, 176, 150, 'ink']], lab: [124, 142] },
+        { segs: [[300, 60, 370, 60, 's3']], lab: [335, 78] }
+      ]
+    };
+    var VIA = {
+      read: {
+        3: { segs: [[94, 288, 410, 164, 's1'], [372, 132, 304, 132, 's1']], lab: [140, 262] },
+        4: { segs: [[280, 288, 430, 164, 's1'], [372, 132, 304, 132, 's1']], lab: [294, 262] },
+        5: { segs: [[466, 288, 452, 164, 's1'], [372, 132, 304, 132, 's1']], lab: [484, 262] }
+      },
+      write: {
+        3: { segs: [[302, 146, 370, 146, 's1'], [420, 164, 100, 288, 's1'], [168, 312, 204, 312, 's1'], [354, 312, 390, 312, 's1']], lab: [262, 250] },
+        4: { segs: [[130, 288, 452, 164, 'ack'], [370, 156, 304, 156, 'ack'], [390, 334, 356, 334, 'ack'], [204, 334, 170, 334, 'ack']], lab: [312, 254] }
+      }
+    };
+    var CLS = { ink: ['sw-2', 'arr'], s1: ['st-s1 sw-2', 'arr-s1'], s3: ['st-s3 sw-2 dash', 'arr-s3'], ack: ['sw-2 dash', 'arr'] };
+
+    function model() {
+      var c = cl.value, w = op.value === 'write', rate, nn, dn;
+      if (via.value) { rate = L; nn = 1; dn = (w ? 3 : 1) * L / (D * L); }
+      else if (w) { rate = Math.min(c * L, D * L / 3); nn = 0; dn = 3 * rate / (D * L); }
+      else { rate = Math.min(c, D) * L; nn = 0; dn = rate / (D * L); }
+      return { rate: rate, nn: nn, dn: dn };
+    }
+    function stepGeo(k) {
+      var o = op.value, v = via.value && VIA[o][k];
+      return v || GEO[o][k];
+    }
+    function draw(m) {
+      var o = op.value, idx = st.index, w = o === 'write';
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      box(8, 8, 300, 170, 'st-muted');
+      T(18, 170, 'client node', 'tx-sm tx-muted');
+      box(20, 64, 84, 56, 'fi-paper sw-2');
+      T(62, 88, 'HDFS', 'tx-sm tx-mid');
+      T(62, 106, 'client', 'tx-sm tx-mid');
+      box(178, 18, 122, 54, 'fi-paper sw-2');
+      T(239, 41, 'Distributed', 'tx-sm tx-mid');
+      T(239, 60, 'FileSystem', 'tx-sm tx-mid');
+      box(178, 108, 122, 54, 'fi-paper sw-2');
+      T(239, 131, 'FSData', 'tx-sm tx-mid');
+      T(239, 150, w ? 'OutputStream' : 'InputStream', 'tx-sm tx-mid');
+      box(372, 18, 180, 144, 'fi-paper st-s6 sw-3 dash');
+      T(462, 42, 'NameNode', 'tx-bold tx-mid');
+      box(378, 54, 168, 98, 'fw-s3 st-s3');
+      var meta = w ? (idx >= 1 ? ['readings.csv', idx >= 2 ? 'blk 1 → dn 1-3' : '', idx >= 6 ? 'complete' : 'being written'] : ['(no file yet)', '', '']) :
+        ['blk 1 → dn 1, 2', 'blk 2 → dn 2, n', 'blk 3 → dn n, 1'];
+      meta.forEach(function (s, i) { if (s) T(386, 78 + i * 24, s, 'tx-mono tx-sm'); });
+      var DX = [20, 206, 392];
+      DX.forEach(function (x, i) {
+        box(x, 290, 148, 64, 'fi-paper sw-2');
+        T(x + 74, 308, (w ? 'datanode ' : 'DataNode ') + (w ? i + 1 : (i < 2 ? i + 1 : 'n')), 'tx-sm tx-mid');
+        if (w) { if (idx >= 3) { file(x + 65, 320); T(x + 74, 333.5, '1', 'tx-mono tx-sm tx-mid'); } }
+        else {
+          var held = [[1, 3], [2, 1], [3, 2]][i];
+          held.forEach(function (b, k) {
+            var sx = x + 50 + k * 30;
+            if (b === i + 1 && idx === 3 + i) S('rect', { x: sx - 3, y: 317, width: 24, height: 24, 'class': 'hl' });
+            S('rect', { x: sx, y: 320, width: 18, height: 18, 'class': 'fw-s1 st-s1 sw-2 dash' });
+            T(sx + 9, 333.5, String(b), 'tx-mono tx-sm tx-mid');
+          });
+        }
+      });
+      /* arrows: future steps faint, past steps drawn, the current one on a highlighter stroke */
+      for (var k = 0; k < 7; k++) {
+        var g = stepGeo(k), state = k < idx ? 'past' : k === idx ? 'now' : 'future';
+        g.segs.forEach(function (sg, si) {
+          var a = { x1: sg[0], y1: sg[1], x2: sg[2], y2: sg[3] };
+          if (state === 'future') { a['class'] = 'st-muted dash sw-1'; a['marker-end'] = 'url(#arr-muted)'; S('line', a); return; }
+          if (state === 'now') S('line', { x1: sg[0], y1: sg[1], x2: sg[2], y2: sg[3], 'class': 'hl' });
+          a['class'] = CLS[sg[4]][0]; a['marker-end'] = 'url(#' + CLS[sg[4]][1] + ')';
+          S('line', a);
+          if (state === 'now' && sg[4] === 's1' && si === 0) {
+            [0.3, 0.5, 0.7].forEach(function (t) {
+              var px = sg[0] + (sg[2] - sg[0]) * t, py = sg[1] + (sg[3] - sg[1]) * t;
+              S('rect', { x: px - 4, y: py - 4, width: 8, height: 8, 'class': 'fw-s1 st-s1' });
+            });
+          }
+        });
+        S('circle', { cx: g.lab[0], cy: g.lab[1], r: 10, 'class': 'fi-paper' + (state === 'future' ? ' st-muted' : state === 'now' ? ' sw-2' : '') });
+        T(g.lab[0], g.lab[1] + 5, String(k + 1), 'tx-sm tx-mid' + (state === 'future' ? ' tx-muted' : ' tx-bold'));
+      }
+      T(10, 384, 'share of each link in use (idealised)', 'tx-sm tx-muted');
+      T(10, 408, 'NameNode', 'tx-sm');
+      box(120, 397, 320, 14, 'st-muted');
+      if (m.nn > 0) box(120, 397, 320 * m.nn, 14, 'fi-s6 st-none');
+      T(452, 408, m.nn ? '100 %' : '≈ 0 %', 'tx-sm');
+      T(10, 432, 'DataNodes', 'tx-sm');
+      box(120, 421, 320, 14, 'st-muted');
+      box(120, 421, Math.max(1, 320 * m.dn), 14, 'fi-s1 st-none');
+      T(452, 432, Math.round(m.dn * 100) + ' %', 'tx-sm');
+    }
+
+    ui.onChange(function () {
+      var m = model(), w = op.value === 'write';
+      roRate.set(Math.round(m.rate) + ' MB/s');
+      roNN.set(m.nn ? '100 %, saturated' : '≈ 0 %, metadata only', m.nn ? 'bad' : undefined);
+      roDN.set(Math.round(m.dn * 100) + ' %');
+      var txt = (w ? WRITE : READ)[st.index];
+      if (via.value) txt += ' <b>Every byte now crosses the NameNode’s one link:</b> the total stays at ' + L + ' MB/s however many clients work, and the NameNode has nothing left for metadata.';
+      else if (w) txt += ' <span class="tx-muted">(Each byte reaches three DataNodes, so writes use three times the network of reads.)</span>';
+      note.set(txt);
+      draw(m);
+    });
+  });
+  </script>
+
+  <p>Why this design? The NameNode answers questions of a few bytes — where are the blocks, may this file be created — while every byte of data flows between clients and DataNodes, many pairs at once. That is the "Intelligent Client" of p. 851 and the "very high aggregate bandwidth" of p. 850.</p>
+
+  <p class="memo"><mark class="key">Metadata goes to the NameNode, data goes to the DataNodes: a read asks where the blocks are and then streams them directly, a write is one upload into a pipeline.</mark></p>
+</section>
+
+
+<section id="l31-yarn">
+  <h2>Hadoop 2: YARN and the end of the lone masters</h2>
+
+  <p>Hadoop 1 had a second very important server. MapReduce ran under one <mark class="key">JobTracker</mark> for the whole cluster and a <mark class="key">TaskTracker</mark> on every machine, which ran tasks in fixed map and reduce slots — the Master and workers of <a href="l30.html#l30-fig-trackers">lesson 30</a>, drawn on p. 832. The slides name them again on pp. 842 and 882 without defining them. The JobTracker did two jobs at once: it managed the resources of the cluster, and it scheduled and monitored every task of every job.</p>
+
+  <p>"Hadoop 1.0 Limitations" (p. 842) lists the cost. "Scalability": "Maximum Cluster Size – 4000 Nodes", "Maximum Concurrent Tasks – 40000", "Coarse synchronization in Job Tracker". "Single point of failure": "Failure kills all queued and running jobs", "Jobs need to be resubmitted by users". And "Restart is very tricky due to complex state". Fig. 5 is the slide's answer (p. 843).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l31-fig-yarn">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Hadoop 1.0: a MapReduce layer that does cluster resource management and data processing, on top of HDFS">
+        <rect x="20" y="30" width="260" height="96" class="fw-s4 st-s4 sw-2"/>
+        <text x="150" y="62" class="tx-bold tx-mid">MapReduce</text>
+        <text x="150" y="86" class="tx-sm tx-mid">cluster resource management</text>
+        <text x="150" y="104" class="tx-sm tx-mid">&amp; data processing</text>
+        <rect x="20" y="136" width="260" height="66" class="fw-s1 st-s1 sw-2"/>
+        <text x="150" y="164" class="tx-bold tx-mid">HDFS</text>
+        <text x="150" y="186" class="tx-sm tx-mid">redundant, reliable storage</text>
+      </svg>
+      <p class="fig-label">Hadoop 1.0: one layer does two jobs</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Hadoop 2.0: MapReduce and other data-processing frameworks side by side on top of YARN, which does cluster resource management, on top of HDFS">
+        <rect x="20" y="10" width="125" height="56" class="fi-paper sw-2"/>
+        <text x="82" y="34" class="tx-sm tx-bold tx-mid">MapReduce</text>
+        <text x="82" y="52" class="tx-sm tx-mid">data processing</text>
+        <rect x="155" y="10" width="125" height="56" class="fi-paper sw-2"/>
+        <text x="217" y="34" class="tx-sm tx-bold tx-mid">Others</text>
+        <text x="217" y="52" class="tx-sm tx-mid">data processing</text>
+        <rect x="20" y="76" width="260" height="56" class="fw-s5 st-s5 sw-2"/>
+        <text x="150" y="100" class="tx-bold tx-mid">YARN</text>
+        <text x="150" y="120" class="tx-sm tx-mid">cluster resource management</text>
+        <rect x="20" y="142" width="260" height="60" class="fw-s1 st-s1 sw-2"/>
+        <text x="150" y="168" class="tx-bold tx-mid">HDFS</text>
+        <text x="150" y="188" class="tx-sm tx-mid">redundant, reliable storage</text>
+      </svg>
+      <p class="fig-label">Hadoop 2.0: YARN takes resource management</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> "Hadoop 1.0 → 2.0 (Yarn!)" (p. 843), redrawn. The MapReduce box of 1.0 is cut along the "&amp;" of its own caption: cluster resource management moves down into YARN, data processing stays on top — next to "Others". HDFS does not change.</figcaption>
+  </figure>
+
+  <p>YARN (p. 882) "Splits up the two major functions of JobTracker":</p>
+  <div class="def">
+    <p><dfn>Resource Manager</dfn> — the "Global Resource Manager", for "Cluster resource management"; one per cluster.</p>
+    <p><dfn>Application Master</dfn> — "Job scheduling and monitoring (one per application)". It "negotiates resource containers from the Scheduler, tracking their status and monitoring for progress", and "itself runs as a normal container".</p>
+    <p><dfn>NodeManager</dfn> — what replaces the TaskTracker: "A new per-node slave is responsible for launching the applications' containers, monitoring their resource usage (cpu, memory, disk, network) and reporting to the Resource Manager".</p>
+    <p><dfn>Container</dfn> — a share of one machine's resources, some CPU and some memory, in which one process of an application runs: a map or a reduce task, a Spark executor, or the Application Master itself.</p>
+  </div>
+  <p>And "YARN maintains compatibility with existing MapReduce applications and users": MapReduce became one application among others. (The Apache documentation writes ResourceManager and ApplicationMaster as one word; this lesson keeps the slides' spelling.)</p>
+
+  <div class="widget" id="l31-w-yarn">
+    <h3 class="widget-title">Hadoop 1.0 against YARN: submit, run, crash</h3>
+    <p class="widget-intro">Four worker machines. In Hadoop 1.0 each TaskTracker has two map slots and one reduce slot, and the JobTracker runs everything; in YARN each NodeManager has three containers for anything. A MapReduce job here is two maps and a reduce, plus its Application Master under YARN; a Spark job is two executors and its Application Master. <em>One step</em> lets time pass (MapReduce needs 10 steps, Spark 6); then crash things.</p>
+    <ol class="tasks">
+      <li>In Hadoop 1.0, submit a MapReduce job and then a Spark job. Predict what the JobTracker does with the second.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The MapReduce job takes two map slots and a reduce slot; the Spark job is refused. The JobTracker understands only map and reduce slots, so nothing else can run on a Hadoop 1.0 cluster.</p></details>
+      </li>
+      <li>Press <em>Reset</em>, submit three MapReduce jobs, press <em>One step</em> four times and crash the master. Predict how many jobs survive, and from what progress the users must start again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>None survive: three jobs at 40 % are killed, "Failure kills all queued and running jobs", and "Jobs need to be resubmitted by users" (p. 842) — from 0 %, because all their bookkeeping lived in the one JobTracker.</p></details>
+      </li>
+      <li>Switch to YARN. Submit MapReduce, Spark, MapReduce, press <em>One step</em> four times, and crash the master — now the Resource Manager. Predict again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>No job is killed. The Resource Manager restarts from the state it saved in ZooKeeper and restarts the Application Masters; the two MapReduce jobs pick up at 40 % from the state saved in HDFS (p. 885). The Spark job here keeps no checkpoint of its own — failover is "Optional ... application-specific" — so it starts again from 0 %.</p></details>
+      </li>
+      <li>Still in YARN, press <em>Crash an Application Master</em> a few times while jobs run. Whom does each crash hurt?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only the job whose Application Master crashed: YARN restarts it, a MapReduce job keeps its progress, a Spark job starts over, and every other job runs on undisturbed. This is the insight of the widget: one Resource Manager for resources, one Application Master per job — so a failure stays inside one job, and any framework that brings its own Application Master can run.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l31-w-yarn', function (root, ui) {
+    var NODES = 4, SLOTS = 3, LETTERS = 'ABCDEFGH';
+    var jobs = [], cells = [], event = '', killed = 0, flash = null, amTurn = 0;
+    function reset() {
+      jobs = []; cells = []; killed = 0; flash = null; amTurn = 0;
+      for (var i = 0; i < NODES * SLOTS; i++) cells.push(null);
+    }
+    reset();
+    var mode = ui.select('cluster', [
+      { value: 'v1', label: 'Hadoop 1.0: JobTracker + TaskTrackers' },
+      { value: 'v2', label: 'Hadoop 2.0: YARN' }
+    ], function () { reset(); event = mode.value === 'v1' ? 'Hadoop 1.0: one JobTracker, a TaskTracker with fixed map and reduce slots on every machine.' : 'YARN: one Resource Manager, a NodeManager with general-purpose containers on every machine.'; }, 'v1');
+    function v1() { return mode.value === 'v1'; }
+    function typeName(j) { return j.type === 'mr' ? 'MapReduce' : 'Spark'; }
+    function need(j) { return v1() ? ['map', 'map', 'reduce'] : j.type === 'mr' ? ['am', 'map', 'map', 'reduce'] : ['am', 'executor', 'executor']; }
+    function allowed(s, kind) { return v1() ? (s < 2 ? kind === 'map' : kind === 'reduce') : true; }
+    function freeOn(n, taken) { var c = 0; for (var s = 0; s < SLOTS; s++) { var i = n * SLOTS + s; if (!cells[i] && taken.indexOf(i) < 0) c++; } return c; }
+    function tryStart(j) {
+      var kinds = need(j), taken = [];
+      for (var q = 0; q < kinds.length; q++) {
+        var best = -1, bestFree = -1;
+        for (var n = 0; n < NODES; n++) {
+          for (var s = 0; s < SLOTS; s++) {
+            var i = n * SLOTS + s;
+            if (cells[i] || taken.indexOf(i) >= 0 || !allowed(s, kinds[q])) continue;
+            var f = freeOn(n, taken);
+            if (f > bestFree) { best = i; bestFree = f; }
+            break;
+          }
+        }
+        if (best < 0) return false;
+        taken.push(best);
+      }
+      taken.forEach(function (i, q) { cells[i] = { job: j, kind: kinds[q] }; });
+      j.state = 'running';
+      return true;
+    }
+    function freeJob(j) { for (var i = 0; i < cells.length; i++) if (cells[i] && cells[i].job === j) cells[i] = null; }
+    function startQueued() {
+      for (var k = 0; k < jobs.length; k++) {
+        if (jobs[k].state !== 'queued') continue;
+        if (!tryStart(jobs[k])) break;
+      }
+    }
+    function submit(type) {
+      flash = null;
+      if (jobs.length >= LETTERS.length) { event = 'Eight jobs is the limit of this demo: press Reset.'; return; }
+      var j = { id: LETTERS[jobs.length], type: type, state: 'queued', prog: 0, len: type === 'mr' ? 10 : 6 };
+      jobs.push(j);
+      if (v1() && type === 'spark') { j.state = 'refused'; event = 'Job ' + j.id + ' refused: the JobTracker knows only map and reduce slots, so a Spark job cannot run on Hadoop 1.0.'; return; }
+      var ahead = jobs.some(function (x) { return x !== j && x.state === 'queued'; });
+      if (!ahead && tryStart(j)) event = 'Job ' + j.id + ' (' + typeName(j) + ') started' + (v1() ? ' in map and reduce slots.' : ': its Application Master runs in a container and asks the Resource Manager for the others.');
+      else event = 'Job ' + j.id + ' queued: no free ' + (v1() ? 'slots' : 'containers') + ' for it yet.';
+    }
+    function tick() {
+      flash = null;
+      var done = [];
+      jobs.forEach(function (j) {
+        if (j.state !== 'running') return;
+        j.prog++;
+        if (j.prog >= j.len) { j.state = 'done'; freeJob(j); done.push(j.id); }
+      });
+      startQueued();
+      event = done.length ? 'Job ' + done.join(', ') + ' finished and freed its ' + (v1() ? 'slots.' : 'containers.') : '';
+    }
+    function crashMaster() {
+      if (v1()) {
+        var k = 0;
+        jobs.forEach(function (j) { if (j.state === 'running' || j.state === 'queued') { j.state = 'killed'; freeJob(j); k++; } });
+        killed += k; flash = 'master';
+        event = 'The JobTracker crashed and came back with an empty memory: ' + k + ' job' + (k === 1 ? '' : 's') + ' killed. "Failure kills all queued and running jobs"; "Jobs need to be resubmitted by users" (p. 842).';
+      } else {
+        var mr = [], sp = [];
+        jobs.forEach(function (j) { if (j.state === 'running') { if (j.type === 'spark') { j.prog = 0; sp.push(j.id); } else mr.push(j.id); } });
+        flash = 'master';
+        event = 'The Resource Manager restarted from its state in ZooKeeper and restarted every Application Master (p. 885). Nothing was killed.' +
+          (mr.length ? ' MapReduce job ' + mr.join(', ') + ' picks up where it left off, from the state saved in HDFS.' : '') +
+          (sp.length ? ' Spark job ' + sp.join(', ') + ' keeps no checkpoint here, so it starts again from 0 %.' : '');
+      }
+    }
+    function crashAM() {
+      if (v1()) { flash = null; event = 'Hadoop 1.0 has no Application Master: every job hangs on the one JobTracker.'; return; }
+      var run = jobs.filter(function (j) { return j.state === 'running'; });
+      if (!run.length) { flash = null; event = 'No job is running: submit one first.'; return; }
+      var j = run[amTurn % run.length]; amTurn++;
+      if (j.type === 'spark') j.prog = 0;
+      flash = j;
+      event = 'The Application Master of job ' + j.id + ' crashed and YARN restarted it in its container. ' +
+        (j.type === 'mr' ? 'A MapReduce job picks up where it left off.' : 'Without a checkpoint of its own, the Spark job starts again from 0 %.') + ' No other job noticed.';
+    }
+    ui.button('Submit MapReduce job', function () { submit('mr'); }, { kind: 'primary' });
+    ui.button('Submit Spark job', function () { submit('spark'); });
+    ui.button('Crash the master', function () { crashMaster(); });
+    ui.button('Crash an Application Master', function () { crashAM(); });
+    ui.player({ ms: 800, label: 'Run', stepLabel: 'One step', onTick: function () { tick(); }, onReset: function () { reset(); event = 'Reset: an empty cluster.'; } });
+    var roJobs = ui.readout('jobs'), roMaster = ui.readout('the master keeps track of'),
+        roLim = ui.readout('limits printed on the slides'), roKill = ui.readout('jobs killed by a failure', { digits: 0 });
+    var note = ui.note('');
+    ui.legend([
+      { label: 'coordinator: JobTracker, Resource Manager, Application Master', color: 's6', mark: 'dash' },
+      { label: 'Hadoop 1.0 slot in use', color: 's4', mark: 'square' },
+      { label: 'YARN container in use', color: 's5', mark: 'square' },
+      { label: 'just crashed and restarted', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 270, { label: 'A master box above four worker machines with three slots or containers each; occupied slots show the job letter and the task, with a progress bar' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      for (var n = 0; n < NODES; n++) S('line', { x1: 280, y1: 60, x2: 8 + n * 138 + 65, y2: 92, 'class': 'st-muted' });
+      if (flash === 'master') S('rect', { x: 166, y: 6, width: 228, height: 58, 'class': 'hl' });
+      S('rect', { x: 170, y: 10, width: 220, height: 50, 'class': 'fi-paper st-s6 sw-3 dash' });
+      T(280, 32, v1() ? 'JobTracker' : 'Resource Manager', 'tx-bold tx-mid');
+      T(280, 51, 'one per cluster', 'tx-sm tx-mid tx-muted');
+      for (n = 0; n < NODES; n++) {
+        var x = 8 + n * 138;
+        S('rect', { x: x, y: 92, width: 130, height: 170, 'class': 'fi-paper' });
+        T(x + 8, 110, 'node ' + (n + 1), 'tx-sm tx-bold');
+        T(x + 8, 127, v1() ? 'TaskTracker' : 'NodeManager', 'tx-sm tx-muted');
+        for (var s = 0; s < SLOTS; s++) {
+          var c = cells[n * SLOTS + s], y = 138 + s * 40, cx = x + 65;
+          if (!c) {
+            S('rect', { x: x + 8, y: y, width: 114, height: 32, 'class': 'st-muted dash' });
+            T(cx, y + 21, v1() ? (s < 2 ? 'map slot' : 'reduce slot') : 'free', 'tx-sm tx-mid tx-muted');
+            continue;
+          }
+          if (c.kind === 'am' && flash === c.job) S('rect', { x: x + 4, y: y - 4, width: 122, height: 40, 'class': 'hl' });
+          S('rect', { x: x + 8, y: y, width: 114, height: 32, 'class': c.kind === 'am' ? 'fw-s5 st-s6 sw-3 dash' : v1() ? 'fw-s4 st-s4 sw-2' : 'fw-s5 st-s5 sw-2' });
+          T(cx, y + 19, c.kind === 'am' ? 'AM of ' + c.job.id : c.job.id + ' ' + c.kind, 'tx-sm tx-mid');
+          var pw = 114 * Math.min(1, c.job.prog / c.job.len);
+          if (pw > 0) S('rect', { x: x + 8, y: y + 26, width: pw, height: 4, 'class': (v1() ? 'fi-s4' : 'fi-s5') + ' st-none' });
+        }
+      }
+    }
+    ui.onChange(function () {
+      var shown = jobs.map(function (j) {
+        var s = j.state === 'running' ? Math.round(100 * j.prog / j.len) + ' %' : j.state;
+        return j.id + ' ' + typeName(j) + ' ' + s;
+      });
+      roJobs.set(shown.length ? shown.join(' · ') : 'none yet');
+      var used = cells.filter(function (c) { return c; }).length;
+      roMaster.set(v1() ? 'every task of every job: ' + used + ' task' + (used === 1 ? '' : 's') : 'resources only: ' + used + ' container' + (used === 1 ? '' : 's') + ' in use; each Application Master tracks its own tasks');
+      roLim.set(v1() ? '4000 nodes, 40000 concurrent tasks (p. 842)' : '6,000–10,000 machines, 100,000+ concurrent tasks, 10,000 concurrent jobs (p. 884)');
+      roKill.set(killed, killed ? 'bad' : undefined);
+      note.set(event || (jobs.length ? 'Press One step or Run to let time pass.' : 'Submit a job to start.'));
+      draw();
+    });
+  });
+  </script>
+
+  <aside class="margin-note">"Multi tenancy" usually means many users sharing one cluster; this bullet is about many frameworks.</aside>
+  <p>What the split buys (pp. 884–886):</p>
+  <ul>
+    <li><b>Scale.</b> "Clusters of 6,000-10,000 machines", "100,000+ concurrent tasks", "10,000 concurrent jobs" (p. 884). Both slides allow about ten tasks per machine — 40000 / 4000 and 100,000 / 10,000 (computed) — so what grew is the number of machines one master can serve: the per-job work moved into the Application Masters.</li>
+    <li><b>Fault tolerance</b> (p. 885). For the Resource Manager, "No single point of failure – state saved in ZooKeeper" and "Application Masters are restarted automatically on RM restart"; for the Application Master, "Optional failover via application-specific checkpoint" and "MapReduce applications pick up where they left off via state saved in HDFS". This also answers "Restart is very tricky due to complex state": the Resource Manager's own state is small — which applications exist and what they hold — while each job's progress lives with its Application Master and in HDFS.</li>
+    <li><b>Upgrades.</b> "Wire Compatibility": "Old clients can talk to new servers", and "Rolling upgrades" update the cluster one machine at a time instead of stopping it.</li>
+    <li><b>Other paradigms</b> (p. 886). "Support for programming paradigms other than MapReduce (Multi tenancy)": Tez, HBase on YARN, Spark, Giraph and Storm, "Enabled by allowing the use of paradigm-specific application master" — "Run all on the same Hadoop cluster!"</li>
+  </ul>
+
+  <h3>The NameNode gets a standby</h3>
+  <p>Hadoop 2 removes the single point of failure of HDFS too. Its architecture slide (p. 883) draws an "Active NameNode" with "All name space edits logged to shared NFS storage; single writer (fencing)", and a "Standby NameNode" that will "Read edit logs and applies to its own namespace". The DataNodes report to both, so the standby is always ready to take over; fencing makes sure only one NameNode ever writes the log. The same slide puts a DataNode and a NodeManager on every worker: containers run where the blocks are.</p>
+
+  <aside class="redpen" data-page="883">
+    <p class="claim">"Secondary Name Node" — drawn next to the "Active NameNode" and the "Standby NameNode"</p>
+    <p class="fix">A cluster with an Active and a Standby NameNode has no Secondary NameNode: the Standby, which replays the edit log anyway, takes the checkpoints. The Secondary NameNode belongs to the single-NameNode cluster of p. 864.</p>
+    <p class="because">The two do the same job — fold the log into a fresh FsImage — and the Apache guide to HDFS high availability says that running a Secondary NameNode in such a cluster is not necessary and in fact an error. The exam may be matched against the printed figure: know that the slide draws the box, and that in a high-availability cluster the Standby replaces it.</p>
+  </aside>
+
+  <h3>Core and ecosystem</h3>
+  <p>The exam-guideline deck asks for "Hadoop architecture and components". Apache Hadoop itself is four modules: Hadoop Common (the shared libraries), HDFS, YARN and MapReduce. "Hadoop Components" (p. 838) lists more — "Apache Hadoop", "Apache Hive", "Apache Pig", "Apache HBase", "Apache Zookeeper", "Flume, Hue, Oozie, and Sqoop" — separate projects that run on the core and ship together. Vendors test and package the whole stack as distributions (p. 841): Cloudera's CDH, MapR, the Hortonworks Data Platform and the Oracle Big Data Appliance, each with a ready-made virtual machine.</p>
+
+  <figure class="fig fig--plain" id="l31-fig-eco">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="The Apache Hadoop ecosystem as a stack: HDFS at the bottom; YARN with MapReduce v2 above it; above that Pig, Hive, Mahout, Oozie and R connectors; HBase beside YARN directly on HDFS; ZooKeeper as a column next to the stack; Sqoop and Flume at the side for data coming in; Ambari on top managing everything">
+      <rect x="10" y="10" width="540" height="36" class="fi-paper sw-2"/>
+      <text x="24" y="34" class="tx-bold">Ambari</text>
+      <text x="100" y="34" class="tx-sm">provisioning, managing, monitoring</text>
+      <rect x="10" y="56" width="90" height="84" class="fi-paper sw-2"/>
+      <text x="55" y="90" class="tx-bold tx-mid">Sqoop</text>
+      <text x="55" y="110" class="tx-sm tx-mid">data</text>
+      <text x="55" y="126" class="tx-sm tx-mid">exchange</text>
+      <rect x="10" y="150" width="90" height="106" class="fi-paper sw-2"/>
+      <text x="55" y="190" class="tx-bold tx-mid">Flume</text>
+      <text x="55" y="210" class="tx-sm tx-mid">log</text>
+      <text x="55" y="226" class="tx-sm tx-mid">collector</text>
+      <rect x="110" y="56" width="44" height="200" class="fi-paper sw-2"/>
+      <text x="138" y="156" class="tx-bold tx-mid" transform="rotate(-90 138 156)">ZooKeeper</text>
+      <rect x="164" y="56" width="93" height="40" class="fi-paper sw-2"/>
+      <text x="210" y="82" class="tx-bold tx-mid">Pig</text>
+      <rect x="263" y="56" width="93" height="40" class="fi-paper sw-2"/>
+      <text x="309" y="82" class="tx-bold tx-mid">Hive</text>
+      <rect x="362" y="56" width="94" height="40" class="fi-paper sw-2"/>
+      <text x="409" y="82" class="tx-bold tx-mid">Mahout</text>
+      <rect x="164" y="102" width="142" height="40" class="fi-paper sw-2"/>
+      <text x="235" y="128" class="tx-bold tx-mid">Oozie</text>
+      <rect x="312" y="102" width="144" height="40" class="fi-paper sw-2"/>
+      <text x="384" y="128" class="tx-bold tx-mid">R connectors</text>
+      <rect x="164" y="148" width="292" height="46" class="fw-s5 st-s5 sw-3"/>
+      <text x="310" y="177" class="tx-bold tx-mid">YARN · MapReduce v2</text>
+      <rect x="466" y="56" width="84" height="138" class="fi-paper sw-2"/>
+      <text x="508" y="116" class="tx-bold tx-mid">HBase</text>
+      <text x="508" y="138" class="tx-sm tx-mid">column</text>
+      <text x="508" y="154" class="tx-sm tx-mid">store</text>
+      <rect x="164" y="204" width="386" height="52" class="fw-s1 st-s1 sw-3"/>
+      <text x="180" y="236" class="tx-bold">HDFS</text>
+      <text x="240" y="236" class="tx-sm">Hadoop Distributed File System</text>
+      <text x="164" y="288" class="tx-hand">the core: HDFS, YARN, MapReduce</text>
+    </svg>
+    <figcaption><b>Fig. 6.</b> "Apache Hadoop Ecosystem" (p. 839), redrawn, read bottom-up: storage (HDFS), resource management and processing (YARN, MapReduce v2), then tools that turn into jobs — Pig for scripting, Hive for SQL queries, Mahout for machine learning, R connectors for statistics — and Oozie for workflows. HBase, a column store, sits directly on HDFS; ZooKeeper coordinates them all; Sqoop exchanges data with relational databases and Flume collects logs; Ambari provisions, manages and monitors the cluster. Hue, on p. 838 but not in the picture, is a web interface.</figcaption>
+  </figure>
+
+  <p>Answer a "components" question with the core first — its masters and workers — and then the ecosystem by role.</p>
+
+  <p class="memo"><mark class="key">YARN splits the JobTracker into one Resource Manager that hands out containers and one Application Master per application that runs its job; a NodeManager on every machine runs the containers.</mark></p>
+</section>
+
+
+<section id="l31-hands">
+  <h2>Hands on HDFS: shell, security, defaults</h2>
+
+  <p>The last part of the deck is a session on the Cloudera virtual machine (user <code>cloudera</code>, HDFS home <code>/user/cloudera</code>). No past paper asks for these commands, so this section shows them rather than drills them; every one of them makes a piece of the architecture visible. "There are two types of shell commands" (p. 873). User commands: <code>hdfs dfs</code> "runs filesystem commands on the HDFS" and <code>hdfs fsck</code> "runs a HDFS filesystem checking command". Administration commands: <code>hdfs dfsadmin</code> "runs HDFS administration commands". The general form is <code>hdfs command [genericOptions] [commandOptions]</code> (p. 879).</p>
+
+  <aside class="margin-note">On pp. 874–879 some options are printed with a long dash, as in –R: a shell needs a plain hyphen.</aside>
+
+  <div class="tabs" id="l31-tabs-cmd">
+    <div data-tab="Files">
+<pre><code># p. 874: list the root directory of HDFS
+hdfs dfs -ls /</code></pre>
+<pre><code># p. 875: a directory tdata in your HDFS home
+hdfs dfs -mkdir tdata</code></pre>
+<pre><code># p. 875: upload a local file into it
+hdfs dfs -copyFromLocal tutorials/data/geneva.csv tdata</code></pre>
+<pre><code># p. 875: list your home recursively
+hdfs dfs -ls -R</code></pre>
+<pre><code># p. 875: go to the local folder that holds the original
+cd tutorials/data/</code></pre>
+<pre><code># p. 875: download the HDFS copy next to it, under another name
+hdfs dfs -copyToLocal tdata/geneva.csv geneva.csv.hdfs</code></pre>
+<pre><code># p. 875: two identical digests = byte for byte the same file
+md5sum geneva.csv geneva.csv.hdfs</code></pre>
+<pre><code># not on the slides: the directory that p. 876 writes into
+hdfs dfs -mkdir tdataset</code></pre>
+<pre><code># p. 876: write a file from standard input (the lone "-")
+echo "blah blah blah" | hdfs dfs -put - tdataset/tfile.txt</code></pre>
+<pre><code># p. 876: print it
+hdfs dfs -cat tdataset/tfile.txt</code></pre>
+<pre><code># p. 877: delete it
+hdfs dfs -rm tdataset/tfile.txt</code></pre>
+      <p>The upload, the download and <code>md5sum</code> make the round trip of the session: the file was cut into blocks, copied three times and put back together, and came out identical. On p. 876 the session writes into <code>tdataset</code>, a directory it never creates (it made <code>tdata</code>): <code>-put</code> does not create a missing parent directory, hence the extra <code>-mkdir</code>.</p>
+    </div>
+    <div data-tab="Blocks and rights">
+<pre><code># p. 874: disk space used, human-readable (K, M, G)
+hdfs dfs -du -h /</code></pre>
+<pre><code># p. 874: one total (-s, summary) for a whole directory
+hdfs dfs -du -s /hbase/data/hbase/namespace/</code></pre>
+<pre><code># p. 876: the replication factor of the file (3)
+hdfs dfs -stat "%r" tdata/geneva.csv</code></pre>
+<pre><code># p. 876: owner, group and access control list
+hdfs dfs -getfacl tdata/geneva.csv</code></pre>
+<pre><code># p. 877: the blocks of the file and the DataNodes holding them
+hdfs fsck /user/cloudera/tdata/geneva.csv -files -blocks -locations</code></pre>
+<pre><code># p. 877: missing blocks and the files they belong to
+hdfs fsck / -list-corruptfileblocks</code></pre>
+      <p><code>fsck</code> prints the NameNode's two maps for one file: its blocks, and for each block the DataNodes of its replicas. It only reports; repairing is the replication engine's job.</p>
+    </div>
+    <div data-tab="Cluster">
+<pre><code># p. 878: capacity, used space and one entry per DataNode
+hdfs dfsadmin -report</code></pre>
+<pre><code># p. 878: the tree of racks and their nodes
+hdfs dfsadmin -printTopology</code></pre>
+<pre><code># p. 878: ask one DataNode for its information, like a ping
+hdfs dfsadmin -getDatanodeInfo localhost:50020</code></pre>
+<pre><code># p. 879: the NameNodes of the cluster
+hdfs getconf -namenodes</code></pre>
+<pre><code># p. 879: the folder where the NameNode keeps its FsImage on the Cloudera VM
+cd /var/lib/hadoop-hdfs/cache/hdfs/dfs/name/current</code></pre>
+<pre><code># p. 879: dump that FsImage to an XML file
+hdfs oiv -i fsimage_0000000000000003388 -o /tmp/fsimage.xml -p XML</code></pre>
+      <p><code>-printTopology</code> shows the racks that block placement relies on; <code>oiv</code>, the offline image viewer, turns the FsImage of Fig. 4 into readable XML.</p>
+    </div>
+  </div>
+
+  <p>The older slide of p. 865 writes the same tools as <code>hadoop dfs</code> and <code>hadoop dfsadmin</code>, still accepted but deprecated since Hadoop 2, with a web page at <code>http://host:port/dfshealth.jsp</code> (the Hadoop 1 address of the NameNode's status page).</p>
+
+  <aside class="redpen" data-page="865">
+    <p class="claim">"hadoop dfsadmin -decommision datanodename"</p>
+    <p class="fix">No such option exists, in either spelling. A DataNode is decommissioned by listing it in the exclude file named by <code>dfs.hosts.exclude</code> and running <code>hdfs dfsadmin -refreshNodes</code>; the NameNode then copies its blocks to other DataNodes before the node is retired.</p>
+    <p class="because">Typed in a shell, the printed line returns an "Unknown command" error. Retiring a node is the replication engine's work, done before the node leaves — the command only tells the NameNode to re-read its lists of allowed and excluded hosts. The exam may be matched against the printed slide: know that it lists decommissioning among the administrator's commands, and how it is really done.</p>
+  </aside>
+
+  <p>"HDFS Security" (p. 869) has three layers. Who you are: "Simple – insecure way of using OS username to determine hadoop identity" or "Kerberos – authentication using kerberos ticket", "Set by <code>hadoop.security.authentication=simple|kerberos</code>". What you may do: "File and Directory permissions are same like in POSIX" — r, w and x for an owner, a group and everybody else — "enabled by default (<code>dfs.permissions.enabled=true</code>)". Exceptions: "ACLs are used for implemention permissions that differ from natural hierarchy of users and groups", "enabled by <code>dfs.namenode.acls.enabled=true</code>" — what <span class="nw"><code>-getfacl</code></span> lists.</p>
+
+  <p>"HDFS Configuration" (p. 870) lives in <code>/etc/hadoop/conf/hdfs-site.xml</code>, with the "HDFS Defaults" "Block Size – 64 MB", "Replication Factor – 3" and "Web UI Port – 50070".</p>
+
+  <aside class="redpen" data-page="870">
+    <p class="claim">"Block Size – 64 MB"</p>
+    <p class="fix">64 MB is the Hadoop 1 default. Since Hadoop 2 the default block size (<code>dfs.blocksize</code>) is 128 MB, and Hadoop 3 moved the NameNode's web interface from port 50070 to 9870; the replication factor is still 3.</p>
+    <p class="because">The HDFS slides describe the Hadoop 1 era, with the 64 MB chunk size that HDFS took over from Google's GFS (so does p. 851, "Typically 64MB block size"); the current Apache design document says "A typical block size used by HDFS is 128 MB". The exam may be matched against the printed defaults: give 64 MB and 50070 as the slide's values, and add today's in one clause.</p>
+  </aside>
+
+  <p>Other doors into HDFS (pp. 871, 880): the "Java API (DistributedFileSystem)", the very class of the read and write diagrams; the "C wrapper (libhdfs)"; the "HTTP protocol" (the NameNode's web page, <code>http://quickstart.cloudera:50070</code>); the "WebDAV protocol"; and the shell, "one of the simplest and most familiar". A FUSE mount makes HDFS look like a local directory, so that "standard Unix utilities such as 'ls', 'cd', 'cp', 'mkdir', 'find', 'grep'" work on it; 8020 is the port of the NameNode's RPC service:</p>
+
+<pre><code># p. 880: a local directory to mount HDFS on
+mkdir /home/cloudera/hdfs</code></pre>
+<pre><code># p. 880: mount HDFS there
+sudo hadoop-fuse-dfs dfs://quickstart.cloudera:8020 /home/cloudera/hdfs</code></pre>
+
+  <h3>Back to the 3 TB file</h3>
+  <p>Run <code>fsck</code> with <code>-files -blocks -locations</code> on the hook's file and HDFS answers with 16,384 blocks, each followed by three DataNode addresses. That is the 3 TB, and what it buys: any DataNode or any whole rack can fail, a corrupt copy is replaced by a good one, and the file never notices.</p>
+  <p>The NameNode keeps those 49,152 locations in RAM — a few megabytes — and answers every "where?" from memory. When a hundred analysts read the file, each asks the NameNode where the blocks are, a few bytes per block, and streams the blocks themselves from the DataNodes: a hundred network links at work and not one byte of data through the NameNode, which is why every machine you add adds bandwidth. The price of keeping all the knowledge in one machine is the single point of failure of HDFS 1; Hadoop 2's standby NameNode is the answer.</p>
+</section>
+
+
+<section id="l31-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>True/false, multiple choice and short open answers, the forms of the theory part, where a wrong answer may cost points; plus one small computation to check the block arithmetic. The exam-guideline deck lists "Hadoop architecture and components" among the theory questions, and "Hadoop simple examples" among the exercises — but none of the nine past papers has a Hadoop exercise.</p>
+
+  <div class="exam" data-kind="mcq" id="l31-exam-write">
+    <div class="exam-q" lang="en">
+      <p>True or false: in HDFS, a client that writes a file sends each block to the NameNode, which then stores it on three DataNodes.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">The NameNode never receives file data: it registers the file (create, complete) and gives the client a list of DataNodes for each block (pp. 862, 868).</span></li>
+      <li data-correct>False <span class="fb">The client writes each block once, to the first DataNode of a pipeline, which forwards it to the second, and the second to the third; acknowledgements flow back (p. 862).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. The NameNode handles only metadata. The client calls create() and the NameNode adds the file to the namespace; for each block the client receives a list of DataNodes chosen by the placement policy. The client streams the block, in packets, to the first DataNode only; the first DataNode forwards the data to the second and the second to the third (data pipelining), and acknowledgements travel back along the pipeline. When all replicas are written the client moves on to the next block; at the end it closes the stream and the NameNode is told that the file is complete. Keeping the NameNode out of the data path is what gives HDFS its high aggregate bandwidth.</p></div>
+      <div class="exam-note"><p>The trap is the NameNode placed next to the word "stores". A full answer adds the pipeline: one upload per block, three copies, acks flowing back.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l31-exam-rdbms">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements agree with the lecture's comparison between an RDBMS and Hadoop? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Hadoop targets petabytes of data, an RDBMS gigabytes. <span class="fb">The "Data size" row of p. 840.</span></li>
+      <li>Hadoop supports both interactive and batch access. <span class="fb">"Interactive &amp; Batch" is the RDBMS column; Hadoop's is "Batch".</span></li>
+      <li data-correct>Hadoop follows a write-once, read-many-times model for updates. <span class="fb">The "Updates" row, and the "write-once-read-many" model of pp. 837 and 851.</span></li>
+      <li>"Integrity: Low" means that HDFS often corrupts the data it stores. <span class="fb">It means no schema, constraints or transactions; HDFS checksums every block with CRC32 (p. 860).</span></li>
+      <li data-correct>Hadoop scales linearly, an RDBMS non-linearly. <span class="fb">The "Scaling" row: each machine stores and processes its own share.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The first, third and fifth statements.</p></div>
+      <div class="exam-note"><p>A select-all question where a wrong tick may cost points. The two false options are the classic misreadings: the access column swapped, and "low integrity" read as "loses data".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="12" data-tol="0" id="l31-exam-num">
+    <div class="exam-q" lang="en">
+      <p>A hospital heating management system stores its sensor readings in HDFS as one file of 200 MB. With the defaults printed on the slides — block size 64 MB, replication factor 3 — how many block replicas does the cluster store for this file?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ n = \left\lceil \frac{200}{64} \right\rceil = 4 \]
+        \[ 4 \times 3 = 12 \]
+        <p>Four blocks (64 + 64 + 64 + 8 MB), three replicas each: 12 block replicas, which occupy 3 × 200 MB = 600 MB of disk.</p>
+      </div>
+      <div class="exam-note"><p>Two traps: rounding 3.1 down to 3 blocks, and computing the disk as 4 × 64 × 3 = 768 MB — the last block holds only its 8 MB.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l31-exam-arch">
+    <div class="exam-q" lang="en">
+      <p>Describe the architecture of Hadoop and its main components, distinguishing the core of Hadoop from its ecosystem.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Hadoop is a software platform for storing and processing very large data sets in batch on clusters of commodity machines; it is an open-source implementation of Google's GFS and MapReduce. Its core has four parts: Hadoop Common (shared libraries), HDFS (storage), YARN (resource management, since Hadoop 2) and MapReduce (batch processing). HDFS has a master/worker architecture: one NameNode keeps the namespace in memory — the blocks of each file and the DataNodes of each block — while the DataNodes store the blocks (64 MB each on the slides, replicated three times), send heartbeats and block reports, and serve data directly to clients. YARN has one Resource Manager for the cluster's resources, a NodeManager on every machine that launches and monitors containers, and one Application Master per application that negotiates containers and schedules and monitors its tasks; in Hadoop 1 both roles belonged to the JobTracker, with a TaskTracker per node. Every worker runs a DataNode and a NodeManager, so computation can be moved to the data. Around the core, the ecosystem adds separate projects: Hive (SQL queries), Pig (scripting), HBase (a column store for random access), ZooKeeper (coordination), Sqoop (data exchange with relational databases), Flume (log collection), Oozie (workflows), Mahout (machine learning), Hue (web interface) and Ambari (cluster management), packaged by distributions such as Cloudera's CDH or the Hortonworks Data Platform.</p></div>
+      <div class="exam-note"><p>The question uses the guideline's own words. Give the core first, with the role of each master and worker, then the ecosystem by role; listing names without roles is the weak answer.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l31-exam-nn">
+    <div class="exam-q" lang="en">
+      <p>What metadata does the HDFS NameNode keep, and where? What are the transaction log and the Secondary NameNode for? Why is the NameNode a single point of failure in HDFS 1, and how does Hadoop 2 address it?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The NameNode manages the file-system namespace: it maps each file name to its list of blocks and each block to the DataNodes holding its replicas, and keeps file attributes such as creation time and replication factor. The entire metadata is in main memory, with no demand paging, so every lookup is fast and the number of files is bounded by RAM. Every change to the namespace, such as a file creation or deletion, is recorded in a transaction log, while the FsImage is the saved snapshot of the namespace. The Secondary NameNode periodically copies the FsImage and the transaction log, merges them into a new FsImage and uploads it to the NameNode, whose log is then purged: it is a checkpointing helper that keeps the log short and the restart fast, not a standby. In HDFS 1 there is a single NameNode, so when it fails the whole file system is unavailable; storing the transaction log in several directories, one on a remote NFS/CIFS file system, only prevents losing the namespace. Hadoop 2 adds an Active and a Standby NameNode: the active one writes every edit to a shared edit log, the standby replays it, and the DataNodes report to both, so the standby can take over.</p></div>
+      <div class="exam-note"><p>Four things are checked: the two maps in RAM, the log and the FsImage, the Secondary as a checkpointer — the most common wrong answer calls it a backup NameNode — and the standby of Hadoop 2.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l31-exam-yarn">
+    <div class="exam-q" lang="en">
+      <p>What were the limitations of Hadoop 1.0, and how does YARN overcome them?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>In Hadoop 1.0 a single JobTracker managed the resources of the whole cluster and also scheduled and monitored every task of every job, while a TaskTracker on each node ran the tasks in map and reduce slots. Scalability was limited to about 4000 nodes and 40000 concurrent tasks, because of coarse synchronization in the JobTracker; the JobTracker was a single point of failure whose failure killed all queued and running jobs, which users had to resubmit; restarting it was tricky because of its complex state; and only MapReduce could run. YARN splits the two functions of the JobTracker: a global Resource Manager does only cluster resource management, and a per-application Application Master, itself running in a container, negotiates resource containers from the scheduler and schedules and monitors its own job; the TaskTracker is replaced by a per-node NodeManager that launches containers, monitors their CPU, memory, disk and network use and reports to the Resource Manager. As a result clusters reach 6,000–10,000 machines and more than 100,000 concurrent tasks; the Resource Manager saves its state in ZooKeeper and restarts the Application Masters automatically, and MapReduce applications resume from state saved in HDFS; protocols are wire-compatible, allowing rolling upgrades; and other paradigms — Tez, Spark, Giraph, Storm, HBase — run on the same cluster through their own Application Masters, while existing MapReduce jobs keep working.</p></div>
+      <div class="exam-note"><p>Pair each limitation of p. 842 with its answer: scalability with the split and the numbers of p. 884; the single point of failure and the tricky restart with the small Resource Manager state saved in ZooKeeper, the restarted Application Masters and the MapReduce state in HDFS; MapReduce-only with paradigm-specific Application Masters. Wire compatibility and rolling upgrades are the bonus point.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l31-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A file is written from a DataNode of rack 1 with r = 3 and the default placement. Then rack 2 loses power. What is the state of each block?</p>
+    <ul class="options">
+      <li>Every block is lost, because all of them had copies on rack 2 <span class="fb">They had two copies there, but the first copy sits on the writer's own node, in rack 1.</span></li>
+      <li data-correct>Every block still has one copy, on the writer's node; the NameNode notices the silent heartbeats and has new copies made <span class="fb">Local node plus two copies on one remote rack: losing that rack leaves one copy, and the replication engine restores the other two.</span></li>
+      <li>Every block still has two copies <span class="fb">Both remote copies were on rack 2, the second and the third replica alike.</span></li>
+      <li>Nothing changes, because rack 2 held only spare copies that are never read <span class="fb">All replicas are equal; clients read from the nearest one, wherever it is.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does HDFS put the third replica on the same remote rack as the second, rather than on a third rack?</p>
+    <ul class="options">
+      <li>Because racks never fail as a whole <span class="fb">They do — one switch, one power line — which is why the second replica leaves the writer's rack.</span></li>
+      <li>Because the NameNode can track at most two racks per block <span class="fb">There is no such limit; extra replicas may land anywhere.</span></li>
+      <li data-correct>Because two racks already survive the loss of either one, and the write pipeline then crosses the link between racks only once per block <span class="fb">Safety against a rack failure at the price of one inter-rack transfer.</span></li>
+      <li>Because clients read faster from a third rack <span class="fb">Clients read from the nearest replica; a third rack would not make that nearer.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A client reads a file of four blocks. Which description of the traffic is right?</p>
+    <ul class="options">
+      <li data-correct>One request to the NameNode for the block locations, then the four blocks stream from DataNodes straight to the client <span class="fb">"Communicates with the NameNode ... Then communicated directly with the data nodes" (p. 866).</span></li>
+      <li>Four requests to the NameNode, each answered with one block <span class="fb">The NameNode never sends file data; it answers with locations.</span></li>
+      <li>The NameNode collects the four blocks from the DataNodes and sends the client the whole file <span class="fb">That would put one machine's link in the path of every read — the switch of the second widget.</span></li>
+      <li>The client asks every DataNode which blocks of the file it holds <span class="fb">DataNodes know blocks, not files; only the NameNode maps a file to its blocks.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these follow from the write-once-read-many model of p. 851? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>The replicas of a block can never disagree, so the DataNodes need no protocol to keep them consistent <span class="fb">This is the "Data Coherency" heading: nobody overwrites a block.</span></li>
+      <li data-correct>A program cannot change a record in the middle of an HDFS file; it can only append <span class="fb">"Client can only append to existing files"; random updates need a store like HBase.</span></li>
+      <li>The NameNode can keep its metadata on disk instead of in RAM <span class="fb">Unrelated: the metadata stays in memory, "No demand paging" (p. 855).</span></li>
+      <li data-correct>A checksum computed when a block is written stays valid for the block's whole life <span class="fb">The bytes never change, so the CRC32 of p. 860 can be checked on every read.</span></li>
+      <li>The client must upload each block three times <span class="fb">Writing once is about updates, not copies: the pipeline needs a single upload.</span></li>
+    </ul>
+    <p class="q-fb">Forbid the operation that would break consistency, and consistency is free: that is the trade HDFS makes.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">You store ten million files of 1 KB each in HDFS, 10 GB in all. Compared with one 10 GB file, which resource runs out first?</p>
+    <ul class="options">
+      <li>Disk space, because each 1 KB file fills a whole 64 MB block <span class="fb">A block holds only the bytes it has; the disk cost is the same 10 GB times r.</span></li>
+      <li>The network, because small files travel slowly <span class="fb">The bytes are the same; the problem appears before any byte moves.</span></li>
+      <li data-correct>The NameNode's memory, because every file and every block is an entry it keeps in RAM <span class="fb">"The entire metadata is in main memory": twenty million objects instead of about 160.</span></li>
+      <li>The DataNodes' CPU, because of the checksums <span class="fb">One CRC32 per 512 bytes either way: same bytes, same checksums.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">What is the Secondary NameNode for?</p>
+    <ul class="options">
+      <li>It takes over automatically when the NameNode fails <span class="fb">In HDFS 1 the NameNode is a single point of failure; the Secondary holds a lagging copy and cannot serve clients.</span></li>
+      <li>It stores a second copy of every block <span class="fb">Blocks are copied by DataNodes; no NameNode ever stores a block.</span></li>
+      <li>It answers metadata requests when the NameNode is busy <span class="fb">It serves no clients at all.</span></li>
+      <li data-correct>It merges the FsImage and the transaction log into a new FsImage, so the log stays short <span class="fb">Copy, merge, upload, purge (p. 864): a checkpointer.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">On a YARN cluster the Application Master of a Spark job crashes while two MapReduce jobs are running. What happens?</p>
+    <ul class="options">
+      <li>All three jobs are killed and must be resubmitted <span class="fb">That was the JobTracker's failure in Hadoop 1.0 (p. 842).</span></li>
+      <li data-correct>Only the Spark job is affected: its Application Master is restarted, and the MapReduce jobs do not notice <span class="fb">One Application Master per application: a failure stays inside its job.</span></li>
+      <li>The Resource Manager takes over the scheduling of the Spark job <span class="fb">The Resource Manager does resource management only; scheduling the job's tasks is the Application Master's work.</span></li>
+      <li>The NodeManager restarts its whole machine <span class="fb">A NodeManager launches and monitors containers; it does not restart nodes.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l31-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Hadoop is HDFS (storage) plus MapReduce (batch processing) on many commodity machines, an open-source version of Google's GFS and MapReduce; its design follows six assumptions — hardware will fail, batch throughput over latency, huge files, high aggregate bandwidth, write-once-read-many, moving computation is cheaper than moving data.</li>
+    <li>HDFS cuts every file into blocks (64 MB on the slides, 128 MB today) and keeps three replicas of each: \(\lceil S/B \rceil\) blocks and \(r \cdot S\) of disk, the last block unpadded.</li>
+    <li>The NameNode holds the whole namespace in RAM — file → blocks, block → DataNodes — plus a transaction log; the DataNodes store the blocks, send a heartbeat every 3 seconds and block reports, and forward data in pipelines.</li>
+    <li>Placement puts one replica on the local node and two on one remote rack; silent heartbeats start the replication engine; CRC32 per 512 bytes lets a client fall back to another replica; the rebalancer evens out the disks.</li>
+    <li>A read asks the NameNode where the blocks are and then streams them from the DataNodes; a write goes through a pipeline of DataNodes with acks flowing back; no file data ever passes through the NameNode, which is why bandwidth grows with the cluster.</li>
+    <li>The NameNode is the single point of failure of HDFS 1 and the Secondary NameNode only checkpoints; Hadoop 2 adds a standby NameNode, and YARN splits the JobTracker into a Resource Manager and one Application Master per application, and replaces the TaskTracker with a NodeManager per machine.</li>
+    <li>Apache Hadoop's core is Common, HDFS, YARN and MapReduce; Hive, Pig, HBase, ZooKeeper, Flume, Sqoop, Oozie, Hue, Mahout and Ambari form the ecosystem around it.</li>
+  </ul>
+  <aside class="cheat" id="l31-cheat">
+    <dl>
+      <dt>Hadoop (p. 835)</dt><dd>HDFS (storage) + MapReduce (batch); scalable, economical, efficient, reliable</dd>
+      <dt>Six assumptions (p. 837)</dt><dd>hardware will fail · batch, throughput over latency · huge files · aggregate bandwidth · write-once-read-many · move computation, not data</dd>
+      <dt>RDBMS vs Hadoop (p. 840)</dt><dd>GB / PB · interactive &amp; batch / batch · read-write / write once · integrity high / low · non-linear / linear · structured / un- and semi-structured</dd>
+      <dt>Goals of HDFS (p. 850)</dt><dd>10K nodes, 100 million files, 10PB · commodity hardware · batch · data locations exposed · very high aggregate bandwidth</dd>
+      <dt>Blocks</dt><dd>\(n = \lceil S/B \rceil\), disk \(= r \cdot S\); B = 64 MB (slides), 128 MB (Hadoop 2+); r = 3</dd>
+      <dt>NameNode</dt><dd>namespace in RAM: file → blocks, block → DataNodes; transaction log; replication engine; single point of failure in HDFS 1</dd>
+      <dt>DataNode</dt><dd>block server; heartbeat every 3 s; block report; forwards data in the pipeline</dd>
+      <dt>Placement (p. 857)</dt><dd>local node · remote rack · same remote rack · extras random; read from the nearest</dd>
+      <dt>Checksums (p. 860)</dt><dd>CRC32 per 512 bytes, computed by the client, stored by the DataNode, checked on read</dd>
+      <dt>Secondary NameNode</dt><dd>copies FsImage + log, merges, uploads; the log is purged — a checkpointer, not a standby</dd>
+      <dt>Read (p. 867)</dt><dd>open → get block locations (NameNode) → read packets from DataNodes → close</dd>
+      <dt>Write (p. 868)</dt><dd>create (NameNode) → write packets into dn 1 → dn 2 → dn 3 → acks back → close → complete</dd>
+      <dt>Hadoop 1.0 limits (p. 842)</dt><dd>4000 nodes, 40000 tasks, JobTracker = single point of failure</dd>
+      <dt>YARN (p. 882)</dt><dd>Resource Manager (cluster) + Application Master (one per application, in a container) + NodeManager (one per node)</dd>
+      <dt>HDFS shell (p. 873)</dt><dd><code>hdfs dfs</code> files · <code>hdfs fsck</code> blocks and health · <code>hdfs dfsadmin</code> cluster</dd>
+      <dt>Defaults (p. 870)</dt><dd>64 MB · 3 · web port 50070 (today 128 MB, 9870)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l31-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=jDlrfBLAIuQ" target="_blank" rel="noopener">Distributed File Systems</a>
+      <span class="res-by">Mining Massive Datasets, Stanford</span><span class="res-dur">16 min</span>
+      <p class="res-why">Why a cluster of cheap machines needs a file system of big replicated chunks and one master that knows where they are — the problem HDFS solves, told before any Hadoop name appears.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-hdfs/HdfsDesign.html" target="_blank" rel="noopener">HDFS Architecture</a>
+      <span class="res-by">Apache Hadoop</span>
+      <p class="res-why">The design document the slides follow: the assumptions of p. 837, the original of the architecture figure of p. 853, and the placement rule of p. 857 in full. Its numbers are today's (128 MB blocks), not the slides'.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://hadoop.apache.org/docs/stable/hadoop-yarn/hadoop-yarn-site/YARN.html" target="_blank" rel="noopener">Apache Hadoop YARN</a>
+      <span class="res-by">Apache Hadoop</span>
+      <p class="res-why">One page and one figure: ResourceManager, NodeManager, ApplicationMaster and containers, the split of p. 882 in the project's own words. Read it next to the third widget.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://vutr.substack.com/p/i-spent-8-hours-reading-the-paper-523" target="_blank" rel="noopener">The Hadoop Distributed File System, illustrated</a>
+      <span class="res-by">Vu Trinh, 2024</span>
+      <p class="res-why">A walk through the original HDFS paper with a diagram for each mechanism: block reports, the write pipeline, replica placement, checkpointing, the balancer — the slides' bullet points as pictures.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=EpIgvowZr00" target="_blank" rel="noopener">Lecture 3: GFS</a>
+      <span class="res-by">MIT 6.824 Distributed Systems</span>
+      <p class="res-why">The Google file system HDFS copied, discussed with the exam's "why" questions: why one master, why big chunks, what the master keeps in memory, what happens when a server dies.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>HDFS stores huge files and MapReduce reads them whole, in batch. But what if you need one row of a petabyte table, now — or SQL instead of Java? The next lesson stacks a column store, a scripting language and two SQL engines on top of HDFS.</p>
+</aside>
+
+</main>
+</body>
+</html>

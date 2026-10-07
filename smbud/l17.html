@@ -1,0 +1,1233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>A database with no queries: key-value stores and Redis · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l17">
+
+<header class="lesson-head">
+  <h1>A database with no queries: key-value stores and Redis</h1>
+  <p class="lede">After this lesson you will explain why a database that answers only "what is under this key?" exists, say what Redis adds to that idea and what it is not, explain why one thread makes every command atomic and still fast, and choose the right one of the seven data types for a need.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>"Every 1/10 second delay resulted in 1% loss of sales." That is what the slide on p. 343 prints next to Amazon's name; on the same slide Google loses 20 % of its traffic for half a second of delay. Speed is money.</p>
+  <p>In 2009 Salvatore Sanfilippo was trying to make LLOOGG, the real-time web-log analyser of his Italian startup, scale, and traditional database systems could not keep up with some of its workloads. He wrote his own database and gave up almost everything a relational one offers: no SQL, no joins, no secondary indexes, everything kept in memory, and a single thread that runs one command at a time. He called it Redis.</p>
+  <p>Two of those choices sound backwards. How can a database that answers only one question — "what is stored under this key?" — be the fix when a relational database is too slow? And how can a server that uses one CPU core, one command at a time, need no locks at all and still keep up? By the end of the lesson you will answer both in the slides' own words.</p>
+</div>
+
+
+<section id="l17-kv">
+  <h2>One key, one value, one step</h2>
+
+  <p>The lecture opens on the map of p. 342, "Overview – NoSQL Family": "Data stored in 4 types: Document, Graph, Key-value, Wide-column", with Redis, Amazon DynamoDB, Aerospike and Riak in the key-value cell (the four families are in <a href="l05.html">lesson 5</a>). Key-value is the plainest of the four, and p. 343, "Why is performance important?", says why anyone wants it: speed. Besides Amazon's 1 % of sales and Google's "20% drop in traffic", it reports that for a "1-second delay in page-load time" an "Industrial Group" counted "11% fewer page views", "16% decrease in customer satisfaction" and "7% loss in conversions".</p>
+
+  <p>Take the slide's own example, the blog database of p. 346 (Fig. 1). To show the page of blog post 101 you need its text from the <code>blog</code> table, its author's name from <code>users</code> and its category from <code>category</code>: three tables, tied by foreign keys. A key-value store keeps the whole page — text, author, category — as one value under one key, <code>post:101</code>, and hands it back in one step.</p>
+
+  <div class="def">
+    <p><dfn>Key-value store</dfn> — a database that stores every value under a unique key and reaches it only through that key: "(Business) Key -&gt; Value" (p. 345). Its whole interface is: put a value under a key, get the value of a key, delete a key. The value is opaque: the store never looks inside it.</p>
+  </div>
+
+  <p>The examples of p. 345 are keys that businesses already have: "(twitter.com) tweet id -&gt; information about tweet", "(kayak.com) Flight number -&gt; information about flight", an account number at a bank, an item number at Amazon. Most of what a site is asked starts from one of them, hence the slide's last line: "Search by ID is usually built on top of a key-value store". In Python terms the store is a <code>dict</code>: <code>d[key] = value</code>, <code>d[key]</code>, <code>del d[key]</code> — and no loop over the values.</p>
+
+  <div class="story" data-year="2004–2007">
+    <p>"It all started in 2004 when Amazon was running Oracle's enterprise edition with clustering and replication," Werner Vogels, Amazon's CTO, recalled in 2017. The database could not "sustain the availability, scalability and performance needs" of the business, and "a deep dive on how we were using our existing databases revealed that they were frequently not used for their relational capabilities": "About 70 percent of operations were of the key-value kind, where only a primary key was used and a single row would be returned." That was "the genesis of the Amazon Dynamo database", published in 2007; Riak, in the key-value cell of p. 342, is one of its clones (p. 411), and Amazon's DynamoDB followed in 2012.</p>
+  </div>
+
+  <p>Page 346 asks the obvious question, "Isn't that just a database?", and lists what a relational database is: "Queried using SQL", "Key-based", "Foreign keys", "Indexes", "Joins". Read the list as two columns: a relational database has all five, a key-value store keeps only one — key-based. Keys exist in both, but they play different roles. In the relational blog the primary and foreign keys connect the tables, indexes let SQL search by any column — the slide's query, <code>SELECT user_id from users WHERE username = "jbellis"</code>, finds a user by name, not by key — and joins put the page back together. The course notes say it in one line: in a key-value store "keys are just used to retrieve a specific value, unlike relational databases where primary and foreign keys are means to do searches and mapping between tables".</p>
+
+  <figure class="fig fig--pair" id="l17-fig-blog">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 270" role="img" aria-label="The blog relational database of page 346: four tables, users, blog, subscriber and category, linked by foreign-key arrows; an SQL query above asks for the user whose username is jbellis, and the username column is outlined as the column the query searches">
+        <text x="10" y="14" class="tx-mono tx-sm">SELECT user_id FROM users</text>
+        <text x="10" y="29" class="tx-mono tx-sm">WHERE username = 'jbellis'</text>
+        <line x1="60" y1="34" x2="60" y2="52" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <rect x="10" y="56" width="118" height="70" class="fi-paper"/>
+        <rect x="10" y="56" width="118" height="18" class="fw-s3 st-s3"/>
+        <rect x="14" y="94" width="110" height="14" class="fi-none st-s2 dash"/>
+        <text x="18" y="69" class="tx-mono tx-sm tx-bold">users</text>
+        <text x="18" y="89" class="tx-mono tx-sm">user_id</text>
+        <text x="18" y="104" class="tx-mono tx-sm">username</text>
+        <text x="18" y="119" class="tx-mono tx-sm">state</text>
+        <rect x="172" y="56" width="118" height="86" class="fi-paper"/>
+        <rect x="172" y="56" width="118" height="18" class="fw-s3 st-s3"/>
+        <text x="180" y="69" class="tx-mono tx-sm tx-bold">blog</text>
+        <text x="180" y="89" class="tx-mono tx-sm">blog_id</text>
+        <text x="180" y="104" class="tx-mono tx-sm">user_id</text>
+        <text x="180" y="119" class="tx-mono tx-sm">blog_entry</text>
+        <text x="180" y="134" class="tx-mono tx-sm">categoryid</text>
+        <rect x="10" y="166" width="118" height="70" class="fi-paper"/>
+        <rect x="10" y="166" width="118" height="18" class="fw-s3 st-s3"/>
+        <text x="18" y="179" class="tx-mono tx-sm tx-bold">subscriber</text>
+        <text x="18" y="199" class="tx-mono tx-sm">subscriber</text>
+        <text x="18" y="214" class="tx-mono tx-sm">blogger</text>
+        <text x="18" y="229" class="tx-mono tx-sm">row_id</text>
+        <rect x="172" y="182" width="118" height="54" class="fi-paper"/>
+        <rect x="172" y="182" width="118" height="18" class="fw-s3 st-s3"/>
+        <text x="180" y="195" class="tx-mono tx-sm tx-bold">category</text>
+        <text x="180" y="215" class="tx-mono tx-sm">category</text>
+        <text x="180" y="230" class="tx-mono tx-sm">categoryid</text>
+        <line x1="170" y1="100" x2="133" y2="87" marker-end="url(#arr)"/>
+        <line x1="69" y1="164" x2="69" y2="131" marker-end="url(#arr)"/>
+        <line x1="231" y1="144" x2="231" y2="177" marker-end="url(#arr)"/>
+        <text x="150" y="262" class="tx-hand tx-mid">ask by any column</text>
+      </svg>
+      <p class="fig-label">Before: the relational way (p. 346)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 270" role="img" aria-label="The same blog in a key-value store: four keys, post 101, 102 and 103 and user 1, each pointing to one opaque value; the request GET post:101 reaches its value in one step, while the question posts by jbellis is crossed out">
+        <text x="10" y="22" class="tx-mono tx-sm">GET post:101</text>
+        <line x1="40" y1="28" x2="40" y2="51" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <rect x="6" y="54" width="288" height="34" class="fi-none st-s2 dash"/>
+        <rect x="10" y="58" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="58" width="192" height="26" class="fi-paper"/>
+        <rect x="10" y="96" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="96" width="192" height="26" class="fi-paper"/>
+        <rect x="10" y="134" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="134" width="192" height="26" class="fi-paper"/>
+        <rect x="10" y="172" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="172" width="192" height="26" class="fi-paper"/>
+        <text x="16" y="75" class="tx-mono tx-sm">post:101</text>
+        <text x="104" y="75" class="tx-mono tx-sm">{entry, author, category}</text>
+        <text x="16" y="113" class="tx-mono tx-sm">post:102</text>
+        <text x="104" y="113" class="tx-mono tx-sm">{entry, author, category}</text>
+        <text x="16" y="151" class="tx-mono tx-sm">post:103</text>
+        <text x="104" y="151" class="tx-mono tx-sm">{entry, author, category}</text>
+        <text x="16" y="189" class="tx-mono tx-sm">user:1</text>
+        <text x="104" y="189" class="tx-mono tx-sm">{username, state}</text>
+        <text x="10" y="226" class="tx-mono tx-sm">posts by jbellis?</text>
+        <line x1="134" y1="215" x2="146" y2="227" class="st-bad sw-3"/>
+        <line x1="146" y1="215" x2="134" y2="227" class="st-bad sw-3"/>
+        <text x="150" y="258" class="tx-hand tx-mid">only by key</text>
+      </svg>
+      <p class="fig-label">After: the key-value way</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Left, the blog database of p. 346: four tables tied by foreign keys (the arrows). SQL may ask by any column — here the username — because the engine keeps indexes and joins the tables. Right, the same blog in a key-value store: each post page is one value under one key, fetched in one step by <code>GET post:101</code>. A question about what is inside the values, such as all the posts of jbellis, has no way in.</figcaption>
+  </figure>
+
+  <p>So the key-value store gives up a lot: no query on what is inside the values, no join, no secondary index, no schema to check. What it buys with that is cost. A lookup by key in a hash table takes one step whatever the number of keys, and nothing has to be parsed, planned or assembled. The race below puts numbers on it.</p>
+
+  <div class="widget" id="l17-w-race">
+    <h3 class="widget-title">The lookup race: one key against a tree and a join</h3>
+    <p class="widget-intro">The same record fetched three ways while the tables grow from a thousand to a billion rows. Each curve counts the steps one lookup takes and multiplies them by the cost of one step. The costs are assumed orders of magnitude, not slide numbers: a random access to memory about 0.1 µs, a random page read about 0.1 ms on an SSD and 10 ms on a spinning disk; the B-tree holds 100 keys per page; nothing is cached unless you choose RAM. The shaded band at the top is everything slower than 100 ms, the delay p. 343 prices. Both axes are logarithmic: each grid line is ten times the one below it.</p>
+    <ol class="tasks">
+      <li>Keep "a spinning disk" and N = 1 million. Before you touch anything: which curve will stay flat when N grows to a billion, and how many page reads will the B-tree need there? Then drag the slider to the right end.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only the key-value line stays flat: one step whatever N, because a hash table jumps straight to the slot of the key. The B-tree gains a level each time N grows a hundredfold: 4 page reads at a million, 6 at a billion (5 index levels and the data page), 60 ms; the join pays it three times, 18 reads, 180 ms. That is what the widget exists to show: the cost of a key lookup does not grow with the data, every other path does.</p></details>
+      </li>
+      <li>Still on the spinning disk, predict: at 1,000 rows per table, is the join of three tables inside the shaded band, slower than the 100 ms of p. 343? Then find the smallest N where it enters the band.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Not yet: 9 page reads, 90 ms. It enters the band just past 10,000 rows (12,589 on the slider): the B-tree grows a third level, each lookup needs 4 reads and the join 12, so 120 ms — in this model, with nothing cached.</p></details>
+      </li>
+      <li>Switch to "RAM, everything cached". Predict: does the key-value store still win at a billion records, and by how much?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Yes, by far less: 100 ns against 600 ns for the B-tree and 1.8 µs for the join, 6 and 18 times. In memory the gap is only the number of steps; on disk it is the medium, three to six orders of magnitude. A key-value store removes both — one step, in memory — and a real database also parses and plans every SQL statement and takes locks, which this model leaves out.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l17-w-race', function (root, ui) {
+    var STEP_RAM = 1e-7;                                   // one random access to memory: about 0.1 µs (assumed)
+    var MEDIA = {
+      hdd: { t: 1e-2, read: 'page reads', note: 'On a spinning disk every page read is a seek of the disk head, about 10 ms here: the medium, not the algorithm, decides the order of magnitude.' },
+      ssd: { t: 1e-4, read: 'page reads', note: 'An SSD has no head to move, about 0.1 ms per random read here: the relational curves drop a hundredfold, yet stay thousands of times above the key lookup.' },
+      ram: { t: 1e-7, read: 'page visits', note: 'Everything in memory: the only difference left is the number of steps, 1 against the levels of the tree, or three times that for the join.' }
+    };
+    var SUP = ['', '', '', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    var YL = ['1 s', '100 ms', '10 ms', '1 ms', '100 µs', '10 µs', '1 µs', '100 ns'];
+
+    function fmtInt(v) { return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function fmtN(v) {
+      var r = Math.round(v);
+      if (r < 1e6) return fmtInt(r);
+      if (r < 1e9) { var m = r / 1e6; return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + ' million'; }
+      return (r / 1e9).toFixed(1) + ' billion';
+    }
+    function fmtT(t) {
+      if (t < 1e-6) return Math.round(t * 1e9) + ' ns';
+      if (t < 1e-3) return +(t * 1e6).toPrecision(2) + ' µs';
+      if (t < 1) return +(t * 1e3).toPrecision(2) + ' ms';
+      return +t.toPrecision(2) + ' s';
+    }
+    function levels(x) { return Math.max(1, Math.ceil(x / 2 - 1e-9)); }    // B-tree height with 100 keys per page: log100 N = x / 2
+    function lg(t) { return Math.log(t) / Math.LN10; }
+
+    var n = ui.slider({ label: 'records in each table, N', min: 3, max: 9, step: 0.1, value: 6,
+      format: function (v) { return fmtN(Math.pow(10, v)); } });
+    var where = ui.select('the relational pages are read from', [
+      { value: 'hdd', label: 'a spinning disk (about 10 ms per page)' },
+      { value: 'ssd', label: 'an SSD (about 0.1 ms per page)' },
+      { value: 'ram', label: 'RAM, everything cached (about 0.1 µs per page)' }
+    ], null, 'hdd');
+    var roKV = ui.readout('key-value store, hash lookup');
+    var roBT = ui.readout('B-tree lookup by primary key');
+    var roJN = ui.readout('join of three tables');
+    var roX = ui.readout('slower than the key lookup');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'key-value store: one hash lookup in RAM', color: 's5', mark: 'line' },
+      { label: 'relational: B-tree lookup in one table', color: 's4', mark: 'line' },
+      { label: 'relational: the same lookup in three tables, joined', color: 's4', mark: 'dash' },
+      { label: 'slower than 100 ms, the delay p. 343 prices at 1% of Amazon’s sales', color: 'muted', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 336, { label: 'Time to find one record, on logarithmic axes, against the number of records in each table from a thousand to a billion: a flat line for the key-value hash lookup in memory, a rising staircase for the B-tree lookup, a higher staircase for the join of three tables, and a shaded band for everything slower than 100 milliseconds' });
+
+    function X(x) { return 84 + (x - 3) * 76; }
+    function Y(L) { return 40 - L * 32; }                // L = log10 of seconds: 0 (1 s) at the top, -7.5 at the bottom
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+
+    function state() {
+      var x = n.value, h = levels(x), m = MEDIA[where.value];
+      return { x: x, h: h, bt: h + 1, jn: 3 * (h + 1), tbt: (h + 1) * m.t, tjn: 3 * (h + 1) * m.t, m: m };
+    }
+    function stairs(mult, t) {
+      var cuts = [3, 4, 6, 8, 9], pts = [];
+      for (var i = 0; i < cuts.length - 1; i++) {
+        var y = Y(lg(mult * (levels((cuts[i] + cuts[i + 1]) / 2) + 1) * t)).toFixed(1);
+        pts.push(X(cuts[i]) + ',' + y, X(cuts[i + 1]) + ',' + y);
+      }
+      return pts.join(' ');
+    }
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var k, L;
+      for (k = 3; k <= 9; k++) S('line', { x1: X(k), y1: 40, x2: X(k), y2: 280, 'class': 'st-grid' });
+      for (L = 0; L >= -7; L--) S('line', { x1: 84, y1: Y(L), x2: 540, y2: Y(L), 'class': 'st-grid' });
+      S('rect', { x: 84, y: 40, width: 456, height: 240, 'class': 'st-line fi-none' });
+      for (L = 0; L >= -7; L--) S('text', { x: 76, y: Y(L) + 5, 'class': 'tx-sm tx-end', text: YL[-L] });
+      for (k = 3; k <= 9; k++) S('text', { x: X(k), y: 302, 'class': 'tx-sm tx-mid', text: '10' + SUP[k] });
+      S('text', { x: 10, y: 22, 'class': 'tx-sm', text: 'time to find one record' });
+      S('text', { x: 312, y: 328, 'class': 'tx-sm tx-mid', text: 'records in each table, N' });
+      S('rect', { x: 84, y: 40, width: 456, height: Y(-1) - 40, 'class': 'fw-ink st-none' });
+      S('line', { x1: 84, y1: Y(-1), x2: 540, y2: Y(-1), 'class': 'st-muted sw-2' });
+      S('line', { x1: X(s.x), y1: 42, x2: X(s.x), y2: 278, 'class': 'hl' });
+      S('line', { x1: X(s.x), y1: 40, x2: X(s.x), y2: 280, 'class': 'st-ink sw-1' });
+      S('line', { x1: 84, y1: Y(-7), x2: 540, y2: Y(-7), 'class': 'st-s5 sw-3' });
+      S('polyline', { points: stairs(1, s.m.t), 'class': 'st-s4 sw-3 fi-none' });
+      S('polyline', { points: stairs(3, s.m.t), 'class': 'st-s4 sw-3 dash fi-none' });
+      S('circle', { cx: X(s.x), cy: Y(-7), r: 6, 'class': 'fi-s5 st-paper sw-2' });
+      S('circle', { cx: X(s.x), cy: Y(lg(s.tbt)), r: 6, 'class': 'fi-s4 st-paper sw-2' });
+      var yj = Y(lg(s.tjn));
+      S('rect', { x: X(s.x) - 6, y: yj - 6, width: 12, height: 12, 'class': 'fi-s4 st-paper sw-2' });
+    }
+    ui.onChange(function () {
+      var s = state();
+      roKV.set('1 step in memory · ' + fmtT(STEP_RAM));
+      roBT.set(s.h + ' index levels + 1 data page = ' + s.bt + ' ' + s.m.read + ' · ' + fmtT(s.tbt));
+      roJN.set('3 × ' + s.bt + ' = ' + s.jn + ' ' + s.m.read + ' · ' + fmtT(s.tjn), s.tjn > 0.1 ? 'key' : undefined);
+      roX.set('B-tree ×' + fmtInt(s.tbt / STEP_RAM) + ' · join ×' + fmtInt(s.tjn / STEP_RAM));
+      note.set(s.m.note + ' Every time shown is computed by this model; only the 100 ms edge of the shaded band comes from a slide (p. 343).');
+      draw(s);
+    });
+  });
+  </script>
+
+  <p>One step in memory is the whole point. A relational lookup, however well indexed, climbs a tree whose height grows with the data and, on disk, pays a seek at every level; a join pays it once per table.</p>
+
+  <p class="memo"><mark class="key">A key-value store answers one question — what is under this key? — and gives up every other question to answer that one in a single step.</mark></p>
+
+  <p>There is a second gift (background, not on these slides). Because every request names its key, the keys can be spread over many machines by hashing them, and any client can compute where a key lives. Dynamo placed keys and machines on a ring — consistent hashing, invented at MIT in 1997 for web caches. Redis's own ways of splitting its keys come in <a href="l19.html">lesson 19</a>; the ring itself returns with Cassandra in <a href="l22.html">lesson 22</a>.</p>
+
+  <div class="pitfall"><p>"A key-value store is a relational table with two columns, key and value." No: a table can be searched by its value column, indexed and joined. A key-value store has none of that; the only efficient question is the exact key. Redis adds operations on the value (next section), never a query over the values.</p></div>
+</section>
+
+
+<section id="l17-redis">
+  <h2>Redis: a dictionary served over the network</h2>
+
+  <p>The section slide of p. 347 spells the name: <b>RE</b>mote <b>DI</b>ctionary <b>S</b>erver. A dictionary — a hash map from keys to values — living in a server and answering over the network. Page 348, "What is REDIS ?", gives the definition:</p>
+
+  <div class="def">
+    <p><dfn>Redis</dfn> — "Redis is an advanced key-value store, where keys can contain data structures such as strings, hashes, lists, sets, and sorted sets. Supporting a set of atomic operations on these data types." The slide highlights the next sentence: "Redis is a different evolution path in the key-value databases where values are complex data types that are closely related to fundamental data structures and are exposed to the programmer as such, without additional abstraction layers."</p>
+  </div>
+
+  <p>Three ideas to keep apart. It is a key-value store: access by key, nothing else. The value under a key can be a <mark class="key">data structure</mark> the server understands — a string, a hash, a list, a set, a sorted set. And the operations on those structures are atomic. The middle idea is what "advanced" means. To a plain key-value store a list is a string of bytes like any other; to Redis it is a list, so you send the operation instead of the value (Fig. 2).</p>
+
+  <figure class="fig fig--pair" id="l17-fig-value">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="A plain key-value store: the client reads the whole value of the key jobs, appends baz in its own code, and writes the whole new value back with SET, which the store acknowledges with OK">
+        <rect x="22" y="12" width="56" height="26" rx="6" class="fi-paper"/>
+        <text x="50" y="29" class="tx-sm tx-mid">client</text>
+        <rect x="160" y="12" width="44" height="26" class="fw-s3 st-s3"/>
+        <text x="182" y="29" class="tx-mono tx-sm tx-mid">jobs</text>
+        <rect x="204" y="12" width="88" height="26" class="fi-paper"/>
+        <text x="248" y="29" class="tx-mono tx-sm tx-mid">[bar,foo]</text>
+        <line x1="50" y1="38" x2="50" y2="224" class="st-muted dash"/>
+        <line x1="230" y1="38" x2="230" y2="224" class="st-muted dash"/>
+        <line x1="52" y1="70" x2="226" y2="70" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="140" y="63" class="tx-mono tx-sm tx-mid halo">GET jobs</text>
+        <line x1="228" y1="104" x2="54" y2="104" class="st-s1 sw-2 dash" marker-end="url(#arr-s1)"/>
+        <text x="140" y="97" class="tx-mono tx-sm tx-mid halo">[bar,foo]</text>
+        <rect x="12" y="124" width="76" height="26" class="fi-soft"/>
+        <text x="50" y="141" class="tx-sm tx-mid">append baz</text>
+        <line x1="52" y1="178" x2="226" y2="178" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="140" y="171" class="tx-mono tx-sm tx-mid halo">SET jobs [bar,foo,baz]</text>
+        <line x1="228" y1="210" x2="54" y2="210" class="dash" marker-end="url(#arr)"/>
+        <text x="140" y="203" class="tx-mono tx-sm tx-mid halo">OK</text>
+      </svg>
+      <p class="fig-label">Before: a plain key-value store</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Redis: the key jobs holds a list bar, foo; the client sends one command, RPUSH jobs baz, the server appends baz to the list itself and replies with the new length, 3">
+        <rect x="22" y="12" width="56" height="26" rx="6" class="fi-paper"/>
+        <text x="50" y="29" class="tx-sm tx-mid">client</text>
+        <rect x="150" y="12" width="44" height="26" class="fw-s3 st-s3"/>
+        <text x="172" y="29" class="tx-mono tx-sm tx-mid">jobs</text>
+        <rect x="200" y="12" width="36" height="26" class="fi-paper"/>
+        <text x="218" y="29" class="tx-mono tx-sm tx-mid">bar</text>
+        <text x="246" y="29" class="tx-sm tx-mid">↔</text>
+        <rect x="256" y="12" width="36" height="26" class="fi-paper"/>
+        <text x="274" y="29" class="tx-mono tx-sm tx-mid">foo</text>
+        <line x1="50" y1="38" x2="50" y2="140" class="st-muted dash"/>
+        <line x1="230" y1="38" x2="230" y2="140" class="st-muted dash"/>
+        <line x1="52" y1="70" x2="226" y2="70" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="140" y="63" class="tx-mono tx-sm tx-mid halo">RPUSH jobs "baz"</text>
+        <line x1="228" y1="104" x2="54" y2="104" class="dash" marker-end="url(#arr)"/>
+        <text x="140" y="97" class="tx-mono tx-sm tx-mid halo">(integer) 3</text>
+        <text x="10" y="167" class="tx-sm tx-muted">after</text>
+        <rect x="58" y="150" width="44" height="26" class="fw-s3 st-s3"/>
+        <text x="80" y="167" class="tx-mono tx-sm tx-mid">jobs</text>
+        <rect x="112" y="150" width="36" height="26" class="fi-paper"/>
+        <text x="130" y="167" class="tx-mono tx-sm tx-mid">bar</text>
+        <text x="158" y="167" class="tx-sm tx-mid">↔</text>
+        <rect x="168" y="150" width="36" height="26" class="fi-paper"/>
+        <text x="186" y="167" class="tx-mono tx-sm tx-mid">foo</text>
+        <text x="214" y="167" class="tx-sm tx-mid">↔</text>
+        <rect x="224" y="150" width="36" height="26" class="fw-s1 st-s1 sw-2"/>
+        <text x="242" y="167" class="tx-mono tx-sm tx-mid">baz</text>
+        <text x="150" y="216" class="tx-hand tx-mid">one command, on the server</text>
+      </svg>
+      <p class="fig-label">After: Redis</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> Adding one job to a list. Left: to a plain key-value store the list is an opaque value, so the client reads all of it, appends in its own code and writes all of it back — the whole value crosses the network twice, and another client's <code>SET</code> can fall between the two steps. Right: Redis knows the value is a list, "exposed to the programmer as such" (p. 348), so one atomic command appends on the server and returns the new length.</figcaption>
+  </figure>
+
+  <p>The exercise session says the same in plain words: "The stored values can be simple types (e.g., numbers) or complex structures (e.g., lists)" (p. 1581). Values — keep that word in mind when you reread the first sentence of p. 348.</p>
+
+  <div class="pitfall"><p>"In Redis a key can be a list or a hash." No: a key is always a string (binary-safe); the value stored under it is the string, hash, list, set or sorted set. The slide's "keys can contain data structures" is Redis's own old tagline and means that a key holds such a value, as the next sentence says: "values are complex data types" (so do the table of p. 354 and the session, p. 1581). Check it on a command: in <code>HSET user:1 name John</code> the key <code>user:1</code> is a plain string, the hash with its field <code>name</code> is its value, and <code>TYPE user:1</code> answers <code>hash</code>, the type of the value. If a true/false question quotes the slide's sentence, it is the slide's own definition: treat it as true, and in your own answers write "the value of a key can be".</p></div>
+
+  <p>The last line of p. 348: "Can be used as Database, a Caching layer or a Message broker", and each role has its reason in a box under it. A <b>database</b>, because "Redis can persist data to the disk": it can write snapshots and logs and reload them after a restart (<a href="l19.html#l19-axes">lesson 19</a>). A <b>caching layer</b>, because "Redis is fast": copies of data that is expensive to fetch or to compute are served from memory. A <b>message broker</b>, because "Redis is not only a key-value store": clients publish messages on channels that other clients subscribe to, or hand work through a list that a worker waits on.</p>
+
+  <p>Page 349, "What is not REDIS", draws the limits:</p>
+  <ul>
+    <li>"Redis is not a replacement for Relational Databases nor Document Stores."</li>
+    <li>"It might be used complementary to a SQL relational store, and/or NoSQL document store."</li>
+    <li>"Even when Redis offers configurable mechanisms for persistency, increased persistency will tend to increase latency and decrease throughput."</li>
+    <li>"Best used for rapidly changing data with a foreseeable database size (should fit mostly in memory)."</li>
+  </ul>
+
+  <p>Each limit follows from where the data lives. In memory, the dataset must fit in the RAM you can afford, so its size must be foreseeable. Persistence is a dial: the more often Redis writes to disk before it answers, the longer each write waits for the disk — the price you saw in the race. So the system of record stays elsewhere, and Redis holds what is small, hot and changing fast (Fig. 3).</p>
+
+  <figure class="fig fig--plain" id="l17-fig-beside">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="An application talks to two stores: on the left a SQL or document store, the system of record, holding orders, payments and patient records; on the right Redis, holding sessions, carts, counters, cached pages, queues and pub/sub channels">
+      <rect x="200" y="14" width="160" height="36" rx="8" class="fi-paper"/>
+      <text x="280" y="38" class="tx-mid">application</text>
+      <line x1="240" y1="52" x2="162" y2="106" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="320" y1="52" x2="398" y2="106" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="186" y="80" class="tx-sm tx-end">the truth</text>
+      <text x="374" y="80" class="tx-sm">hot data</text>
+      <rect x="20" y="110" width="240" height="122" class="fi-paper st-s4 sw-2"/>
+      <text x="36" y="138" class="tx-bold">SQL / document store</text>
+      <text x="36" y="164" class="tx-sm">orders, payments,</text>
+      <text x="36" y="186" class="tx-sm">patient records</text>
+      <text x="36" y="212" class="tx-sm tx-bold">the system of record</text>
+      <rect x="300" y="110" width="240" height="122" class="fi-paper st-s5 sw-2"/>
+      <text x="316" y="138" class="tx-bold">Redis</text>
+      <text x="316" y="164" class="tx-sm">sessions, carts,</text>
+      <text x="316" y="186" class="tx-sm">counters, cached pages,</text>
+      <text x="316" y="212" class="tx-sm">queues, pub/sub</text>
+      <text x="280" y="266" class="tx-hand tx-mid">beside it, not instead of it</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> Where Redis sits, after p. 349: not "a replacement for Relational Databases nor Document Stores" but "complementary" to them. The application keeps what it must never lose in the system of record, and the small, hot, rapidly changing data in Redis.</figcaption>
+  </figure>
+
+  <p>The use cases of p. 350 are the roles at work; the table pairs each with what does the work in Redis. (If you ever serve one of your AN2DL networks in an application, the features it reads at prediction time live in the same kind of store: the feature-store lecture says they are "typically stored in low-latency databases like Redis", p. 735, <a href="l29.html">lesson 29</a>.)</p>
+
+  <figure class="tbl-fig">
+    <figcaption>The use cases of p. 350 and what serves each of them.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Use case (p. 350)</th><th>Role</th><th>What does the work</th></tr></thead>
+        <tbody>
+          <tr><td>Caching; MVC Output Cache provider</td><td>caching layer</td><td>a value under a key, usually with a lifetime (<a href="l19.html">lesson 19</a>)</td></tr>
+          <tr><td>Counting things</td><td>database</td><td>a string holding an integer, increased on the server</td></tr>
+          <tr><td>Blocking queues</td><td>message broker</td><td>a list: push at one end, a pop that waits at the other</td></tr>
+          <tr><td>Pub/Sub (service bus); Backplane for SignalR; "Any real-time, cross-platform, cross-application communication"</td><td>message broker</td><td>channels: publishers send, every subscriber receives</td></tr>
+          <tr><td>ASP.NET Session State provider; Online user data (shopping cart, …)</td><td>database or cache</td><td>a hash per session, user or cart, often with a lifetime</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Page 351, "When to consider Redis", condenses all of this into four conditions — two reasons to choose Redis, then two limits it must respect:</p>
+  <ul>
+    <li>"Speed is critical" — the data is in memory and most commands take one step.</li>
+    <li>"More than just key-value pairs" — you need the data structures and their atomic operations; for plain opaque values a simpler cache does the job (memcached, <a href="l19.html#l19-memcached">lesson 19</a>).</li>
+    <li>"Dataset can fit in memory" — the limit of p. 349.</li>
+    <li>"Dataset is not critical" — you can afford to lose the latest changes if the server crashes, because making every write durable costs the speed you came for.</li>
+  </ul>
+
+  <div class="pitfall"><p>If you revise from the course notes: their p. 20 says that "being in-memory means that a single shutdown will cost you all your data". The slides say otherwise — "Redis can persist data to the disk" (p. 348). What a crash may cost is the most recent writes, depending on how persistence is set (<a href="l19.html">lesson 19</a>); that is the risk "Dataset is not critical" accepts.</p></div>
+
+  <p class="memo"><mark class="key">Redis is a key-value store whose values are data structures the server understands: you send the operation, not the whole value.</mark></p>
+</section>
+
+
+<section id="l17-thread">
+  <h2>One thread, one command at a time</h2>
+
+  <p>Page 352, "Redis Architecture", is a list of facts. The plain ones first: Redis is "Written in ANSI C by Salvatore Sanfilippo (@antirez)", "Works in most POSIX systems like Linux, BSD and OS X", "Linux is the recommended", and there is "No official support for Windows" (the slide adds a Win-64 port maintained by Microsoft). Two more lines carry the exam.</p>
+
+  <p>Start from a case. Two nurses' tablets record a visit to the same ward at the same instant: both send <code>INCR visits</code>, and <code>visits</code> holds 10. Inside a Redis server there is no "same instant": the two commands wait in line and run one after the other, 10 → 11 → 12 (Fig. 4).</p>
+
+  <figure class="fig fig--plain" id="l17-fig-thread">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Three clients A, B and C send commands into one queue; a single thread runs them one after another down a time axis: INCR visits from A gives 11, INCR visits from C gives 12, LPUSH jobs x from B gives 1, GET visits from A gives 12">
+      <text x="20" y="30" class="tx-sm">clients</text>
+      <rect x="20" y="46" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="38" y="63" class="tx-mid">A</text>
+      <rect x="20" y="116" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="38" y="133" class="tx-mid">B</text>
+      <rect x="20" y="186" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="38" y="203" class="tx-mid">C</text>
+      <line x1="58" y1="60" x2="168" y2="98" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="58" y1="128" x2="168" y2="128" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="58" y1="196" x2="168" y2="158" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <rect x="172" y="84" width="30" height="22" class="fi-paper"/>
+      <rect x="172" y="106" width="30" height="22" class="fi-paper"/>
+      <rect x="172" y="128" width="30" height="22" class="fi-paper"/>
+      <rect x="172" y="150" width="30" height="22" class="fi-paper"/>
+      <text x="187" y="194" class="tx-sm tx-mid">queue</text>
+      <line x1="204" y1="128" x2="234" y2="128" marker-end="url(#arr)"/>
+      <text x="240" y="30" class="tx-sm">one thread</text>
+      <rect x="240" y="46" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="66" class="tx-mono tx-sm">A  INCR visits</text>
+      <text x="462" y="66" class="tx-mono tx-sm">→ 11</text>
+      <rect x="240" y="86" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="106" class="tx-mono tx-sm">C  INCR visits</text>
+      <text x="462" y="106" class="tx-mono tx-sm">→ 12</text>
+      <rect x="240" y="126" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="146" class="tx-mono tx-sm">B  LPUSH jobs x</text>
+      <text x="462" y="146" class="tx-mono tx-sm">→ 1</text>
+      <rect x="240" y="166" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="186" class="tx-mono tx-sm">A  GET visits</text>
+      <text x="462" y="186" class="tx-mono tx-sm">→ "12"</text>
+      <line x1="544" y1="46" x2="544" y2="196" class="st-muted" marker-end="url(#arr-muted)"/>
+      <text x="536" y="30" class="tx-sm tx-end">time</text>
+      <text x="345" y="248" class="tx-hand tx-mid">no two at the same time</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> Three clients, one thread. Commands from every connection wait in one queue and run one at a time, each to its end before the next begins — "no two commands can run at the same time" (p. 352). The two increments of A and C cannot interleave: <code>visits</code> goes from 10 to 11 to 12, with no lock anywhere.</figcaption>
+  </figure>
+
+  <p>The slide: "Redis is a single-threaded server, not designed to benefit from multiple CPU cores. Several Redis instances can be launched to scale out on several cores." And the consequence, one bullet later: "All operations are atomic (no two commands can run at the same time)."</p>
+
+  <div class="def">
+    <p><dfn>Atomic command</dfn> — a command that runs from start to end with no other command in between: no client can see it half done, and it happens entirely or not at all.</p>
+  </div>
+
+  <p>Single-threaded, so atomic, with no lock anywhere: a lock exists to keep two threads off the same data, and here there is only one thread. Two clients that send <code>INCR</code> at once always count twice; an <code>LPUSH</code> never meets a half-built list.</p>
+
+  <div class="pitfall"><p>"All operations are atomic, so anything I send is safe." Each <em>command</em> is atomic. A <code>GET</code> followed by a <code>SET</code> is two commands, and another client's command can run between them — the lost update that the exercise session draws, and the reason <code>INCR</code> exists (<a href="l18.html#l18-w-race">lesson 18</a> replays it). Several commands become one atomic block only inside a transaction (<code>MULTI</code> … <code>EXEC</code>) or a Lua script: the advantages slide names "Atomic operations and Transactions" and "LUA scripting support" (p. 365) without teaching them — background beyond the exam's commands.</p></div>
+
+  <p>One thread sounds slow. It is fast for four reasons:</p>
+  <ul>
+    <li>The data is in memory: no disk sits on the path of a request, unless you make every write wait for one (the dial of p. 349) — the race of section 1.</li>
+    <li>The steps are short: "It executes most commands in O(1) complexity and with minimal lines of code" (p. 352).</li>
+    <li>Nothing waits for anything else: no locks to take, no switching between threads.</li>
+    <li>One thread serves thousands of connections: it watches all of them at once and serves whichever has a command ready (an event loop; background).</li>
+  </ul>
+
+  <p>Kleppmann adds a subtler reason in <i>Designing Data-Intensive Applications</i> (background): "the performance advantage of in-memory databases is not due to the fact that they don't need to read from disk … Rather, they can be faster because they can avoid the overheads of encoding in-memory data structures in a form that can be written to disk." A Redis list is a list in memory, not a page format to translate back and forth.</p>
+
+  <p>The design has a price. While one command runs, every other client waits, so a command over a huge value — all the members of a set with a million entries — holds up everybody; "most commands in O(1)" is what keeps the queue moving. And one thread uses one core: to use eight cores you run eight instances, each with part of the keys — the seed of partitioning (<a href="l19.html">lesson 19</a>).</p>
+
+  <details class="why">
+    <summary>Is Redis still single-threaded?</summary>
+    <p>Mostly. Since Redis 6.0 (2020) reading and writing the network traffic can be spread over extra threads, and saving to disk runs in a separate child process. The commands themselves still execute one at a time on one thread, which is what the slide means, what makes them atomic, and what the exam expects you to say.</p>
+  </details>
+
+  <p>Page 353 draws the whole server on one slide, and it doubles as the map of this lesson and the next two (Fig. 5).</p>
+
+  <figure class="fig fig--plain" id="l17-fig-map">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="The architecture map of page 353: on the left the data structures string, hash, list, set, sorted set, HLL and bitmap; in the centre a pentagon labelled REDIS; on the right persistence, journal text and snapshot binary over persist and restore over the OS; below, replication, networking and clients, and under them sentinel and cluster">
+      <text x="14" y="22" class="tx-sm">data structures · lessons 17–18</text>
+      <text x="546" y="22" class="tx-sm tx-end">persistence · lesson 19</text>
+      <rect x="14" y="32" width="212" height="152" class="fw-s1 st-none"/>
+      <rect x="24" y="42" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="60" class="tx-sm tx-mid">string</text>
+      <rect x="24" y="78" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="96" class="tx-sm tx-mid">hash</text>
+      <rect x="24" y="114" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="132" class="tx-sm tx-mid">list</text>
+      <rect x="24" y="150" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="168" class="tx-sm tx-mid">set</text>
+      <rect x="118" y="42" width="100" height="26" class="fi-paper st-s1"/>
+      <text x="168" y="60" class="tx-sm tx-mid">sorted set</text>
+      <rect x="118" y="78" width="100" height="26" class="fi-paper st-s1"/>
+      <text x="168" y="96" class="tx-sm tx-mid">HLL</text>
+      <rect x="118" y="114" width="100" height="26" class="fi-paper st-s1"/>
+      <text x="168" y="132" class="tx-sm tx-mid">bitmap</text>
+      <polygon points="288,64 334,97 316,152 260,152 242,97" class="fi-paper sw-2"/>
+      <text x="288" y="121" class="tx-bold tx-mid">REDIS</text>
+      <rect x="352" y="36" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="54" class="tx-sm tx-mid">journal (text)</text>
+      <rect x="352" y="70" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="88" class="tx-sm tx-mid">snapshot (binary)</text>
+      <rect x="352" y="104" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="122" class="tx-sm tx-mid">persist / restore</text>
+      <rect x="352" y="138" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="156" class="tx-sm tx-mid">OS</text>
+      <rect x="40" y="198" width="130" height="26" class="fi-paper"/>
+      <text x="105" y="216" class="tx-sm tx-mid">replication</text>
+      <rect x="210" y="198" width="130" height="26" class="fi-paper"/>
+      <text x="275" y="216" class="tx-sm tx-mid">networking</text>
+      <rect x="380" y="198" width="110" height="26" class="fi-paper"/>
+      <text x="435" y="216" class="tx-sm tx-mid">clients</text>
+      <rect x="150" y="240" width="110" height="26" class="fi-paper"/>
+      <text x="205" y="258" class="tx-sm tx-mid">sentinel</text>
+      <rect x="300" y="240" width="110" height="26" class="fi-paper"/>
+      <text x="355" y="258" class="tx-sm tx-mid">cluster</text>
+      <text x="424" y="258" class="tx-sm tx-muted">lesson 19</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> The architecture map of p. 353, redrawn without its colours, with the lessons that cover each part. Left, the data structures (HLL, the HyperLogLog, and bitmap are built on strings); right, persistence; below, replication, networking and clients, and the two add-ons for when one server is not enough, Sentinel and Cluster.</figcaption>
+  </figure>
+
+  <p>Read it as a table of contents. Left, the data structures: the next section, then the commands of <a href="l18.html">lesson 18</a>. Right, persistence: the "journal (text)" is the log of every write, the <abbr title="append-only file">AOF</abbr>, and the "snapshot (binary)" a picture of the whole dataset, the <abbr title="Redis database snapshot">RDB</abbr> file — the two mechanisms of p. 359. Below, the machinery for more than one server: replication keeps slaves as "exact copies of the master" (p. 359), Sentinel promotes a slave when the master dies, Cluster also spreads the keys over several masters (<a href="l19.html">lesson 19</a>).</p>
+
+  <p class="memo"><mark class="key">One thread runs one command at a time: every command is atomic without a lock, and fast because each is a short step in memory.</mark></p>
+</section>
+
+
+<section id="l17-types">
+  <h2>Seven shapes for a value</h2>
+
+  <p>Page 354, "Redis data types", lists what the value under a key can be: seven types, each with a picture, what it "Contains" and its "Read/write ability". Look at the pictures first (Fig. 6); the slide's text for each type is in the tabs below it.</p>
+
+  <figure class="fig fig--plain" id="l17-fig-types">
+    <svg class="dia" viewBox="0 0 560 330" role="img" aria-label="The seven Redis data types of page 354, each as the value under one key: a string with its bitmap view, a hash with the fields name and visits, a list A C B C with repeats, a set D B C A, a sorted set ordered by score from B 0.1 to C 250, a geospatial member with latitude and longitude, and a HyperLogLog made of bits">
+      <text x="10" y="31" class="tx-sm">String</text>
+      <rect x="130" y="12" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="31" class="tx-mono tx-sm">greeting</text>
+      <line x1="222" y1="26" x2="236" y2="26" class="st-muted"/>
+      <rect x="236" y="12" width="144" height="28" class="fi-paper"/>
+      <text x="242" y="31" class="tx-mono tx-sm">I'm a string!</text>
+      <rect x="390" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="408" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="426" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="444" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="462" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="480" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="498" y="12" width="18" height="28" class="fi-paper"/>
+      <text x="399" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="417" y="31" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="435" y="31" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="453" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="471" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="489" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="507" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="524" y="31" class="tx-sm">…</text>
+
+      <text x="10" y="77" class="tx-sm">Hash</text>
+      <rect x="130" y="58" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="77" class="tx-mono tx-sm">user:1</text>
+      <line x1="222" y1="72" x2="236" y2="72" class="st-muted"/>
+      <rect x="236" y="58" width="54" height="28" class="fi-soft"/>
+      <rect x="290" y="58" width="54" height="28" class="fi-paper"/>
+      <rect x="354" y="58" width="74" height="28" class="fi-soft"/>
+      <rect x="428" y="58" width="30" height="28" class="fi-paper"/>
+      <text x="242" y="77" class="tx-mono tx-sm">name</text>
+      <text x="296" y="77" class="tx-mono tx-sm">John</text>
+      <text x="360" y="77" class="tx-mono tx-sm">visits</text>
+      <text x="443" y="77" class="tx-mono tx-sm tx-mid">1</text>
+
+      <text x="10" y="123" class="tx-sm">List</text>
+      <rect x="130" y="104" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="123" class="tx-mono tx-sm">jobs</text>
+      <line x1="222" y1="118" x2="236" y2="118" class="st-muted"/>
+      <rect x="236" y="104" width="32" height="28" class="fi-paper"/>
+      <rect x="292" y="104" width="32" height="28" class="fi-paper"/>
+      <rect x="348" y="104" width="32" height="28" class="fi-paper"/>
+      <rect x="404" y="104" width="32" height="28" class="fi-paper"/>
+      <text x="252" y="123" class="tx-mono tx-sm tx-mid">A</text>
+      <text x="280" y="123" class="tx-sm tx-mid">↔</text>
+      <text x="308" y="123" class="tx-mono tx-sm tx-mid">C</text>
+      <text x="336" y="123" class="tx-sm tx-mid">↔</text>
+      <text x="364" y="123" class="tx-mono tx-sm tx-mid">B</text>
+      <text x="392" y="123" class="tx-sm tx-mid">↔</text>
+      <text x="420" y="123" class="tx-mono tx-sm tx-mid">C</text>
+
+      <text x="10" y="169" class="tx-sm">Set</text>
+      <rect x="130" y="150" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="169" class="tx-mono tx-sm">users</text>
+      <line x1="222" y1="164" x2="236" y2="164" class="st-muted"/>
+      <rect x="236" y="150" width="32" height="28" class="fi-paper"/>
+      <rect x="278" y="150" width="32" height="28" class="fi-paper"/>
+      <rect x="320" y="150" width="32" height="28" class="fi-paper"/>
+      <rect x="362" y="150" width="32" height="28" class="fi-paper"/>
+      <text x="252" y="169" class="tx-mono tx-sm tx-mid">D</text>
+      <text x="294" y="169" class="tx-mono tx-sm tx-mid">B</text>
+      <text x="336" y="169" class="tx-mono tx-sm tx-mid">C</text>
+      <text x="378" y="169" class="tx-mono tx-sm tx-mid">A</text>
+
+      <text x="10" y="215" class="tx-sm">Sorted set</text>
+      <rect x="130" y="196" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="215" class="tx-mono tx-sm">scores</text>
+      <line x1="222" y1="210" x2="236" y2="210" class="st-muted"/>
+      <rect x="236" y="196" width="64" height="28" class="fi-paper"/>
+      <rect x="306" y="196" width="64" height="28" class="fi-paper"/>
+      <rect x="376" y="196" width="64" height="28" class="fi-paper"/>
+      <rect x="446" y="196" width="64" height="28" class="fi-paper"/>
+      <text x="268" y="215" class="tx-mono tx-sm tx-mid">B 0.1</text>
+      <text x="338" y="215" class="tx-mono tx-sm tx-mid">D 0.3</text>
+      <text x="408" y="215" class="tx-mono tx-sm tx-mid">A 250</text>
+      <text x="478" y="215" class="tx-mono tx-sm tx-mid">C 250</text>
+
+      <text x="10" y="254" class="tx-sm">Geospatial</text>
+      <text x="10" y="273" class="tx-sm tx-muted">lat, lon</text>
+      <rect x="130" y="242" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="261" class="tx-mono tx-sm">places</text>
+      <line x1="222" y1="256" x2="236" y2="256" class="st-muted"/>
+      <rect x="236" y="242" width="64" height="28" class="fi-paper"/>
+      <rect x="306" y="242" width="96" height="28" class="fi-paper"/>
+      <rect x="408" y="242" width="116" height="28" class="fi-paper"/>
+      <text x="268" y="261" class="tx-mono tx-sm tx-mid">Value</text>
+      <text x="354" y="261" class="tx-mono tx-sm tx-mid">20.63373</text>
+      <text x="466" y="261" class="tx-mono tx-sm tx-mid">-103.55328</text>
+
+      <text x="10" y="307" class="tx-sm">HyperLogLog</text>
+      <rect x="130" y="288" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="307" class="tx-mono tx-sm">visitors</text>
+      <line x1="222" y1="302" x2="236" y2="302" class="st-muted"/>
+      <rect x="236" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="254" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="272" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="290" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="308" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="326" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="344" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="362" y="288" width="18" height="28" class="fi-paper"/>
+      <text x="245" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="263" y="307" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="281" y="307" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="299" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="317" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="335" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="353" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="371" y="307" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="390" y="307" class="tx-sm">…</text>
+      <text x="410" y="307" class="tx-sm tx-muted">fixed 12 KB</text>
+    </svg>
+    <figcaption><b>Fig. 6.</b> The seven types of p. 354, each drawn as the value under one key (violet). The pictures are the slide's, with concrete fields for the hash: the list keeps order and repeats (C twice), the set keeps neither; the sorted set is ordered by score, A and C tying at 250; the geospatial index holds a member with its latitude and longitude; the HyperLogLog holds only bits. A string can also be read and written bit by bit — the bitmap row.</figcaption>
+  </figure>
+
+  <aside class="margin-note">The session calls the sorted set an ordered set (p. 1602): the same type.</aside>
+
+  <p>Read the pictures in pairs. A list and a set both hold strings, but the list keeps the order of insertion and the repeats — C appears twice — while the set keeps neither: each string once, in no order. The exercise session gives the reason to pick a set: "SETS are useful as it is very quick to test the existence of a value, which is not as easy when it comes to lists" (p. 1600). A <mark class="key">sorted set</mark> is a set whose members carry a number, the <mark class="key">score</mark>, and stay in score order; A and C tie at 250 and are ordered by name (Redis breaks ties alphabetically; background). A <mark class="key">hash</mark> is a small dictionary inside the value: its inner keys are called <mark class="key">fields</mark> (<code>HSET user:1 name John</code>), so the Redis key names the object and the fields name its attributes.</p>
+
+  <aside class="margin-note">The slide prints 12Kb: read 12 KB, kilobytes.</aside>
+
+  <p>The last two are built on the others. A geospatial index is "Sorted set implementation using geospatial information as the score": the position is packed into one number, so points near each other mostly get scores near each other and a radius search becomes a few ranges of scores (background) — <code>TYPE</code> on such a key answers <code>zset</code>. A HyperLogLog answers one question only, how many different items have been added, approximately and in at most 12 KB; it never gives an item back.</p>
+
+  <div class="tabs" id="l17-tabs-types">
+    <div data-tab="String">
+      <p><b>Contains:</b> "Binary-safe strings (up to 512 MB), Integers or Floating point values, Bitmaps." <b>Read/write ability:</b> "Operate on the whole string, parts, increment/decrement the integers and floats, get/set bits by position."</p>
+      <p>Binary-safe means any bytes: a word, a JSON text, a whole JPEG. A string that holds a number can be increased on the server — the counter of "Counting things". In Python: <code>str</code>, <code>bytes</code>, or <code>int</code> when it holds a number. Use it for one value: a cached page, a counter, a flag.</p>
+<pre><code># p. 355: bar held 223; returns (integer) 1223
+INCRBY bar 1000</code></pre>
+    </div>
+    <div data-tab="Hash">
+      <p><b>Contains:</b> "Unordered hash table of keys to string values". <b>Read/write ability:</b> "Add, fetch, or remove individual items by key, fetch the whole hash."</p>
+      <p>The "keys" inside a hash are its fields. In Python: a <code>dict</code> of strings to strings. Use it for one object with named attributes — a user, a patient, a gas heater — read one field or all of them.</p>
+<pre><code># p. 357: returns (integer) 1, the number of fields added to user:1
+HSET user:1 name John</code></pre>
+    </div>
+    <div data-tab="List">
+      <p><b>Contains:</b> "Doubly linked list of strings". <b>Read/write ability:</b> "Push or pop items from both ends, trim based on offsets, read individual or multiple items, find or remove items by value."</p>
+      <p>Order of insertion, repeats allowed, cheap at both ends. In Python: a <code>collections.deque</code>. Use it for queues, stacks and "the latest N".</p>
+<pre><code># p. 357: returns (integer) 1, the new length of the list jobs
+RPUSH jobs "foo"</code></pre>
+    </div>
+    <div data-tab="Set">
+      <p><b>Contains:</b> "Unordered collection of unique strings". <b>Read/write ability:</b> "Add, fetch, or remove individual items, check membership, intersect, union, difference, fetch random items."</p>
+      <p>No order, no repeats, a fast "is it in?". In Python: a <code>set</code>. Use it for tags, memberships and "what do these two have in common".</p>
+<pre><code># p. 358: returns (integer) 2, the number of new members
+SADD users "John" "Peter"</code></pre>
+    </div>
+    <div data-tab="Sorted set">
+      <p><b>Contains:</b> "Ordered mapping of string members to floating-point scores, ordered by score". <b>Read/write ability:</b> "Add, fetch, or remove individual items, fetch items based on score ranges or member value."</p>
+      <p>Unique members, each with a score, kept in score order. Python has no built-in twin: think of a <code>dict</code> from member to score that is always sorted by score. Use it for rankings, leaderboards and anything "sorted by year".</p>
+<pre><code># p. 358: the score comes before the member; returns (integer) 3
+ZADD scores 50 "Peter" 200 "Charles" 1000 "Mary"</code></pre>
+    </div>
+    <div data-tab="Geospatial">
+      <p><b>Contains:</b> "Sorted set implementation using geospatial information as the score". <b>Read/write ability:</b> "Add, fetch or remove individual items, search by coordinates and radius, calculate distance."</p>
+      <p>Use it for "what is near this point". The commands take the longitude first.</p>
+<pre><code># the point of p. 354, longitude first; returns (integer) 1
+GEOADD places -103.55328 20.63373 "Value"</code></pre>
+    </div>
+    <div data-tab="HyperLogLog">
+      <p><b>Contains:</b> "Probabilistic data structure to count unique things using 12Kb of memory". <b>Read/write ability:</b> "Add individual or multiple items, get the cardinality."</p>
+      <p>The cardinality is the number of different items. In Python terms: <code>len(set(items))</code>, approximately, without keeping the set. Use it for unique visitors or distinct searches when a small error is fine.</p>
+<pre><code># returns (integer) 1: the structure changed
+PFADD visitors "u17" "u03" "u17"</code></pre>
+<pre><code># returns (integer) 2: about two different visitors
+PFCOUNT visitors</code></pre>
+    </div>
+  </div>
+
+  <details class="why">
+    <summary>How can 12 KB count a billion different visitors?</summary>
+    <p>Background, not on the slides: the idea behind HyperLogLog, with the two numbers the Redis documentation gives, 16,384 registers and 12 KB.</p>
+    <ol class="steps" id="l17-steps-hll">
+      <li><p>Hash every item. A good hash looks like a row of fair coin flips, and a returning visitor produces exactly the same row, so repeats change nothing.</p></li>
+      <li><p>Look at how each row starts. A run of \(k\) zeros at the front turns up about once in \(2^{k}\) different rows: if the longest run seen so far is 20, about a million different items have probably gone by. That is one small number, not the items.</p></li>
+      <li><p>One longest run is a noisy guess, so 14 bits of the hash send each item to one of \(2^{14} = 16\,384\) groups; each group keeps its own longest run in a register, and the registers are combined into one estimate.</p></li>
+      <li><p>A register stores only a run length, and 6 bits count up to 63, so the memory has a fixed ceiling whatever comes in:</p>
+        \[ \begin{aligned} 16\,384 \times 6 &amp;= 98\,304 \text{ bits} \\ &amp;= 12\,288 \text{ bytes} \end{aligned} \]
+        <p>— the 12 KB of p. 354, the most it ever takes, for a thousand items or a billion.</p></li>
+      <li><p>The price is an error. With \(m = 16\,384\) registers the standard error is</p>
+        \[ \frac{1.04}{\sqrt{m}} = \frac{1.04}{128} \approx 0.81\,\% \]
+        <p>— and, as with the standard error of a mean in Applied Statistics, it shrinks like one over the square root of what you average.</p></li>
+    </ol>
+  </details>
+
+  <p>The slide's seven are the classic types. Newer versions add Streams (since Redis 5.0, 2018), a log of messages for queues, and modules such as JSON — background, not on the slides. Choosing a type is choosing which commands you get for free: ask what the question needs — order, uniqueness, a score, named fields, a position, a count of different things — and the type follows. Try it on eight cases.</p>
+
+  <div class="widget" id="l17-w-pick">
+    <h3 class="widget-title">Pick the structure</h3>
+    <p class="widget-intro">Eight needs from the worlds of the past papers. Choose a scenario, then press the type you would store it in. The picture shows what the key would hold in that type, the verdict says why it fits or not, and the right type shows the commands that do the work on the server (their details are <a href="l18.html">lesson 18</a>). The insight to take away: the question you will ask decides the type.</p>
+    <ol class="tasks">
+      <li>Open "Unique visitors". Predict what a List would report for the six visits, then press List, Set and HyperLogLog in turn.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The list keeps every visit, so its length is 6 for 4 people. The set keeps each id once, an exact 4 — but it stores every id, millions of them on a busy day. The HyperLogLog says about 4 and never grows past 12 KB: the right answer when an error of about 1 % is fine.</p></details>
+      </li>
+      <li>Open "Fastest laps", then "A waiting queue", and press Sorted set in both. Predict first: where is it right, and why only "works, but" in the other?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Right for the laps: the lap time is a natural score, and Redis keeps the fastest first however the times arrive. For the queue you would have to invent the score (a check-in number) yourself, while a list keeps arrival order for free.</p></details>
+      </li>
+      <li>Find the two scenarios where a List is the right type. What do their questions have in common?
+        <details class="answer"><summary>What you should see</summary>
+          <p>"A waiting queue" and "The last ten readings": both depend on the order of arrival, both keep repeats, and both work at the ends of the list — push at one end, pop or trim at the other.</p></details>
+      </li>
+      <li>Open "Ambulances near a landslide" and press Sorted set. Why does the verdict say "close"?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Because a geospatial index is a sorted set whose score encodes the position (p. 354). With plain sorted-set commands you would have to compute that score and the distances yourself; the GEO commands do both.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l17-w-pick', function (root, ui) {
+    var TYPES = [['string', 'String'], ['hash', 'Hash'], ['list', 'List'], ['set', 'Set'], ['zset', 'Sorted set'], ['geo', 'Geospatial'], ['hll', 'HyperLogLog']];
+    var NAME = {};
+    TYPES.forEach(function (t) { NAME[t[0]] = t[1]; });
+    var GENERIC = {
+      string: 'A string holds one value: every new arrival would replace the last one (<code>SET</code> overwrites), so only the latest survives.',
+      hash: 'A hash names the fields of one object; nothing here is one object with named attributes.',
+      list: 'A list keeps strings in arrival order, repeats included; that is not what this question needs.',
+      set: 'A set keeps unique strings in no order; it cannot rank, count repeats or name fields.',
+      zset: 'A sorted set orders its members by a number, the score; nothing here is ordered by a number.',
+      geo: 'A geospatial index needs a longitude and a latitude for every member; nothing here has a position.',
+      hll: 'A HyperLogLog only estimates how many different items it has seen; it cannot give a single item back.'
+    };
+    var BITS = [0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0];
+    var SC = [
+      { id: 'views', title: 'Counting views of a film', key: 'film:42:views', best: 'string', ok: ['hash', 'zset'],
+        text: '<b>Views of a film page.</b> Every time someone opens the page of film 42 the count goes up by one; the page shows the total ("Counting things", p. 350). It stands at 1,017.',
+        v: {
+          string: 'Right. A string also holds an integer (p. 354: "increment/decrement the integers and floats"), and <code>INCR</code> adds one on the server, atomically: two viewers at the same instant both count.',
+          hash: 'Works, but: a field inside a hash can count too (<code>HINCRBY</code>), yet there is no object here, only one number; a string is the simpler fit.',
+          zset: 'Works, but: <code>ZINCRBY</code> can raise one member’s score, yet a sorted set exists to rank many members; with a single member it is a counter in disguise.',
+          list: 'A list would grow by one element per view: memory for every view, to answer one number.',
+          set: 'A set keeps each string once: every view is the same "view", so the count stops at 1.',
+          hll: 'A HyperLogLog counts different things: a thousand views of the same page count as one.' },
+        cmds: ['INCR film:42:views', 'GET film:42:views'],
+        view: {
+          string: { style: 'one', cells: ['1018'], cap: 'after INCR film:42:views: (integer) 1018' },
+          hash: { style: 'pairs', cells: [['views', '1018']], cap: 'one field, for one number' },
+          zset: { style: 'loose', cells: ['film:42 1018'], cap: 'one member, one score' },
+          list: { style: 'linked', cells: ['view', 'view', 'view', 'view', '…'], cap: 'LLEN = 1018: one element per view' },
+          set: { style: 'loose', cells: ['view'], cap: 'SCARD = 1: repeats vanish' },
+          hll: { style: 'bits', cap: '≈ 1 different item' } } },
+      { id: 'profile', title: 'A patient’s profile', key: 'patient:7', best: 'hash', ok: ['string'],
+        text: '<b>A patient’s profile.</b> Name, e-mail and number of visits of patient 7. The screens read one attribute at a time, and every visit adds one to the counter.',
+        v: {
+          hash: 'Right. One key for the object, one field per attribute (the "keys to string values" of p. 354 are called fields): <code>HGET</code> reads one, <code>HGETALL</code> all of them, and <code>HINCRBY</code> counts a visit without touching the rest.',
+          string: 'Works, but: the whole profile becomes one text, say JSON. Reading the e-mail fetches everything, and a visit means <code>GET</code>, edit in your code, <code>SET</code> it all back — while another client may write in between.',
+          list: 'A list keeps values by position, not by name: is element 1 the e-mail or the visits? And counting a visit means rewriting an element.',
+          set: 'A set keeps unlabelled strings in no order: "Ada", "ada@x.it" and "3" lose their names, and a second "3" would vanish.',
+          zset: 'A sorted set needs a number for every member; a name and an e-mail are not scores.' },
+        cmds: ['HSET patient:7 name "Ada" email "ada@x.it" visits 3', 'HINCRBY patient:7 visits 1', 'HGET patient:7 email'],
+        view: {
+          hash: { style: 'pairs', cells: [['name', 'Ada'], ['email', 'ada@x.it'], ['visits', '3']], cap: 'one field per attribute' },
+          string: { style: 'one', cells: ['{"name":"Ada","email":…}'], cap: 'one opaque text: read and rewrite it whole' },
+          list: { style: 'linked', cells: ['Ada', 'ada@x.it', '3'], cap: 'which position is the e-mail?' },
+          set: { style: 'loose', cells: ['3', 'Ada', 'ada@x.it'], cap: 'no names, no order' } } },
+      { id: 'queue', title: 'A waiting queue', key: 'queue:triage', best: 'list', ok: ['zset'],
+        text: '<b>Triage queue.</b> Patients check in at the emergency desk one after another — Bob, Carla, Dan; the next free nurse takes whoever has waited longest, and a nurse with nobody to see waits until someone arrives ("Blocking queues", p. 350).',
+        v: {
+          list: 'Right. A list keeps the order of arrival and is open at both ends: <code>RPUSH</code> adds at the tail, <code>LPOP</code> takes from the head, and <code>BLPOP</code> makes a free nurse wait until someone arrives — the "Blocking queues" of p. 350.',
+          zset: 'Works, but: with a check-in number as the score the earliest patient comes first, yet you must invent and supply that score yourself; a list keeps the arrival order for free.',
+          set: 'A set has no order: <code>SPOP</code> takes a random patient, not the one who has waited longest.',
+          hash: 'A hash would need a field per patient and still has no order.' },
+        cmds: ['RPUSH queue:triage "Dan"', 'LPOP queue:triage', 'BLPOP queue:triage 0'],
+        view: {
+          list: { style: 'linked', cells: ['Bob', 'Carla', 'Dan'], cap: 'LPOP takes Bob at the head; RPUSH adds at the tail' },
+          zset: { style: 'loose', cells: ['Bob 1', 'Carla 2', 'Dan 3'], cap: 'the score is a check-in number you supply' },
+          set: { style: 'loose', cells: ['Dan', 'Bob', 'Carla'], cap: 'no order: who came first?' },
+          string: { style: 'one', cells: ['Dan'], cap: 'only the last check-in survives' },
+          hll: { style: 'bits', cap: '≈ 3 different patients, but who?' } } },
+      { id: 'last10', title: 'The last ten readings', key: 'heater:HS1:last', best: 'list', ok: [],
+        text: '<b>Last ten readings.</b> A heating system sends a temperature reading every minute; the dashboard shows the ten most recent, newest first, and older readings can be thrown away. Twelve readings have arrived so far, two of them 21.0 and two 21.4.',
+        v: {
+          list: 'Right. A list keeps the order and the repeats (21.0 twice is two readings). <code>LPUSH</code> puts each new reading at the head and <code>LTRIM</code> with 0 9 cuts everything after the tenth — the "trim based on offsets" of p. 354.',
+          set: 'A set drops the repeated 21.0 and 21.4 and has no order: "the newest ten" cannot even be asked.',
+          zset: 'A sorted set keeps each member once, so the two readings of 21.0 collapse into one, and it orders by score, not by arrival: you would have to invent a unique member (time and value) and use the time as the score, where a list keeps order and repeats for free.',
+          hash: 'A field per minute would store the readings, but nothing keeps them in order or drops the old ones.' },
+        cmds: ['LPUSH heater:HS1:last 22.0', 'LTRIM heater:HS1:last 0 9', 'LRANGE heater:HS1:last 0 9'],
+        view: {
+          list: { style: 'linked', cells: ['22.0', '21.9', '21.8', '21.6', '21.3', '21.4', '21.4', '21.2', '21.0', '21.0'], cap: 'newest first, trimmed to ten: 20.5 and 20.7 are gone' },
+          set: { style: 'loose', cells: ['21.4', '20.5', '22.0', '21.0', '21.9', '20.7', '21.2', '21.8', '21.3', '21.6'], cap: 'SCARD = 10: twelve readings, repeats gone, no order' },
+          string: { style: 'one', cells: ['22.0'], cap: 'only the last reading survives' },
+          hll: { style: 'bits', cap: '≈ 10 different values, but which?' } } },
+      { id: 'allergens', title: 'Allergens of a dish', key: 'dish:risotto:allergens', best: 'set', ok: [],
+        text: '<b>Allergens of a dish.</b> Each ingredient of the risotto brings its allergens: milk, gluten, milk again, celery. A waiter asks "does it contain nuts?", and the kitchen wants the allergens the risotto shares with the lasagna.',
+        v: {
+          set: 'Right. A set keeps each allergen once, <code>SISMEMBER</code> answers "nuts?" without reading the rest, and <code>SINTER</code> gives what two dishes share. The session says it: sets make it "very quick to test the existence of a value, which is not as easy when it comes to lists" (p. 1600).',
+          list: 'A list keeps milk twice, and "does it contain nuts?" means reading the whole list in your code.',
+          hash: 'A hash would need a dummy value for every allergen, and it has no intersection: <code>SINTER</code> exists for sets.',
+          zset: 'A sorted set holds unique members too, but needs a score for each, and allergens have no number to be ordered by.',
+          hll: 'A HyperLogLog could say "about 3 different allergens", but not which, and not whether nuts is among them.' },
+        cmds: ['SADD dish:risotto:allergens "milk" "gluten" "milk" "celery"', 'SISMEMBER dish:risotto:allergens "nuts"', 'SINTER dish:risotto:allergens dish:lasagna:allergens'],
+        view: {
+          set: { style: 'loose', cells: ['gluten', 'celery', 'milk'], cap: 'each allergen once; nuts? 0' },
+          list: { style: 'linked', cells: ['milk', 'gluten', 'milk', 'celery'], cap: 'milk twice; finding nuts means a scan' },
+          string: { style: 'one', cells: ['celery'], cap: 'only the last value survives' },
+          hll: { style: 'bits', cap: '≈ 3 different, but which?' } } },
+      { id: 'laps', title: 'Fastest laps', key: 'race:monza:laps', best: 'zset', ok: [],
+        text: '<b>Fastest laps.</b> During a race each driver’s best lap time is stored and replaced whenever he goes faster; the screen shows the ten fastest drivers, fastest first. The times arrived in the order LEC, VER, NOR, HAM.',
+        v: {
+          zset: 'Right. Each driver is a member and his best time the score; Redis keeps the members ordered by score, so <code>ZRANGE</code> from 0 to 9 returns the fastest ten, fastest first, and a new <code>ZADD</code> for the same driver just moves him.',
+          list: 'A list keeps arrival order, not time order: to show the fastest ten you would read and sort everything in your code, and a driver’s older lap stays in the list when he improves.',
+          hash: 'Driver → time finds one driver’s time, but cannot return the ten fastest without reading every field and sorting them yourself.',
+          set: 'A set has no scores and no order.' },
+        cmds: ['ZADD race:monza:laps 83.456 "LEC"', 'ZRANGE race:monza:laps 0 9 WITHSCORES'],
+        view: {
+          zset: { style: 'loose', cells: ['VER 83.102', 'LEC 83.456', 'NOR 83.611', 'HAM 83.950'], cap: 'kept in score order: the fastest is always first' },
+          list: { style: 'linked', cells: ['LEC 83.456', 'VER 83.102', 'NOR 83.611', 'HAM 83.950'], cap: 'arrival order: VER is fastest but second' },
+          hash: { style: 'pairs', cells: [['LEC', '83.456'], ['VER', '83.102'], ['NOR', '83.611'], ['HAM', '83.950']], cap: 'no order: sorting is your job' },
+          set: { style: 'loose', cells: ['NOR 83.611', 'LEC 83.456', 'HAM 83.950', 'VER 83.102'], cap: 'no order' },
+          string: { style: 'one', cells: ['HAM 83.950'], cap: 'only the last value survives' } } },
+      { id: 'ambulances', title: 'Ambulances near a landslide', key: 'ambulances', best: 'geo', ok: ['zset'],
+        text: '<b>Ambulances near a landslide.</b> Every ambulance reports its position; when a landslide is reported at longitude 9.200, latitude 45.470, the dispatcher needs the ambulances within 5 km, nearest first.',
+        v: {
+          geo: 'Right. <code>GEOADD</code> stores each ambulance with its longitude and latitude, and <code>GEOSEARCH</code> with <code>BYRADIUS 5 km ASC</code> returns those within 5 km, nearest first — "search by coordinates and radius, calculate distance" (p. 354).',
+          zset: 'Close: a geospatial index is a sorted set whose score encodes the position (p. 354). With plain sorted-set commands you would have to compute that score, and the radius search, yourself.',
+          hash: 'Storing "lon,lat" per ambulance works as storage, but "within 5 km" means reading every position and computing every distance in your code.',
+          list: 'A list of names knows nothing about positions.',
+          set: 'A set of names knows nothing about positions.' },
+        cmds: ['GEOADD ambulances 9.190 45.464 "AMB1"', 'GEOSEARCH ambulances FROMLONLAT 9.200 45.470 BYRADIUS 5 km ASC'],
+        view: {
+          geo: { style: 'loose', cells: ['AMB1 1.0 km', 'AMB2 2.2 km', 'AMB3 9.3 km'], hit: [0, 1], cap: 'within 5 km, nearest first: AMB1, AMB2' },
+          zset: { style: 'loose', cells: ['AMB1 ?', 'AMB2 ?', 'AMB3 ?'], cap: 'the score would have to encode the position' },
+          hash: { style: 'pairs', cells: [['AMB1', '9.190,45.464'], ['AMB2', '9.225,45.480'], ['AMB3', '9.105,45.520']], cap: 'positions stored, distances not' },
+          list: { style: 'linked', cells: ['AMB1', 'AMB2', 'AMB3'], cap: 'names only' },
+          set: { style: 'loose', cells: ['AMB2', 'AMB3', 'AMB1'], cap: 'names only' },
+          string: { style: 'one', cells: ['AMB3'], cap: 'only the last value survives' } } },
+      { id: 'visitors', title: 'Unique visitors', key: 'home:visitors:today', best: 'hll', ok: ['set'],
+        text: '<b>Unique visitors.</b> How many different people opened the home page today? There are millions of visits, the same person comes back many times, and an answer within about 1 % is good enough. The first six visits came from u17, u03, u17, u42, u03, u99.',
+        v: {
+          hll: 'Right. <code>PFADD</code> feeds every visitor id in, <code>PFCOUNT</code> answers "about how many different?". The structure never grows past 12 KB however many people come (p. 354: "count unique things using 12Kb of memory"), at the price of a small error, about 0.81 % in the Redis documentation — and it cannot list who came.',
+          set: 'Works, and exactly: <code>SADD</code> ignores repeats and <code>SCARD</code> counts the members. But the set keeps every id: millions of visitors cost megabytes every day, where a HyperLogLog stays at 12 KB.',
+          list: 'A list keeps every visit: its length is 6 for 4 people. Repeats are exactly what this question must ignore.',
+          hash: 'Visitor → visits works like a set (<code>HLEN</code> counts the fields) and grows like one, with every id stored.',
+          zset: 'A sorted set keeps every id as a member, like a set, plus a score this question does not need.' },
+        cmds: ['PFADD home:visitors:today "u17" "u03" "u17" "u42" "u03" "u99"', 'PFCOUNT home:visitors:today'],
+        view: {
+          hll: { style: 'bits', cap: '≈ 4 different visitors, in at most 12 KB' },
+          set: { style: 'loose', cells: ['u42', 'u17', 'u99', 'u03'], cap: 'SCARD = 4, exact; every id is kept' },
+          list: { style: 'linked', cells: ['u17', 'u03', 'u17', 'u42', 'u03', 'u99'], cap: 'LLEN = 6, for 4 people' },
+          string: { style: 'one', cells: ['u99'], cap: 'only the last value survives' },
+          hash: { style: 'pairs', cells: [['u17', '2'], ['u03', '2'], ['u42', '1'], ['u99', '1']], cap: 'HLEN = 4; every id is kept' } } }
+    ];
+    var picks = {};
+
+    var scn = ui.select('scenario', SC.map(function (s, i) { return { value: String(i), label: (i + 1) + '. ' + s.title }; }), null, '0');
+    TYPES.forEach(function (t) {
+      ui.button(t[1], function () { picks[SC[+scn.value].id] = t[0]; });
+    });
+    var roPick = ui.readout('your pick');
+    var roFound = ui.readout('scenarios solved');
+    var noteVerdict = ui.note('');      // each note is inserted right after the readouts: create the lower one first
+    var noteScn = ui.note('');
+    var svg = ui.svg(560, 164, { label: 'The key of the chosen scenario, in violet, and below it the value that key would hold in the data type you picked, drawn as a row of cells, with a short caption' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function wCell(s) { return Math.max(30, Math.round(12 + 10.2 * s.length)); }
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var sc = SC[+scn.value], pick = picks[sc.id];
+      S('rect', { x: 14, y: 10, width: wCell(sc.key), height: 26, 'class': 'fw-s3 st-s3' });
+      S('text', { x: 20, y: 28, 'class': 'tx-mono tx-sm', text: sc.key });
+      S('line', { x1: 30, y1: 36, x2: 30, y2: 55, 'class': 'st-ink', 'marker-end': 'url(#arr)' });
+      var v = pick ? sc.view[pick] : null;
+      if (!v) {
+        S('rect', { x: 14, y: 60, width: 60, height: 26, 'class': 'fi-paper st-muted dash' });
+        S('text', { x: 44, y: 78, 'class': 'tx-mono tx-sm tx-mid', text: '?' });
+        S('text', { x: 14, y: 116, 'class': 'tx-sm tx-muted', text: pick ? 'a ' + NAME[pick].toLowerCase() + ' has no place for this data' : 'pick a type for the value' });
+        return;
+      }
+      var x = 14, y = 60, H = 26, items = [];
+      function place(w, gap) {
+        if (x + w > 546 && x > 14) { x = 14; y += 36; }
+        var at = { x: x, y: y, w: w };
+        x += w + gap;
+        return at;
+      }
+      if (v.style === 'bits') {
+        BITS.forEach(function (b) {
+          var at = place(18, 0);
+          S('rect', { x: at.x, y: at.y, width: 18, height: H, 'class': 'fi-paper' });
+          S('text', { x: at.x + 9, y: at.y + 18, 'class': 'tx-mono tx-sm tx-mid', text: String(b) });
+        });
+      } else if (v.style === 'pairs') {
+        v.cells.forEach(function (p) {
+          var wf = wCell(p[0]), wv = wCell(p[1]), at = place(wf + wv, 12);
+          S('rect', { x: at.x, y: at.y, width: wf, height: H, 'class': 'fi-soft' });
+          S('rect', { x: at.x + wf, y: at.y, width: wv, height: H, 'class': 'fi-paper' });
+          S('text', { x: at.x + 6, y: at.y + 18, 'class': 'tx-mono tx-sm', text: p[0] });
+          S('text', { x: at.x + wf + 6, y: at.y + 18, 'class': 'tx-mono tx-sm', text: p[1] });
+        });
+      } else {
+        var gap = v.style === 'linked' ? 24 : 10;
+        v.cells.forEach(function (c, i) {
+          var at = place(wCell(c), gap);
+          items.push(at);
+          var hit = v.hit && v.hit.indexOf(i) >= 0;
+          S('rect', { x: at.x, y: at.y, width: at.w, height: H, 'class': 'fi-paper' });
+          if (hit) S('rect', { x: at.x - 3, y: at.y - 3, width: at.w + 6, height: H + 6, 'class': 'fi-none st-s2 sw-2 dash' });
+          S('text', { x: at.x + at.w / 2, y: at.y + 18, 'class': 'tx-mono tx-sm tx-mid', text: c });
+        });
+        if (v.style === 'linked') {
+          for (var i = 1; i < items.length; i++) {
+            if (items[i].y === items[i - 1].y) S('text', { x: items[i].x - 12, y: items[i].y + 18, 'class': 'tx-sm tx-mid', text: '↔' });
+          }
+        }
+      }
+      S('text', { x: 14, y: y + H + 24, 'class': 'tx-sm', text: v.cap });
+    }
+
+    ui.onChange(function () {
+      var sc = SC[+scn.value], pick = picks[sc.id];
+      var solved = SC.filter(function (s) { return picks[s.id] === s.best; }).length;
+      noteScn.set(sc.text);
+      if (!pick) {
+        roPick.set('—');
+        noteVerdict.set('Which type would you store it in? Press one of the seven buttons.');
+      } else {
+        var tone = pick === sc.best ? 'good' : sc.ok.indexOf(pick) >= 0 ? 'key' : 'bad';
+        roPick.set(NAME[pick] + (tone === 'good' ? ': right' : tone === 'key' ? ': works, but' : ': does not fit'), tone);
+        var html = sc.v[pick] || GENERIC[pick];
+        if (pick === sc.best) html += '<br>What it unlocks: ' + sc.cmds.map(function (c) { return '<code>' + c + '</code>'; }).join(' · ');
+        noteVerdict.set(html);
+      }
+      roFound.set(solved + ' of ' + SC.length, solved === SC.length ? 'good' : undefined);
+      draw();
+    });
+  });
+  </script>
+
+  <div class="tip"><p>In an exam exercise, write the type you chose and its reason in one line before the commands — "a hash: one key for the object, one field per attribute". The paper of 30 Jan 2026 asked for "a single key-value pair to store all the data of one Gas Heater" and named no type: there the choice is the point of the question (<a href="l18.html#l18-exam-heating">lesson 18</a> solves that paper; the exercise below trains the same choices on another paper's ER model).</p></div>
+
+  <p class="memo"><mark class="key">Pick the type by the question you will ask: order and repeats, a list; uniqueness, a set; order by a number, a sorted set; named fields, a hash; one value or a counter, a string; a position, a geospatial index; how many different, a HyperLogLog.</mark></p>
+</section>
+
+
+<section id="l17-solved">
+  <h2>The puzzle, answered</h2>
+
+  <p>Back to the two choices of 2009 that sounded backwards. A database that answers only "what is under this key?" is the fix when a relational one is too slow, because that question costs one step in memory whatever the size of the data, with nothing to parse, plan or join — the flat line of the race. And Redis gives back much of what a plain key-value store loses: the value is a data structure, so a push, an increment or a membership test is still one command on one key.</p>
+
+  <p>One thread needs no lock because it cannot race with itself: commands run one after another, each atomic. It keeps up because every step is short and in memory, and when one core is not enough you start another instance. The price is printed on p. 349: the data must fit in memory, and the safer you make it on disk, the slower it gets.</p>
+
+  <p>The course introduction says that each category of systems "is covered along 5 dimensions": data model, "(declarative vs. imperative) query languages", data distribution, non-functional aspects and architectural solutions. A theory question on the features of Redis fits on that grid:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Redis along the five dimensions of the course agenda.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Dimension</th><th>Redis</th></tr></thead>
+        <tbody>
+          <tr><td>Data model</td><td>key → value: the key a string, the value one of seven data structures (pp. 348, 354)</td></tr>
+          <tr><td>Query language</td><td>nothing declarative: no SQL, no query over the values; imperative commands, each one operation on one key (<a href="l18.html">lesson 18</a>)</td></tr>
+          <tr><td>Data distribution</td><td>several instances "to scale out on several cores" (p. 352); replication, and partitioning that breaks up the data "across different hosts in a cluster" (p. 359, <a href="l19.html">lesson 19</a>)</td></tr>
+          <tr><td>Non-functional aspects</td><td>fast because in memory and most commands O(1); every command atomic; the dataset must fit in memory; more persistency, more latency and less throughput (pp. 349, 352)</td></tr>
+          <tr><td>Architecture</td><td>a single-threaded server in ANSI C; around the data structures, persistence, replication, networking, clients, Sentinel and Cluster (pp. 352–353)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="tip"><p>When the exam's one-point table asks which DB technology fits which entities (<a href="l05.html">lesson 5</a>), motivate a key-value row like this: data accessed only by its ID, read and written very often, small enough for memory and not critical — sessions, carts, counters, cached results, live rankings — in Redis.</p></div>
+</section>
+
+
+<section id="l17-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Theory questions in the forms the theory part uses — short open answers, true/false and multiple choice, where a wrong tick may cost points — and one practical exercise in the style of the papers, on the ER model of a past paper. The Redis exercises of the past papers themselves are solved in <a href="l18.html">lesson 18</a>.</p>
+
+  <div class="exam" data-kind="open" id="l17-exam-kv">
+    <div class="exam-q" lang="en">
+      <p>What is a key-value store? Explain why search by ID is usually built on top of a key-value store, and what a key-value store gives up compared with a relational database.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A key-value store is a dictionary: every value is stored under a unique key, typically a business key such as a tweet id, a flight number, an account number or an item number, and the only way to reach a value is through its key. The store does not interpret the value; its operations are put, get and delete by key. Search by ID is built on top of a key-value store because a lookup by key is the cheapest possible access: with a hash table in memory it takes constant time whatever the size of the data, and it needs no query parsing, planning or join. Compared with a relational database, which is queried using SQL and is key-based with foreign keys, indexes and joins, a key-value store keeps only the key: no queries on the content of the values, no foreign keys, no secondary indexes, no joins. Keys are used only to retrieve a value, not to search or to map tables to each other. In exchange the store is very fast and easy to split across machines by key.</p>
+      </div>
+      <div class="exam-note"><p>Three things make the answer complete: the definition (one key, one opaque value, access only by key), the reason (constant-time lookup with no parsing, planning or joins) and the trade-off measured against the five items of p. 346. One example from p. 345 shows you know the slide.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l17-exam-redis">
+    <div class="exam-q" lang="en">
+      <p>What is Redis? Explain its definition, the three roles it can play, and what Redis is not.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Redis (REmote DIctionary Server) is an advanced key-value store in which the value stored under a key can be a data structure — a string, a hash, a list, a set or a sorted set — with a set of atomic operations on these data types. Unlike a plain key-value store, the values are complex data types close to the fundamental data structures and are exposed to the programmer as such, without additional abstraction layers, so the client sends an operation (append this element, add this member) and the server applies it. Redis can be used as a database, because it can persist data to disk; as a caching layer, because it is fast, the data being in memory; and as a message broker, because it is not only a key-value store (publish/subscribe, blocking queues). It is not a replacement for relational databases or document stores: it is used next to them. Increasing persistency increases latency and decreases throughput, and the dataset should fit in memory, so Redis is best used for rapidly changing data with a foreseeable size.</p>
+      </div>
+      <div class="exam-note"><p>The three parts of p. 348, the three roles each with its reason, and the limits of p. 349. Prefer "the value of a key can be a list" to the slide's "keys can contain data structures" (the pitfall in section 2), but recognise the printed wording if a question quotes it.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l17-exam-atomic">
+    <div class="exam-q" lang="en">
+      <p>True or false: since all operations in Redis are atomic, a client that reads a counter with <code>GET</code> and then writes the incremented value back with <code>SET</code> performs one indivisible operation.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Each of the two commands is atomic on its own, but p. 352 only guarantees that no two commands run at the same time: another client's command can run between the <code>GET</code> and the <code>SET</code>.</span></li>
+      <li data-correct>False <span class="fb">Atomic means each single command. <code>GET</code> and <code>SET</code> are two commands; another client's <code>SET</code> can fall between them and an increment is lost. <code>INCR</code> does the read and the write in one command.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. Redis is single-threaded, so no two commands run at the same time and every single command is atomic. A <code>GET</code> followed by a <code>SET</code> is two commands: another client's command can be executed between them, so an update can be lost. A single <code>INCR</code> (or <code>INCRBY</code>) is atomic.</p></div>
+      <div class="exam-note"><p>The trap is the word "all". <a href="l18.html">Lesson 18</a> plays this race step by step. Wrong answers may carry a penalty (the rule is announced just before the exam): tick only what you can justify.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l17-exam-thread">
+    <div class="exam-q" lang="en">
+      <p>Redis is a single-threaded server. Explain why this makes every command atomic, why Redis is nevertheless fast, and how it can use more than one CPU core.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Redis executes commands on a single thread: the commands of all clients are queued and executed one at a time, each from start to end, so no two commands can run at the same time and no client can observe or interleave with a half-executed command. Every command is therefore atomic, and no locks are needed. Redis is nevertheless fast because the data is in memory, so no disk access is on the path of a request; because most commands run in O(1) and take very little time; because a single thread spends nothing on locks or on switching between threads; and because one event loop serves many connections. The cost is that a slow command, such as an O(N) operation on a large structure, delays every other client. Redis is not designed to benefit from multiple CPU cores: to use several cores, several Redis instances are launched, each holding part of the data.</p>
+      </div>
+      <div class="exam-note"><p>Three questions, three answers; the chain single thread, then atomic, then no locks is the core of the answer. You may add as background that since Redis 6.0 network I/O can use helper threads, while commands still execute on one thread.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l17-exam-types">
+    <div class="exam-q" lang="en">
+      <p>Which statements about the Redis data types are correct? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>A list may contain the same string more than once, in insertion order. <span class="fb">A list is a "Doubly linked list of strings"; the slide's picture holds A, C, B, C.</span></li>
+      <li>A set returns its members in the order in which they were inserted. <span class="fb">A set is an "Unordered collection of unique strings".</span></li>
+      <li data-correct>The members of a sorted set are ordered by a floating-point score. <span class="fb">"Ordered mapping of string members to floating-point scores, ordered by score" (p. 354).</span></li>
+      <li data-correct>A geospatial index is implemented as a sorted set. <span class="fb">"Sorted set implementation using geospatial information as the score" (p. 354).</span></li>
+      <li>A HyperLogLog returns the list of the unique items it has seen. <span class="fb">It only estimates their number, the cardinality, in at most 12 KB; the items are not kept.</span></li>
+      <li data-correct>A string can hold an integer that Redis increments on the server. <span class="fb">Strings contain "Integers or Floating point values" and can "increment/decrement the integers and floats" (p. 354).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Correct: the statements on the list, the sorted set, the geospatial index and the string. A set is unordered; a HyperLogLog only estimates the number of distinct items and cannot return them.</p></div>
+      <div class="exam-note"><p>A select-all question where wrong ticks may cost points: the two false statements are the classic confusions, list against set and counting against storing.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l17-exam-puzzle">
+    <div class="exam-q" lang="en">
+      <p><b>Exam-style exercise, written for this notebook</b> on the ER model of the exam of 30 May 2025 (its header prints June 30, 2025), tracking puzzles' production and sales; that paper has no Redis exercise. The part used: Puzzle (Puzzle ID, Name, Collection Name (e.g., Museum Collection), Number of Pieces, Width, Height, Description), produced by one Company (Produce, with Production Date: Company (1, N) – Puzzle (1, 1)); User (Personal ID, Name, Surname, Age, Birth Date, City, Country), who buys puzzles (Buy, with Buy Date: Puzzle (0, N) – User (0, N)). N.B. All sizes are in cm.</p>
+      <p>Exercise – Redis. For each request, state the Redis data type you use and why, in one line, then write the commands.</p>
+      <p>(1) Create a single key-value pair to store all the data of one Puzzle, with all the attributes describing the object.</p>
+      <p>(2) Store the puzzles of the "Museum Collection" sorted by their number of pieces. Then, query them to get the puzzle with the most pieces.</p>
+      <p>(3) Store the countries of the users who bought the puzzle "P1", each country only once. Then, check whether "Italy" is one of them.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(1) A hash: one key for the puzzle and one field for each of its attributes, so a single attribute can be read or changed on its own. The values are examples, and the attribute names are written with underscores (a field name with spaces would need double quotes).</p>
+<pre><code>HSET puzzle:P1 Puzzle_ID "P1" Name "Starry Night" Collection_Name "Museum Collection" Number_of_Pieces 1000 Width 70 Height 50 Description "Van Gogh, 1889"</code></pre>
+        <p>The reply is <code>(integer) 7</code>, the number of fields created. One string holding the whole puzzle as JSON would also be a single key-value pair, but reading one attribute would then mean reading the whole text.</p>
+        <p>(2) A sorted set: the number of pieces is the score, so Redis keeps the puzzles in that order whatever the order of insertion. The highest score is the last element, at index -1, so the second command returns "P3".</p>
+<pre><code>ZADD museum:by_pieces 1000 "P1" 500 "P2" 2000 "P3"
+ZRANGE museum:by_pieces -1 -1</code></pre>
+        <p>(3) A set: each country is kept once, however many users from it bought the puzzle, and the membership test is one command. <code>SADD</code> replies <code>(integer) 3</code>, because the second "Italy" is ignored; <code>SISMEMBER</code> replies <code>(integer) 1</code>.</p>
+<pre><code>SADD puzzle:P1:countries "Italy" "France" "Italy" "Spain"
+SISMEMBER puzzle:P1:countries "Italy"</code></pre>
+      </div>
+      <div class="exam-note"><p>Written for this notebook in the wording of the papers; no official solution exists for it, nor for any past paper. It trains the choice that the exam of 30 Jan 2026, exercise 5, asks on its hospital ER model (solved in <a href="l18.html#l18-exam-heating">lesson 18</a>). What makes each answer complete: (1) every attribute of Puzzle under one key — a hash, or JSON in a string; (2) a structure that keeps the order by itself, the score written before the member, and the right end read: index 0 is the lowest score, -1 the highest — a list would need the puzzles pushed already in order; (3) uniqueness and membership, the two things a set gives for free and a list does not ("very quick to test the existence of a value", p. 1600).</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l17-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A key-value store keeps every blog post under keys like <code>post:101</code>, with the whole page as the value. Which request can it not answer by itself?</p>
+    <ul class="options">
+      <li>Return post 101 <span class="fb">That is the one question a key-value store answers, in one step: get by key.</span></li>
+      <li data-correct>List the posts written by jbellis <span class="fb">The author is inside the values, and the store never looks inside them; without a second key mapping jbellis to his post ids there is no way in.</span></li>
+      <li>Delete post 102 <span class="fb">Delete by key is one of its three operations.</span></li>
+      <li>Replace the page of post 103 <span class="fb">Put a new value under the same key.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the lookup race, choose "RAM, everything cached" and grow N from a million to a billion. What happens?</p>
+    <ul class="options">
+      <li>All three curves stay flat: in memory every lookup takes constant time <span class="fb">Memory makes each step cheap, not the steps fewer: the B-tree still descends one more level each time N grows a hundredfold.</span></li>
+      <li data-correct>The hash lookup stays at 1 step; the B-tree goes from 4 to 6 page visits and the join from 12 to 18 <span class="fb">The cost of one step dropped from milliseconds to 0.1 µs; the number of steps did not change.</span></li>
+      <li>Only the join grows: a single B-tree lookup does not depend on N <span class="fb">The join grows because each of its three lookups grows: 3 × (levels + 1).</span></li>
+      <li>The hash lookup grows too, because a larger table needs more probes <span class="fb">A hash table jumps straight to the slot of the key; its expected cost does not depend on how many keys there are.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does <code>RPUSH jobs "baz"</code> on Redis beat <code>GET</code>, append and <code>SET</code> on a plain key-value store (Fig. 2)?</p>
+    <ul class="options">
+      <li data-correct>Redis knows the value is a list and appends one element on the server in one atomic command; with <code>GET</code> and <code>SET</code> the whole value crosses the network twice and another client can write in between <span class="fb">The server understands the structure, so you send the operation instead of the value.</span></li>
+      <li><code>RPUSH</code> writes the list to disk, while <code>GET</code> and <code>SET</code> only work in memory <span class="fb">Both work on the value in memory; persistence is a separate matter.</span></li>
+      <li>Redis runs list commands on several threads in parallel <span class="fb">Redis executes commands on one thread (p. 352).</span></li>
+      <li>There is no real difference: both are a single step for the server <span class="fb"><code>GET</code> plus <code>SET</code> are two commands with work in the client between them, and the whole value travels twice.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these follow from Redis executing commands on a single thread? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>Every single command is atomic <span class="fb">No two commands run at the same time (p. 352).</span></li>
+      <li data-correct>No lock is needed to keep two commands off the same key <span class="fb">There is no second thread to keep out.</span></li>
+      <li data-correct>One slow command over a huge value makes every other client wait <span class="fb">The thread is busy until it ends; that is why "most commands in O(1)" matters.</span></li>
+      <li>Redis uses all the cores of the machine by itself <span class="fb">"not designed to benefit from multiple CPU cores" (p. 352): you launch several instances.</span></li>
+      <li>A <code>GET</code> followed by a <code>SET</code> from one client runs without interruption <span class="fb">Those are two commands: another client's command can run between them.</span></li>
+    </ul>
+    <p class="q-fb">Atomic per command, not per conversation: that line separates this lesson's theory from the <code>INCR</code> of lesson 18.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In <code>HSET user:1 name John</code>, which part is the data structure that p. 348 means by "keys can contain data structures"?</p>
+    <ul class="options">
+      <li data-correct>The value stored under the key <code>user:1</code>, a hash with the field <code>name</code> <span class="fb">The key is a plain string; the hash is its value — <code>TYPE user:1</code> answers <code>hash</code>.</span></li>
+      <li>The key <code>user:1</code> itself, which becomes a hash <span class="fb">Keys are always (binary-safe) strings; only values have types.</span></li>
+      <li>The field <code>name</code>, which is a key inside the key <span class="fb"><code>name</code> is a field of the hash: the hash's own inner key, part of the value.</span></li>
+      <li>The string <code>John</code> <span class="fb"><code>John</code> is the value of one field inside the hash.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A screen lists a hospital's buildings from the newest to the oldest by year of construction, and new records are added over time in any order. Which type keeps them in that order without your code sorting them?</p>
+    <ul class="options">
+      <li>A list, pushing each building as it is recorded <span class="fb">A list keeps the order of insertion: a building recorded later but built earlier lands in the wrong place.</span></li>
+      <li data-correct>A sorted set with the year as the score <span class="fb">Redis keeps the members ordered by score; reading from the highest score down gives the newest first, whatever the order of insertion.</span></li>
+      <li>A set of building ids <span class="fb">A set has no order at all.</span></li>
+      <li>A hash from building id to year <span class="fb">A hash stores the years but returns its fields in no particular order.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A hospital plans to keep all its patients' medical records — 60 TB, growing every year, and by law never to be lost — only in Redis. Which conditions of p. 351 does the plan clearly violate? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>Dataset can fit in memory <span class="fb">60 TB, and growing, is far more than the memory of one server, and not a foreseeable size: Redis is "Best used for rapidly changing data with a foreseeable database size (should fit mostly in memory)" (p. 349).</span></li>
+      <li data-correct>Dataset is not critical <span class="fb">These records are critical, and making every write durable costs latency and throughput (p. 349), the very speed Redis is chosen for.</span></li>
+      <li>Speed is critical <span class="fb">Nothing in the plan contradicts it; speed is simply not the problem here.</span></li>
+      <li>More than just key-value pairs <span class="fb">A record could well be a hash; the data types are not the problem.</span></li>
+    </ul>
+    <p class="q-fb">Redis belongs next to the system of record (Fig. 3), not in its place.</p>
+  </div>
+</section>
+
+
+<section class="recap" id="l17-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A key-value store maps a business key to a value and answers only "what is under this key?" with put, get and delete; search by ID is usually built on one, because a lookup by key in memory takes one step whatever the size of the data.</li>
+    <li>A relational database is queried using SQL and is key-based with foreign keys, indexes and joins; a key-value store keeps only the key, gives up queries on values, joins and secondary indexes, and gains speed and an easy split of the keys across machines.</li>
+    <li>Redis, the REmote DIctionary Server, is an advanced key-value store whose values are data structures exposed as such, with atomic operations on them; it serves as a database, a caching layer or a message broker, next to a relational or document store and never instead of it.</li>
+    <li>Consider Redis when speed is critical, you need more than key-value pairs, the dataset fits in memory and the data is not critical; more persistency means more latency and less throughput.</li>
+    <li>Redis, written in ANSI C, executes commands on one thread: no two commands run at the same time, so each is atomic with no locks, and it stays fast because each step is short and in memory; more cores mean more instances.</li>
+    <li>The seven types: string (bytes, numbers, bitmaps), hash (fields to values), list (ordered, repeats, both ends), set (unique, unordered, membership and set algebra), sorted set (members ordered by score), geospatial index (a sorted set scored by position) and HyperLogLog (an approximate count of distinct items in 12 KB) — choose by the question you will ask.</li>
+  </ul>
+  <aside class="cheat" id="l17-cheat">
+    <dl>
+      <dt>Key-value store</dt><dd>business key → opaque value; put, get, delete by key only</dd>
+      <dt>p. 345</dt><dd>"Search by ID is usually built on top of a key-value store"</dd>
+      <dt>Relational (p. 346)</dt><dd>queried using SQL · key-based · foreign keys · indexes · joins</dd>
+      <dt>Redis</dt><dd>REmote DIctionary Server: advanced key-value store; values are data structures; atomic operations</dd>
+      <dt>Roles (p. 348)</dt><dd>database (persists to disk) · caching layer (fast) · message broker (not only key-value)</dd>
+      <dt>Is not (p. 349)</dt><dd>no replacement for relational or document stores; more persistency = more latency, less throughput; should fit in memory</dd>
+      <dt>When to consider (p. 351)</dt><dd>speed is critical · more than key-value pairs · fits in memory · not critical</dd>
+      <dt>Architecture (p. 352)</dt><dd>ANSI C · single-threaded → every command atomic · more cores = more instances · most commands O(1)</dd>
+      <dt>String</dt><dd>binary-safe, up to 512 MB; integers, floats, bitmaps — <code>SET</code>, <code>GET</code>, <code>INCR</code></dd>
+      <dt>Hash</dt><dd>fields → string values — <code>HSET key field value</code>, <code>HGET</code>, <code>HGETALL</code></dd>
+      <dt>List</dt><dd>doubly linked, ordered, repeats — <code>LPUSH</code> / <code>RPUSH</code>, <code>LPOP</code> / <code>RPOP</code>, <code>LRANGE</code></dd>
+      <dt>Set</dt><dd>unique, unordered — <code>SADD</code>, <code>SISMEMBER</code>, <code>SINTER</code> / <code>SUNION</code> / <code>SDIFF</code></dd>
+      <dt>Sorted set</dt><dd>members ordered by a float score — <code>ZADD key score member</code>, <code>ZRANGE</code></dd>
+      <dt>Geospatial index</dt><dd>sorted set scored by position — <code>GEOADD key lon lat member</code>, <code>GEOSEARCH</code></dd>
+      <dt>HyperLogLog</dt><dd>approximate count of distinct items, 12 KB, about 0.81 % error — <code>PFADD</code>, <code>PFCOUNT</code></dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l17-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=G1rOthIU-uo" target="_blank" rel="noopener">Redis in 100 Seconds</a>
+      <span class="res-by">Fireship</span>
+      <p class="res-why">A very short tour of an in-memory key-value store whose values have types — the hook of this lesson in motion.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://redis.io/docs/latest/develop/data-types/" target="_blank" rel="noopener">Redis data types</a>
+      <span class="res-by">Redis documentation</span>
+      <p class="res-why">One page per type with its commands and their complexity; open it next to the tabs of section 4, and read the sorted-set page in full.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://redis.io/try/sandbox/" target="_blank" rel="noopener">Redis Sandbox</a>
+      <span class="res-by">Redis</span>
+      <p class="res-why">A Redis console in the browser, no install: type the commands of the tabs and of the widget and compare the replies. Writes go to a temporary session whose keys must start with <code>pg:</code>, so type <code>HSET pg:user:1 name John</code>. The slide's "Online Demo: http://try.redis.io" no longer resolves; this is its official replacement.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.allthingsdistributed.com/2017/10/a-decade-of-dynamo.html" target="_blank" rel="noopener">A Decade of Dynamo</a>
+      <span class="res-by">Werner Vogels, 2017</span>
+      <p class="res-why">The story behind the 70 per cent of section 1: why Amazon built a key-value store instead of tuning its relational database, and what came of it.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://cs.brown.edu/courses/cs227/archives/2011/slides/mar07-redis.pdf" target="_blank" rel="noopener">REmote DIctionary Server</a>
+      <span class="res-by">Chris Keith and James Tavares, Brown CS227, 2011</span>
+      <p class="res-why">The deck p. 354 cites for "Redis data types internals": how each type is built inside (a skip list for sorted sets), with Redis's early history.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You chose a hash for a puzzle, a sorted set for a collection and a set for its buyers' countries, but every command was a preview. What exactly does <code>LPUSH</code> answer, why does <code>TTL</code> return −2, and why does <code>INCR</code> exist when <code>GET</code> and <code>SET</code> already do? The next lesson writes every command the past papers asked for.</p>
+</aside>
+
+</main>
+</body>
+</html>

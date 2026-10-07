@@ -1,0 +1,1373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Search is not a WHERE clause: relevance, TF-IDF and the inverted index · SMBUD Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local styles for the two widgets: text inputs, the live term-document matrix and the index table; tokens only */
+.l24-text { width: 100%; min-height: 2.5rem; box-sizing: border-box; padding: 0.3rem 0.6rem; font-family: var(--f-mono); font-size: var(--t-sm); color: var(--ink); background: var(--paper); border: 1.5px solid var(--line-2); border-radius: var(--radius); }
+.l24-text:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.l24-mxwrap, .l24-ixwrap { padding: 0.7rem 1rem 0.9rem; border-top: 1px solid var(--line); }
+.l24-mx, .l24-ix { width: auto; }
+.l24-mx caption, .l24-ix caption { font-size: var(--t-sm); }
+.l24-mx th, .l24-mx td { padding: 0.18rem 0.55rem; font-size: 0.78rem; white-space: nowrap; text-align: right; }
+.l24-mx th:first-child { text-align: left; }
+.l24-mx td { font-family: var(--f-mono); }
+.l24-mx .l24-z { color: var(--ink-3); }
+.l24-mx .l24-hit { background: var(--key-bg); color: var(--key-fg); }
+.l24-mx .l24-col { box-shadow: inset 0 -3px 0 var(--ink); }
+.l24-mx .l24-qt { font-weight: 720; }
+.l24-ix th, .l24-ix td { padding: 0.2rem 1.1rem 0.2rem 0; font-size: 0.8rem; white-space: nowrap; }
+.l24-cnt th, .l24-cnt td { padding-inline: 0.3rem; }
+.l24-cnt th:first-child, .l24-cnt td:first-child { text-align: left; }
+.l24-idf td:last-child, .l24-rk td:last-child { white-space: nowrap; }
+.l24-int th, .l24-int td, .l24-rk th, .l24-rk td { padding-right: 0.5rem; }
+.l24-ix td { font-family: var(--f-mono); }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l24">
+
+<header class="lesson-head">
+  <h1>Search is not a WHERE clause: relevance, TF-IDF and the inverted index</h1>
+  <p class="lede">After this lesson you will turn the lecture's eight book titles into TF-IDF vectors by hand, rebuild its ranking down to the score 0.159, say why a title can score exactly zero, and explain how an inverted index answers a query in tenths of a second.</p>
+</header>
+
+<div class="hook" data-label="A puzzle to start">
+  <p>Eight books, known only by their titles (p. 557). A customer is interested in <em>Building data mining applications for CRM</em>, and the system recommends the closest of the other seven (p. 564). First comes <em>Data Mining Your Website</em>. Third comes <em>Mastering Data Mining: The Art and Science of Customer Relationship Management</em> — although it shares with the query exactly the same two words as the winner: data and mining.</p>
+  <p>Further down, <em>Customer knowledge management</em> is "Not recommended": its score is exactly 0. Yet CRM stands for customer relationship management, and the third title spells those three words out. They earn it nothing.</p>
+  <p>Why do the same two words count for more in the shorter title, and why can the system not see what CRM means? By the end of the lesson you will compute the whole ranking by hand — 0.159, 0.102, 0.094 and four zeros — and answer both.</p>
+</div>
+
+
+<section id="l24-search">
+  <h2>A query that answers "how well"</h2>
+
+  <p>Number the eight titles in the slide's order (p. 557); T1 is the book the customer likes.</p>
+
+  <figure class="tbl-fig" id="l24-tbl-titles">
+    <figcaption>The eight books of p. 557, as printed (capitals included).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>id</th><th>title</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td class="n">T1</td><td>Building data mining applications for CRM</td></tr>
+          <tr><td class="n">T2</td><td>Accelerating Customer Relationships: Using CRM and Relationship Technologies</td></tr>
+          <tr><td class="n">T3</td><td>Mastering Data Mining: The Art and Science of Customer Relationship Management</td></tr>
+          <tr><td class="n">T4</td><td>Data Mining Your Website</td></tr>
+          <tr><td class="n">T5</td><td>Introduction to marketing</td></tr>
+          <tr><td class="n">T6</td><td>Consumer behavior</td></tr>
+          <tr><td class="n">T7</td><td>marketing research, a handbook</td></tr>
+          <tr><td class="n">T8</td><td>Customer knowledge management</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Ask a relational database for the books about data and you write a predicate:</p>
+
+<pre><code>-- T1, T3 and T4: a set, in no order
+SELECT title FROM books WHERE LOWER(title) LIKE '%data%';</code></pre>
+
+  <p>Each row satisfies the <code>WHERE</code> clause or not, so T1, T3 and T4 come back as a set: none is "more about data" than the others, and a title that says the same in other words is left out. Right for an invoice; wrong for "books like this one".</p>
+
+  <p>The lecture starts from this gap. After recalling the four NoSQL families of the course — document, graph, key-value, wide-column (p. 551) — its roadmap slide (p. 552) lists the "New ingredients" that search adds to database access: intent, similarity, relevance, ranking and, in brackets, efficiency.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l24-fig-where">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 260" role="img" aria-label="A WHERE clause with LIKE data splits the eight titles into a set of three, T1, T3 and T4, with no order among them, and five titles left out">
+        <rect x="30" y="10" width="240" height="30" rx="4" class="fi-paper st-s2 dash"/>
+        <ellipse cx="150" cy="132" rx="106" ry="52" class="fw-s2 st-s2"/>
+        <text x="150" y="30" class="tx-mono tx-mid">LOWER(title) LIKE '%data%'</text>
+        <text x="150" y="70" class="tx-hand tx-mid">in, no order</text>
+        <text x="96" y="124" class="tx-mono tx-lg tx-mid">T3</text>
+        <text x="186" y="114" class="tx-mono tx-lg tx-mid">T1</text>
+        <text x="140" y="162" class="tx-mono tx-lg tx-mid">T4</text>
+        <text x="40" y="214" class="tx-mono tx-mid tx-muted">T2</text>
+        <text x="95" y="214" class="tx-mono tx-mid tx-muted">T5</text>
+        <text x="150" y="214" class="tx-mono tx-mid tx-muted">T6</text>
+        <text x="205" y="214" class="tx-mono tx-mid tx-muted">T7</text>
+        <text x="260" y="214" class="tx-mono tx-mid tx-muted">T8</text>
+        <text x="150" y="250" class="tx-hand tx-mid">out</text>
+      </svg>
+      <p class="fig-label">Before: a WHERE clause</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 260" role="img" aria-label="A search for titles similar to T1 scores every title and sorts them: T4 0.159, T2 0.102, T3 0.094, then T5, T6, T7 and T8 with score 0">
+        <rect x="30" y="10" width="240" height="30" rx="4" class="fi-paper st-s2 dash"/>
+        <rect x="66" y="59" width="159" height="13" class="fw-s2 st-s2"/>
+        <rect x="66" y="85" width="102" height="13" class="fw-s2 st-s2"/>
+        <rect x="66" y="111" width="94" height="13" class="fw-s2 st-s2"/>
+        <line x1="10" y1="135" x2="290" y2="135" class="st-muted dash"/>
+        <path d="M86 144 h6 v92 h-6" class="st-muted"/>
+        <text x="150" y="30" class="tx-mid">titles similar to T1</text>
+        <text x="12" y="70" class="tx-sm">#1</text>
+        <text x="40" y="70" class="tx-mono">T4</text>
+        <text x="231" y="70" class="tx-mono tx-sm">0.159</text>
+        <text x="12" y="96" class="tx-sm">#2</text>
+        <text x="40" y="96" class="tx-mono">T2</text>
+        <text x="174" y="96" class="tx-mono tx-sm">0.102</text>
+        <text x="12" y="122" class="tx-sm">#3</text>
+        <text x="40" y="122" class="tx-mono">T3</text>
+        <text x="166" y="122" class="tx-mono tx-sm">0.094</text>
+        <text x="40" y="154" class="tx-mono tx-muted">T5</text>
+        <text x="66" y="154" class="tx-mono tx-sm tx-muted">0</text>
+        <text x="40" y="180" class="tx-mono tx-muted">T6</text>
+        <text x="66" y="180" class="tx-mono tx-sm tx-muted">0</text>
+        <text x="102" y="194" class="tx-sm tx-muted">not recommended</text>
+        <text x="40" y="206" class="tx-mono tx-muted">T7</text>
+        <text x="66" y="206" class="tx-mono tx-sm tx-muted">0</text>
+        <text x="40" y="232" class="tx-mono tx-muted">T8</text>
+        <text x="66" y="232" class="tx-mono tx-sm tx-muted">0</text>
+        <text x="200" y="250" class="tx-hand tx-mid">best first</text>
+      </svg>
+      <p class="fig-label">After: a ranked search</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> One shelf, two kinds of question. Left: a predicate splits the titles into in and out, with no order. Right: a search scores every title against T1 and sorts them; four titles score 0. You will compute these scores in section 4 — the slide prints only the order.</figcaption>
+  </figure>
+
+  <h3>Intent: what the user really wants</h3>
+
+  <p>A query is a few words; behind it there is a need. The slide defines <mark class="key">intent</mark> as "the underlying goal, purpose, need, or desire a user has when interacting with a system (e.g., entering a search query or a message to a chatbot)" and names four kinds (p. 553):</p>
+
+  <figure class="tbl-fig" id="l24-tbl-intent">
+    <figcaption>The four intent types of p. 553, with the slide's example queries.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl l24-int">
+        <thead><tr><th>intent</th><th>the user wants to…</th><th>slide's example</th></tr></thead>
+        <tbody>
+          <tr><td>Informational</td><td>learn something or find a specific fact</td><td>"How does user intent work?"</td></tr>
+          <tr><td>Navigational</td><td>go to a specific website or location</td><td>"Facebook login page"</td></tr>
+          <tr><td>Commercial/<wbr>Investigational</td><td>compare options or research products before a purchase</td><td>"best laptop for students"</td></tr>
+          <tr><td>Transactional</td><td>complete an action, like buying a product or downloading a file</td><td>"buy new iPhone 16 now"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Matching, similarity, relevance, ranking</h3>
+
+  <p>Matching is "the technical process of linking the user's input (query, utterance) to predefined intents or data within the DB" (p. 554), and the slide's title, "Matching (→ Similarity?)", hints at how: by computing how similar the input is to each item. <mark class="key">Similarity</mark> is a number the system computes.</p>
+
+  <p><mark class="key">Relevance</mark> is not. The same slide calls it "the qualitative measure of how well the search results align with the user's actual needs and expectations, ultimately satisfying their intent", and gives a test: "A result is relevant if the user finds what they were looking for quickly and easily". <mark class="key">Ranking</mark> sorts the results by similarity, best first; efficiency keeps it all fast (section 5).</p>
+
+  <p class="memo"><mark class="key">Similarity is computed by the system; relevance is judged by the user. A ranking is the system's bet that the first predicts the second.</mark></p>
+
+  <h3>What is compared: attributes or text</h3>
+
+  <p>To compute a similarity you need the content of an item (p. 555): explicit attributes — for a film, "Action / adventure", "Feature Bruce Willis", "Year 1995" — which compare like columns, or textual content, "title, description, table of content, etc.", for which "Several techniques exist to compute the distance between two textual documents". The rest of the lecture builds one of them.</p>
+
+  <p>The slide files the book example under information filtering (p. 557) — keeping and ordering the items that match one user's interest — and calls it "An (unrealistic) example", matching "based only on their title": small enough to compute by hand.</p>
+</section>
+
+
+<section id="l24-bag">
+  <h2>Turning a title into numbers</h2>
+
+  <p>How does a program compare two texts? Page 556 answers in two lines: "A textual document is scanned and parsed" and "Word occurrences are counted (may be stemmed)".</p>
+
+  <div class="def">
+    <p><dfn>Bag of words</dfn> — a document represented only by how many times each term occurs in it; the order of the words is thrown away.</p>
+  </div>
+
+  <p>Figure 2 runs T2 through it.</p>
+
+  <figure class="fig fig--plain" id="l24-fig-bag">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="The words of title T2 as printed are lower-cased, stripped of punctuation and stemmed into eight tokens; counting them gives seven terms, and relationship gets the count 2 because Relationships and Relationship became the same term">
+      <line x1="225" y1="104" x2="345" y2="104" class="hl"/>
+      <line x1="225" y1="208" x2="345" y2="208" class="hl"/>
+      <line x1="400" y1="156" x2="550" y2="156" class="hl"/>
+      <line x1="174" y1="52" x2="212" y2="52" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="78" x2="212" y2="78" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="104" x2="212" y2="104" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="130" x2="212" y2="130" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="156" x2="212" y2="156" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="182" x2="212" y2="182" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="208" x2="212" y2="208" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="174" y1="234" x2="212" y2="234" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="356" y1="143" x2="390" y2="143" class="sw-2" marker-end="url(#arr)"/>
+      <text x="20" y="24" class="tx-sm">title, as printed</text>
+      <text x="225" y="24" class="tx-sm">tokens</text>
+      <text x="400" y="24" class="tx-sm">bag of words</text>
+      <text x="20" y="56" class="tx-mono">Accelerating</text>
+      <text x="20" y="82" class="tx-mono">Customer</text>
+      <text x="20" y="108" class="tx-mono">Relationships:</text>
+      <text x="20" y="134" class="tx-mono">Using</text>
+      <text x="20" y="160" class="tx-mono">CRM</text>
+      <text x="20" y="186" class="tx-mono">and</text>
+      <text x="20" y="212" class="tx-mono">Relationship</text>
+      <text x="20" y="238" class="tx-mono">Technologies</text>
+      <text x="225" y="56" class="tx-mono">accelerating</text>
+      <text x="225" y="82" class="tx-mono">customer</text>
+      <text x="225" y="108" class="tx-mono">relationship</text>
+      <text x="225" y="134" class="tx-mono">using</text>
+      <text x="225" y="160" class="tx-mono">crm</text>
+      <text x="225" y="186" class="tx-mono">and</text>
+      <text x="225" y="212" class="tx-mono">relationship</text>
+      <text x="225" y="238" class="tx-mono">technology</text>
+      <text x="400" y="56" class="tx-mono">accelerating</text>
+      <text x="548" y="56" class="tx-mono tx-end">1</text>
+      <text x="400" y="82" class="tx-mono">and</text>
+      <text x="548" y="82" class="tx-mono tx-end">1</text>
+      <text x="400" y="108" class="tx-mono">crm</text>
+      <text x="548" y="108" class="tx-mono tx-end">1</text>
+      <text x="400" y="134" class="tx-mono">customer</text>
+      <text x="548" y="134" class="tx-mono tx-end">1</text>
+      <text x="400" y="160" class="tx-mono">relationship</text>
+      <text x="548" y="160" class="tx-mono tx-end">2</text>
+      <text x="400" y="186" class="tx-mono">technology</text>
+      <text x="548" y="186" class="tx-mono tx-end">1</text>
+      <text x="400" y="212" class="tx-mono">using</text>
+      <text x="548" y="212" class="tx-mono tx-end">1</text>
+      <text x="330" y="278" class="tx-hand tx-mid">two forms, one term</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> T2 through the bag of words: lower-cased, punctuation dropped, plurals stemmed (Technologies → technology), then counted. "Relationships" and "Relationship" become one term with count 2 — the only 2 in the table of p. 558. The word order is gone.</figcaption>
+  </figure>
+
+  <p>Do it for all eight titles and you get the "Word count" table of p. 558: one row per term, one column per title, 29 terms in all. Six of its rows, plus a column you will need soon — the number of titles containing the term, its document frequency df:</p>
+
+  <figure class="tbl-fig" id="l24-tbl-counts">
+    <figcaption>Six rows of the word-count table of p. 558 (blank = 0), plus the document frequency.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center l24-cnt">
+        <thead><tr><th>term</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th><th>T6</th><th>T7</th><th>T8</th><th>df</th></tr></thead>
+        <tbody>
+          <tr><td>crm</td><td class="num">1</td><td class="num">1</td><td></td><td></td><td></td><td></td><td></td><td></td><td class="num">2</td></tr>
+          <tr><td>customer</td><td></td><td class="num">1</td><td class="num">1</td><td></td><td></td><td></td><td></td><td class="num">1</td><td class="num">3</td></tr>
+          <tr class="is-key"><td>data</td><td class="num">1</td><td></td><td class="num">1</td><td class="num">1</td><td></td><td></td><td></td><td></td><td class="num">3</td></tr>
+          <tr><td>mining</td><td class="num">1</td><td></td><td class="num">1</td><td class="num">1</td><td></td><td></td><td></td><td></td><td class="num">3</td></tr>
+          <tr><td>relationship</td><td></td><td class="num">2</td><td class="num">1</td><td></td><td></td><td></td><td></td><td></td><td class="num">2</td></tr>
+          <tr><td>the</td><td></td><td></td><td class="num">1</td><td></td><td></td><td></td><td></td><td></td><td class="num">1</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Stemming cuts a word down to a common stem, so that relationships and relationship count as one term.</aside>
+
+  <p>Notice what the table did without a word of explanation. It lower-cased everything, so "Data" and "data" are one term. It dropped the punctuation. It stemmed three plurals — applications, relationships and technologies became application, relationship and technology — which is why relationship counts 2 in T2. And it kept every short word: a, and, for, of, the, to and your all have rows of their own.</p>
+
+  <p>Then comes the "Problem: importance of words" (p. 556). In raw counts "the" weighs as much as "mining", a word three titles share as much as a word only one title has, and a long title overlaps with anything by sheer bulk. Three questions, three fixes: how loud is the term in this document (TF), how rare in the collection (IDF), how long is the document (normalisation).</p>
+</section>
+
+
+<section id="l24-tfidf">
+  <h2>Loud here, rare elsewhere: TF × IDF</h2>
+
+  <p>Page 559 gives the plan: "Each document is transformed into a normed TFIDF vector, size N" — one coordinate per term of the vocabulary, N = 29 here, most of them 0. Each non-zero coordinate is the product of two factors.</p>
+
+  <h3>TF: how loud the term is in this document</h3>
+
+  <p><mark class="key">Term frequency</mark> is local, one document at a time. Page 560 defines it as a fraction:</p>
+
+  <div class="formula" data-label="TF, p. 560">
+    \[ \mathrm{tf}_{i,j} = \frac{n_{i,j}}{|d_j|} \]
+    <dl class="legend">
+      <dt>\(n_{i,j}\)</dt><dd>number of times term \(i\) appears in document \(j\)</dd>
+      <dt>\(|d_j|\)</dt><dd>number of terms in document \(j\)</dd>
+    </dl>
+  </div>
+
+  <p>The "Actual formula" of p. 562 uses a different one:</p>
+
+  <div class="formula" data-label="TF, p. 562">
+    \[ TF = \log(\mathit{count} + 1) \]
+  </div>
+
+  <p>Both are standard. The fraction makes an occurrence count less in a longer document; the logarithm damps repetition — a term seen twice is not twice as telling: \(\log 3 = 1.099\) against \(\log 2 = 0.693\). Natural logarithms throughout; another base multiplies every weight by one constant, which the normalisation below removes.</p>
+
+  <h3>IDF: how rare the term is in the collection</h3>
+
+  <p><mark class="key">Inverse document frequency</mark> is global. Page 561 calls it a measure of "how common a term is across the collection of documents, the lower the less important that term is": the more documents contain the term, the lower its IDF.</p>
+
+  <div class="formula" data-label="IDF, p. 561">
+    \[ \mathrm{idf}_i = \log \frac{|D|}{|\{d : i \in d\}|} \]
+    <dl class="legend">
+      <dt>\(|D|\)</dt><dd>number of documents in the collection</dd>
+      <dt>\(|\{d : i \in d\}|\)</dt><dd>number of documents containing term \(i\): its document frequency, df</dd>
+    </dl>
+  </div>
+
+  <aside class="margin-note">The hyphens in #docs-the-term-occurs-in join one name; they are not minus signs. It is df.</aside>
+
+  <p>The "Actual formula" of p. 562 differs again, slightly:</p>
+
+  <div class="formula" data-label="IDF, p. 562">
+    \[ IDF = \log\left( \frac{\#\mathit{docs} + 1}{\begin{gathered} \#\mathit{docs}\text{-}\mathit{the}\text{-}\mathit{term}\text{-} \\ \mathit{occurs}\text{-}\mathit{in} \end{gathered}} \right) \]
+  </div>
+
+  <p>The +1 matters at the edge: a term in all eight titles gets \(\log(8/8) = 0\) from p. 561 but \(\log(9/8) = 0.118\) from p. 562 — still the weakest, never exactly zero, so no document becomes a vector of zeros that cannot be normalised. Here df is 1, 2 or 3, so IDF takes three values:</p>
+
+  <figure class="tbl-fig" id="l24-tbl-idf">
+    <figcaption>IDF of p. 562 on the eight titles (#docs = 8).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl l24-idf">
+        <thead><tr><th>df</th><th>terms</th><th>IDF</th></tr></thead>
+        <tbody>
+          <tr><td class="n">3</td><td>customer, data, mining</td><td class="n">log(9/3) = 1.099</td></tr>
+          <tr><td class="n">2</td><td>and, crm, management, marketing, relationship</td><td class="n">log(9/2) = 1.504</td></tr>
+          <tr><td class="n">1</td><td>the other 21 terms</td><td class="n">log(9/1) = 2.197</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Rarity is measured in this collection, not in English: "a" and "the" occur in one title each, so they get the top IDF, 2.197, like "website". The weight of a term is the product of the two factors — loud here times rare elsewhere (p. 561):</p>
+
+  <div class="formula" data-label="TF-IDF, p. 561">
+    \[ (\text{tf-idf})_{i,j} = \mathrm{tf}_{i,j} \times \mathrm{idf}_i \]
+  </div>
+
+  <p>Page 560 says what the product is for: it "Measures the relevance of a term inside a document" and "Penalizes the words that appear too often across different documents". Relevance in a loose sense here: the weight of a term, not the user's judgement of p. 554.</p>
+
+  <div class="story" data-year="1972">
+    <p>IDF comes from Karen Spärck Jones, in a short 1972 paper in the <em>Journal of Documentation</em>: terms "should be weighted according to collection frequency, so that matches on less frequent, more specific, terms are of greater value than matches on frequent terms".</p>
+  </div>
+
+  <aside class="redpen" data-page="559">
+    <p class="claim">"(Term Frequency / Inverted Document Frequency)"</p>
+    <p class="fix">Term Frequency-Inverse Document Frequency, as p. 560 of the same deck prints it; p. 561 too says "Inverse Document Frequency".</p>
+    <p class="because">"Inverse" says that the factor grows as the document frequency shrinks, \(\log(|D| / \mathrm{df})\); "inverted" is the name of the index of section 5, a different thing. The slash only separates the two names, as in the common spelling TF/IDF: the weight is their product, \(\mathrm{tf} \times \mathrm{idf}\) (p. 561). The exam may be matched against the printed wording: recognise "inverted" there, and write "inverse" yourself.</p>
+  </aside>
+
+  <h3>Normalisation: every document gets length 1</h3>
+
+  <p>The last fix is length. The formula of p. 559, boxed in red on p. 562, divides every weight of a document by the length of its whole vector:</p>
+
+  <aside class="margin-note">Here N counts the terms. Textbooks often use N for the number of documents, which these slides write \(|D|\) or #docs.</aside>
+
+  <div class="formula" data-label="normed TF-IDF, pp. 559 and 562">
+    \[ TFIDF = \frac{TF \times IDF}{\sqrt{\sum_N (TF \times IDF)^2}} \]
+    <dl class="legend">
+      <dt>\(TF \times IDF\)</dt><dd>the raw weight of one term in this document</dd>
+      <dt>\(\sum_N\)</dt><dd>sum over the N terms of the vocabulary (here 29), for the same document</dd>
+      <dt>\(\sqrt{\cdots}\)</dt><dd>the Euclidean length (norm) of the document's raw vector</dd>
+    </dl>
+  </div>
+
+  <p>This <mark class="key">normalisation</mark> makes every document a vector of length 1. Long titles lose their bulk advantage, and the same raw weight ends up lighter in a long title, which shares the unit length among more terms — why p. 563 circles two different numbers for one word (Figure 3).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l24-fig-norm">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Raw TF times IDF weights of the four terms of T4 and the eleven terms of T3; the data bar has the same height, 0.76, in both titles; the vector lengths are 2.41 and 4.07">
+        <line x1="10" y1="200" x2="290" y2="200" class="st-muted"/>
+        <rect x="20" y="150" width="12" height="50" class="fi-s1 st-s1"/>
+        <rect x="36" y="150" width="12" height="50" class="fw-s1 st-s1"/>
+        <rect x="52" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <rect x="68" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <rect x="110" y="150" width="12" height="50" class="fi-s1 st-s1"/>
+        <rect x="126" y="150" width="12" height="50" class="fw-s1 st-s1"/>
+        <rect x="142" y="150" width="12" height="50" class="fw-s1 st-s1"/>
+        <rect x="158" y="131" width="12" height="69" class="fw-s1 st-s1"/>
+        <rect x="174" y="131" width="12" height="69" class="fw-s1 st-s1"/>
+        <rect x="190" y="131" width="12" height="69" class="fw-s1 st-s1"/>
+        <rect x="206" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <rect x="222" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <rect x="238" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <rect x="254" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <rect x="270" y="100" width="12" height="100" class="fw-s1 st-s1"/>
+        <text x="50" y="30" class="tx-sm tx-mid">length 2.41</text>
+        <text x="196" y="30" class="tx-sm tx-mid">length 4.07</text>
+        <text x="150" y="74" class="tx-hand tx-mid">same raw weight</text>
+        <text x="26" y="142" class="tx-mono tx-sm tx-mid">0.76</text>
+        <text x="116" y="142" class="tx-mono tx-sm tx-mid">0.76</text>
+        <text x="50" y="220" class="tx-sm tx-mid">T4: 4 terms</text>
+        <text x="196" y="220" class="tx-sm tx-mid">T3: 11 terms</text>
+      </svg>
+      <p class="fig-label">Before: TF × IDF</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="The same bars after each title is divided by its own length: data weighs 0.316 in T4 and 0.187 in T3">
+        <line x1="10" y1="200" x2="290" y2="200" class="st-muted"/>
+        <rect x="20" y="159" width="12" height="41" class="fi-s1 st-s1"/>
+        <rect x="36" y="159" width="12" height="41" class="fw-s1 st-s1"/>
+        <rect x="52" y="118" width="12" height="82" class="fw-s1 st-s1"/>
+        <rect x="68" y="118" width="12" height="82" class="fw-s1 st-s1"/>
+        <rect x="110" y="176" width="12" height="24" class="fi-s1 st-s1"/>
+        <rect x="126" y="176" width="12" height="24" class="fw-s1 st-s1"/>
+        <rect x="142" y="176" width="12" height="24" class="fw-s1 st-s1"/>
+        <rect x="158" y="167" width="12" height="33" class="fw-s1 st-s1"/>
+        <rect x="174" y="167" width="12" height="33" class="fw-s1 st-s1"/>
+        <rect x="190" y="167" width="12" height="33" class="fw-s1 st-s1"/>
+        <rect x="206" y="151" width="12" height="49" class="fw-s1 st-s1"/>
+        <rect x="222" y="151" width="12" height="49" class="fw-s1 st-s1"/>
+        <rect x="238" y="151" width="12" height="49" class="fw-s1 st-s1"/>
+        <rect x="254" y="151" width="12" height="49" class="fw-s1 st-s1"/>
+        <rect x="270" y="151" width="12" height="49" class="fw-s1 st-s1"/>
+        <text x="50" y="30" class="tx-sm tx-mid">length 1</text>
+        <text x="196" y="30" class="tx-sm tx-mid">length 1</text>
+        <text x="150" y="80" class="tx-hand tx-mid">short title wins</text>
+        <text x="26" y="151" class="tx-mono tx-sm tx-mid">0.316</text>
+        <text x="116" y="168" class="tx-mono tx-sm tx-mid">0.187</text>
+        <text x="50" y="220" class="tx-sm tx-mid">T4: 4 terms</text>
+        <text x="196" y="220" class="tx-sm tx-mid">T3: 11 terms</text>
+      </svg>
+      <p class="fig-label">After: each title divided by its length</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Left: "data" (the solid bar) has the same raw weight in T4 and in T3. Right: dividing each title by its own length, 2.41 and 4.07, leaves 0.316 in the short title and 0.187 in the long one — the two cells circled on p. 563. Each panel is drawn to its own scale.</figcaption>
+  </figure>
+
+  <p>Now compute T4's column by hand, then T1's, the query book's.</p>
+
+  <ol class="steps" id="l24-steps-t4">
+    <li><p>Count. T4, "Data Mining Your Website", has four terms, each once, so all get the same TF:</p> \[ TF = \log(1 + 1) = 0.693 \]</li>
+    <li><p>Look up df: data and mining are in T1, T3 and T4, your and website only in T4. With #docs = 8:</p> \[ IDF_{\text{data}} = \log \tfrac{9}{3} = \log 3 = 1.099 \] \[ IDF_{\text{website}} = \log \tfrac{9}{1} = \log 9 = 2.197 \]</li>
+    <li><p>Multiply, for data and mining, then for your and website — with unrounded logarithms (0.693 × 1.099 would give 0.7616):</p> \[ \log 2 \times \log 3 = 0.7615 \] \[ \log 2 \times \log 9 = 1.523 \]</li>
+    <li><p>The length of T4's vector is the square root of the sum of the squared weights:</p> \[ \sqrt{2 \times 0.7615^2 + 2 \times 1.523^2} \] \[ = \sqrt{5.799} = 2.408 \]</li>
+    <li><p>Divide every weight by the length — the cells printed on p. 563:</p> \[ \text{data:}\quad 0.7615 / 2.408 = 0.316 \] \[ \text{website:}\quad 1.523 / 2.408 = 0.632 \]</li>
+    <li><p>Same recipe for T1: the unique terms building, application and for weigh 1.523 each, data and mining 0.7615, and crm, in two titles, gets \(\log 2 \times \log 4.5 = 1.043\). The length:</p> \[ \sqrt{3 \times 1.523^2 + 2 \times 0.7615^2 + 1.043^2} \] \[ = \sqrt{9.206} = 3.034 \]</li>
+    <li><p>Divide: data and mining 0.251, crm 0.344, the unique words 0.502 — again the printed cells.</p> \[ 0.7615 / 3.034 = 0.251 \] \[ 1.043 / 3.034 = 0.344 \]</li>
+  </ol>
+
+  <div class="tip"><p>Check T4 without a calculator: since \(\log 9 = 2 \log 3\), its vector is proportional to (1, 1, 2, 2), of length \(\sqrt{10}\), so data \(= 1/\sqrt{10} = 0.316\) and website \(= 2/\sqrt{10} = 0.632\).</p></div>
+
+  <div class="pitfall"><p>"TF-IDF is one formula." No: the deck prints two TFs and two IDFs, and the table of p. 563 follows p. 562's pair only. With p. 560's fraction, relationship in T2 would be 0.556, not 0.468; with p. 561's IDF, data in T4 would be 0.302, not 0.316. At the exam, say which variant you use.</p></div>
+</section>
+
+
+<section id="l24-rank">
+  <h2>From vectors to a ranking</h2>
+
+  <p>The third line of p. 559 says "The distance between any pair of vectors is computed". Which distance? For unit vectors the Euclidean distance and the cosine similarity give the same ranking — four short steps show why.</p>
+
+  <figure class="fig fig--plain" id="l24-fig-cos">
+    <svg class="dia" viewBox="0 0 560 260" role="img" aria-label="Two unit vectors on a circle of radius 1, the query q and a document d, with the angle theta between them and the chord joining their tips: the chord is the distance, and distance squared equals 2 minus 2 cos theta">
+      <circle cx="140" cy="125" r="100" class="st-muted dash"/>
+      <line x1="140" y1="125" x2="188" y2="42" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="140" y1="125" x2="232" y2="92" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="190" y1="38" x2="234" y2="91" class="sw-2 dash"/>
+      <path d="M172 113.4 A34 34 0 0 0 157 95.6"/>
+      <circle cx="140" cy="125" r="3" class="fi-ink"/>
+      <text x="172" y="101" class="tx-mid">θ</text>
+      <text x="198" y="32" class="halo">query q</text>
+      <text x="242" y="118" class="halo">document d</text>
+      <text x="224" y="62" class="tx-sm halo">distance</text>
+      <text x="320" y="60" class="tx-sm">both have length 1</text>
+      <text x="320" y="152">distance² = 2 − 2 cos θ</text>
+      <text x="320" y="188">cos θ = q · d</text>
+      <text x="320" y="212" class="tx-sm tx-muted">the dot product</text>
+      <text x="320" y="248" class="tx-hand">smaller angle, closer</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The query \(\vb{q}\) and a document \(\vb{d}\) as unit vectors. The chord between their tips is the distance, and it grows with the angle: distance² = 2 − 2 cos θ. Rank by the shortest chord or by the largest cosine — the order is the same.</figcaption>
+  </figure>
+
+  <ol class="steps" id="l24-steps-cos">
+    <li><p>Write the squared distance between the query \(\vb{q}\) and a document \(\vb{d}\) as a dot product:</p> \[ \lVert \vb{q} - \vb{d} \rVert^2 = (\vb{q} - \vb{d}) \cdot (\vb{q} - \vb{d}) \]</li>
+    <li><p>Expand it as you would \((a - b)^2\):</p> \[ = \vb{q} \cdot \vb{q} - 2\, \vb{q} \cdot \vb{d} + \vb{d} \cdot \vb{d} \]</li>
+    <li><p>Both vectors are normed, so \(\vb{q} \cdot \vb{q} = \vb{d} \cdot \vb{d} = 1\); and for unit vectors the dot product is the cosine of the angle between them:</p> \[ \lVert \vb{q} - \vb{d} \rVert^2 = 2 - 2 \cos\theta \]</li>
+    <li><p>The distance falls exactly when the cosine rises. Ranking by the smallest distance or by the largest cosine gives the same order, and the one number to compute is \(\vb{q} \cdot \vb{d}\).</p></li>
+  </ol>
+
+  <aside class="margin-note">The same identity from Applied Statistics: on rows scaled to length 1, the Euclidean distance and the cosine distance \(1 - \cos\theta\) rank any pairs alike.</aside>
+
+  <p>So the score is the dot product, and for sparse vectors it is short: only terms both documents contain survive, every other product has a 0 in it. T1 and T4 share data and mining, each contributing \(0.251 \times 0.316\):</p>
+
+  \[ \begin{aligned} s(T_1, T_4) &amp;= 2 \times (0.251 \times 0.316) \\ &amp;= 0.159 \end{aligned} \]
+
+  <p>Repeat it for the other six titles and you get the ranking of p. 564:</p>
+
+  <figure class="tbl-fig" id="l24-tbl-rank">
+    <figcaption>The ranking of p. 564 with the scores computed from the table of p. 563 (the slide prints only the order).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl l24-rk">
+        <thead><tr><th>rank</th><th>title</th><th>dot product</th><th>score</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>#1</td><td>T4 Data Mining Your Website</td><td>data, mining: 2 × 0.251 × 0.316</td><td class="n">0.159</td></tr>
+          <tr><td>#2</td><td>T2 Accelerating Customer…</td><td>crm: 0.344 × 0.296</td><td class="n">0.102</td></tr>
+          <tr><td>#3</td><td>T3 Mastering Data Mining…</td><td>data, mining: 2 × 0.251 × 0.187</td><td class="n">0.094</td></tr>
+          <tr><td>—</td><td>Not recommended: T5, T6, T7, T8</td><td>none</td><td class="n">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The computed scores reproduce the printed order exactly. Now take the computation apart yourself.</p>
+
+  <div class="widget" id="l24-w-tfidf">
+    <h3 class="widget-title">The TF-IDF lab: eight titles, one query</h3>
+    <p class="widget-intro">The collection is the eight titles of p. 557; the query is any text you type, analysed like the titles (lower-cased, plurals stemmed). The bars rank the titles by the dot product of their normed vectors with the query's; the table below them shows each step for all 29 terms, with the explained title's column next to the query's and the cells of their shared terms highlighted. The three switches are the slides' other variants.</p>
+    <ol class="tasks">
+      <li>Leave the query at title 1 and the table at "normed TF-IDF". T3 and T4 share the same two words with it. Before you read the bars, predict which of the two scores higher. Then set "explain the score of" to T4 and to T3, and switch the table to "TF × IDF, before normalising".
+        <details class="answer"><summary>What you should see</summary>
+          <p>T4: 0.251 × 0.316 + 0.251 × 0.316 = 0.159. T3: 0.251 × 0.187 + 0.251 × 0.187 = 0.094. Before normalising, data shows the same 0.762 (0.7615 to four decimals) in both columns; the last row gives the lengths, 2.408 for T4 and 4.074 for T3. The division by the length is the whole difference.</p></details>
+      </li>
+      <li>Pick the query "customer relationship management" — what CRM stands for. Predict the #1 title, and the score of T1, the book whose title says CRM.
+        <details class="answer"><summary>What you should see</summary>
+          <p>#1 is T8, Customer knowledge management, with 0.503 (customer and management), then T3 with 0.407 and T2 with 0.393. T1 scores 0: its "crm" is another token. This is what the lab is built to show: a score is a sum over shared tokens, so a meaning that is not spelled the same way does not exist for it.</p></details>
+      </li>
+      <li>Back to title 1. Switch on "remove stop words, as p. 559 says". Predict: does the order of p. 564 — T4, T2, T3 — survive?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. T4 0.237, T3 0.134, T2 0.123: #2 and #3 swap, and the check readout no longer matches p. 563. The slide's own ranking is computed with every stop word kept.</p></details>
+      </li>
+      <li>Switch "remove stop words" off again, then switch on the TF of p. 560 and watch the readout "normed table vs p. 563". Switch it off and do the same with the IDF of p. 561. Which columns change each time?
+        <details class="answer"><summary>What you should see</summary>
+          <p>With p. 560's TF, 7 of the 232 printed cells differ, all in column T2 (relationship 0.556 instead of 0.468): in every other title each term occurs once, and the \(1/|d|\) cancels in the normalisation. With p. 561's IDF, 38 cells differ, in every column but T6, whose two words have the same df; data in T4 becomes 0.302. Only p. 562's pair reproduces the printed table.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l24-w-tfidf', function (root, ui) {
+    var TITLES = [
+      'Building data mining applications for CRM',
+      'Accelerating Customer Relationships: Using CRM and Relationship Technologies',
+      'Mastering Data Mining: The Art and Science of Customer Relationship Management',
+      'Data Mining Your Website',
+      'Introduction to marketing',
+      'Consumer behavior',
+      'marketing research, a handbook',
+      'Customer knowledge management'
+    ];
+    var SHORT = ['Building data mining applications for CRM', 'Accelerating Customer Relationships…', 'Mastering Data Mining: The Art…',
+      'Data Mining Your Website', 'Introduction to marketing', 'Consumer behavior', 'marketing research, a handbook', 'Customer knowledge management'];
+    var STOP = { a: 1, and: 1, 'for': 1, of: 1, the: 1, to: 1, your: 1 };
+    /* the normed table as printed on p. 563, columns T1 … T8 */
+    var PRINTED = {
+      a: [0, 0, 0, 0, 0, 0, 0.537, 0], accelerating: [0, 0.432, 0, 0, 0, 0, 0, 0], and: [0, 0.296, 0.256, 0, 0, 0, 0, 0],
+      application: [0.502, 0, 0, 0, 0, 0, 0, 0], art: [0, 0, 0.374, 0, 0, 0, 0, 0], behavior: [0, 0, 0, 0, 0, 0.707, 0, 0],
+      building: [0.502, 0, 0, 0, 0, 0, 0, 0], consumer: [0, 0, 0, 0, 0, 0.707, 0, 0], crm: [0.344, 0.296, 0, 0, 0, 0, 0, 0],
+      customer: [0, 0.216, 0.187, 0, 0, 0, 0, 0.381], data: [0.251, 0, 0.187, 0.316, 0, 0, 0, 0], 'for': [0.502, 0, 0, 0, 0, 0, 0, 0],
+      handbook: [0, 0, 0, 0, 0, 0, 0.537, 0], introduction: [0, 0, 0, 0, 0.636, 0, 0, 0], knowledge: [0, 0, 0, 0, 0, 0, 0, 0.763],
+      management: [0, 0, 0.256, 0, 0, 0, 0, 0.522], marketing: [0, 0, 0, 0, 0.436, 0, 0.368, 0], mastering: [0, 0, 0.374, 0, 0, 0, 0, 0],
+      mining: [0.251, 0, 0.187, 0.316, 0, 0, 0, 0], of: [0, 0, 0.374, 0, 0, 0, 0, 0], relationship: [0, 0.468, 0.256, 0, 0, 0, 0, 0],
+      research: [0, 0, 0, 0, 0, 0, 0.537, 0], science: [0, 0, 0.374, 0, 0, 0, 0, 0], technology: [0, 0.432, 0, 0, 0, 0, 0, 0],
+      the: [0, 0, 0.374, 0, 0, 0, 0, 0], to: [0, 0, 0, 0, 0.636, 0, 0, 0], using: [0, 0.432, 0, 0, 0, 0, 0, 0],
+      website: [0, 0, 0, 0.632, 0, 0, 0, 0], your: [0, 0, 0, 0.632, 0, 0, 0, 0]
+    };
+
+    function stem(w) {
+      if (w.length > 4 && /ies$/.test(w)) return w.slice(0, -3) + 'y';
+      if (/(xes|ches|shes|sses|zes)$/.test(w)) return w.slice(0, -2);
+      if (w.length > 3 && /s$/.test(w) && !/(ss|us|is)$/.test(w)) return w.slice(0, -1);
+      return w;
+    }
+    function tokens(text, dropStop) {
+      var raw = String(text || '').toLowerCase().match(/[a-z0-9]+/g) || [], out = [];
+      raw.forEach(function (t) { t = stem(t); if (!(dropStop && STOP[t])) out.push(t); });
+      return out;
+    }
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+    /* controls: a free query, presets, what the table shows, which score to explain, the slides' variants */
+    var qInput = Course.el('input', { type: 'text', id: 'l24-w-tfidf-query', 'class': 'l24-text', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+    qInput.value = TITLES[0];
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide' }, [
+      Course.el('label', { 'for': 'l24-w-tfidf-query' }, [Course.el('span', { 'class': 'ctl-label', text: 'query (type anything)' })]), qInput]));
+    var preset = ui.select('or pick a query', [
+      { value: '', label: '— pick a query —' },
+      { value: TITLES[0], label: 'title 1, the slide’s query (p. 564)' },
+      { value: 'customer relationship management', label: 'customer relationship management' },
+      { value: 'CRM', label: 'CRM' },
+      { value: 'data mining', label: 'data mining' },
+      { value: 'consumer marketing research', label: 'consumer marketing research' }
+    ], function (v) { if (v) qInput.value = v; }, TITLES[0]);
+    qInput.addEventListener('input', function () { preset.value = ''; ui.changed(); });
+    var view = ui.select('the table shows', [
+      { value: 'count', label: 'word counts (p. 558)' },
+      { value: 'tf', label: 'TF of each term' },
+      { value: 'idf', label: 'IDF of each term present' },
+      { value: 'raw', label: 'TF × IDF, before normalising' },
+      { value: 'norm', label: 'normed TF-IDF (p. 563)' }
+    ], null, 'norm');
+    var explain = ui.select('explain the score of', TITLES.map(function (t, j) { return { value: String(j), label: 'T' + (j + 1) + ' ' + SHORT[j] }; }), null, '3');
+    var tStop = ui.toggle('remove stop words, as p. 559 says', false);
+    var tTF = ui.toggle('TF = count / |d| (p. 560)', false);
+    var tIDF = ui.toggle('IDF = log(|D| / df) (p. 561)', false);
+
+    var roScore = ui.readout('score of the explained title (computed)');
+    var roQ = ui.readout('the query’s normed vector');
+    var roCheck = ui.readout('normed table vs p. 563');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'score against the query (computed; p. 564 prints only the order)', color: 's2', mark: 'square' },
+      { label: 'cell of a term shared by the query and the explained title', color: 'key', mark: 'area' }
+    ]);
+
+    var svgEl = ui.svg(560, 380, { label: 'The eight titles ranked by their score against the query: one bar per title with the score at its end; titles that share no term with the query are marked not recommended' });
+    var wrap = Course.el('div', { 'class': 'scroll-x l24-mxwrap' });
+    var table = Course.el('table', { 'class': 'tbl l24-mx' });
+    wrap.appendChild(table);
+    ui.stage.appendChild(wrap);
+
+    /* the model: the same arithmetic as pp. 558-563, with the switches deciding the variant */
+    function compute() {
+      var drop = tStop.value, frac = tTF.value, plain = tIDF.value;
+      var docs = TITLES.map(function (t) { return tokens(t, drop); });
+      var n = docs.length, df = {}, terms;
+      docs.forEach(function (ts) {
+        var seen = {};
+        ts.forEach(function (t) { if (!seen[t]) { seen[t] = 1; df[t] = (df[t] || 0) + 1; } });
+      });
+      terms = Object.keys(df).sort();
+      var idf = {};
+      terms.forEach(function (t) { idf[t] = plain ? Math.log(n / df[t]) : Math.log((n + 1) / df[t]); });
+      function weigh(ts) {
+        var c = {}, tf = {}, raw = {}, unit = {}, sq = 0;
+        ts.forEach(function (t) { c[t] = (c[t] || 0) + 1; });
+        Object.keys(c).forEach(function (t) {
+          tf[t] = frac ? c[t] / ts.length : Math.log(c[t] + 1);
+          if (idf[t] != null) { raw[t] = tf[t] * idf[t]; sq += raw[t] * raw[t]; }
+        });
+        var norm = Math.sqrt(sq);
+        Object.keys(raw).forEach(function (t) { unit[t] = norm > 0 ? raw[t] / norm : 0; });
+        return { c: c, len: ts.length, tf: tf, raw: raw, unit: unit, norm: norm };
+      }
+      var D = docs.map(weigh), Q = weigh(tokens(qInput.value, drop));
+      var unknown = Object.keys(Q.c).filter(function (t) { return idf[t] == null; }).sort();
+      var scores = D.map(function (d) {
+        var s = 0;
+        Object.keys(Q.unit).forEach(function (t) { if (d.unit[t]) s += Q.unit[t] * d.unit[t]; });
+        return s;
+      });
+      var self = scores.map(function (s) { return Q.norm > 0 && s > 0.99995; });
+      var diff = 0, total = 0;
+      Object.keys(PRINTED).forEach(function (t) {
+        PRINTED[t].forEach(function (v, j) {
+          total++;
+          var got = D[j].unit[t] || 0;
+          if (Math.abs(Math.round(got * 1000) / 1000 - v) > 0.0005) diff++;
+        });
+      });
+      return { terms: terms, df: df, idf: idf, D: D, Q: Q, unknown: unknown, scores: scores, self: self, diff: diff, total: total };
+    }
+
+    function drawRank(m) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var order = [0, 1, 2, 3, 4, 5, 6, 7].sort(function (a, b) {
+        var sa = m.self[a] ? -1 : m.scores[a], sb = m.self[b] ? -1 : m.scores[b];
+        return (sb - sa) || (a - b);
+      });
+      var max = 0, rank = 0;
+      order.forEach(function (j) { if (!m.self[j]) max = Math.max(max, m.scores[j]); });
+      order.forEach(function (j, i) {
+        var y = 8 + i * 46, s = m.scores[j], hit = !m.self[j] && s > 1e-12;
+        var head = m.self[j] ? '=' : hit ? '#' + (++rank) : '';
+        Course.svg('text', { x: 10, y: y + 16, 'class': 'tx-sm' + (hit || m.self[j] ? '' : ' tx-muted'), text: (head ? head + '  ' : '') + 'T' + (j + 1) + '  ' + SHORT[j] }, svgEl);
+        if (m.self[j]) {
+          Course.svg('text', { x: 10, y: y + 36, 'class': 'tx-sm tx-muted', text: 'the query itself: score 1, left out of the ranking' }, svgEl);
+        } else if (hit) {
+          var w = Math.max(3, 380 * s / (max > 0 ? max : 1));
+          Course.svg('rect', { x: 10, y: y + 24, width: w.toFixed(1), height: 12, 'class': 'fw-s2 st-s2' }, svgEl);
+          Course.svg('text', { x: (10 + w + 8).toFixed(1), y: y + 35, 'class': 'tx-mono tx-sm', text: Course.fmt(s, 3) }, svgEl);
+        } else {
+          Course.svg('line', { x1: 10, y1: y + 30, x2: 40, y2: y + 30, 'class': 'st-muted dash' }, svgEl);
+          Course.svg('text', { x: 50, y: y + 35, 'class': 'tx-sm tx-muted', text: '0 · no shared term · not recommended' }, svgEl);
+        }
+      });
+    }
+
+    var CAPS = {
+      count: 'Word counts, as on p. 558 (blank = 0); last row: the number of tokens',
+      tf: 'TF of each term in each document',
+      idf: 'IDF of each term, shown where the term occurs',
+      raw: 'TF × IDF before normalising; last row: the length of each vector',
+      norm: 'Normed TF-IDF, computed live: compare it with p. 563'
+    };
+    function value(d, t, mode, m) {
+      if (!d.c[t]) return null;
+      if (mode === 'count') return d.c[t];
+      if (mode === 'tf') return d.tf[t];
+      if (m.idf[t] == null) return null;
+      if (mode === 'idf') return m.idf[t];
+      if (mode === 'raw') return d.raw[t];
+      return d.unit[t];
+    }
+    function td(v, mode, hit) {
+      var cls = hit ? ' class="l24-hit"' : '';
+      if (v == null) return mode === 'norm' ? '<td class="l24-z' + (hit ? ' l24-hit' : '') + '">0.000</td>' : '<td' + cls + '></td>';
+      return '<td' + cls + '>' + (mode === 'count' ? String(v) : Course.fmt(v, 3)) + '</td>';
+    }
+    function drawTable(m) {
+      var k = +explain.value, mode = view.value, q = m.Q.c;
+      /* the explained title's column stands next to the query's: the two factors of each product side by side */
+      var cols = [k].concat([0, 1, 2, 3, 4, 5, 6, 7].filter(function (j) { return j !== k; }));
+      var h = '<caption>' + esc(CAPS[mode] + (mode === 'tf' ? (tTF.value ? ': count / |d| (p. 560)' : ': log(count + 1) (p. 562)') : mode === 'idf' ? (tIDF.value ? ': log(|D| / df) (p. 561)' : ': log((#docs + 1) / df) (p. 562)') : '')) + '</caption>';
+      h += '<thead><tr><th scope="col">term</th><th scope="col">df</th><th scope="col">query</th>';
+      cols.forEach(function (j) { h += '<th scope="col"' + (j === k ? ' class="l24-col"' : '') + ' title="' + esc(TITLES[j]) + '">T' + (j + 1) + '</th>'; });
+      h += '</tr></thead><tbody>';
+      m.terms.concat(m.unknown).forEach(function (t) {
+        var shared = !!(q[t] && m.D[k].c[t] && m.idf[t] != null);
+        h += '<tr><th scope="row"' + (q[t] ? ' class="l24-qt"' : '') + '>' + esc(t) + '</th><td>' + (m.df[t] || 0) + '</td>';
+        h += td(value(m.Q, t, mode, m), mode, shared);
+        cols.forEach(function (j) { h += td(value(m.D[j], t, mode, m), mode, shared && j === k); });
+        h += '</tr>';
+      });
+      h += '</tbody>';
+      if (mode === 'count' || mode === 'raw' || mode === 'norm') {
+        var lab = mode === 'count' ? 'tokens' : 'length';
+        var cellOf = function (d) { return mode === 'count' ? String(d.len) : Course.fmt(mode === 'raw' ? d.norm : (d.norm > 0 ? 1 : 0), 3); };
+        h += '<tfoot><tr><th scope="row">' + lab + '</th><td></td><td>' + cellOf(m.Q) + '</td>';
+        cols.forEach(function (j) { h += '<td>' + cellOf(m.D[j]) + '</td>'; });
+        h += '</tr></tfoot>';
+      }
+      table.innerHTML = h;
+    }
+
+    ui.onChange(function () {
+      var m = compute(), k = +explain.value, d = m.D[k], parts = [];
+      drawRank(m);
+      drawTable(m);
+      Object.keys(m.Q.unit).sort().forEach(function (t) {
+        if (d.unit[t]) parts.push(Course.fmt(m.Q.unit[t], 3) + ' × ' + Course.fmt(d.unit[t], 3) + ' (' + t + ')');
+      });
+      var who = 'T' + (k + 1) + ': ';
+      if (m.self[k]) roScore.set(who + '1.000, the query itself');
+      else if (!parts.length) roScore.set(who + '0, no term in common with the query');
+      else roScore.set(who + parts.join(' + ') + ' = ' + Course.fmt(m.scores[k], 3));
+      var qv = Object.keys(m.Q.unit).sort().map(function (t) { return t + ' ' + Course.fmt(m.Q.unit[t], 3); });
+      roQ.set(qv.length ? qv.join(' · ') : 'empty: no word of the query occurs in a title');
+      if (m.diff === 0) roCheck.set('all ' + m.total + ' printed cells reproduced', 'good');
+      else roCheck.set(m.diff + ' of ' + m.total + ' printed cells differ');
+      var s = [];
+      if (!tStop.value && !tTF.value && !tIDF.value) s.push('These are the slide’s own choices: TF = log(count + 1) and IDF = log((#docs + 1) / df) of p. 562, every stop word kept.');
+      if (tStop.value) s.push('Stop words removed (a, and, for, of, the, to, your), as p. 559 says, though not as its example does.');
+      if (tTF.value) s.push('TF = count / |d| of p. 560: only a title with a repeated term can change, and only T2 has one.');
+      if (tIDF.value) s.push('IDF = log(|D| / df) of p. 561: the ratios between rare and common terms change, so almost every weight moves.');
+      if (m.unknown.length) s.push('In no title, so no IDF and no match: ' + m.unknown.join(', ') + '.');
+      s.push('Scores are computed from the vectors; p. 564 prints only the order.');
+      note.set(esc(s.join(' ')));
+    });
+  });
+  </script>
+
+  <aside class="redpen" data-page="559">
+    <p class="claim">"Several words or «tokens» are not taken into account: rarely used or «stop words»"</p>
+    <p class="fix">The worked example that follows takes every token into account: a, and, for, of, the, to and your all have rows on pp. 558 and 563 ("a" weighs 0.537 in T7), and so do the 21 terms that occur in one title only. Removing tokens is an optional step before TF-IDF, not part of it.</p>
+    <p class="because">Apply the printed sentence and the printed results change: remove the seven stop words in the lab and T3 (0.134) overtakes T2 (0.123); drop the rarely used words too — here, the 21 terms of a single title — and T6, Consumer behavior, is left with no term at all. The exam may be matched against the printed wording: know the sentence, and know that the slide's own numbers keep every token.</p>
+  </aside>
+
+  <h3>Back to the puzzle</h3>
+
+  <p>Both questions of the opening now have answers. The same two words count for more in T4 because normalisation spreads each title's unit length over its terms, four in T4 and eleven in T3: 0.316 against 0.187 per word, 0.159 against 0.094 in total.</p>
+
+  <p>And CRM stays invisible because the system compares tokens, not meanings: "crm" and "customer relationship management" are different strings. T3's three spelled-out words earn it nothing, and T8's score is a sum over an empty set, exactly 0. Type the expansion into the lab and the picture turns over — T8 rises to #1 with 0.503, and the book that says "CRM" drops to 0 (Figure 5).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l24-fig-gap">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="The six tokens of T1 and the three tokens of T8 side by side with no line between them: they share no token, so the score is 0">
+        <rect x="10" y="32" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="60" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="88" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="116" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="144" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="172" width="100" height="22" class="fi-paper"/>
+        <rect x="190" y="32" width="100" height="22" class="fi-paper"/>
+        <rect x="190" y="60" width="100" height="22" class="fi-paper"/>
+        <rect x="190" y="88" width="100" height="22" class="fi-paper"/>
+        <text x="60" y="20" class="tx-sm tx-mid">query: T1</text>
+        <text x="240" y="20" class="tx-sm tx-mid">T8</text>
+        <text x="60" y="47" class="tx-mono tx-mid">building</text>
+        <text x="60" y="75" class="tx-mono tx-mid">data</text>
+        <text x="60" y="103" class="tx-mono tx-mid">mining</text>
+        <text x="60" y="131" class="tx-mono tx-mid">application</text>
+        <text x="60" y="159" class="tx-mono tx-mid">for</text>
+        <text x="60" y="187" class="tx-mono tx-mid">crm</text>
+        <text x="240" y="47" class="tx-mono tx-mid">customer</text>
+        <text x="240" y="75" class="tx-mono tx-mid">knowledge</text>
+        <text x="240" y="103" class="tx-mono tx-mid">management</text>
+        <text x="240" y="134" class="tx-sm tx-mid">score 0</text>
+        <text x="215" y="180" class="tx-hand tx-mid">nothing shared</text>
+      </svg>
+      <p class="fig-label">Before: the query T1</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="The expanded query customer relationship management and the three tokens of T8, joined by two lines, customer and management: the score is 0.503">
+        <line x1="110" y1="43" x2="190" y2="43" class="st-s2 sw-2"/>
+        <line x1="110" y1="99" x2="190" y2="99" class="st-s2 sw-2"/>
+        <rect x="10" y="32" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="60" width="100" height="22" class="fi-paper"/>
+        <rect x="10" y="88" width="100" height="22" class="fi-paper"/>
+        <rect x="190" y="32" width="100" height="22" class="fi-paper"/>
+        <rect x="190" y="60" width="100" height="22" class="fi-paper"/>
+        <rect x="190" y="88" width="100" height="22" class="fi-paper"/>
+        <text x="60" y="20" class="tx-sm tx-mid">expanded query</text>
+        <text x="240" y="20" class="tx-sm tx-mid">T8</text>
+        <text x="60" y="47" class="tx-mono tx-mid">customer</text>
+        <text x="60" y="75" class="tx-mono tx-mid">relationship</text>
+        <text x="60" y="103" class="tx-mono tx-mid">management</text>
+        <text x="240" y="47" class="tx-mono tx-mid">customer</text>
+        <text x="240" y="75" class="tx-mono tx-mid">knowledge</text>
+        <text x="240" y="103" class="tx-mono tx-mid">management</text>
+        <text x="240" y="134" class="tx-sm tx-mid">score 0.503</text>
+        <text x="215" y="180" class="tx-hand tx-mid">two shared</text>
+      </svg>
+      <p class="fig-label">After: CRM spelled out</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> The score is a sum over the lines, one line per shared term. Left: T1 and T8 have no token in common, so the sum is empty and the score is exactly 0, although CRM stands for customer relationship management. Right: spell CRM out and the query shares customer and management with T8 — 0.503, the top score in the lab.</figcaption>
+  </figure>
+
+  <p>Seeing that two strings mean the same thing needs a representation of meaning: embeddings, which place related texts close together whatever their spelling (<a href="l27.html">lesson 27</a>). If you met word embeddings in AN2DL, this is where they come back — compared with the same cosine.</p>
+
+  <p class="memo"><mark class="key">A lexical score is a sum over the shared terms: no shared token, no score — whatever the meaning.</mark></p>
+
+  <h3>What a real engine computes</h3>
+
+  <p>Page 560 opens by saying where TF-IDF is used: in the scoring function of Lucene, the search library inside Elasticsearch. The idea is right; the name is out of date.</p>
+
+  <aside class="redpen" data-page="560">
+    <p class="claim">"Results are scored with Lucene’s Practical Scoring Function, which uses TF-IDF"</p>
+    <p class="fix">Since Elasticsearch 5.0 (October 2016) the default similarity is BM25, which keeps the TF and IDF ideas but weighs them differently. The practical scoring function was the default only up to the 2.x versions.</p>
+    <p class="because">The 5.0 release announcement: "The default relevance calculation has been changed from TF/IDF to the more modern BM25". BM25 still makes rare terms weigh more and long fields less, but lets term frequency saturate: a tenth repetition adds far less than a second. The exam may be matched against the printed wording: asked what the slides say, answer TF-IDF and Lucene's practical scoring function; know that Elasticsearch now computes BM25.</p>
+  </aside>
+
+  <p>In Elasticsearch you never compute these weights yourself: a <code>match</code> query (<a href="l26.html">lesson 26</a>) returns the titles that share a term with the query, sorted by BM25 score — T8 would not even be listed.</p>
+</section>
+
+
+<section id="l24-index">
+  <h2>Under the hood: an index turned inside out</h2>
+
+  <p>So far you looked at every title. "On the internet, time affects attention", p. 565 warns: "attention is money", and "search engines need to respond in tenths of a second". Reading every document at query time is out of the question; the answer must be prepared before the query arrives.</p>
+
+  <p>The preparation is the <mark class="key">inverted index</mark>, "the building blocks of search engines", "made of mappings: TermIDs =&gt; DocumentIDs" (p. 566). It is the index at the back of a textbook: you do not read four hundred pages to find "mitochondria", you look the word up and get a list of pages.</p>
+
+  <div class="def">
+    <p><dfn>Inverted index</dfn> — for every term, the list of the documents that contain it, called its <dfn>posting list</dfn>. "Inverted" because a document naturally lists its words; the index lists, for each word, its documents.</p>
+  </div>
+
+  <p>Page 568 builds one from "The quick brown fox jumped over the lazy dog" and "Quick brown foxes leap over lazy dogs in summer". The index "Lists every unique word from every document and identifies which documents a word appears in": "quick" -&gt; D1,D2, "fox" -&gt; D1, "summer" -&gt; D2… Two entries reveal what the slide does not say. "quick" -&gt; D1,D2, though D2 writes Quick: the index lower-cased. "fox" -&gt; D1 only, though D2 has foxes: no stemming, so foxes is another term. An index finds exactly the token it stored, so the query must be cut the same way — what Elasticsearch calls analysis (<a href="l25.html">lesson 25</a>).</p>
+
+  <div class="widget" id="l24-w-index">
+    <h3 class="widget-title">Build an inverted index and join two posting lists</h3>
+    <p class="widget-intro">Three short documents: the two of p. 568 and a third that is yours. The two switches decide how text is cut into terms, for the documents and for the query alike. The drawing shows the posting list of each query term and the joined result; the table below it is the whole index, as the engine stores it.</p>
+    <ol class="tasks">
+      <li>With the slide's settings (lower-case on, stemming off), predict the answer to "quick fox" before you look.
+        <details class="answer"><summary>What you should see</summary>
+          <p>D1 only. quick -&gt; D1, D2, but fox -&gt; D1: D2 says "foxes", which this index keeps as a different term. The engine answered from two posting lists without opening a document — and it found exactly the tokens it stored. That is the insight of this widget.</p></details>
+      </li>
+      <li>Switch on stemming. Which posting lists change, and what does "quick fox" return now?
+        <details class="answer"><summary>What you should see</summary>
+          <p>fox gains D2 (foxes → fox) and dog gains D2 (dogs → dog); the index shrinks from 13 terms to 11, and "quick fox" returns D1 and D2. The query was stemmed too: documents and query must be analysed the same way.</p></details>
+      </li>
+      <li>Switch stemming off again and lower-casing off. Predict the posting list of "quick".
+        <details class="answer"><summary>What you should see</summary>
+          <p>quick -&gt; D1 only, and a separate term Quick -&gt; D2; The and the split as well, both in D1. "quick fox" still returns D1, but a user who types "Quick fox" gets nothing: Quick is only in D2, fox only in D1.</p></details>
+      </li>
+      <li>Lower-case on, stemming off. Type a third document, "A quick dog", then ask "quick dog" with AND and with OR.
+        <details class="answer"><summary>What you should see</summary>
+          <p>AND gives D1 and D3 (quick -&gt; D1, D2, D3; dog -&gt; D1, D3); OR gives all three, the union. Switch stemming on and the AND gives all three as well, because "dogs" in D2 becomes dog.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l24-w-index', function (root, ui) {
+    function stem(w) {
+      if (w.length > 4 && /ies$/i.test(w)) return w.slice(0, -3) + 'y';
+      if (/(xes|ches|shes|sses|zes)$/i.test(w)) return w.slice(0, -2);
+      if (w.length > 3 && /s$/i.test(w) && !/(ss|us|is)$/i.test(w)) return w.slice(0, -1);
+      return w;
+    }
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function short(t) { return t.length > 9 ? t.slice(0, 8) + '…' : t; }
+    function field(id, label, val, hint) {
+      var inp = Course.el('input', { type: 'text', id: id, 'class': 'l24-text', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false' });
+      inp.value = val;
+      if (hint) inp.setAttribute('placeholder', hint);
+      inp.addEventListener('input', function () { ui.changed(); });
+      ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide' }, [
+        Course.el('label', { 'for': id }, [Course.el('span', { 'class': 'ctl-label', text: label })]), inp]));
+      return inp;
+    }
+    var docsIn = [
+      field('l24-w-index-d1', 'Document 1 (p. 568)', 'The quick brown fox jumped over the lazy dog'),
+      field('l24-w-index-d2', 'Document 2 (p. 568)', 'Quick brown foxes leap over lazy dogs in summer'),
+      field('l24-w-index-d3', 'Document 3 (yours)', '', 'type a third document, e.g. A quick dog')
+    ];
+    var tLower = ui.toggle('lower-case every term, as the slide does', true);
+    var tStem = ui.toggle('stem plurals: foxes → fox, dogs → dog', false);
+    var qIn = field('l24-w-index-q', 'query', 'quick fox');
+    var join = ui.select('join the posting lists with', [
+      { value: 'and', label: 'AND: intersection' },
+      { value: 'or', label: 'OR: union' }
+    ], null, 'and');
+
+    var roTerms = ui.readout('query terms after analysis');
+    var roLists = ui.readout('posting lists read');
+    var roRes = ui.readout('result');
+    var roSize = ui.readout('terms in the index', { digits: 0 });
+    var note = ui.note('');
+    ui.legend([
+      { label: 'posting list entry (the index)', color: 's3', mark: 'square' },
+      { label: 'document returned by the join', color: 's2', mark: 'square' }
+    ]);
+    var svgEl = ui.svg(560, 240, { label: 'The posting list of each query term, one row per term, with a box under D1, D2 or D3 when that document contains the term, and a last row with the documents the join returns' });
+    var wrap = Course.el('div', { 'class': 'scroll-x l24-ixwrap' });
+    var table = Course.el('table', { 'class': 'tbl l24-ix' });
+    wrap.appendChild(table);
+    ui.stage.appendChild(wrap);
+
+    function analyse(text) {
+      var m = String(text || '').match(/[A-Za-z0-9]+/g) || [];
+      return m.map(function (t) { if (tLower.value) t = t.toLowerCase(); if (tStem.value) t = stem(t); return t; });
+    }
+    function build() {
+      var docs = docsIn.map(function (inp) { return analyse(inp.value); });
+      var present = docs.map(function (ts) { return ts.length > 0; });
+      var index = {};
+      docs.forEach(function (ts, j) {
+        ts.forEach(function (t) {
+          var p = index.hasOwnProperty(t) ? index[t] : (index[t] = []);
+          if (p[p.length - 1] !== j) p.push(j);
+        });
+      });
+      var terms = Object.keys(index).sort(function (a, b) {
+        var la = a.toLowerCase(), lb = b.toLowerCase();
+        return la < lb ? -1 : la > lb ? 1 : (a < b ? -1 : a > b ? 1 : 0);
+      });
+      var q = [], seen = {};
+      analyse(qIn.value).forEach(function (t) { if (!seen[t]) { seen[t] = 1; q.push(t); } });
+      var lists = q.map(function (t) { return index.hasOwnProperty(t) ? index[t] : []; });
+      var result = [];
+      if (q.length) {
+        for (var j = 0; j < 3; j++) {
+          var inAll = lists.every(function (l) { return l.indexOf(j) >= 0; });
+          var inAny = lists.some(function (l) { return l.indexOf(j) >= 0; });
+          if (join.value === 'and' ? inAll : inAny) result.push(j);
+        }
+      }
+      return { docs: docs, present: present, index: index, terms: terms, q: q, lists: lists, result: result, op: join.value };
+    }
+    function D(j) { return 'D' + (j + 1); }
+
+    function drawJoin(m) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var X = [215, 305, 395], top = 34, rowH = 44, shown = m.q.slice(0, 6), j;
+      for (j = 0; j < 3; j++) Course.svg('text', { x: X[j] + 35, y: 20, 'class': 'tx-sm tx-mid tx-muted', text: D(j) + (m.present[j] ? '' : ' empty') }, svgEl);
+      if (!shown.length) Course.svg('text', { x: 20, y: top + 18, 'class': 'tx-sm tx-muted', text: 'type a query to see its posting lists' }, svgEl);
+      shown.forEach(function (t, i) {
+        var y = top + i * rowH, list = m.index.hasOwnProperty(t) ? m.index[t] : [], known = list.length > 0;
+        Course.svg('rect', { x: 20, y: y, width: 130, height: 26, 'class': known ? 'fi-paper sw-2' : 'fi-paper st-muted dash' }, svgEl);
+        Course.svg('text', { x: 85, y: y + 18, 'class': 'tx-mono tx-mid' + (known ? '' : ' tx-muted'), text: short(t) }, svgEl);
+        if (!known) { Course.svg('text', { x: X[0], y: y + 18, 'class': 'tx-sm tx-muted', text: 'in no document' }, svgEl); return; }
+        Course.svg('line', { x1: 154, y1: y + 13, x2: 204, y2: y + 13, 'class': 'st-s3 sw-2', 'marker-end': 'url(#arr-s3)' }, svgEl);
+        for (var c = 0; c < 3; c++) {
+          if (!m.present[c]) continue;
+          var on = list.indexOf(c) >= 0;
+          Course.svg('rect', { x: X[c], y: y, width: 70, height: 26, 'class': on ? 'fw-s3 st-s3' : 'st-muted dash' }, svgEl);
+          if (on) Course.svg('text', { x: X[c] + 35, y: y + 18, 'class': 'tx-mono tx-mid', text: D(c) }, svgEl);
+        }
+      });
+      var yr = top + Math.max(1, shown.length) * rowH + 14;
+      Course.svg('line', { x1: 20, y1: yr - 9, x2: 470, y2: yr - 9, 'class': 'st-line' }, svgEl);
+      Course.svg('rect', { x: 20, y: yr, width: 130, height: 26, 'class': 'fi-paper sw-2' }, svgEl);
+      Course.svg('text', { x: 85, y: yr + 18, 'class': 'tx-mid tx-bold', text: m.op === 'and' ? 'AND' : 'OR' }, svgEl);
+      Course.svg('line', { x1: 154, y1: yr + 13, x2: 204, y2: yr + 13, 'class': 'sw-2', 'marker-end': 'url(#arr)' }, svgEl);
+      for (j = 0; j < 3; j++) {
+        if (!m.present[j]) continue;
+        var hit = m.result.indexOf(j) >= 0;
+        Course.svg('rect', { x: X[j], y: yr, width: 70, height: 26, 'class': hit ? 'fw-s2 st-s2 sw-2' : 'st-muted dash' }, svgEl);
+        if (hit) Course.svg('text', { x: X[j] + 35, y: yr + 18, 'class': 'tx-mono tx-mid tx-bold', text: D(j) }, svgEl);
+      }
+      if (shown.length && !m.result.length) Course.svg('text', { x: X[0], y: yr + 50, 'class': 'tx-sm tx-muted', text: 'no document qualifies' }, svgEl);
+      if (m.q.length > shown.length) Course.svg('text', { x: 20, y: yr + 72, 'class': 'tx-sm tx-muted', text: '+ ' + (m.q.length - shown.length) + ' more, joined too' }, svgEl);
+      var H = yr + 92;
+      Course.svg('text', { x: 548, y: H - 12, 'class': 'tx-hand tx-end', text: 'no document opened' }, svgEl);
+      svgEl.setAttribute('viewBox', '0 0 560 ' + H);
+    }
+
+    function drawTable(m) {
+      var qs = {}, h = '<caption>The whole index, in dictionary order</caption>';
+      m.q.forEach(function (t) { qs[t] = 1; });
+      h += '<thead><tr><th scope="col">term</th><th scope="col">posting list</th><th scope="col">df</th></tr></thead><tbody>';
+      if (!m.terms.length) h += '<tr><td colspan="3">all three documents are empty</td></tr>';
+      m.terms.forEach(function (t) {
+        h += '<tr' + (qs[t] ? ' class="is-key"' : '') + '><td>"' + esc(t) + '"</td><td>' + m.index[t].map(D).join(', ') + '</td><td>' + m.index[t].length + '</td></tr>';
+      });
+      table.innerHTML = h + '</tbody>';
+    }
+
+    ui.onChange(function () {
+      var m = build();
+      drawJoin(m);
+      drawTable(m);
+      roTerms.set(m.q.length ? esc(m.q.join(' · ')) : '—');
+      roLists.set(m.q.length ? esc(m.q.map(function (t, i) { return t + ' → ' + (m.lists[i].length ? m.lists[i].map(D).join(', ') : 'none'); }).join(' · ')) : '—');
+      roRes.set(!m.q.length ? '—' : m.result.length ? m.result.map(D).join(', ') : 'no document', m.result.length ? 'good' : '');
+      roSize.set(m.terms.length);
+      var tips = [];
+      m.q.forEach(function (t) {
+        if (m.index.hasOwnProperty(t)) return;
+        var base = stem(t.toLowerCase()), twins = m.terms.filter(function (u) { return u !== t && stem(u.toLowerCase()) === base; });
+        if (twins.length) tips.push('"' + t + '" is not in the index, but ' + twins.map(function (u) { return '"' + u + '"'; }).join(' and ') + ' is: the same word, cut differently.');
+        else tips.push('"' + t + '" is in no document.');
+      });
+      m.q.forEach(function (t, i) {
+        if (!m.lists[i].length) return;
+        var twins = m.terms.filter(function (u) { return u !== t && stem(u.toLowerCase()) === stem(t.toLowerCase()); });
+        if (!twins.length) return;
+        /* which analysis step would make the two spellings one term: Quick/quick needs lower-casing, foxes/fox stemming, Dogs/dog both */
+        var need = {};
+        twins.forEach(function (u) {
+          if (u.toLowerCase() === t.toLowerCase()) need.lc = 1;
+          else if (stem(u) === stem(t)) need.st = 1;
+          else { need.lc = 1; need.st = 1; }
+        });
+        var how = need.lc && need.st ? 'lower-casing and stemming' : need.lc ? 'lower-casing' : 'stemming';
+        tips.push('"' + t + '" has a twin in the index, ' + twins.map(function (u) { return '"' + u + '"'; }).join(' and ') + ', with its own posting list: switch on ' + how + ' to merge them.');
+      });
+      tips.push('The answer comes from the posting lists alone: no document is opened.');
+      note.set(esc(tips.join(' ')));
+    });
+  });
+  </script>
+
+  <h3>A query is a join of posting lists</h3>
+
+  <p>"Computing retrieval function involves: finding all documents containing set of terms, i.e. computing a join over the posting lists" (p. 567). For "quick fox" the engine intersects two short lists, D1, D2 and D1: the answer is D1 — in SQL terms, a join on the document id. With both lists sorted by document id, one pass over each suffices, and no document is opened (background, not on the slide). OR takes the union; only its documents get scored.</p>
+
+  <h3>Small enough to stay in memory</h3>
+
+  <p>The lists must be small and quick to read. Page 566: they are "compressed with integer compression algorithms that allow for fast decompression, take statistics of text into account, are in blocks to allow for easy reading" — and "why compressed? to reduce the amount of space in memory". An index that fits in RAM is read at memory speed, and decompressing a block costs less than fetching it from disk.</p>
+
+  <p>One common trick (background, not on the slide) shows what "statistics of text" can mean: store a sorted id list as the gaps between ids. A frequent term's ids lie close together, so the gaps are small numbers needing few bits (Figure 6, left).</p>
+
+  <h3>Stopping early</h3>
+
+  <p>Page 567 adds a second speed-up: "Entries in the posting list are sorted from most important documents (with highest term counts) to least", which "allows for early termination". The engine computes "bounds on scores" — the best score an unread document could still reach — and when that bound cannot beat the results found, it skips the rest: "lower ranked documents dropped as early as possible". The last bullet adds <mark class="key">index pruning</mark> techniques, which "get rid of documents that would never be retrieved for a certain query": their entries are never read at all. The top 10 of a billion cost a small fraction of the billion.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l24-fig-postings">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="A posting list sorted by document id, 3, 7, 8, 15, 21, 22, stored as the gaps 3, 4, 1, 7, 6, 1 in two blocks of three">
+        <rect x="8" y="24" width="56" height="22" class="fi-paper"/>
+        <line x1="66" y1="35" x2="84" y2="35" class="st-s3" marker-end="url(#arr-s3)"/>
+        <rect x="92" y="24" width="30" height="22" class="fi-paper st-s3"/>
+        <rect x="126" y="24" width="30" height="22" class="fi-paper st-s3"/>
+        <rect x="160" y="24" width="30" height="22" class="fi-paper st-s3"/>
+        <rect x="194" y="24" width="30" height="22" class="fi-paper st-s3"/>
+        <rect x="228" y="24" width="30" height="22" class="fi-paper st-s3"/>
+        <rect x="262" y="24" width="30" height="22" class="fi-paper st-s3"/>
+        <rect x="92" y="86" width="30" height="22" class="fw-s3 st-s3"/>
+        <rect x="126" y="86" width="30" height="22" class="fw-s3 st-s3"/>
+        <rect x="160" y="86" width="30" height="22" class="fw-s3 st-s3"/>
+        <rect x="194" y="86" width="30" height="22" class="fw-s3 st-s3"/>
+        <rect x="228" y="86" width="30" height="22" class="fw-s3 st-s3"/>
+        <rect x="262" y="86" width="30" height="22" class="fw-s3 st-s3"/>
+        <path d="M92 114 v6 h94 v-6" class="st-muted"/>
+        <path d="M194 114 v6 h98 v-6" class="st-muted"/>
+        <text x="92" y="14" class="tx-sm">document ids, increasing</text>
+        <text x="36" y="39" class="tx-mono tx-mid">data</text>
+        <text x="107" y="39" class="tx-mono tx-mid">3</text>
+        <text x="141" y="39" class="tx-mono tx-mid">7</text>
+        <text x="175" y="39" class="tx-mono tx-mid">8</text>
+        <text x="209" y="39" class="tx-mono tx-mid">15</text>
+        <text x="243" y="39" class="tx-mono tx-mid">21</text>
+        <text x="277" y="39" class="tx-mono tx-mid">22</text>
+        <text x="92" y="76" class="tx-sm">stored as gaps: id − previous id</text>
+        <text x="107" y="101" class="tx-mono tx-mid">3</text>
+        <text x="141" y="101" class="tx-mono tx-mid">4</text>
+        <text x="175" y="101" class="tx-mono tx-mid">1</text>
+        <text x="209" y="101" class="tx-mono tx-mid">7</text>
+        <text x="243" y="101" class="tx-mono tx-mid">6</text>
+        <text x="277" y="101" class="tx-mono tx-mid">1</text>
+        <text x="139" y="136" class="tx-sm tx-mid tx-muted">block</text>
+        <text x="243" y="136" class="tx-sm tx-mid tx-muted">block</text>
+        <text x="150" y="176" class="tx-hand tx-mid">small numbers, few bits</text>
+        <text x="150" y="212" class="tx-sm tx-mid">read and decoded a block at a time</text>
+      </svg>
+      <p class="fig-label">Sorted by document id: small gaps</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="A posting list sorted from the highest term count to the lowest, D7 5, D2 4, D9 2, D4 1, D1 1, D5 1; for a top 3 the engine stops after the third entry and skips the rest">
+        <rect x="8" y="24" width="56" height="22" class="fi-paper"/>
+        <line x1="66" y1="35" x2="80" y2="35" class="st-s3" marker-end="url(#arr-s3)"/>
+        <rect x="84" y="24" width="32" height="22" class="fw-s2 st-s2"/>
+        <rect x="120" y="24" width="32" height="22" class="fw-s2 st-s2"/>
+        <rect x="156" y="24" width="32" height="22" class="fw-s2 st-s2"/>
+        <rect x="192" y="24" width="32" height="22" class="fi-paper st-muted dash"/>
+        <rect x="228" y="24" width="32" height="22" class="fi-paper st-muted dash"/>
+        <rect x="264" y="24" width="32" height="22" class="fi-paper st-muted dash"/>
+        <line x1="190" y1="16" x2="190" y2="86" class="sw-2 dash"/>
+        <text x="84" y="14" class="tx-sm">highest term count first</text>
+        <text x="36" y="39" class="tx-mono tx-mid">data</text>
+        <text x="100" y="39" class="tx-mono tx-mid">D7</text>
+        <text x="136" y="39" class="tx-mono tx-mid">D2</text>
+        <text x="172" y="39" class="tx-mono tx-mid">D9</text>
+        <text x="208" y="39" class="tx-mono tx-mid tx-muted">D4</text>
+        <text x="244" y="39" class="tx-mono tx-mid tx-muted">D1</text>
+        <text x="280" y="39" class="tx-mono tx-mid tx-muted">D5</text>
+        <text x="8" y="66" class="tx-sm">count</text>
+        <text x="100" y="66" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="136" y="66" class="tx-mono tx-sm tx-mid">4</text>
+        <text x="172" y="66" class="tx-mono tx-sm tx-mid">2</text>
+        <text x="208" y="66" class="tx-mono tx-sm tx-mid tx-muted">1</text>
+        <text x="244" y="66" class="tx-mono tx-sm tx-mid tx-muted">1</text>
+        <text x="280" y="66" class="tx-mono tx-sm tx-mid tx-muted">1</text>
+        <text x="190" y="116" class="tx-hand tx-mid">stop here</text>
+        <text x="150" y="160" class="tx-sm tx-mid">top 3 wanted: the entries left have</text>
+        <text x="150" y="178" class="tx-sm tx-mid">lower counts, so they are skipped</text>
+      </svg>
+      <p class="fig-label">Sorted by importance: early stop</p>
+    </div>
+    <figcaption><b>Fig. 6.</b> Two ways to store one posting list. Left: ids in increasing order, stored as gaps — small integers that compress well, kept in blocks that are read as a unit (p. 566). Right: the slide's order (p. 567), most important documents first — once the entries still unread cannot beat the results found, the engine stops reading. One query term here; with several, the engine keeps a bound for each.</figcaption>
+  </figure>
+
+  <details class="why">
+    <summary>Sorted by importance, or by document id?</summary>
+    <p>Document-id order gives small gaps and one-pass intersections; importance order brings the best documents first. Lucene, inside Elasticsearch, keeps document-id order and stores per block the best score a document in it could reach, skipping blocks that cannot reach the top — both ideas at once (background, not on the slide). At the exam write the slide's version, knowing it is one of two layouts.</p>
+  </details>
+
+  <p class="memo"><mark class="key">The inverted index answers from term lists, never from the documents: the lists are joined, compressed to stay in memory, and ordered so that the engine can stop early.</mark></p>
+</section>
+
+
+<section id="l24-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+  <p>Theory questions in the forms the readme of the past papers names — multiple choice, true/false and open answers; wrong answers may carry a penalty — plus a short computation of the kind the slides make, and one practical exercise in the wording of a past paper.</p>
+
+  <div class="exam" data-kind="mcq" id="l24-exam-intent">
+    <div class="exam-q" lang="en">
+      <p>Which pairing of a search query with its intent type agrees with the definitions of the lecture?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>"buy new iPhone 16 now" — commercial/investigational <span class="fb">The user is ready to complete an action, buying: transactional.</span></li>
+      <li>"Facebook login page" — informational <span class="fb">The user wants to go to a specific website: navigational.</span></li>
+      <li data-correct>"best laptop for students" — commercial/investigational <span class="fb">The user is considering a purchase and wants to compare options or research products (p. 553).</span></li>
+      <li>"How does user intent work?" — navigational <span class="fb">The user wants to learn something: informational.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The third. A user searching "best laptop for students" is considering a purchase and wants to compare options or research products: commercial/investigational intent. The other three queries are transactional ("buy new iPhone 16 now"), navigational ("Facebook login page") and informational ("How does user intent work?").</p></div>
+      <div class="exam-note"><p>These are the slide's own four examples, shuffled. The trap is telling commercial (still comparing) from transactional (ready to act). Wrong answers may carry a penalty: tick only what you can justify.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l24-exam-cos">
+    <div class="exam-q" lang="en">
+      <p>True or false: with the normed TF-IDF vectors of the lecture, ranking documents by their Euclidean distance from the query vector gives the same order as ranking them by cosine similarity.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">For unit vectors the squared distance is 2 − 2 cos θ: it shrinks exactly when the cosine grows.</span></li>
+      <li>False <span class="fb">That would hold for raw vectors of different lengths, where a long document is far from everything; normalisation removes the length.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True. After normalisation every vector has length 1, so</p>
+        \[ \lVert \vb{q} - \vb{d} \rVert^2 = \vb{q} \cdot \vb{q} - 2\, \vb{q} \cdot \vb{d} + \vb{d} \cdot \vb{d} \]
+        \[ = 2 - 2\cos\theta . \]
+        <p>A smaller distance means a larger cosine, so both criteria give the same ranking, and the score to compute is the dot product of the normed vectors.</p></div>
+      <div class="exam-note"><p>If the question comes as an open one, write the one-line derivation, not only the verdict. Without normalisation the two orders can differ: a long document is far from every short query even when it points the same way.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.316" data-tol="0.002" id="l24-exam-dish">
+    <div class="exam-q" lang="en">
+      <p>Consider the Dish entity of the restaurant ER diagram of the exam of 6 Sept 2024: Dish (Dish_ID, Name, Price, Recipe, Description). Three dishes are named D1 "grilled salmon", D2 "salmon tartare with avocado" and D3 "grilled octopus". Treat each name as a document (lower-case, no stemming, every word kept) and use the formulas of the lecture: TF = log(count + 1), IDF = log((#docs + 1) / #docs-the-term-occurs-in), then normalise each vector to length 1. Which dish is the most similar to D1? Enter its similarity score with three decimals.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>#docs = 3. df: grilled 2, salmon 2, tartare 1, with 1, avocado 1, octopus 1. IDF: df 2 gives log(4/2) = log 2, df 1 gives log 4 = 2 log 2. Every count is 1, so TF = log 2 for every term, and each raw weight is (log 2)² times 1 (df 2) or times 2 (df 1); the common factor cancels in the normalisation.</p>
+        <p>D1 is proportional to (grilled 1, salmon 1): 0.707 each. D2 is proportional to (salmon 1, tartare 2, with 2, avocado 2), length √13: salmon 0.277. D3 is proportional to (grilled 1, octopus 2), length √5: grilled 0.447.</p>
+        <p>sim(D1, D2) = 0.707 × 0.277 = 0.196; sim(D1, D3) = 0.707 × 0.447 = 0.316. D3 is the most similar, with 0.316.</p>
+      </div>
+      <div class="exam-note"><p>The scenario comes from the paper; the question does not — no past paper asks for a TF-IDF computation. Show the order TF, IDF, normalisation, and let the dot product run over the shared terms only. Both rivals share one word with D1; the shorter name keeps more weight per word — T4's advantage on p. 563 again. The base of the logarithm cancels.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l24-exam-weights">
+    <div class="exam-q" lang="en">
+      <p>Using the formulas of the lecture (TF = log(count + 1), IDF = log((#docs + 1) / #docs-the-term-occurs-in), then normalisation), explain why the word "data" has weight 0.316 in the title "Data Mining Your Website" but 0.187 in "Mastering Data Mining: The Art and Science of Customer Relationship Management". What would the second weight become if the word "the" were removed from that title?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>In both titles "data" occurs once, so TF = log 2, and it occurs in 3 of the 8 titles, so IDF = log(9/3) = log 3: the raw weight is the same, log 2 × log 3 = 0.7615. The difference comes from the normalisation, which divides each weight by the Euclidean length of the whole title vector: 2.408 for the four-term title, 4.074 for the eleven-term one. So 0.7615 / 2.408 = 0.316 and 0.7615 / 4.074 = 0.187: the same word counts for more in a short document. Removing "the" removes one raw weight of 1.523 from the sum under the square root: the length drops to √(16.598 − 2.320) = 3.779, and "data" rises to 0.7615 / 3.779 = 0.202, although its TF and IDF do not change.</p></div>
+      <div class="exam-note"><p>Three things to say: same TF, same IDF, different length. The trap in the second part is to think the weight of "data" cannot change because nothing about "data" changed — normalisation couples every word of a document.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l24-exam-index">
+    <div class="exam-q" lang="en">
+      <p>What is an inverted index? Explain how a search engine uses it to answer a query with several terms, and why, according to the lecture, its posting lists are compressed and sorted from the most important documents to the least.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>An inverted index is the building block of a search engine: a mapping from each term (TermID) to the list of the documents that contain it (DocumentIDs), its posting list. It is called inverted because it turns the natural direction, document to words, into word to documents. To answer a query with several terms, the engine finds all documents containing the set of terms by computing a join over their posting lists — the intersection for AND, the union for OR — without reading the documents. Search engines must respond in tenths of a second, so the lists are compressed with integer compression algorithms that allow fast decompression, take the statistics of text into account and are organised in blocks for easy reading; the reason is to reduce the space in memory, so that the index is kept and read in RAM. Sorting each posting list from the most important documents (highest term counts) to the least allows early termination: the engine computes bounds on the scores that the remaining documents could reach and drops lower-ranked documents as early as possible, while index pruning removes entries that would never be retrieved for a query.</p></div>
+      <div class="exam-note"><p>Four things to cover: the mapping, the join, why compression (memory, hence speed) and early termination. With time to spare, add the hidden assumption of the slide's example: "fox" -&gt; D1 only, because the index did not stem "foxes".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="1" id="l24-exam-table">
+    <div class="exam-q" lang="en">
+      <p><b>Exam of 24 June 2024, exercise 1.</b> Consider the ER diagram representing a data structure for tracking Disney's digital products. Company Section (ID, Name, Description, Number of Employees); Digital Content (Title, Release Date, Duration, Production Cost, Minimum Age), with the sub-entities Series (Number of Episodes, …) and Movie (Sequence Number, Nominated for Award (Yes/No), …), (T, E), and Animated Movie (…), a sub-entity of Movie, (P, O); Character (Name, Nickname, Age); Actor (Personal ID, Name, Surname, Age, Birth Date, Career Description), with the sub-entity Voice Actor (Voice Tone, Voice Strength (from -5 to 5)), (P, O); Script (ID, Length, Duration, Title); Location (ID, Name, Description, Furniture (Text), Indoor (Yes/No)); Line (ID, Sequence Number, Text). Relationships: Play, Character (1:1) – Actor (1:N); Involve, Character (1:N) – Digital Content (1:N); Produce, Company Section (1:N) – Digital Content (1:N), with Starting Date and End Date; Describe, Digital Content (1:N) – Script (1:1); Include, Script (1:N) – Line (1:1); Perform, Actor (1:N) – Line (1:1), with Recording Date; Located, Script (1:N) – Location (1:1).</p>
+      <p>Which DB technology would be the best to store the entities/rel. of the ER diagram? [you may not need all the rows of the table] (1 PT) — ENTITIES / REL. | DB TYPE | MOTIVATION</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th>ENTITIES / REL.</th><th>DB TYPE</th><th>MOTIVATION</th></tr></thead>
+            <tbody>
+              <tr><td>Character, Actor, Voice Actor, Line; Play, Perform</td><td>Graph DB (Neo4j)</td><td>Many links traversed and counted (lines an actor performed, characters an actor played); the (P, O) Voice Actor is a second label on the same node; Recording Date is an edge property.</td></tr>
+              <tr><td>Company Section, Digital Content, Series, Movie, Animated Movie, Script; Produce, Describe</td><td>Document DB (MongoDB)</td><td>A digital content is read as one aggregate with its scripts embedded (each script describes exactly one content); the sub-entities have different attributes, which schema-less documents hold without empty fields; Produce, with its dates, is a sub-collection of each content.</td></tr>
+              <tr><td>Location (Name, Description, Furniture)</td><td>Search-based DB (Elasticsearch)</td><td>Description and Furniture are free text, queried by words and ranked by relevance: an inverted index finds the locations that contain the words, and a TF-IDF-family score orders them; Indoor is an exact value for counting.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Involve, Include and Located cross the groups: keep them as identifiers inside the documents or nodes they connect.</p>
+      </div>
+      <div class="exam-note"><p>The grouping follows the paper's own later exercises: Neo4j on Character, Actor, Voice Actor and Line; MongoDB on Company Section, Digital Content with its sub-entities and Script; Elasticsearch on Location. Its exercise 4 asks for the Locations whose description includes "Stadium" and "Basketball", "assigning a higher score" to those whose furniture includes "Planet" and description "Space": a ranking, not a <code>WHERE</code> clause. That is the motivation the third row must give — free text, an inverted index, a relevance score.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l24-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">You delete the word "the" from T3 and recompute the normed vectors. What happens to the weight of "data" in T3?</p>
+    <ul class="options">
+      <li>It stays 0.187: the count and the IDF of "data" did not change <span class="fb">TF and IDF are unchanged, but the length of T3's vector shrinks, and every weight is divided by that length.</span></li>
+      <li data-correct>It grows, to about 0.202 <span class="fb">One raw weight fewer under the square root: the length falls from 4.074 to 3.779, and 0.7615 / 3.779 = 0.202.</span></li>
+      <li>It drops, because T3 now has fewer words in common with T1 <span class="fb">A weight inside T3 does not depend on T1 at all; and T1 never contained "the".</span></li>
+      <li>It becomes 0.316, as in T4 <span class="fb">T3 still has ten weighted terms against T4's four, so its length stays larger.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Suppose every one of the eight titles also contained the word "book". Which IDF does "book" get?</p>
+    <ul class="options">
+      <li>0 with both formulas: a word in every document carries no information <span class="fb">That is p. 561's value only, log(8/8) = 0. The +1 of p. 562 gives log(9/8).</span></li>
+      <li>2.197 with both, the highest IDF on the shelf <span class="fb">2.197 = log 9 belongs to a term in a single title; "book" is in all eight.</span></li>
+      <li data-correct>0.118 with p. 562's formula and 0 with p. 561's <span class="fb">log(9/8) = 0.118 and log(8/8) = 0: the +1 keeps a universal term small but never exactly zero.</span></li>
+      <li>1 with both, since it occurs in 8 of 8 titles <span class="fb">IDF is the logarithm of a ratio, not a frequency; 8 of 8 gives log 1 = 0 in p. 561's formula.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which changes would give T8, Customer knowledge management, a score above 0 against the query T1, Building data mining applications for CRM? Select all that apply.</p>
+    <ul class="options">
+      <li>Removing the stop words from all titles <span class="fb">T8 has no stop word and shares no token with T1 either way.</span></li>
+      <li data-correct>Expanding "crm" in the query into "customer relationship management" before scoring <span class="fb">Then the query shares customer and management with T8, so T8 scores above 0 (in the lab, the query "customer relationship management" alone puts T8 first, with 0.503).</span></li>
+      <li>Using the TF of p. 560 instead of p. 562's <span class="fb">Whatever the TF, a term T8 does not contain is multiplied by 0 in the dot product.</span></li>
+      <li data-correct>Comparing embeddings of the two titles instead of their words <span class="fb">Embeddings place texts with related meanings close together, whatever their spelling (lesson 27).</span></li>
+      <li>Scoring with BM25 instead of TF-IDF <span class="fb">BM25 is lexical too: a sum over the shared terms, and there are none.</span></li>
+    </ul>
+    <p class="q-fb">Only a change of what counts as "the same term" helps: an expansion of the query or a representation of meaning.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">T3 and T4 share exactly the same two words with the query, data and mining. Why does T4 score 0.159 and T3 only 0.094?</p>
+    <ul class="options">
+      <li>"data" and "mining" occur more often in T4 <span class="fb">Once each, in both titles.</span></li>
+      <li>Their IDF is higher in T4 <span class="fb">IDF belongs to the term, not to the document: log 3 in both titles.</span></li>
+      <li>T3 also shares "customer" and "relationship" with the query, which lowers its score <span class="fb">The query T1 contains neither word; and with non-negative weights an extra shared term could only add to a dot product.</span></li>
+      <li data-correct>T4 is shorter, so after normalisation each of its terms keeps a larger share of the length 1 <span class="fb">Lengths 2.408 against 4.074, hence 0.316 against 0.187 per word.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">On the index of p. 568 — lower-cased, not stemmed — the query "quick fox" with AND returns…</p>
+    <ul class="options">
+      <li data-correct>D1 <span class="fb">quick -&gt; D1, D2 and fox -&gt; D1: the intersection is D1.</span></li>
+      <li>D1 and D2 <span class="fb">That needs a stemmer: D2 says "foxes", which this index keeps as another term.</span></li>
+      <li>D2 <span class="fb">D2 contains quick (from "Quick") but not fox.</span></li>
+      <li>nothing, because "Quick" and "quick" differ <span class="fb">This index lower-cased: "quick" -&gt; D1,D2 is printed on the slide.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does the lecture compress posting lists (p. 566)?</p>
+    <ul class="options">
+      <li>To hide their content from whoever reads the disk <span class="fb">Compression is not encryption.</span></li>
+      <li>To save disk space; reading them gets slower, but that is the price <span class="fb">The slide lists compression under "engineered to be fast", with codes chosen for fast decompression.</span></li>
+      <li data-correct>To reduce the amount of space in memory, so the index can be kept and read in RAM <span class="fb">"why compressed? to reduce the amount of space in memory" — and memory is what makes tenths of a second possible.</span></li>
+      <li>Because posting lists are stored as text <span class="fb">They store integers — document ids — hence "integer compression algorithms".</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A posting list is sorted from the documents with the highest term counts to the lowest (p. 567). How does that let the engine stop early when it needs only the top 10?</p>
+    <ul class="options">
+      <li>It reads the first 10 entries and stops, whatever their scores <span class="fb">With several query terms a document can score high through another term; the engine stops when a bound says nothing left can enter the top 10, not after a fixed count.</span></li>
+      <li data-correct>It keeps a bound on the best score the unread documents could still reach, and stops when that bound falls below the 10th best score found <span class="fb">"compute bounds on scores", "lower ranked documents dropped as early as possible".</span></li>
+      <li>It deletes the low-count entries from the index while answering <span class="fb">Nothing is deleted while a query runs: early termination only skips the rest of the list for this query. Getting rid of entries for good is index pruning, the last bullet of p. 567.</span></li>
+      <li>It reads the list backwards, from the least important documents <span class="fb">The order exists so that the most important entries come first.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l24-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A <code>WHERE</code> clause decides in or out; search scores and ranks. Its new ingredients (p. 552) are intent, similarity, relevance, ranking and efficiency; similarity is computed by the system, relevance is judged by the user.</li>
+    <li>Intent comes in four kinds (p. 553): informational, navigational, commercial/investigational and transactional.</li>
+    <li>A text becomes a bag of words — scanned, parsed, counted, maybe stemmed. TF says how loud a term is in a document, IDF how rare it is in the collection, and their product weighs the term; the table of p. 563 uses TF = log(count + 1) and IDF = log((#docs + 1) / df), with every stop word kept.</li>
+    <li>Normalisation divides each document by its length, so every document is a unit vector: distance and cosine rank alike, and the score is a dot product over the shared terms — 0.159, 0.102 and 0.094 for T4, T2 and T3, and 0 for the rest.</li>
+    <li>Lexical matching cannot see synonyms or abbreviations: no shared token, score 0. That is why T8 scores 0 against a book about CRM, and why meaning needs embeddings.</li>
+    <li>An inverted index maps each term to its posting list; a query is a join of posting lists; the lists are compressed to stay in memory and ordered by importance for early termination.</li>
+    <li>Three corrections to carry: "inverse", not "inverted", document frequency; the example keeps the stop words that p. 559 says are dropped; current Elasticsearch scores with BM25, not the practical scoring function of p. 560.</li>
+  </ul>
+  <aside class="cheat" id="l24-cheat">
+    <dl>
+      <dt>Search vs WHERE</dt><dd>a predicate returns a set (in / out); search scores and ranks every item</dd>
+      <dt>New ingredients (p. 552)</dt><dd>intent · similarity · relevance · ranking · (efficiency)</dd>
+      <dt>Intent (p. 553)</dt><dd>informational · navigational · commercial/investigational · transactional</dd>
+      <dt>Matching vs relevance (p. 554)</dt><dd>matching: the technical process linking the input to the data, through a computed similarity · relevance: qualitative, how well the results meet the user's need</dd>
+      <dt>Bag of words (p. 556)</dt><dd>scan, parse, count (maybe stem); word order lost</dd>
+      <dt>TF (p. 560)</dt><dd>\(\mathrm{tf}_{i,j} = n_{i,j} / |d_j|\)</dd>
+      <dt>TF (p. 562, the table)</dt><dd>\(TF = \log(\mathit{count} + 1)\)</dd>
+      <dt>IDF (p. 561)</dt><dd>\(\mathrm{idf}_i = \log(|D| / \mathrm{df}_i)\)</dd>
+      <dt>IDF (p. 562, the table)</dt><dd>\(IDF = \log((\#\mathit{docs} + 1) / \mathrm{df})\)</dd>
+      <dt>TF-IDF (p. 561)</dt><dd>tf × idf: loud here, rare elsewhere</dd>
+      <dt>Normed TF-IDF (pp. 559, 562)</dt><dd>each weight divided by \(\sqrt{\sum_N (TF \times IDF)^2}\); N = number of terms</dd>
+      <dt>Unit vectors</dt><dd>\(\lVert \vb{q} - \vb{d} \rVert^2 = 2 - 2\cos\theta\): distance and cosine rank alike</dd>
+      <dt>Score</dt><dd>dot product = sum over the shared terms of the products of their weights</dd>
+      <dt>Eight titles, query T1</dt><dd>T4 0.159 · T2 0.102 · T3 0.094 · T5–T8 0</dd>
+      <dt>Lexical gap</dt><dd>no shared token, no score: "crm" and "customer relationship management" never meet</dd>
+      <dt>Inverted index (pp. 566, 568)</dt><dd>term → posting list: TermIDs =&gt; DocumentIDs</dd>
+      <dt>Multi-term query (p. 567)</dt><dd>join of posting lists: AND = intersection, OR = union</dd>
+      <dt>Compression (p. 566)</dt><dd>integer codes, fast decompression, blocks — to fit in memory</dd>
+      <dt>Early termination (p. 567)</dt><dd>postings sorted by importance + bounds on scores; index pruning</dd>
+      <dt>Elasticsearch scoring</dt><dd>slide: Lucene's practical scoring function (TF-IDF); default since 5.0: BM25</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l24-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=bFrO8piASKg" target="_blank" rel="noopener">Indexing 2: inverted index</a>
+      <span class="res-by">Victor Lavrenko, University of Edinburgh</span><span class="res-dur">2:44</span>
+      <p class="res-why">The term → postings mapping built on a whiteboard in under three minutes: the moving version of the finished picture on p. 568.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://mbrenndoerfer.com/writing/tf-idf-bag-of-words-text-representation-information-retrieval" target="_blank" rel="noopener">TF-IDF and Bag of Words: Text Representation &amp; Search</a>
+      <span class="res-by">Michael Brenndoerfer</span>
+      <p class="res-why">The eight-title example shrunk to three tiny documents, from counts to IDF to cosine — every number checkable by hand before you face the 29-row table.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://nlp.stanford.edu/IR-book/html/htmledition/tf-idf-weighting-1.html" target="_blank" rel="noopener">Tf-idf weighting (Introduction to Information Retrieval, 6.2.2)</a>
+      <span class="res-by">Manning, Raghavan, Schütze</span>
+      <p class="res-why">The textbook form, idf = log(N/df), and the three properties of the weight in one paragraph. Mind the notation: there N counts documents.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://kaustubhbutte777.github.io/playground/inverted-index/" target="_blank" rel="noopener">Inverted Index + TF-IDF Playground</a>
+      <span class="res-by">Kaustubh Butte</span>
+      <p class="res-why">Steps through a query on eight documents: each posting list with its df and IDF, the pointer walk of an AND, the merge of an OR, the scores. Predict the winner before you press Execute.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables" target="_blank" rel="noopener">Practical BM25, Part 2: The BM25 Algorithm and its Variables</a>
+      <span class="res-by">Shane Connelly, Elastic</span>
+      <p class="res-why">What replaced the practical scoring function of p. 560: the same IDF idea, a term frequency that saturates, and a knob for document length.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You can now score eight titles by hand and look them up through an index. Next: the system that does both for millions of JSON documents spread over many machines — and the mapping that decides, before any query runs, which strings become terms.</p>
+</aside>
+
+</main>
+</body>
+</html>
