@@ -1,0 +1,1208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Guess now, pay later · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l17">
+
+<header class="lesson-head">
+  <h1>Guess now, pay later: speculation, precise exceptions and the reorder buffer</h1>
+  <p class="lede">After this lesson you will fill a reorder-buffer entry and a rename table snapshot by snapshot, say which entries a mispredicted branch tears off, and explain why the register file is written only at commit.</p>
+</header>
+
+<div class="hook" data-label="A warm-up puzzle">
+  <p>Robert Tomasulo's 1967 paper describes hardware that looks ahead about eight instructions. Intel's Golden Cove core of 2021 keeps 512 in flight. Most of those 512 sit behind a branch nobody has evaluated yet — about one instruction in five is a branch — so the core guesses the outcome, runs ahead, and is wrong now and then. Yet it never leaves a wrong value in a register, and a divide by zero three instructions back never leaves a half-finished mess behind it.</p>
+  <p>The trick is a queue with two pointers that delays the one step which cannot be undone. In the notes' own example an instruction computes the value 10 in cycle 4, and the register F0 becomes 10 only in cycle 5. Keep that puzzle in mind: why would a machine built for speed wait a whole cycle to write a number it already has?</p>
+  <p>One more number before you start. In April 2026, 57 students took the professor's second self-assessment test — ILP, dynamic scheduling, reorder buffer — and averaged 5.9 out of 10. This lesson is where those points are.</p>
+</div>
+
+<section id="l17-spec">
+  <h2>Guess now: speculation, and the one step that cannot be undone</h2>
+
+  <p>Take the loop of the notes' February 2025 reorder-buffer exercise (<a href="l18.html">lesson 18</a> fills its table). Registers are written as the 2026 paper writes them, without the dollar sign; older papers write <code>$F2</code>.</p>
+
+<pre><code>LOOP: LD    F2, 0(R1)
+      FADD  F4, F2, F2
+      SD    F4, 0(R1)
+      ADDUI R1, R1, 4
+      BNE   R1, R2, LOOP   ; pred. taken</code></pre>
+
+  <p>The fetch unit reaches BNE at the end of the first iteration. It does not know whether R1 equals R2 — the ADDUI before it may not even have executed. A branch predictor (<a href="l05.html">lesson 5</a>) says "taken", and fetch continues at LOOP: the second iteration's LD, FADD and SD enter the machine while the first BNE is still a question mark. Figure 1 shows the stream: everything below the branch is a guess until the branch resolves.</p>
+
+  <figure class="fig fig--plain" id="l17-fig-stream">
+    <svg class="dia" viewBox="0 0 560 310" role="img" aria-label="Eight instructions in program order: the five of the first iteration, then the BNE predicted taken and the first three of the second iteration, which are speculative until the branch resolves">
+      <text x="58" y="43" class="tx-end tx-mono tx-sm">I0</text>
+      <rect x="70" y="26" width="170" height="24" rx="4" class="fi-paper"/>
+      <text x="78" y="43" class="tx-mono">LD F2, 0(R1)</text>
+      <text x="58" y="77" class="tx-end tx-mono tx-sm">I1</text>
+      <rect x="70" y="60" width="170" height="24" rx="4" class="fi-paper"/>
+      <text x="78" y="77" class="tx-mono">FADD F4, F2, F2</text>
+      <text x="58" y="111" class="tx-end tx-mono tx-sm">I2</text>
+      <rect x="70" y="94" width="170" height="24" rx="4" class="fi-paper"/>
+      <text x="78" y="111" class="tx-mono">SD F4, 0(R1)</text>
+      <text x="58" y="145" class="tx-end tx-mono tx-sm">I3</text>
+      <rect x="70" y="128" width="170" height="24" rx="4" class="fi-paper"/>
+      <text x="78" y="145" class="tx-mono">ADDUI R1, R1, 4</text>
+      <text x="58" y="179" class="tx-end tx-mono tx-sm">I4</text>
+      <rect x="70" y="162" width="170" height="24" rx="4" class="fw-s2 st-s2"/>
+      <text x="78" y="179" class="tx-mono">BNE R1, R2, LOOP</text>
+      <line x1="30" y1="191" x2="540" y2="191" class="st-s2 dash sw-2"/>
+      <path d="M 240 174 C 292 174, 292 208, 244 208" class="st-ink" marker-end="url(#arr)"/>
+      <text x="298" y="189" class="tx-sm halo">predicted taken</text>
+      <text x="320" y="44" class="tx-sm tx-muted">iteration 1</text>
+      <text x="320" y="214" class="tx-sm tx-muted">iteration 2</text>
+      <text x="58" y="213" class="tx-end tx-mono tx-sm">I5</text>
+      <rect x="70" y="196" width="170" height="24" rx="4" class="fi-paper dash"/>
+      <text x="78" y="213" class="tx-mono">LD F2, 0(R1)</text>
+      <rect x="250" y="199" width="44" height="18" rx="6" class="fi-none st-s3 dash"/>
+      <text x="272" y="212" class="tx-mid tx-sm">spec</text>
+      <text x="58" y="247" class="tx-end tx-mono tx-sm">I6</text>
+      <rect x="70" y="230" width="170" height="24" rx="4" class="fi-paper dash"/>
+      <text x="78" y="247" class="tx-mono">FADD F4, F2, F2</text>
+      <rect x="250" y="233" width="44" height="18" rx="6" class="fi-none st-s3 dash"/>
+      <text x="272" y="246" class="tx-mid tx-sm">spec</text>
+      <text x="58" y="281" class="tx-end tx-mono tx-sm">I7</text>
+      <rect x="70" y="264" width="170" height="24" rx="4" class="fi-paper dash"/>
+      <text x="78" y="281" class="tx-mono">SD F4, 0(R1)</text>
+      <rect x="250" y="267" width="44" height="18" rx="6" class="fi-none st-s3 dash"/>
+      <text x="272" y="280" class="tx-mid tx-sm">spec</text>
+      <text x="320" y="262" class="tx-hand">still a guess</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The predictor says "taken", so I5–I7 enter the machine behind an unresolved BNE. They are speculative: they may execute, but nothing they produce may become visible until the branch is known.</figcaption>
+  </figure>
+
+  <p>On the classic Tomasulo machine of <a href="l11.html">lesson 11</a> those guessed instructions would issue, execute and, at Write Result, put their results on the common data bus — which writes them straight into the register file. Suppose the guess was wrong and the loop was over. Now F2 and F4 hold values the program never asked for, and the SD may have written memory. Nobody kept the old values; there is nothing to roll back to. That is why a Tomasulo machine with a predictor may fetch down the predicted path but must not let those instructions change the state before the branch resolves — and waiting for every branch throws away most of the parallelism the predictor was supposed to buy.</p>
+
+  <div class="def">
+    <p><dfn>Hardware-based speculation</dfn> — executing instructions before it is known whether they are needed (they are control-dependent on an unresolved branch), with the ability to undo their effects if the prediction turns out wrong. Hennessy &amp; Patterson make it three ideas: dynamic branch prediction to choose the path, speculation to execute along it before the branch resolves, and dynamic scheduling to overlap instructions from several basic blocks.</p>
+  </div>
+
+  <p>The problem it creates is in the notes' own words (p. 222): "how do we prevent side effects (e.g., register or memory updates) from mispredicted instructions?". The answer: <mark class="key">defer the architectural state update until it is safe to commit</mark>. The architectural state is what the program can see — the register file and memory. Everything else, reservation stations, buses and the buffer below, is scaffolding that can be thrown away.</p>
+
+  <div class="def">
+    <p><dfn>Reorder buffer (ROB)</dfn> — a buffer that holds the results of instructions that have finished execution but are not yet committed. It lets results be written to the register file and memory in program order, and it lets the processor discard the results of a mispredicted path before they get there.</p>
+  </div>
+
+  <p>The notes list what the ROB is critical for (p. 222): decoupling execution completion from the state update, which they call commit; supporting precise exceptions, so the CPU can stop cleanly at the last correct instruction; and tracking which instructions are speculative and which are not. Hennessy &amp; Patterson put it in one sentence: the bypassing of results among instructions, which speculative execution needs, must be separated from the actual completion of an instruction. Bypassing happens on the bus, as before. Completion — the write that counts — happens later, at a gate.</p>
+
+  <p class="memo"><mark class="key">Completed is not committed: a result exists the moment the unit produces it; it becomes part of the program's state only when its instruction reaches the head of the reorder buffer.</mark></p>
+
+  <p>Why go to this trouble? Here is the chain an examiner expects you to reproduce. Branches are frequent, so waiting for each one serialises the stream and wastes most of the available ILP. So predict and keep going. Some of that work is wrong. So it may compute, but it must not commit. So you need a place to park completed results and a rule to release them in order. The place is the ROB; the rule is in-order commit at the head. The cost sits next to the benefit: every misprediction wastes the work fetched down the wrong path (roughly the misprediction rate times the number of instructions behind the branch), recovery takes cycles, and the buffer is hardware — entries, ports, comparators and a copy of every result into the register file at commit.</p>
+</section>
+
+<section id="l17-commit">
+  <h2>Pay later: out of order, in order, and the fault that waits its turn</h2>
+
+  <p>Out-of-order execution (<a href="l08.html">lesson 8</a>, <a href="l09.html">lesson 9</a>, <a href="l11.html">lesson 11</a>) exists because dependences and delays stop some instructions from executing now: a RAW hazard, a load that misses in the cache. Letting independent instructions bypass the stalled one keeps the functional units busy. The notes' example (p. 223): while an instruction waits for a memory load, an ALU operation behind it executes. The risk comes with it. Instructions complete in a different order from the program, which breaks the precise exception model; and the instructions behind a predicted branch may simply be wrong. The fix the notes state (p. 223): instructions must commit — retire — in order, exactly as they appear in the program. Execution out of order, commit in order, and the ROB bridges the two.</p>
+
+  <p>What the ROB does in each phase (pp. 223–224). At issue it allocates an entry, which marks the instruction's place in program order. During execution it stores the result as soon as the instruction finishes. At commit the instruction updates the architectural registers or memory only if three things hold:</p>
+
+  <ol>
+    <li>it is at the <mark class="key">head</mark> of the ROB;</li>
+    <li>its execution has completed;</li>
+    <li>it is not speculative.</li>
+  </ol>
+
+  <p>With these, the state is updated in program order only; speculative results stay in the buffer until validated; and a speculated instruction can be undone — its entry is simply dropped. The notes' summary (p. 224): the ROB lets the processor execute instructions as soon as their operands are ready, regardless of program order, while ensuring they commit their results in order.</p>
+
+  <h3>Precise exceptions, by construction</h3>
+
+  <aside class="margin-note">Lesson 7 showed the five-stage pipeline taking exceptions at WB, oldest first. The reorder buffer gives an out-of-order machine the same property.</aside>
+
+  <p><a href="l07.html#l07-exceptions">Lesson 7</a> introduced the problem: once units complete out of order, a younger instruction may already have written its register when an older one faults — the exception is imprecise and the program cannot be restarted. The notes now define the goal (p. 224). An exception is <mark class="key">precise</mark> if the processor can stop at a well-defined point corresponding to a specific instruction, all previous instructions are fully committed, and no subsequent instruction has modified the architectural state. Then the operating system or the handler can identify the error and resume the program.</p>
+
+  <p>The ROB delivers all three (p. 224): results go to the ROB, not to the register file or memory; only the head commits, in order; on an exception or a misprediction the entries after the faulting instruction are flushed and execution restarts from the faulting instruction or from the handler. The rollback is clean because the architectural state was never touched beyond the last committed instruction. One detail the notes leave out, from Hennessy &amp; Patterson: the exception is recorded in the entry of the faulting instruction and is taken only when that instruction reaches the head. At that moment everything older is committed and everything younger is still in the buffer — the three conditions hold by construction. And an instruction on a mispredicted path that faults never reaches the head: it is flushed together with its entry, exception included. A speculative exception never happens.</p>
+
+  <p>The notes' Example 11 (p. 225) is the case to watch: four instructions, the third divides by zero, the fourth is independent and finishes early, writing R5. In the papers' mnemonics:</p>
+
+<pre><code>I1: LD    F2, 0(R1)
+I2: FADD  F4, F2, F2
+I3: FDIV  F6, F4, F0   ; F0 = 0: fault
+I4: ADDUI R5, R5, 8    ; independent</code></pre>
+
+  <div class="widget" id="l17-w-precise">
+    <h3 class="widget-title">The same fault, with and without a reorder buffer</h3>
+    <p class="widget-intro">The four instructions of Example 11 as cards, the register file on the right, and a stepper that lets results arrive in the order they really finish: I1, then I4 (early), then I2, then the faulting I3. The selector decides when the register file is written. The insight to take away: deferring the architectural write until commit is the whole precision mechanism — nothing else changes.</p>
+    <ol class="tasks">
+      <li>Keep "Write Result". Before stepping, predict the value of R5 at the moment the divide by zero is reported (step 4). Then step there.
+        <details class="answer"><summary>What you should see</summary>
+          <p>R5 = 108. I4 wrote R5 at step 2, two steps before the older I3 faulted. The handler would find a register changed by an instruction that, in program order, has not happened yet: imprecise. Step 5 adds the consequence — restarting at I3 would run I4 again and leave R5 = 116.</p></details>
+      </li>
+      <li>Switch to "Commit". Step to 4, then to 5. Predict: when is the fault taken, and what is R5 at that moment?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At step 4 the fault is only recorded in ROB2; the register file still shows the values before I1. At step 5 I1 and I2 commit (F2 = 5, F4 = 10), I3 reaches the head and the fault is taken with R5 = 100; I4's 108 is discarded with its entry. Older instructions done, younger ones without effect: precise.</p></details>
+      </li>
+      <li>Switch on the branch toggle and keep "Commit". Step to 5. Does the divide by zero ever reach the operating system? Then try the same toggle with "Write Result".
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. The branch at the head resolves as mispredicted, the four entries behind it are torn off, and the recorded fault goes with them: a speculative exception never happens. With "Write Result" the opposite: a fault is taken for an instruction that should never have run, and F2, F4, R5 are already overwritten.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l17-w-precise', function (root, ui) {
+    var S = Course.svg;
+    var INS = [
+      { id: 'I1', text: 'LD F2, 0(R1)',    dest: 'F2', val: 5,    done: 1 },
+      { id: 'I2', text: 'FADD F4, F2, F2', dest: 'F4', val: 10,   done: 3 },
+      { id: 'I3', text: 'FDIV F6, F4, F0', dest: 'F6', val: null, done: 4, fault: true },
+      { id: 'I4', text: 'ADDUI R5, R5, 8', dest: 'R5', val: 108,  done: 2 }
+    ];
+    var RFREGS = ['F2', 'F4', 'F6', 'R5'];
+    var mode = ui.select('the register file is written at', [
+      { value: 'wr', label: 'Write Result — no reorder buffer' },
+      { value: 'commit', label: 'Commit — through the reorder buffer' }
+    ], null, 'wr');
+    var behind = ui.toggle('the four instructions sit behind a mispredicted branch', false);
+    var st = ui.stepper({ steps: [
+      'Step 0 — the four instructions have issued in program order; nothing has finished yet.',
+      'Step 1 — I1 finishes: its result is 5.',
+      'Step 2 — I4 finishes early, out of order: 100 + 8 = 108.',
+      'Step 3 — I2 finishes: 5 + 5 = 10.',
+      'Step 4 — I3 finishes: F0 is 0, so FDIV raises divide by zero.',
+      'Step 5 — what the operating system gets to see.'
+    ] });
+    var svg = ui.svg(560, 330, { label: 'Four instruction cards with their status, the register file on the right, and a line saying whether the exception is precise' });
+    var roRF = ui.readout('register file'), roEx = ui.readout('exception');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'finished, parked in its ROB entry', color: 's1', mark: 'area' },
+      { label: 'value already in the register file', color: 'soft', mark: 'square' },
+      { label: 'the register file: architectural state', color: 's6', mark: 'dash' },
+      { label: 'fault, corrupted value, discarded entry', color: 'bad', mark: 'cross' }
+    ]);
+
+    function state() {
+      var k = st.index, rob = mode.value === 'commit', b = behind.value;
+      var rf = { F2: 0, F4: 0, F6: 0, R5: 100 }, bad = {}, rows = [], base = b ? 1 : 0;
+      var out = { rows: rows, rf: rf, bad: bad, banner: [], tone: 'muted', ex: 'none yet', exTone: '', note: '' };
+      if (b) rows.push({ id: 'B', text: 'BNE R1, R2, SKIP', status: k >= 5 ? 'resolved: wrong' : 'pred. taken', cls: k >= 5 ? 'fault' : 'issued' });
+      INS.forEach(function (ins, i) {
+        var fin = k >= ins.done, r = { id: ins.id, text: ins.text, status: 'issued', cls: 'issued' };
+        rows.push(r);
+        if (!fin) return;
+        if (!rob) {
+          if (ins.fault) { r.status = 'FAULT reported'; r.cls = 'fault'; }
+          else { rf[ins.dest] = ins.val; r.status = ins.dest + ' ← ' + ins.val + ' written'; r.cls = 'committed'; }
+          return;
+        }
+        if (k < 5) {
+          if (ins.fault) { r.status = 'fault recorded'; r.cls = 'fault'; }
+          else { r.status = 'in ROB' + (i + base) + ': ' + ins.val; r.cls = 'done'; }
+          return;
+        }
+        if (b) { r.status = 'discarded'; r.cls = 'discarded'; return; }
+        if (ins.fault) { r.status = 'fault taken'; r.cls = 'fault'; }
+        else if (i < 2) { rf[ins.dest] = ins.val; r.status = 'committed: ' + ins.val; r.cls = 'committed'; }
+        else { r.status = 'discarded'; r.cls = 'discarded'; }
+      });
+      if (!rob) {
+        if (k < 4) { out.banner = ['No fault yet. Registers are written as results arrive.']; out.note = 'Without a reorder buffer every result goes to the register file at Write Result — in completion order, not program order.'; }
+        else if (!b) {
+          bad.R5 = true; out.ex = 'imprecise'; out.exTone = 'bad'; out.tone = 'bad';
+          out.banner = k === 4 ? ['Divide by zero reported with R5 already 108:', 'IMPRECISE — a state that no sequential run ever has.'] : ['Restart at I3 would run I4 again: R5 → 116.', 'The program cannot be resumed correctly.'];
+          out.note = 'I4 is younger than I3 in program order, yet its write is already in the register file. Condition 3 of a precise exception is violated.';
+        } else {
+          bad.F2 = true; bad.F4 = true; bad.R5 = true; out.ex = 'taken on a wrong path'; out.exTone = 'bad'; out.tone = 'bad';
+          out.banner = k === 4 ? ['A fault on a wrong-path instruction is taken anyway,', 'and the registers are already overwritten.'] : ['BNE resolves: mispredicted. Nothing can be undone:', 'F2, F4 and R5 were written at Write Result.'];
+          out.note = 'Speculation without a reorder buffer: the guessed path changed the architectural state, so the misprediction cannot be rolled back.';
+        }
+      } else {
+        if (k < 4) { out.banner = ['Results wait in their entries; registers untouched.']; out.note = 'Each finished instruction keeps its value in its ROB entry with Ready = Yes. The register file is still the state before I1.'; }
+        else if (k === 4) { out.ex = 'recorded, not taken'; out.banner = ['Fault recorded in ROB' + (2 + base) + ', not taken yet.', 'Registers untouched: still precise.']; out.note = 'The exception travels with the entry. It will be acted on only when I3 reaches the head of the buffer.'; }
+        else if (!b) { out.ex = 'precise'; out.exTone = 'good'; out.tone = 'good'; out.banner = ['I1, I2 committed; I3 at the head: fault taken.', 'R5 = 100, I4 discarded — PRECISE.']; out.note = 'Everything older than I3 is final, everything younger is dropped. The handler sees exactly the state after I2, and I3 can be restarted.'; }
+        else { out.ex = 'discarded with the path'; out.exTone = 'good'; out.tone = 'good'; out.banner = ['BNE at the head resolves wrong: four entries torn off,', 'fault included. No exception. Registers untouched.']; out.note = 'A speculative exception never happens: the faulting instruction was never part of the program, architecturally.'; }
+      }
+      return out;
+    }
+
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      s.rows.forEach(function (r, i) {
+        var y = 30 + i * 38, cls = 'fi-paper';
+        if (r.cls === 'done') cls = 'fw-s1 st-s1';
+        else if (r.cls === 'committed') cls = 'fi-soft';
+        else if (r.cls === 'fault') cls = 'fi-paper st-bad sw-2';
+        S('rect', { x: 40, y: y, width: 170, height: 24, rx: 4, 'class': cls }, svg);
+        S('text', { x: 32, y: y + 17, 'class': 'tx-end tx-mono tx-sm', text: r.id }, svg);
+        S('text', { x: 48, y: y + 17, 'class': 'tx-mono', text: r.text }, svg);
+        if (r.cls === 'discarded') {
+          S('line', { x1: 40, y1: y, x2: 210, y2: y + 24, 'class': 'st-bad sw-2' }, svg);
+          S('line', { x1: 210, y1: y, x2: 40, y2: y + 24, 'class': 'st-bad sw-2' }, svg);
+        }
+        S('text', { x: 222, y: y + 17, 'class': 'tx-sm' + (r.cls === 'fault' || r.cls === 'discarded' ? ' tx-bad' : r.cls === 'issued' ? ' tx-muted' : ''), text: r.status }, svg);
+      });
+      S('text', { x: 400, y: 22, 'class': 'tx-sm', text: 'Registers' }, svg);
+      S('rect', { x: 392, y: 30, width: 150, height: 130, rx: 4, 'class': 'fi-none st-s6 dash sw-2' }, svg);
+      RFREGS.forEach(function (rg, i) {
+        var y = 40 + i * 30;
+        S('text', { x: 404, y: y + 18, 'class': 'tx-mono tx-sm', text: rg }, svg);
+        S('text', { x: 470, y: y + 18, 'class': 'tx-mono', text: rg === 'F6' ? '—' : String(s.rf[rg]) }, svg);
+        if (s.bad[rg]) S('rect', { x: 458, y: y + 1, width: 72, height: 24, rx: 4, 'class': 'fi-none st-bad sw-2' }, svg);
+      });
+      var tcls = s.tone === 'bad' ? 'tx-bad' : s.tone === 'good' ? 'tx-good' : 'tx-muted';
+      s.banner.forEach(function (line, i) { S('text', { x: 20, y: 290 + i * 22, 'class': 'tx-sm ' + tcls, text: line }, svg); });
+    }
+
+    ui.onChange(function () {
+      var s = state();
+      draw(s);
+      roRF.set(RFREGS.map(function (rg) { return rg + ' = ' + (rg === 'F6' ? '—' : s.rf[rg]); }).join(', '));
+      roEx.set(s.ex, s.exTone || undefined);
+      note.set(s.note);
+    });
+  });
+  </script>
+
+  <p>A word about condition 3. In the course's tables an entry carries an explicit Speculative flag. In Hennessy &amp; Patterson's model there is no flag: a branch commits only after it has resolved, so by the time an instruction reaches the head every older branch has committed and the instruction is no longer speculative by construction. The two views agree; the flag just makes the flush set visible on paper. Real processors do not even wait for the branch to reach the head: they recover as soon as it resolves, clearing the younger entries and restarting fetch — the notes' Example 13 does this silently.</p>
+
+  <p>The notes sum up the ROB's functional roles (p. 225): <em>result buffering</em> — results of instructions that have completed but not committed; <em>speculative result propagation</em> — results pass among instructions issued after a predicted branch, through the ROB and the bus, without touching the architectural registers; <em>precise interrupt support</em> — only committed instructions affect the state, and a flush rolls back a misprediction or an exception. The closing line is worth keeping: the ROB "is not merely a commit buffer, it is also a speculation-aware result forwarding structure, enabling safe communication among instructions that may never actually commit."</p>
+
+  <aside class="redpen" data-page="225">
+    <p class="claim">"Originally introduced in 1988, the ROB was created to: Preserve the precise interrupt model."</p>
+    <p class="fix">The reorder buffer was proposed by James Smith and Andrew Pleszkun in "Implementing Precise Interrupts in Pipelined Processors", presented at ISCA in 1985; 1988 is the date of the journal version in IEEE Transactions on Computers.</p>
+    <p class="because">The paper is in the resources below. Its definition is the one the notes paraphrase: the saved state must correspond to a sequential model in which one instruction completes before the next begins; it compares five solutions, and the reorder buffer — with or without bypassing — is among the ones later out-of-order cores adopted.</p>
+  </aside>
+</section>
+
+<section id="l17-tags">
+  <h2>Names, again: the ROB number is the new tag</h2>
+
+  <aside class="margin-note">The notes write ADDD, MULTD and L.D as Hennessy and Patterson do; the lesson writes FADD, FMUL and LD as the papers do.</aside>
+
+  <p>Lesson 11 renamed registers with reservation-station names: the tag on the bus said "I am the result of RS3". With a reorder buffer the name changes. A <mark class="key">ROB number</mark> is simply the index of an entry — the slot an issued instruction occupies, unique among the instructions in flight (p. 226). The notes use it in two ways.</p>
+
+  <p><b>As the destination tag (register renaming).</b> When an instruction that writes a register issues, the register is not renamed to another physical register; the architectural register is mapped to the instruction's ROB number — "the identical logic of tag in Tomasulo algorithm", only in a different namespace. <b>For operand dependency resolution.</b> A later instruction that needs that result does not stall: it records the ROB number as its operand source, and when the entry becomes ready — the value is written into the ROB — it reads the value and proceeds. In Tomasulo this listening was the CDB's job, and it still is: the bus now carries the pair (ROB number, value), and every waiting reservation station and the ROB entry itself listen. As before, the mechanism avoids WAR and WAW hazards and forwards data before commit.</p>
+
+  <p>Put together, at issue each source register goes through three cases. The notes give two of them on p. 232 and the third on p. 239; Figure 2 has all three.</p>
+
+  <figure class="fig fig--plain" id="l17-fig-operand">
+    <svg class="dia" viewBox="0 0 560 230" role="img" aria-label="The three-way operand rule at issue: a source register with no mapping is read from the register file; mapped to a ready ROB entry, its value is read from the ROB; mapped to an entry that is not ready, the reservation station receives the tag and waits for the CDB">
+      <text x="20" y="24" class="tx-sm">Source F2 at issue: the rename table decides</text>
+      <text x="20" y="54" class="tx-sm tx-muted">rename table</text>
+      <rect x="20" y="60" width="120" height="36" rx="4" class="fw-s3 st-s3"/>
+      <text x="80" y="83" class="tx-mid tx-mono">F2 → ?</text>
+      <line x1="140" y1="78" x2="296" y2="58" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="140" y1="78" x2="296" y2="128" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="140" y1="78" x2="296" y2="198" class="st-ink" marker-end="url(#arr)"/>
+      <text x="160" y="52" class="tx-sm halo">no mapping</text>
+      <text x="175" y="112" class="tx-sm halo">mapped, ready</text>
+      <text x="150" y="172" class="tx-sm halo">mapped, not ready</text>
+      <rect x="300" y="40" width="240" height="36" rx="4" class="fi-none st-s6 dash sw-2"/>
+      <text x="420" y="63" class="tx-mid">register file: value</text>
+      <rect x="300" y="110" width="240" height="36" rx="4" class="fw-s3 st-s3"/>
+      <text x="420" y="133" class="tx-mid">ROB[h].Value: value</text>
+      <rect x="300" y="180" width="240" height="36" rx="4" class="fw-s2 st-s2 dash"/>
+      <text x="420" y="203" class="tx-mid">tag h — wait for the CDB</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The three-way operand rule. Only the third case makes the instruction wait, and it waits for a ROB number on the bus, never for a commit. In the paper's Tomasulo table the third case is the row's "RAW with I#".</figcaption>
+  </figure>
+
+  <p>Why do WAR and WAW vanish? Every writer gets a fresh name — its own entry — so two writes to F0 never collide (WAW), and a later write to F0 cannot overtake an earlier read, because the reader captured the old value or the old tag at issue (WAR). Only RAW remains, and it is served by the bus. And why must the tag be the ROB number rather than the reservation-station number? Because the reservation station is freed at Write Result, while the value must stay nameable until commit: an instruction issuing after the broadcast finds it in the ROB, by its number.</p>
+
+  <h3>Reservation stations stay, demoted</h3>
+
+  <p>The ROB buffers results and hands them to dependents as soon as they are ready, so reservation stations are no longer responsible for naming (p. 227). Their role now: buffer decoded instructions before the functional units, and hold operand values or ROB tags temporarily. The notes call them "staging areas" and "lightweight instruction and operand buffers". The notes' Tables 21 and 22 summarise the change; two of their rows are wrong, so here is the comparison as it should read.</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before: classic Tomasulo (lesson 11)">
+      <p>Tags are reservation-station names. At Write Result the CDB carries (RS tag, value) to the waiting reservation stations <em>and to the register file</em>; the producing station is freed. The register file is the only home of a result, so nothing can be undone: no speculation, imprecise exceptions. Stores wait in store buffers.</p>
+    </div>
+    <div class="compare-col" data-label="After: Tomasulo with a reorder buffer">
+      <p>Tags are ROB entry numbers. At Write Result the CDB carries (ROB number, value) to the waiting reservation stations <em>and to the ROB entry</em>, which becomes Ready; the station is freed. The register file is written only at Commit, by the head. An operand may also be read from a ready entry at issue. Stores live in their entries: no store buffer.</p>
+    </div>
+  </div>
+
+  <aside class="redpen" data-page="226">
+    <p class="claim">"RS buffers result locally" — Table 21, the Tomasulo column, against "ROB stores result globally".</p>
+    <p class="fix">In classic Tomasulo the producing reservation station never holds its own result: at Write Result the value goes on the CDB to the register file and to the waiting stations, and the producing station is freed. The right contrast is: Tomasulo — the result lands in the register file at Write Result; with the ROB — it lands in the ROB entry at Write Result and in the register file only at Commit.</p>
+    <p class="because">Check it on lesson 11's Write Result step: the station is released in the same cycle the value is broadcast; a value that lived only in a freed station would be lost. This is exactly the difference the exam asks about when it asks when the register file is updated.</p>
+  </aside>
+
+  <aside class="redpen" data-page="227">
+    <p class="claim">Table 22, row "Data forwarding": Tomasulo — RS; ROB-based Tomasulo — ROB.</p>
+    <p class="fix">Forwarding to a waiting reservation station is still done by the CDB broadcast, captured by the stations, in both designs. What the ROB adds is a second source of operands at issue: a completed but uncommitted value is read from the ROB entry.</p>
+    <p class="because">The notes' own Write Result step (p. 240) says it: the (ROB tag, value) pair is broadcast on the CDB to all stations waiting for it. Figure 2 above shows where the ROB really enters the picture — in the middle case of the operand rule.</p>
+  </aside>
+
+  <div class="pitfall">
+    <p>"The ROB replaces the reservation stations." No. It replaces the store buffers and takes over the tag namespace; the stations stay as buffers between issue and execution. And "reservation stations help reduce structural hazards" (p. 227) is true in one sense only: an instruction can issue while its functional unit is still busy. But a full set of stations — or a full ROB — <em>is</em> a structural hazard, and it stalls issue.</p>
+  </div>
+</section>
+
+<section id="l17-arch">
+  <h2>The machine: Figure 27 and the six fields of an entry</h2>
+
+  <p>Figure 27 of the notes (p. 228) is Hennessy &amp; Patterson's Figure 3.11: the floating-point unit of lesson 11 extended to handle speculation. Put the two side by side and three things have moved.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l17-fig-datapath">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 280" role="img" aria-label="Classic Tomasulo: the common data bus writes the register file at Write Result, and stores wait in a store buffer">
+        <rect x="10" y="16" width="86" height="30" rx="4" class="fi-paper"/>
+        <text x="53" y="36" class="tx-mid tx-sm">Instr. queue</text>
+        <rect x="10" y="80" width="86" height="30" rx="4" class="fi-paper"/>
+        <text x="53" y="100" class="tx-mid tx-sm">Reservation st.</text>
+        <rect x="10" y="150" width="86" height="30" rx="4" class="fi-paper sw-2"/>
+        <text x="53" y="170" class="tx-mid tx-sm">FP unit</text>
+        <rect x="120" y="16" width="84" height="44" rx="4" class="fi-paper st-s6 dash sw-2"/>
+        <text x="162" y="42" class="tx-mid tx-sm">Registers</text>
+        <rect x="214" y="80" width="76" height="30" rx="4" class="fi-paper"/>
+        <text x="252" y="100" class="tx-mid tx-sm">Store buf.</text>
+        <rect x="214" y="150" width="76" height="30" rx="4" class="fi-paper"/>
+        <text x="252" y="170" class="tx-mid tx-sm">Memory</text>
+        <line x1="53" y1="46" x2="53" y2="76" class="st-ink" marker-end="url(#arr)"/>
+        <line x1="53" y1="110" x2="53" y2="146" class="st-ink" marker-end="url(#arr)"/>
+        <line x1="252" y1="110" x2="252" y2="146" class="st-ink" marker-end="url(#arr)"/>
+        <line x1="10" y1="222" x2="290" y2="222" class="st-ink sw-4"/>
+        <text x="288" y="242" class="tx-end tx-sm">CDB</text>
+        <line x1="70" y1="180" x2="70" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="30" y1="222" x2="30" y2="114" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="162" y1="222" x2="162" y2="64" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="168" y="130" class="tx-sm halo">at Write Result</text>
+      </svg>
+      <p class="fig-label">Before: classic Tomasulo</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 280" role="img" aria-label="Speculative Tomasulo: the common data bus writes the reorder buffer, the reorder buffer writes the register file and memory at Commit, and the store buffer is gone">
+        <rect x="10" y="16" width="86" height="30" rx="4" class="fi-paper"/>
+        <text x="53" y="36" class="tx-mid tx-sm">Instr. queue</text>
+        <rect x="10" y="80" width="86" height="30" rx="4" class="fi-paper"/>
+        <text x="53" y="100" class="tx-mid tx-sm">Reservation st.</text>
+        <rect x="10" y="150" width="86" height="30" rx="4" class="fi-paper sw-2"/>
+        <text x="53" y="170" class="tx-mid tx-sm">FP unit</text>
+        <rect x="120" y="16" width="84" height="44" rx="4" class="fi-paper st-s6 dash sw-2"/>
+        <text x="162" y="42" class="tx-mid tx-sm">Registers</text>
+        <rect x="120" y="80" width="84" height="44" rx="4" class="fw-s3 st-s3"/>
+        <text x="162" y="98" class="tx-mid tx-sm">Reorder</text>
+        <text x="162" y="114" class="tx-mid tx-sm">buffer</text>
+        <rect x="214" y="80" width="76" height="30" rx="4" class="fi-none st-muted dash"/>
+        <text x="252" y="100" class="tx-mid tx-sm tx-muted">Store buf.</text>
+        <line x1="214" y1="80" x2="290" y2="110" class="st-bad sw-2"/>
+        <line x1="290" y1="80" x2="214" y2="110" class="st-bad sw-2"/>
+        <rect x="214" y="150" width="76" height="30" rx="4" class="fi-paper"/>
+        <text x="252" y="170" class="tx-mid tx-sm">Memory</text>
+        <line x1="53" y1="46" x2="53" y2="76" class="st-ink" marker-end="url(#arr)"/>
+        <line x1="53" y1="110" x2="53" y2="146" class="st-ink" marker-end="url(#arr)"/>
+        <line x1="10" y1="222" x2="290" y2="222" class="st-ink sw-4"/>
+        <text x="288" y="242" class="tx-end tx-sm">CDB</text>
+        <line x1="70" y1="180" x2="70" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="30" y1="222" x2="30" y2="114" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="162" y1="222" x2="162" y2="128" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="168" y="200" class="tx-sm halo">Write Result</text>
+        <line x1="162" y1="80" x2="162" y2="64" class="st-s6 sw-2 dash" marker-end="url(#arr-s6)"/>
+        <text x="170" y="74" class="tx-sm halo">Commit</text>
+        <line x1="204" y1="112" x2="214" y2="160" class="st-s6 sw-2 dash" marker-end="url(#arr-s6)"/>
+        <text x="290" y="141" class="tx-sm tx-end halo">Commit (stores)</text>
+      </svg>
+      <p class="fig-label">After: Tomasulo with a reorder buffer</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> The three changes of Figure 27: the CDB feeds the reorder buffer instead of the register file; the register file (and memory, for stores) is written only from the buffer, at Commit; the store buffer is gone, because a store's address and data live in its entry until it commits.</figcaption>
+  </figure>
+
+  <p>Walk the components (pp. 228–230). The <em>instruction queue</em> holds fetched instructions and supplies each one to a reservation station and to the ROB in parallel. The <em>reservation stations</em> are temporary buffers between issue and execution — three for the adders, two for the multipliers in the figure — holding the instruction with operand values or ROB tags. The <em>FP units</em> receive an instruction when its operands are ready. The <em>CDB</em> broadcasts result values with their ROB tag; all waiting instructions and all ROB entries listen. The <em>ROB</em> is central: it takes over the tag namespace and the store buffers. The <em>load buffers</em> and the <em>address unit</em> stay: a load still gets a buffer at issue, the address unit computes base plus offset, and — step 3 of the notes' four — the load may access memory early only if no earlier store has an unresolved or equal address; otherwise it waits until memory disambiguation clears it. That is a RAW hazard through memory. A store, on the other hand, keeps its address and its data in its ROB entry and writes memory at commit, in order: WAW and WAR hazards through memory disappear, and since a store can never be undone it had to wait for commit anyway — which is why the store buffer could go. Finally the <em>register file</em>: not updated after execution, updated only when instructions commit through the ROB. In the figure the "Reg #" and "Data" arrows come from the buffer, and the CDB no longer reaches the registers.</p>
+
+  <h3>The six fields of an entry</h3>
+
+  <p>Each entry holds (p. 229): <b>Busy</b> — the entry is active or free; <b>Instruction type</b> — branch (no result), store (the destination is a memory address), load or ALU (the destination is a register); <b>Destination</b> — the register number, or the memory address for a store; <b>Value</b> — the result after execution, kept until commit; <b>Ready</b> — set when execution has completed and the result is valid; <b>Speculative</b> — whether the instruction was issued after an unresolved branch. The exam's table (February 2025) keeps the same information under its own headings and adds one column, <mark class="key">Res. Alloc.</mark>: the reservation station or load buffer the instruction occupies. Figure 4 shows the mapping.</p>
+
+  <figure class="fig fig--plain" id="l17-fig-entry">
+    <svg class="dia" viewBox="0 0 560 150" role="img" aria-label="One reorder-buffer entry in the exam's columns, with the names of the notes' fields written under each column; the Res. Alloc. column exists only on the exam paper">
+      <rect x="10" y="30" width="50" height="26" class="fw-s3 st-s3"/>
+      <rect x="60" y="30" width="130" height="26" class="fw-s3 st-s3"/>
+      <rect x="190" y="30" width="56" height="26" class="fw-s3 st-s3"/>
+      <rect x="246" y="30" width="96" height="26" class="fw-s3 st-s3"/>
+      <rect x="342" y="30" width="110" height="26" class="fw-s3 st-s3"/>
+      <rect x="452" y="30" width="50" height="26" class="fw-s3 st-s3"/>
+      <rect x="502" y="30" width="50" height="26" class="fw-s3 st-s3"/>
+      <text x="35" y="47" class="tx-mid tx-sm">ROB#</text>
+      <text x="125" y="47" class="tx-mid tx-sm">Instruction</text>
+      <text x="218" y="47" class="tx-mid tx-sm">Dest.</text>
+      <text x="294" y="47" class="tx-mid tx-sm">Res. Alloc.</text>
+      <text x="397" y="47" class="tx-mid tx-sm">Ready/Status</text>
+      <text x="477" y="47" class="tx-mid tx-sm">Value</text>
+      <text x="527" y="47" class="tx-mid tx-sm">Spec.</text>
+      <rect x="10" y="56" width="50" height="26" class="fi-paper"/>
+      <rect x="60" y="56" width="130" height="26" class="fi-paper"/>
+      <rect x="190" y="56" width="56" height="26" class="fi-paper"/>
+      <rect x="246" y="56" width="96" height="26" class="fi-paper"/>
+      <rect x="342" y="56" width="110" height="26" class="fi-paper"/>
+      <rect x="452" y="56" width="50" height="26" class="fi-paper"/>
+      <rect x="502" y="56" width="50" height="26" class="fi-paper"/>
+      <rect x="246" y="30" width="96" height="52" class="hl fi-none"/>
+      <text x="35" y="73" class="tx-mid tx-mono tx-sm">ROB0</text>
+      <text x="125" y="73" class="tx-mid tx-mono tx-sm">LD F0, 0(R1)</text>
+      <text x="218" y="73" class="tx-mid tx-mono tx-sm">F0</text>
+      <text x="294" y="73" class="tx-mid tx-mono tx-sm">Load1</text>
+      <text x="397" y="73" class="tx-mid tx-mono tx-sm">No, exec.</text>
+      <text x="477" y="73" class="tx-mid tx-mono tx-sm">–</text>
+      <text x="527" y="73" class="tx-mid tx-mono tx-sm">No</text>
+      <text x="35" y="104" class="tx-mid tx-sm tx-muted">–</text>
+      <text x="125" y="104" class="tx-mid tx-sm tx-muted">Instr. type</text>
+      <text x="218" y="104" class="tx-mid tx-sm tx-muted">Dest</text>
+      <text x="294" y="104" class="tx-mid tx-sm tx-muted">paper only</text>
+      <text x="397" y="104" class="tx-mid tx-sm tx-muted">Ready</text>
+      <text x="477" y="104" class="tx-mid tx-sm tx-muted">Value</text>
+      <text x="527" y="104" class="tx-mid tx-sm tx-muted">Spec</text>
+      <text x="10" y="140" class="tx-hand">Busy = the row is filled</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The entry of Example 12 (p. 231) in the paper's columns; under each column, the notes' name for the field. The highlighted column is the paper's own: which station or buffer the instruction holds. The paper has no Value column; this lesson keeps one while you learn, because it shows exactly what the register file does not yet have.</figcaption>
+  </figure>
+
+  <p>Conventions for the paper's columns, which lesson 18 drills: <b>Res. Alloc.</b> is Load1 … for loads, FP1 … for floating-point operations, Int1 … for integer operations and branches (a branch evaluates its condition on an integer unit), and "–" for a store — the ROB machine has no store buffer, the address and data live in the entry. A station is busy from issue to Write Result. <b>Ready/Status</b> is written "No, issued", "No, exec.(*)" for an instruction stuck in execution — the asterisk marks the cache miss the exercise announces — or "Yes". <b>Dest.</b> is the register, or "Mem" with the address for a store. A free entry is simply an empty row. Here is Example 12 in that format.</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Example 12 of the notes (p. 231): one instruction in a four-entry ROB. Head at ROB0 (first to commit once ready), tail at ROB1 (the next free entry).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>ROB0</td><td>In: LD F0, 0(R1)</td><td>F0</td><td>Load1</td><td>No, exec.</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB1</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB2</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB3</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two of the fields are control bits with a life of their own (p. 230). The <b>Ready bit</b> is set when the instruction finishes execution and the result is written into the ROB; it tells dependents that the value can be read — from the bus or directly from the entry — and it enables commit: no commit without Ready. The <b>Speculative flag</b> is set at issue when the instruction follows an unresolved branch and cleared when the branch resolves as predicted; its purpose is that speculative instructions never update the state, and that all of them can be flushed on a misprediction or an exception. The notes' summary of the design (p. 230): the ROB replaces the store buffers, so memory writes wait for commit; renaming moves from the reservation stations to the ROB; precise exceptions and speculation are both served by tracking and flushing; the CDB stays critical for forwarding and readiness detection.</p>
+
+  <div class="pitfall">
+    <p>"The ROB replaces the register renaming logic" (p. 229). Overstated: the register status table of lesson 11 still exists — it now holds ROB numbers, and the exam calls it the Rename Table. What the ROB replaces is the station-based tag namespace and the store buffers.</p>
+  </div>
+</section>
+
+<section id="l17-ring">
+  <h2>Two pointers and a ring: head, tail, the rename table, and the notes' Example 13</h2>
+
+  <p>The ROB is a circular buffer — a circular FIFO queue — run by two pointers (p. 231). The <mark class="key">head</mark> points to the oldest instruction, the next to commit; it advances at commit. The <mark class="key">tail</mark> points to the next free entry, where the next issued instruction goes; it advances at issue. Why two pointers and a ring (pp. 231–232)? Insertion at the tail preserves program order at issue. Retirement from the head makes commit in order. When a pointer reaches the end of the buffer it wraps around to 0, so entries never move: no data shifting, less silicon. And full and empty are told apart with the two pointers and one busy bit:</p>
+
+  <figure class="fig fig--pair fig--plain" id="l17-fig-fullempty">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="A four-entry ring with every entry busy; head and tail both point at ROB0, and the busy bit says the buffer is full">
+        <circle cx="150" cy="112" r="78" class="fi-none st-grid dash"/>
+        <rect x="114" y="16" width="72" height="36" rx="6" class="fw-s3 st-s3"/>
+        <text x="120" y="31" class="tx-mono tx-sm">ROB0</text>
+        <text x="120" y="46" class="tx-mono tx-sm">In</text>
+        <rect x="192" y="94" width="72" height="36" rx="6" class="fw-s3 st-s3"/>
+        <text x="198" y="109" class="tx-mono tx-sm">ROB1</text>
+        <text x="198" y="124" class="tx-mono tx-sm">In+1</text>
+        <rect x="114" y="172" width="72" height="36" rx="6" class="fw-s3 st-s3"/>
+        <text x="120" y="187" class="tx-mono tx-sm">ROB2</text>
+        <text x="120" y="202" class="tx-mono tx-sm">In+2</text>
+        <rect x="36" y="94" width="72" height="36" rx="6" class="fw-s3 st-s3 dash"/>
+        <text x="42" y="109" class="tx-mono tx-sm">ROB3</text>
+        <text x="42" y="124" class="tx-mono tx-sm">In+3</text>
+        <line x1="144" y1="98" x2="144" y2="58" class="st-ink sw-2" marker-end="url(#arr)"/>
+        <line x1="156" y1="98" x2="156" y2="58" class="st-ink sw-2 dash" marker-end="url(#arr)"/>
+        <text x="136" y="82" class="tx-sm tx-end">head</text>
+        <text x="164" y="82" class="tx-sm">tail</text>
+        <text x="150" y="240" class="tx-mid tx-sm">head = tail = ROB0, entry busy: FULL</text>
+      </svg>
+      <p class="fig-label">Full: head = tail and the entry is busy — issue stalls</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="The same ring with every entry free; head and tail both point at ROB0, and the busy bit says the buffer is empty">
+        <circle cx="150" cy="112" r="78" class="fi-none st-grid dash"/>
+        <rect x="114" y="16" width="72" height="36" rx="6" class="fi-none st-muted dash"/>
+        <text x="120" y="31" class="tx-mono tx-sm tx-muted">ROB0</text>
+        <rect x="192" y="94" width="72" height="36" rx="6" class="fi-none st-muted dash"/>
+        <text x="198" y="109" class="tx-mono tx-sm tx-muted">ROB1</text>
+        <rect x="114" y="172" width="72" height="36" rx="6" class="fi-none st-muted dash"/>
+        <text x="120" y="187" class="tx-mono tx-sm tx-muted">ROB2</text>
+        <rect x="36" y="94" width="72" height="36" rx="6" class="fi-none st-muted dash"/>
+        <text x="42" y="109" class="tx-mono tx-sm tx-muted">ROB3</text>
+        <line x1="144" y1="98" x2="144" y2="58" class="st-ink sw-2" marker-end="url(#arr)"/>
+        <line x1="156" y1="98" x2="156" y2="58" class="st-ink sw-2 dash" marker-end="url(#arr)"/>
+        <text x="136" y="82" class="tx-sm tx-end">head</text>
+        <text x="164" y="82" class="tx-sm">tail</text>
+        <text x="150" y="240" class="tx-mid tx-sm">head = tail = ROB0, entry not busy: EMPTY</text>
+      </svg>
+      <p class="fig-label">Empty: head = tail and the entry is free — nothing to commit</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> The same two pointers, the same position; only the busy bit of the entry they point at tells full from empty (p. 232). The left ring is cycle 3 of the corrected Example 13 below: ROB2 holds the branch, and the dashed outline of ROB3 marks the one speculative entry behind it.</figcaption>
+  </figure>
+
+  <p>In symbols, with \(N\) entries, head \(h\), tail \(t\) and the busy bit \(b[h]\) of the entry at the head (the full / empty rule is the notes'; the modular arithmetic is background):</p>
+  <div class="formula">
+    \[ \text{full} \iff h = t \wedge b[h] \]
+    \[ \text{empty} \iff h = t \wedge \neg b[h] \]
+    \[ \text{issue: } t \leftarrow (t + 1) \bmod N \]
+    \[ \text{commit: } h \leftarrow (h + 1) \bmod N \]
+    <dl class="legend">
+      <dt>\(h\), \(t\)</dt><dd>head and tail pointers, as entry numbers</dd>
+      <dt>\(b[h]\)</dt><dd>busy bit of the entry the head points at</dd>
+      <dt>\(N\)</dt><dd>number of entries of the buffer</dd>
+    </dl>
+  </div>
+
+  <p>Full is the costly state. The head blocks everything behind it: if the oldest instruction waits on a cache miss, finished instructions behind it cannot commit, their entries do not free, and when the tail meets the head issue stops — the whole window is exhausted. Nothing commits out of order to make room, ever. That is the price of the design, and it is why the size of the buffer matters.</p>
+
+  <div class="story" data-year="1967">
+    <p>Only about fifteen IBM System/360 Model 91s were built. The first went to NASA's Goddard Space Flight Center in October 1967, where at 16.6 MIPS it was the most powerful computer in user operation. It ran Tomasulo's algorithm — and it had imprecise exceptions and out-of-order memory stores, the two problems the reorder buffer later fixed. The hook's 512-entry buffer is the same algorithm with a window 64 times wider than the Model 91's eight instructions.</p>
+  </div>
+
+  <details class="why">
+    <summary>Why do modern cores need hundreds of entries?</summary>
+    <p>Background, not in the notes. To sustain a throughput of IPC instructions per cycle while each instruction stays in the buffer for T cycles from issue to commit, the buffer must hold about IPC × T entries (Little's law). A cache miss of a hundred cycles at the head, on a core that issues four instructions per cycle, needs hundreds of entries behind it — or issue stalls long before the miss is served.</p>
+  </details>
+
+  <h3>The rename table</h3>
+
+  <p>The <mark class="key">rename table</mark> (p. 232) is a small hardware table that records where the most recent value of each register will come from while its producer is still in flight: it maps F0, F2, … to the ROB entry producing their new value. It is lesson 11's register status table with ROB numbers instead of station names, and the exam calls it the Rename Table. A writer issues: its destination is mapped to its new ROB number. A reader issues: it checks the table — mapped, so read the value from the ROB, or take the tag if the entry is not ready; not mapped, so read the register file. Two rules the notes leave implicit. At commit the mapping is cleared only if it still points to the committing entry: a younger writer may have re-mapped the register, and that mapping must stay. At a flush every mapping that points to a flushed entry goes back to the older in-flight producer of that register, or to "–" if there is none; real cores keep a checkpoint of the table at each branch for exactly this.</p>
+
+  <p class="memo"><mark class="key">The rename table holds names, never values: a ROB number or nothing. The values live in the entries and, after commit, in the register file.</mark></p>
+
+  <div class="widget" id="l17-w-ring">
+    <h3 class="widget-title">The ring: issue at the tail, finish anywhere, commit at the head</h3>
+    <p class="widget-intro">A reorder buffer drawn as a ring of entries with its head and tail pointers, the rename table and the register file under it. "Issue next" takes the next instruction of the program below (the notes' Example 13 with the branch put back, then three more); the slider picks which entry "Complete" finishes — in any order you like, as long as its operands have arrived; "Commit head" is the only button that can change the register file; the two branch buttons resolve the BNE. The insight to take away: completed is not committed, and the ring is what makes an out-of-order machine undo-able.</p>
+    <ol class="tasks">
+      <li>Press "Issue next" four times. Before the fourth press, predict which entries will be marked spec and what the status line will say after it. Then, with the slider at 0, press "Complete ROB0" and look at F0 in the register file. Does it change?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only ROB3 (In+3) is marked spec: it sits behind the BNE in ROB2, which is itself not speculative. After the fourth issue the line reads head ROB0, tail ROB0, FULL. Completing ROB0 puts 10 in the entry with "ready", but the register file still says F0 = 0 and the rename table still says F0 → ROB0. Only "Commit head" writes F0 = 10 and clears the mapping.</p></details>
+      </li>
+      <li>Start over, issue twice, set the slider to 1 and press "Complete ROB1" before completing ROB0. Predict the note. Then complete ROB0 and ROB1 in that order.
+        <details class="answer"><summary>What you should see</summary>
+          <p>It refuses: FADD F2 waits for F0 from ROB0 on the CDB — a RAW hazard, the third case of the operand rule. After ROB0 completes, ROB1 captures 10 from the bus and completes with 20, while the register file still says F0 = 0: forwarding before commit.</p></details>
+      </li>
+      <li>Follow Example 13 to its cycle 7: Issue four times, Complete ROB0, Commit, Issue (In+4 lands in ROB0), Complete ROB1, Commit. The branch is now at the head and ROB0 and ROB3 are speculative. Predict what "Branch: mispredicted" does to the ring, the tail and the rename table — then press it, and press Commit once more.
+        <details class="answer"><summary>What you should see</summary>
+          <p>ROB3 and ROB0 are torn off (crossed out), the tail goes to ROB3, F6 and F8 go back to "–", and the register file still shows F0 = 10, F2 = 20 — nothing to undo there. The branch stays and commits on the next press, leaving head = tail = ROB3 with the entry free: empty. The next "Issue next" fetches the fall-through SD F2, 0(R1), not speculative.</p></details>
+      </li>
+      <li>Switch to 8 entries, press "Issue next" seven times and look at F0 in the rename table. Predict what it will map to after "Branch: mispredicted": ROB6, "–", or ROB0?
+        <details class="answer"><summary>What you should see</summary>
+          <p>ROB0. In+6 (ROB6) re-mapped F0 while In (ROB0) was still in flight; the flush restores the older in-flight producer, not "–". A later reader of F0 must still wait for ROB0 — it must not read the stale register file.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l17-w-ring', function (root, ui) {
+    var S = Course.svg;
+    var REGS = ['F0', 'F2', 'F4', 'F6', 'F8', 'R1'];
+    function add(a, b) { return a + b; }
+    function mul(a, b) { return a * b; }
+    var PRED = [
+      { name: 'In',   text: 'LD F0, 0(R1)',     short: 'LD F0',    kind: 'load',   cls: 'Load', dest: 'F0', src: ['R1'],       val: 10 },
+      { name: 'In+1', text: 'FADD F2, F0, F0',  short: 'FADD F2',  kind: 'fp',     cls: 'FP',   dest: 'F2', src: ['F0', 'F0'], op: add },
+      { name: 'In+2', text: 'BNE R1, R2, NEXT', short: 'BNE',      kind: 'branch', cls: 'Int',  dest: null, src: ['R1'] },
+      { name: 'In+3', text: 'FMUL F6, F2, F2',  short: 'FMUL F6',  kind: 'fp',     cls: 'FP',   dest: 'F6', src: ['F2', 'F2'], op: mul },
+      { name: 'In+4', text: 'FADD F8, F6, F2',  short: 'FADD F8',  kind: 'fp',     cls: 'FP',   dest: 'F8', src: ['F6', 'F2'], op: add },
+      { name: 'In+5', text: 'LD F4, 8(R1)',     short: 'LD F4',    kind: 'load',   cls: 'Load', dest: 'F4', src: ['R1'],       val: 7 },
+      { name: 'In+6', text: 'FADD F0, F4, F2',  short: 'FADD F0',  kind: 'fp',     cls: 'FP',   dest: 'F0', src: ['F4', 'F2'], op: add },
+      { name: 'In+7', text: 'SD F0, 16(R1)',    short: 'SD F0',    kind: 'store',  cls: null,   dest: 'Mem', src: ['F0', 'R1'], off: 16 }
+    ];
+    var FALL = [
+      { name: 'Ia', text: 'SD F2, 0(R1)',    short: 'SD F2',    kind: 'store', cls: null,  dest: 'Mem', src: ['F2', 'R1'], off: 0 },
+      { name: 'Ib', text: 'ADDUI R1, R1, 8', short: 'ADDUI R1', kind: 'int',   cls: 'Int', dest: 'R1', src: ['R1'],       op: function (a) { return a + 8; } }
+    ];
+    var POOL = { Load: 4, FP: 4, Int: 2 };
+    var M = {};
+
+    function say(s) { M.log.push(s); if (M.log.length > 3) M.log.shift(); }
+    M.reset = function (n) {
+      M.N = n; M.rob = []; for (var k = 0; k < n; k++) M.rob.push({ busy: false, torn: false });
+      M.head = 0; M.tail = 0; M.rename = {}; M.rf = { F0: 0, F2: 0, F4: 0, F6: 0, F8: 0, R1: 16 };
+      REGS.forEach(function (r) { M.rename[r] = null; });
+      M.path = PRED; M.pathName = 'predicted'; M.qi = 0; M.units = { Load: [], FP: [], Int: [] }; M.log = []; M.last = -1; M.lastReg = null; M.mem = [];
+      say('Reset: ROB empty, head = tail = ROB0 (not busy). Next to issue: ' + PRED[0].name + ' ' + PRED[0].text + '.');
+    };
+    M.isFull = function () { return M.head === M.tail && M.rob[M.head].busy; };
+    M.isEmpty = function () { return M.head === M.tail && !M.rob[M.head].busy; };
+    M.inFlight = function () { var c = 0; M.rob.forEach(function (e) { if (e.busy) c++; }); return c; };
+    M.readyCount = function () { var c = 0; M.rob.forEach(function (e) { if (e.busy && e.ready) c++; }); return c; };
+    M.unresolvedBranch = function () { for (var k = 0; k < M.N; k++) if (M.rob[k].busy && M.rob[k].kind === 'branch' && !M.rob[k].ready) return k; return -1; };
+    M.nextIns = function () { return M.qi < M.path.length ? M.path[M.qi] : null; };
+    function clearTorn() { M.rob.forEach(function (e) { e.torn = false; }); M.lastReg = null; }
+    function allocUnit(cls) {
+      if (!cls) return '–';
+      var u = M.units[cls];
+      for (var i = 1; i <= POOL[cls]; i++) if (u.indexOf(i) < 0) { u.push(i); return cls + i; }
+      return null;
+    }
+    function freeUnit(e) { if (e.unitCls && e.unitNo) { var u = M.units[e.unitCls], i = u.indexOf(e.unitNo); if (i >= 0) u.splice(i, 1); } }
+
+    M.issue = function () {
+      clearTorn();
+      var ins = M.nextIns();
+      if (!ins) { say('Nothing left to fetch on the ' + M.pathName + ' path.'); return; }
+      if (M.isFull()) { say('ROB full: head = tail = ROB' + M.head + ' and the entry is busy. Issue stalls until the head commits' + (M.readyCount() ? ', although ' + M.readyCount() + ' ' + (M.readyCount() > 1 ? 'entries are' : 'entry is') + ' already ready.' : '.')); return; }
+      var unit = allocUnit(ins.cls);
+      if (unit === null) { say('No free ' + ins.cls + ' reservation station for ' + ins.name + ' (' + ins.text + '): structural hazard, issue stalls.'); return; }
+      var k = M.tail, e = M.rob[k], spec = M.unresolvedBranch() >= 0;
+      e.busy = true; e.ins = ins; e.kind = ins.kind; e.name = ins.name; e.ready = false; e.value = null; e.torn = false;
+      e.unit = unit; e.unitCls = ins.cls; e.unitNo = ins.cls ? +unit.slice(ins.cls.length) : 0;
+      e.spec = spec;
+      e.srcs = ins.src.map(function (r) {
+        var m = M.rename[r];
+        if (m === null) return { reg: r, tag: null, value: M.rf[r], from: 'value ' + M.rf[r] + ' from the register file' };
+        if (M.rob[m].ready) return { reg: r, tag: null, value: M.rob[m].value, from: 'value ' + M.rob[m].value + ' from ROB' + m + ' (ready, not yet committed)' };
+        return { reg: r, tag: m, value: null, from: 'tag ROB' + m + ' (not ready: wait for the CDB)' };
+      });
+      var ren = '';
+      if (ins.dest && ins.dest !== 'Mem') { M.rename[ins.dest] = k; ren = ' Rename table: ' + ins.dest + ' → ROB' + k + '.'; }
+      var seen = {}, where = [];
+      e.srcs.forEach(function (s) { if (!seen[s.reg]) { seen[s.reg] = true; where.push(s.reg + ': ' + s.from); } });
+      say(ins.name + ' ' + ins.text + ' → ROB' + k + ', ' + (unit === '–' ? 'no reservation station (a store lives in its entry)' : unit) + (spec ? ', Spec = Yes (an older branch is unresolved)' : ', Spec = No') + '. Operands: ' + where.join('; ') + '.' + ren);
+      M.last = k; M.tail = (k + 1) % M.N; M.qi++;
+    };
+
+    M.complete = function (k) {
+      clearTorn();
+      if (k >= M.N) { say('This ROB has only ' + M.N + ' entries, ROB0 to ROB' + (M.N - 1) + '.'); return; }
+      var e = M.rob[k];
+      if (!e.busy) { say('ROB' + k + ' is free: nothing to complete.'); return; }
+      if (e.ready) { say('ROB' + k + ' (' + e.name + ') is already ready: it waits to commit, not to execute.'); return; }
+      if (e.kind === 'branch') { say('ROB' + k + ' is the branch: resolve it with the two branch buttons.'); return; }
+      var waiting = [];
+      e.srcs.forEach(function (s) { if (s.tag !== null) waiting.push(s.reg + ' from ROB' + s.tag); });
+      if (waiting.length) { say(e.name + ' (ROB' + k + ') cannot execute yet: it waits for ' + waiting.join(' and ') + ' on the CDB — a RAW hazard.'); return; }
+      var v;
+      if (e.kind === 'load') v = e.ins.val;
+      else if (e.kind === 'store') v = e.srcs[0].value;
+      else v = e.ins.op(e.srcs[0].value, e.srcs[1] ? e.srcs[1].value : 0);
+      e.ready = true; e.value = v; freeUnit(e);
+      var captured = [];
+      M.rob.forEach(function (o, j) {
+        if (o.busy && !o.ready && o.srcs) o.srcs.forEach(function (s) { if (s.tag === k) { s.tag = null; s.value = v; if (captured.indexOf('ROB' + j) < 0) captured.push('ROB' + j); } });
+      });
+      say(e.name + ' writes its result: the CDB carries (ROB' + k + ', ' + v + '); Value = ' + v + ', Ready = Yes' + (e.unit !== '–' ? ', ' + e.unit + ' freed' : '') + (captured.length ? '; ' + captured.join(', ') + ' captured the value' : '') + '. The register file ' + (e.kind === 'store' ? 'and memory are' : 'is') + ' untouched.');
+      M.last = k;
+    };
+
+    M.resolve = function (correct) {
+      clearTorn();
+      var b = M.unresolvedBranch();
+      if (b < 0) { say('There is no unresolved branch in the ROB.'); return; }
+      var e = M.rob[b]; e.ready = true; e.value = null; freeUnit(e);
+      var younger = [];
+      for (var j = (b + 1) % M.N; j !== M.tail; j = (j + 1) % M.N) younger.push(j);
+      if (correct) {
+        younger.forEach(function (j) { M.rob[j].spec = false; });
+        say('BNE resolves as predicted: ' + (younger.length ? 'Spec cleared on ROB' + younger.join(', ROB') : 'no younger entry to clear') + '. Nothing else changes; the branch will commit like any other entry.');
+        M.last = b; return;
+      }
+      younger.forEach(function (j) { var o = M.rob[j]; freeUnit(o); o.busy = false; o.ready = false; o.spec = false; o.torn = true; });
+      M.tail = (b + 1) % M.N;
+      REGS.forEach(function (r) { M.rename[r] = null; });
+      var cnt = M.inFlight();
+      for (var s = 0, q = M.head; s < cnt; s++, q = (q + 1) % M.N) { var o = M.rob[q]; if (o.busy && o.ins.dest && o.ins.dest !== 'Mem') M.rename[o.ins.dest] = q; }
+      M.path = FALL; M.pathName = 'fall-through'; M.qi = 0;
+      say('BNE mispredicted: ' + (younger.length ? 'ROB' + younger.join(', ROB') + ' torn off' : 'nothing younger to flush') + '; tail → ROB' + M.tail + '; rename table restored to the surviving producers; fetch restarts on the fall-through path. The register file was never touched.');
+      M.last = b;
+    };
+
+    M.commit = function () {
+      clearTorn();
+      if (M.isEmpty()) { say('ROB empty: head = tail = ROB' + M.head + ' and the entry is not busy. Nothing to commit.'); return; }
+      var e = M.rob[M.head], h = M.head;
+      if (!e.ready) { var rc = M.readyCount(); say('Head ROB' + h + ' (' + e.name + ') is not ready: nothing commits' + (rc ? ', although ' + rc + ' younger ' + (rc > 1 ? 'entries are' : 'entry is') + ' ready — completed is not committed.' : '.')); return; }
+      if (e.spec) { say('Head ROB' + h + ' is still speculative: it waits for its branch.'); return; }
+      var what;
+      if (e.kind === 'store') { M.mem.push('Mem[' + e.ins.off + '+R1] = ' + e.value); what = 'memory written, Mem[' + e.ins.off + '+R1] ← ' + e.value; }
+      else if (e.kind === 'branch') what = 'a resolved branch retires with no change of state';
+      else {
+        M.rf[e.ins.dest] = e.value; M.lastReg = e.ins.dest;
+        what = 'register file ' + e.ins.dest + ' ← ' + e.value;
+        if (M.rename[e.ins.dest] === h) { M.rename[e.ins.dest] = null; what += '; rename table ' + e.ins.dest + ' → –'; }
+        else if (M.rename[e.ins.dest] !== null) what += '; the rename table keeps ' + e.ins.dest + ' → ROB' + M.rename[e.ins.dest] + ' (a younger writer)';
+      }
+      e.busy = false; e.ready = false; e.spec = false;
+      M.head = (h + 1) % M.N;
+      say(e.name + ' commits from ROB' + h + ': ' + what + '. Entry freed, head → ROB' + M.head + '.');
+      M.last = h;
+    };
+
+    M.reset(4);
+
+    ui.select('ROB size', [{ value: '4', label: '4 entries (the notes’ Example 13)' }, { value: '8', label: '8 entries' }], function (v) { M.reset(+v); }, '4');
+    var kSel = ui.slider({ label: 'entry to complete (k)', min: 0, max: 7, step: 1, value: 0 });
+    ui.button('Issue next', function () { M.issue(); }, { kind: 'primary', icon: 'next' });
+    var bComp = ui.button('Complete ROB0', function () { M.complete(kSel.value | 0); }, { icon: 'check' });
+    ui.button('Commit head', function () { M.commit(); }, { icon: 'arrow-right' });
+    ui.button('Branch: predicted right', function () { M.resolve(true); }, { kind: 'ghost' });
+    ui.button('Branch: mispredicted', function () { M.resolve(false); }, { kind: 'ghost', icon: 'cross' });
+    ui.button('Start over', function () { M.reset(M.N); }, { kind: 'ghost', icon: 'refresh' });
+
+    var svg = ui.svg(560, 580, { label: 'A reorder buffer drawn as a ring of entries with head and tail pointers, with the rename table and the register file under it' });
+    var roHead = ui.readout('head'), roTail = ui.readout('tail'), roFlight = ui.readout('in flight', { digits: 0 }), roState = ui.readout('state');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'entry in flight (bookkeeping)', color: 's3', mark: 'area' },
+      { label: 'speculative entry: behind an unresolved branch', color: 's3', mark: 'dash' },
+      { label: 'free entry', color: 'muted', mark: 'dash' },
+      { label: 'the register file: architectural state', color: 's6', mark: 'dash' },
+      { label: 'torn off by a misprediction', color: 'bad', mark: 'cross' },
+      { label: 'the entry just touched', color: 'ink', mark: 'hl' }
+    ]);
+
+    function pointer(label, k, cls, dth, frac, side) {
+      var N = M.N, cx = 280, cy = 190, R = N === 4 ? 120 : 150;
+      var th = -Math.PI / 2 + k * 2 * Math.PI / N + dth, c = Math.cos(th), s = Math.sin(th);
+      var t = Math.min(50 / Math.max(Math.abs(c), 1e-6), 28 / Math.max(Math.abs(s), 1e-6));
+      var r1 = 14, r2 = R - t - 6;
+      S('line', { x1: cx + r1 * c, y1: cy + r1 * s, x2: cx + r2 * c, y2: cy + r2 * s, 'class': cls, 'marker-end': 'url(#arr)' }, svg);
+      var rm = r1 + (r2 - r1) * frac, px = -s * side * 14, py = c * side * 14;
+      S('text', { x: cx + rm * c + px, y: cy + rm * s + py + 5, 'class': 'tx-mid tx-sm halo', text: label }, svg);
+    }
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var N = M.N, cx = 280, cy = 190, R = N === 4 ? 120 : 150, BW = 100, BH = 56, k;
+      S('circle', { cx: cx, cy: cy, r: R, 'class': 'fi-none st-grid dash' }, svg);
+      for (k = 0; k < N; k++) {
+        var th = -Math.PI / 2 + k * 2 * Math.PI / N, x = cx + R * Math.cos(th), y = cy + R * Math.sin(th), e = M.rob[k];
+        if (k === M.last) S('rect', { x: x - BW / 2 - 5, y: y - BH / 2 - 5, width: BW + 10, height: BH + 10, rx: 10, 'class': 'hl fi-none' }, svg);
+        S('rect', { x: x - BW / 2, y: y - BH / 2, width: BW, height: BH, rx: 6, 'class': !e.busy ? 'fi-none st-muted dash' : (e.spec ? 'fw-s3 st-s3 dash' : 'fw-s3 st-s3') }, svg);
+        S('text', { x: x - BW / 2 + 6, y: y - BH / 2 + 15, 'class': 'tx-mono tx-sm' + (e.busy ? '' : ' tx-muted'), text: 'ROB' + k }, svg);
+        if (e.busy) {
+          if (e.spec) S('text', { x: x + BW / 2 - 6, y: y - BH / 2 + 15, 'class': 'tx-sm tx-muted tx-end', text: 'spec' }, svg);
+          S('text', { x: x - BW / 2 + 6, y: y + 5, 'class': 'tx-mono', text: e.ins.short }, svg);
+          if (e.kind !== 'branch') S('text', { x: x - BW / 2 + 6, y: y + BH / 2 - 7, 'class': 'tx-mono tx-sm', text: e.ready ? String(e.value) : '—' }, svg);
+          S('text', { x: x + BW / 2 - 6, y: y + BH / 2 - 7, 'class': 'tx-sm tx-end ' + (e.ready ? 'tx-good' : 'tx-muted'), text: e.ready ? (e.kind === 'branch' ? 'resolved' : 'ready') : 'issued' }, svg);
+        }
+        if (e.torn) {
+          S('line', { x1: x - BW / 2, y1: y - BH / 2, x2: x + BW / 2, y2: y + BH / 2, 'class': 'st-bad sw-3' }, svg);
+          S('line', { x1: x + BW / 2, y1: y - BH / 2, x2: x - BW / 2, y2: y + BH / 2, 'class': 'st-bad sw-3' }, svg);
+        }
+      }
+      var same = M.head === M.tail;
+      pointer('head', M.head, 'st-ink sw-2', same ? -0.11 : 0, 0.42, -1);
+      pointer('tail', M.tail, 'st-ink sw-2 dash', same ? 0.11 : 0, 0.68, 1);
+      S('text', { x: cx, y: 402, 'class': 'tx-mid tx-mono', text: 'head ROB' + M.head + ' · tail ROB' + M.tail + ' · ' + (M.isFull() ? 'FULL' : M.isEmpty() ? 'EMPTY' : M.inFlight() + ' in flight') }, svg);
+      S('text', { x: 40, y: 430, 'class': 'tx-sm', text: 'Rename table' }, svg);
+      S('text', { x: 320, y: 430, 'class': 'tx-sm', text: 'Register file' }, svg);
+      S('rect', { x: 312, y: 438, width: 200, height: 6 * 20 + 10, rx: 4, 'class': 'fi-none st-s6 dash sw-2' }, svg);
+      REGS.forEach(function (r, i) {
+        var y = 446 + i * 20, m = M.rename[r];
+        S('text', { x: 46, y: y + 14, 'class': 'tx-mono tx-sm', text: r }, svg);
+        if (m === null) S('text', { x: 100, y: y + 14, 'class': 'tx-mono tx-sm tx-muted', text: '–' }, svg);
+        else {
+          S('rect', { x: 96, y: y, width: 50, height: 18, rx: 6, 'class': 'fw-s3 st-s3' }, svg);
+          S('text', { x: 121, y: y + 14, 'class': 'tx-mid tx-mono tx-sm', text: 'ROB' + m }, svg);
+        }
+        if (M.lastReg === r) S('rect', { x: 384, y: y - 1, width: 90, height: 20, rx: 4, 'class': 'hl fi-none' }, svg);
+        S('text', { x: 326, y: y + 14, 'class': 'tx-mono tx-sm', text: r }, svg);
+        S('text', { x: 400, y: y + 14, 'class': 'tx-mono', text: String(M.rf[r]) }, svg);
+      });
+    }
+
+    ui.onChange(function () {
+      bComp.label('Complete ROB' + (kSel.value | 0));
+      draw();
+      roHead.set('ROB' + M.head); roTail.set('ROB' + M.tail); roFlight.set(M.inFlight());
+      var st = M.isFull() ? 'full' : M.isEmpty() ? 'empty' : (M.N - M.inFlight()) + ' free';
+      roState.set(st, M.isFull() ? 'key' : undefined);
+      var nx = M.nextIns();
+      note.set(M.log.map(function (s) { return '<span>' + s + '</span>'; }).join('<br>') + '<br><b>Next to issue:</b> ' + (nx ? nx.name + ' ' + nx.text + (M.unresolvedBranch() >= 0 ? ' (would be speculative)' : '') : 'nothing on this path') + (M.mem.length ? ' · <b>memory:</b> ' + M.mem.join(', ') : ''));
+    });
+  });
+  </script>
+
+  <h3>Example 13, corrected: eight cycles, two commits, one flush</h3>
+
+  <p>The notes' Example 13 (pp. 232–237) runs five instructions, In to In+4, through a four-entry ROB. Two things need fixing before it can be followed: there is no branch in the buffer although In+3 and In+4 are called speculative, and the rename table ends up holding values (both red pens are below). Here In+2 is the branch, and every instruction gets a mnemonic so that the paper's columns can be filled; the machine is the one of February 2025 — four load buffers, four FP reservation stations, two integer ones. The notes' numbers — 10, 20, the cycle of each event, the pointers — are unchanged. The notes count snapshots as cycles and issue two instructions in "cycle 1": read the cycles as snapshots, not as a timing table.</p>
+
+<pre><code>In:   LD   F0, 0(R1)    ; Load1, value 10
+In+1: FADD F2, F0, F0   ; FP1, RAW F0, 20
+In+2: BNE  R1, R2, NEXT ; Int1, pred. taken
+In+3: FMUL F6, F2, F2   ; FP2, spec
+In+4: FADD F8, F6, F2   ; FP3, spec</code></pre>
+
+  <ol class="steps" id="l17-steps-ex13">
+    <li><p><b>Cycle 1.</b> In and In+1 issue. Head ROB0, tail ROB2. F0 and F2 are renamed: whoever reads them now looks at ROB0 and ROB1, not at the register file. In+1 received the tag ROB0 for F0.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr><td>ROB0</td><td>In: LD F0, 0(R1)</td><td>F0</td><td>Load1</td><td>No, exec.</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB2</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB3</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>ROB0</td><td>ROB1</td><td>–</td><td>–</td><td>–</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 2.</b> The branch In+2 issues into ROB2 and takes Int1. It has no destination, so the rename table does not change; it is not speculative itself — it <em>is</em> the unresolved branch. Tail ROB3.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr><td>ROB0</td><td>In: LD F0, 0(R1)</td><td>F0</td><td>Load1</td><td>No, exec.</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr class="is-key"><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB3</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>ROB0</td><td>ROB1</td><td>–</td><td>–</td><td>–</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 3.</b> In+3 issues into ROB3 with Spec = Yes: an older branch is unresolved. All four entries are busy, so the tail meets the head at ROB0 and the entry is busy — the ROB is full. Nothing more can issue until In commits.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr><td>ROB0</td><td>In: LD F0, 0(R1)</td><td>F0</td><td>Load1</td><td>No, exec.</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr class="is-key"><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, issued</td><td>–</td><td>Yes</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>ROB0</td><td>ROB1</td><td>–</td><td>ROB3</td><td>–</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 4.</b> In completes: the CDB carries (ROB0, 10), ROB0 becomes Ready with Value 10, Load1 is freed, and In+1's station captures the 10. The register file still holds the old F0, and the rename table still says F0 → ROB0: the value is in the ROB, not in the register.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>ROB0</td><td>In: LD F0, 0(R1)</td><td>F0</td><td>–</td><td>Yes</td><td>10</td><td>No</td></tr>
+          <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, exec.</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, issued</td><td>–</td><td>Yes</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>ROB0</td><td>ROB1</td><td>–</td><td>ROB3</td><td>–</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 5.</b> In commits: it is at the head, Ready, not speculative. The register file gets F0 = 10, ROB0 is freed, the head moves to ROB1 and the tail finally finds a free entry at ROB0. The rename entry of F0 is cleared — it pointed to the committing entry — and reads "–", as the paper writes it.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>ROB0</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, exec.</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, issued</td><td>–</td><td>Yes</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>ROB1</td><td>–</td><td>ROB3</td><td>–</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 6.</b> In+4 issues into the freed ROB0 — the ring has wrapped — with Spec = Yes and the station FP3 (FP1 is still busy until In+1 writes its result). In+1 completes with 20 = 10 + 10; In+3 and In+4 capture the 20 from the bus. Full again: head = tail = ROB1, busy.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>ROB0</td><td>In+4: FADD F8, F6, F2</td><td>F8</td><td>FP3</td><td>No, issued</td><td>–</td><td>Yes</td></tr>
+          <tr class="is-key"><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>–</td><td>Yes</td><td>20</td><td>No</td></tr>
+          <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, exec.</td><td>–</td><td>Yes</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>ROB1</td><td>–</td><td>ROB3</td><td>ROB0</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 7.</b> In+1 commits: F2 = 20 in the register file, ROB1 freed, head ROB2, tail ROB1, F2 → "–". The head is now the branch. ROB0 and ROB3 are speculative and still executing; they can neither commit nor be trusted.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr><td>ROB0</td><td>In+4: FADD F8, F6, F2</td><td>F8</td><td>FP3</td><td>No, issued</td><td>–</td><td>Yes</td></tr>
+          <tr class="is-key"><td>ROB1</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, exec.</td><td>–</td><td>Yes</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>–</td><td>–</td><td>ROB3</td><td>ROB0</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 8, before the flush.</b> The branch executes: R1 equals R2 after all, the prediction "taken" was wrong. ROB2 becomes Ready (resolved) and the mispredict is detected. Everything issued after it — ROB3, then ROB0 — is on the wrong path.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr><td>ROB0</td><td>In+4: FADD F8, F6, F2</td><td>F8</td><td>FP3</td><td>No, issued</td><td>–</td><td>Yes</td></tr>
+          <tr><td>ROB1</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr class="is-key"><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>–</td><td>Yes (mispredicted)</td><td>–</td><td>No</td></tr>
+          <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, exec.</td><td>–</td><td>Yes</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>–</td><td>–</td><td>ROB3</td><td>ROB0</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 8, after the flush.</b> ROB3 and ROB0 are freed and FP2, FP3 released; the tail moves back to ROB3, the entry after the last surviving instruction; F6 and F8 lose their mappings — no older producer of F6 or F8 is in flight, so they read "–"; fetch restarts at the fall-through instruction. The register file was never touched: F0 = 10 and F2 = 20 are exactly the state after In+1.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>ROB0</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB1</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>–</td><td>Yes</td><td>–</td><td>No</td></tr>
+          <tr class="is-key"><td>ROB3</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr></tbody></table></div>
+    </li>
+    <li><p><b>Cycle 9, one step beyond the notes.</b> The branch commits: a resolved branch retires with no change of state. Head ROB3, tail ROB3, entry not busy — the ROB is empty, and the next instruction of the correct path will issue into ROB3 with Spec = No.</p>
+      <div class="scroll-x"><table class="tbl tbl--center">
+        <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Value</th><th>Spec.</th></tr></thead>
+        <tbody>
+          <tr><td>ROB0</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB1</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr class="is-key"><td>ROB2</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>ROB3</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+        </tbody></table></div>
+      <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr></tbody></table></div>
+    </li>
+  </ol>
+
+  <aside class="redpen" data-page="234">
+    <p class="claim">"In+3 writes to register F6. The speculative bit is set to “Yes”, so this instruction depends on an unresolved branch (it’s speculative)." — and on p. 236: "At some point, misprediction detected!"</p>
+    <p class="fix">A speculative entry can only sit behind a branch that occupies an older entry of the ROB: the branch marks where speculation starts and its resolution is the event that validates or kills the younger entries. In the notes' table every entry (In, In+1, In+2) writes a register and none is a branch, so nothing can be speculative and nothing can be mispredicted. Make In+2 the branch, as above.</p>
+    <p class="because">The notes themselves list Branch as an instruction type that takes a ROB entry (p. 229) and handle a misprediction "if the instruction at the head is a branch" (p. 241). The February 2025 exam table has an explicit BNE row (ROB7); a student copying the pattern of Example 13 would leave it out.</p>
+  </aside>
+
+  <aside class="redpen" data-page="235">
+    <p class="claim">"F0 no longer points to a ROB entry, but to the final committed value (10)." — the rename-table rows of pp. 235–237 print 10 and 20 as pointers, and p. 237 prints "ROB3 (obsolete)", "ROB0 (obsolete)" after the flush.</p>
+    <p class="fix">The rename table holds ROB numbers or "no mapping"; the values 10 and 20 live in the register file. After the commit of In the entry of F0 is "–" (the February 2025 paper writes <code>$F0 –</code>). After the flush the mappings of F6 and F8 are not left "obsolete": the hardware clears them, or restores them to the older in-flight producer of the register when there is one.</p>
+    <p class="because">A later reader of F6 would otherwise wait for a tag ROB3 that will never be broadcast, or take a stale value. The widget above does both operations: commit clears F0, and in the 8-entry run a flushed F0 → ROB6 goes back to ROB0, which is still in flight.</p>
+  </aside>
+
+  <p>Now the warm-up puzzle. In computes 10 in cycle 4 and F0 becomes 10 in cycle 5. The machine does not wait because it doubts the value; it waits because every result goes through the same gate — the head, in program order. For In the gate costs one cycle and buys nothing visible. For In+3 the same gate is what makes cycle 8 possible: its entry is torn off and F6 never changed. For a faulting instruction it is what makes the exception precise. The price is a delay of the architectural write, never of execution — dependents got the 10 from the bus in cycle 4 — and what it buys is undo. That rule, not the ring or the flag, is the reorder buffer.</p>
+</section>
+
+<section id="l17-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="4" id="l17-exam-q1">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used by modern superscalar processors (Tomasulo-style), in about five lines each: (2) dynamic branch prediction and speculative execution; (5) dynamic register renaming; (6) out-of-order execution; (7) reorder buffer.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>Dynamic branch prediction and speculative execution.</b> The outcome and target of a branch are predicted at fetch from run-time history (BHT, BTB). The instructions after the branch are fetched, issued and executed before the branch resolves; their results are forwarded among them through the CDB and the ROB but kept out of the architectural state until the branch is resolved and the instruction commits. On a misprediction the younger entries of the ROB are flushed and fetch restarts at the correct target. Benefit: branches no longer drain the pipeline, and the window of exploitable ILP spans several basic blocks. Cost: wasted work and recovery time on mispredictions, so accuracy matters.</p>
+        <p><b>Dynamic register renaming.</b> Each issued instruction that writes a register gets a fresh name for its result — a reservation station in classic Tomasulo, a ROB entry in the speculative version; the rename table maps the architectural register to its newest producer, and a consumer issuing later takes that producer's value or its tag. Benefit: WAR and WAW (name) hazards disappear, so instructions and loop iterations can be overlapped freely and only true (RAW) dependences remain. Cost: a rename table to keep, to restore after a misprediction, and the copy of each value into the architectural register at commit.</p>
+        <p><b>Out-of-order execution.</b> Instructions wait in reservation stations and start as soon as their own operands are ready, independently of program order; results are broadcast on the CDB. Issue and commit remain in order. Benefit: a stalled instruction — a cache miss, a long-latency FP operation — does not block independent later ones; functional units stay busy and CPI drops. It requires renaming against WAR/WAW hazards and in-order commit to keep exceptions precise.</p>
+        <p><b>Reorder buffer.</b> A circular FIFO: an entry is allocated at issue in program order, written out of order at Write Result (value, ready bit) and drained in order at Commit from the head (head, ready, not speculative). It supplies operands between completion and commit, provides the names for renaming (the ROB number is the tag) and replaces the store buffers, keeping a store's address and data until commit. Benefits: precise exceptions, since nothing younger than a faulting instruction has touched the state; cheap misprediction recovery by discarding the entries after the branch; speculation made safe. Cost: a finite window — a stalled head stops issue when the buffer fills.</p>
+      </div>
+      <div class="exam-note"><p>Four of the eight sub-points of the June 2026 open question. The examiner looks for the "what it buys" line in each one and for the pairing cost / benefit; "the ROB makes the processor faster" alone earns nothing — it makes speculation safe, and the speed comes from executing past unresolved branches.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="2" id="l17-exam-q2">
+    <div class="exam-q" lang="en">
+      <p>What is a precise exception (give the three conditions)? Explain how the reorder buffer guarantees precise exceptions in an out-of-order processor, and what happens if an instruction on a mispredicted path raises an exception.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>An exception is precise if (1) the processor can stop at a well-defined point corresponding to a specific instruction, (2) all previous instructions are fully committed, and (3) no subsequent instruction has modified the architectural state. With a reorder buffer, results are written to the ROB entry at Write Result, never directly to the register file or memory; only the head commits, in program order. An exception is recorded in the entry of the faulting instruction and taken when that instruction reaches the head: at that moment every older instruction has committed and every younger one is still in the buffer, so the younger entries are discarded and fetch restarts at the handler — the three conditions hold by construction. An exception raised on a mispredicted path never reaches the head: when the branch resolves, the entries after it are flushed together with the recorded exception, so it is never taken.</p>
+      </div>
+      <div class="exam-note"><p>Give the three conditions as a list and then map each one to a property of the buffer (results parked, in-order commit at the head, flush of the younger entries). The last sentence — a speculative exception is simply discarded — is the part most answers miss.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l17-exam-q3">
+    <div class="exam-q" lang="en">
+      <p>(Single answer.) In the speculative Tomasulo algorithm, when is the architectural register file updated?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>At Write Result, when the CDB broadcasts the value <span class="fb">At Write Result the value goes to the ROB entry and to the waiting reservation stations; the CDB no longer reaches the register file (Figure 27).</span></li>
+      <li>At Issue, when the destination register is mapped to a ROB entry <span class="fb">Issue writes the rename table, not the register file: a name, not a value.</span></li>
+      <li data-correct>At Commit, when the instruction is at the head of the ROB with its result ready <span class="fb">Only then is the instruction certainly part of the program's path and older than nothing unfinished.</span></li>
+      <li>As soon as the functional unit finishes <span class="fb">That is completion; the result exists, but it is parked in the entry with Ready = Yes.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The third option: at Commit. The register file must reflect only instructions that are certainly part of the program's path; at Write Result the value goes to the ROB entry and to the waiting reservation stations.</p></div>
+      <div class="exam-note"><p>Keep the contrast straight: in classic Tomasulo the register file is written at Write Result (Table 21's "commit on write-back"); with the ROB only at Commit. In neither design does the value wait inside the reservation station — the red pen on Table 21 above.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l17-exam-q4">
+    <div class="exam-q" lang="en">
+      <p>(Multiple answers.) Which of the following statements about the reorder buffer are true?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>The tag broadcast on the CDB is the ROB entry number <span class="fb">The ROB number is the unique name of the in-flight result, from issue to commit.</span></li>
+      <li>The reservation station is released at Commit <span class="fb">The station is freed at Write Result; it is the ROB entry that is freed at Commit.</span></li>
+      <li data-correct>A store writes memory at Commit <span class="fb">Its address and data wait in the entry; the ROB replaced the store buffer.</span></li>
+      <li>The tail pointer points to the newest issued instruction <span class="fb">The tail points to the next free entry, one past the newest instruction.</span></li>
+      <li data-correct>When head = tail the ROB may be either full or empty <span class="fb">The busy bit of the entry decides (p. 232).</span></li>
+      <li data-correct>A load may read memory only when no earlier store in the ROB has an unresolved or equal address <span class="fb">Memory disambiguation: a RAW hazard through memory (p. 229, step 3).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: 1, 3, 5, 6. False: 2 (the station is freed at Write Result, the ROB entry at Commit) and 4 (the tail points to the next free entry).</p></div>
+      <div class="exam-note"><p>The two false statements are the two confusions the lesson warns against most: which structure is freed when, and what the tail points to.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l17-exam-q5">
+    <div class="exam-q" lang="en">
+      <p>(Single answer.) In the Speculative Tomasulo Architecture, what type of hardware block is used to undo speculative instructions in case of a mispredicted branch? Motivate your answer by explaining what happens in the case of a mispredicted branch.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Reorder Buffer <span class="fb">Speculative results live only in ROB entries; discarding the entries younger than the branch undoes them.</span></li>
+      <li>Instruction Dispatcher <span class="fb">Issue allocates entries; it has no record of results to undo.</span></li>
+      <li>Store Buffer <span class="fb">The speculative design has no store buffer: stores wait in the ROB.</span></li>
+      <li>Reservation Stations <span class="fb">They hold operands and tags, not the commit state; they are squashed as a consequence of the flush.</span></li>
+      <li>Load Buffers <span class="fb">They queue loads before memory access; nothing architectural is kept there.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The Reorder Buffer. A speculative instruction's result is held only in its ROB entry (and in copies inside reservation stations), never in the register file or memory, and the entry is marked speculative. When the branch resolves as mispredicted: all ROB entries younger than the branch are invalidated and the tail is moved back to the entry after the branch; the reservation stations and load buffers working for them are squashed; the rename table is restored to the mapping valid at the branch, so that each register points to its older in-flight producer or to nothing; fetch is redirected to the correct target; the branch itself commits normally. Nothing has to be undone in the architectural state, because nothing speculative ever reached it.</p></div>
+      <div class="exam-note"><p>The quiz of the February 2025 paper, as reproduced in the notes (p. 582). The motivation is worth the extra point: name the four actions (invalidate the younger entries, squash their stations, restore the rename table, redirect fetch) and the reason nothing in the registers needs undoing.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l17-exam-q6">
+    <div class="exam-q" lang="en">
+      <p>Consider the following instruction sequence executed on a speculative Tomasulo architecture with a 4-entry ROB, 4 load buffers (Load1–Load4), 4 FP reservation stations (FP1–FP4) and 2 integer reservation stations (Int1–Int2). The BNE is predicted taken. Complete the ROB table and the Rename Table (a) when the ROB becomes full, (b) after In has committed, (c) after the BNE has been found mispredicted and the ROB has been flushed.</p>
+<pre><code>In:   LD   F0, 0(R1)
+In+1: FADD F2, F0, F0
+In+2: BNE  R1, R2, NEXT
+In+3: FMUL F6, F2, F2
+In+4: FADD F8, F6, F2</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) The ROB is full after four issues: head = tail = ROB0 and the entry is busy. In+3 is speculative because the BNE in ROB2 is unresolved; the BNE itself is not.</p>
+        <div class="scroll-x"><table class="tbl tbl--center">
+          <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Spec.</th></tr></thead>
+          <tbody>
+            <tr><td>ROB0</td><td>In: LD F0, 0(R1)</td><td>F0</td><td>Load1</td><td>No, exec.</td><td>No</td></tr>
+            <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, issued</td><td>No</td></tr>
+            <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>No</td></tr>
+            <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, issued</td><td>Yes</td></tr>
+          </tbody></table></div>
+        <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>ROB0</td><td>ROB1</td><td>–</td><td>ROB3</td><td>–</td></tr></tbody></table></div>
+        <p>(b) In completes (Ready = Yes, value 10 in ROB0, Load1 released) and commits from the head: F0 = 10 in the register file, ROB0 freed, head ROB1, tail ROB0, and the mapping of F0 cleared. In+1 has captured F0 from the CDB and is executing.</p>
+        <div class="scroll-x"><table class="tbl tbl--center">
+          <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Spec.</th></tr></thead>
+          <tbody>
+            <tr><td>ROB0</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+            <tr><td>ROB1</td><td>In+1: FADD F2, F0, F0</td><td>F2</td><td>FP1</td><td>No, exec.</td><td>No</td></tr>
+            <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>Int1</td><td>No, issued</td><td>No</td></tr>
+            <tr><td>ROB3</td><td>In+3: FMUL F6, F2, F2</td><td>F6</td><td>FP2</td><td>No, issued</td><td>Yes</td></tr>
+          </tbody></table></div>
+        <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>ROB1</td><td>–</td><td>ROB3</td><td>–</td></tr></tbody></table></div>
+        <p>(c) In+4 has meanwhile issued into ROB0 (FP3, speculative) and In+1 has committed (F2 = 20, head ROB2, tail ROB1). The BNE resolves as mispredicted: ROB3 and ROB0 are flushed, FP2 and FP3 released, the tail moves to ROB3, the mappings of F6 and F8 are cleared (no older producer is in flight), fetch restarts at the fall-through instruction. The branch is Ready at the head and commits next; the register file holds F0 = 10, F2 = 20 and was never touched by the flushed instructions.</p>
+        <div class="scroll-x"><table class="tbl tbl--center">
+          <thead><tr><th>ROB#</th><th>Instruction</th><th>Dest.</th><th>Res. Alloc.</th><th>Ready/Status</th><th>Spec.</th></tr></thead>
+          <tbody>
+            <tr><td>ROB0</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+            <tr><td>ROB1</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+            <tr><td>ROB2</td><td>In+2: BNE R1, R2, NEXT</td><td>–</td><td>–</td><td>Yes</td><td>No</td></tr>
+            <tr><td>ROB3</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          </tbody></table></div>
+        <div class="scroll-x"><table class="tbl tbl--center"><thead><tr><th>Reg #</th><th>F0</th><th>F2</th><th>F4</th><th>F6</th><th>F8</th></tr></thead><tbody><tr><td>ROB #</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr></tbody></table></div>
+      </div>
+      <div class="exam-note"><p>The three snapshots are cycles 3, 5 and 8 of the corrected Example 13. Marks go to: the Spec column (Yes only behind the branch, No for the branch itself), the Res. Alloc. names and their release at Write Result, the head and tail positions in each snapshot, and the rename table — "–" after a commit, and after the flush "–" only because no older producer of F6 or F8 is still in flight.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l17-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">In sits in ROB0 with Ready = Yes and Value = 10; the head is at ROB0, nothing has committed yet. In this cycle a new instruction that reads F0 issues. Where does it get F0 from?</p>
+    <ul class="options">
+      <li>From the register file <span class="fb">The register file still holds the old F0: the commit has not happened. The rename table says F0 → ROB0, so the register file is not consulted.</span></li>
+      <li data-correct>From the ROB entry ROB0, as a value <span class="fb">Mapped and ready: the second case of the operand rule. The value is copied into the reservation station at issue.</span></li>
+      <li>It receives the tag ROB0 and waits for the CDB <span class="fb">That is the third case, for an entry that is not ready. ROB0 is ready; waiting would be a wasted cycle, and the broadcast has already passed.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">You see head = tail = ROB5. Is the ROB full or empty?</p>
+    <ul class="options">
+      <li>Full: the tail has caught up with the head <span class="fb">Possible, but the pointers alone cannot say — after the last commit the head catches up with the tail and the picture is identical.</span></li>
+      <li>Empty: there is nothing between the pointers <span class="fb">Possible too; the same picture appears when the tail has filled the ring and come round.</span></li>
+      <li data-correct>It depends on the busy bit of ROB5 <span class="fb">Busy → full (issue stalls); not busy → empty (nothing to commit). Two pointers and one bit, p. 232.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Renaming registers to ROB entries removes which hazards?</p>
+    <ul class="options">
+      <li>RAW <span class="fb">A true dependence cannot be renamed away: the consumer waits for the producer's tag on the CDB.</span></li>
+      <li data-correct>WAR <span class="fb">The reader captured the old value or the old tag at issue, so a later writer cannot overtake it.</span></li>
+      <li data-correct>WAW <span class="fb">Each writer gets its own entry, and commit writes the register file in program order.</span></li>
+      <li>Structural <span class="fb">A full ROB or a full set of reservation stations is a structural hazard that stalls issue; renaming does nothing about it.</span></li>
+    </ul>
+    <p class="q-fb">Same answer as for classic Tomasulo — only the namespace of the tags changed.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The tail pointer of the reorder buffer points to…</p>
+    <ul class="options">
+      <li>the newest instruction in flight <span class="fb">One entry too early: the newest instruction sits just before the tail.</span></li>
+      <li data-correct>the next free entry, where the next issued instruction will go <span class="fb">And it advances at issue; the head advances at commit.</span></li>
+      <li>the oldest instruction, the next to commit <span class="fb">That is the head.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">F0 is mapped to ROB5, a speculative entry that is flushed; an older entry ROB0, which also writes F0, is still in flight. What should the rename table say for F0 after the recovery?</p>
+    <ul class="options">
+      <li>"–": no mapping <span class="fb">Then a later reader of F0 would take the stale value in the register file, although ROB0 is about to produce a new one.</span></li>
+      <li>ROB5 <span class="fb">The entry no longer exists; a reader would wait for a tag that is never broadcast.</span></li>
+      <li data-correct>ROB0 <span class="fb">The mapping goes back to the older in-flight producer — the mapping that was valid at the branch. Real cores checkpoint the table at each branch for this.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An instruction on a mispredicted path divides by zero before the branch resolves. What happens?</p>
+    <ul class="options">
+      <li>The exception is taken immediately: a fault cannot wait <span class="fb">It can and it must: the exception is recorded in the entry and would be taken only at the head.</span></li>
+      <li data-correct>Nothing: the entry is flushed with the path, exception included <span class="fb">The instruction never reaches the head, so its recorded fault is never acted on. Architecturally it never existed.</span></li>
+      <li>The exception is taken when the branch commits <span class="fb">When the branch resolves as mispredicted the younger entries are discarded, not committed.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about freeing and writing are correct in the speculative Tomasulo algorithm?</p>
+    <ul class="options">
+      <li data-correct>The reservation station is freed at Write Result <span class="fb">Once the result is on the bus, the station's job is done.</span></li>
+      <li data-correct>The ROB entry is freed at Commit <span class="fb">It must hold the value until the instruction reaches the head.</span></li>
+      <li>The ROB entry is freed at Write Result <span class="fb">Then there would be nowhere to keep the result until commit, and nothing to flush on a misprediction.</span></li>
+      <li>The register file is written at Write Result <span class="fb">That is classic Tomasulo; with the ROB the register file is written only at Commit.</span></li>
+    </ul>
+    <p class="q-fb">The exam's Res. Alloc. column follows the first rule: a station name appears from issue to Write Result and then becomes free for the next instruction.</p>
+  </div>
+</section>
+
+<section class="recap" id="l17-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Speculation means predict, execute before the branch resolves, and undo if the guess was wrong; the undo is possible only because the architectural state — register file and memory — is not touched until commit.</li>
+    <li>Execution is out of order, commit is in order: completed is not committed. An instruction commits only when it is at the head, its result is ready and it is not speculative.</li>
+    <li>Precise exceptions come for free: an exception is recorded in the entry and taken at the head, when everything older is committed and everything younger is still in the buffer; an exception on a flushed path is discarded with it.</li>
+    <li>The ROB number is the new tag: the rename table maps each register to the entry of its newest in-flight producer; an operand comes from the register file, from a ready entry, or as a tag to wait for on the CDB. WAR and WAW vanish, RAW is served by the bus, and reservation stations remain as staging areas.</li>
+    <li>Figure 27 changes three things in Tomasulo's datapath: the CDB feeds the ROB, the ROB writes the register file and memory at commit, and the store buffer is gone because a store's address and data live in its entry.</li>
+    <li>The ROB is a ring: issue at the tail, commit at the head, full and empty told apart by the busy bit; a blocked head stalls issue when the ring fills. A misprediction frees every entry younger than the branch, moves the tail back and restores the rename table — which holds names, never values.</li>
+  </ul>
+  <aside class="cheat" id="l17-cheat">
+    <dl>
+      <dt>Commit condition</dt><dd>at the head AND Ready = Yes AND Spec = No → write the register (or memory for a store), free the entry, head ← head + 1 (mod N)</dd>
+      <dt>Issue</dt><dd>needs a free reservation station of the right class AND a free ROB entry; the entry is the tail, tail ← tail + 1 (mod N); the destination register is mapped to this ROB#; Spec = Yes if an older branch is unresolved</dd>
+      <dt>Operand at issue</dt><dd>no mapping → value from the register file; mapped and ready → value from ROB[h]; mapped and not ready → tag h, wait for the CDB (the "RAW with I#" of the table)</dd>
+      <dt>Write Result</dt><dd>CDB carries (ROB#, value) to the waiting stations and to the entry: Ready = Yes; the station is freed; the register file is not touched</dd>
+      <dt>Full / empty</dt><dd>head = tail and busy → full, issue stalls; head = tail and not busy → empty</dd>
+      <dt>Misprediction</dt><dd>free every entry younger than the branch; tail ← branch + 1; rename table back to the older in-flight producer or "–"; fetch restarts; the branch commits normally; nothing to undo in the registers</dd>
+      <dt>Precise exception</dt><dd>stop at one instruction, all older ones committed, no younger one has changed the state; recorded in the entry, taken at the head; on a flushed path, discarded</dd>
+      <dt>Exam columns</dt><dd>ROB# | Instruction | Dest. | Res. Alloc. | Ready/Status | Spec.; status "No, issued" / "No, exec.(*)" / "Yes"; Res. Alloc. Load1…, FP1…, Int1… (branches too), "–" for a store; Rename Table Reg # → ROB # or "–"</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l17-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=TnxJA6uyP7Y" target="_blank" rel="noopener">ROB Part 1 — Georgia Tech — HPCA: Part 3</a>
+      <span class="res-by">Udacity (Milos Prvulovic)</span><span class="res-dur">short clip</span>
+      <p class="res-why">Watch it right after section 2: why Tomasulo alone cannot undo a mispredicted branch or give precise exceptions, and the before/after of "registers written at write-result" versus "at commit".</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://ocw.mit.edu/courses/6-823-computer-system-architecture-fall-2005/fb1b60ca989e4740271a9a472a7fccd9_handout10.pdf" target="_blank" rel="noopener">Handout 10: Out-of-Order Execution with ROB</a>
+      <span class="res-by">MIT 6.823, 2005 (Arvind, Asanović, Emer)</span><span class="res-dur">2 pages</span>
+      <p class="res-why">The whole ROB machine on one sheet, with a filled-in snapshot of ROB, rename table and register file: open it next to the ring widget and match the fields. Mind its own notation (p1/src1, tags t1 … tn), not the notes' Vj Vk Qj Qk.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://robgiorgi.github.io/freess/" target="_blank" rel="noopener">FREESS — free superscalar simulator (browser build)</a>
+      <span class="res-by">Roberto Giorgi, University of Siena</span>
+      <p class="res-why">A superscalar Tomasulo with an explicit ROB. Run the same small loop with a ROB of 4 and of 16 entries and watch how a small ring stalls issue — the cost named at the end of section 5.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.virginia.edu/~evans/greatworks/smith.pdf" target="_blank" rel="noopener">Implementing Precise Interrupts in Pipelined Processors</a>
+      <span class="res-by">James E. Smith and Andrew R. Pleszkun, IEEE Transactions on Computers, 1988</span><span class="res-dur">12 pages</span>
+      <p class="res-why">Where the reorder buffer comes from. Read the definition of "precise" on the first pages and the comparison of the five solutions; the reorder buffer (with and without bypass) and the history buffer are the ones that survived.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You now know what an entry holds, how the ring turns and what a flush tears off. Next come the four stages of the speculative algorithm in order — issue, execute, write result, commit — on the notes' eight-entry loop, and the February 2025 exam table filled to the last cell.</p>
+</aside>
+
+</main>
+</body>
+</html>

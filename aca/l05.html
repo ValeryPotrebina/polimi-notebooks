@@ -1,0 +1,1216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Learning from the past · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+  /* the BHT playground draws an exam-style table in its stage: no component covers a table inside a stage */
+  #l05-w-bht .widget-stage { padding: 0.8rem 1rem; }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l05">
+
+<header class="lesson-head">
+  <h1>Learning from the past: 1-bit and 2-bit history tables, and the BTB</h1>
+  <p class="lede">After this lesson you will fill the exam's predictor table for any loop and any initial state, explain why one bit of memory does worse than no memory at all on a loop, and say what the branch target buffer adds that no direction predictor can.</p>
+</header>
+
+<div class="hook" data-label="A warm-up puzzle">
+  <p>A loop runs ten times. Its closing <code>BNE</code> is taken nine times and falls through once: it goes the same way 90 % of the time. The dumbest rule of the previous lesson, "always predict taken", is right 9 times out of 10.</p>
+  <p>Now give the hardware a memory: one bit per branch that stores what the branch did last time, and predict that. Remembering must beat guessing. Run the loop again and count — the one-bit predictor is right 8 times out of 10. Learning made it worse.</p>
+  <p>By the end of the lesson you will know where the two lost predictions go, why a second bit wins one of them back, and why even a perfect direction predictor cannot fetch the next instruction without a second, smaller table: the branch target buffer.</p>
+</div>
+
+<section id="l05-learn">
+  <h2>Hardware that learns at run time</h2>
+
+  <p>Lesson 4 left the branch problem half solved. A static rule — always not taken, always taken, backward taken and forward not — is fixed before the program runs, so it cannot tell a loop that runs a million times from an <code>if</code> that flips with the data. In the five-stage pipeline of this course the branch outcome and its target are computed in ID, so every wrong guess costs one cycle: the wrong-path instruction becomes a NOP and fetch restarts at the right address.</p>
+
+  <div class="def">
+    <p><dfn>Dynamic branch prediction</dfn> — hardware that observes how each branch behaved in the past, at run time, and predicts its next outcome from that history (notes, p. 54). Nothing is decided by the compiler: the same binary adapts to its input.</p>
+  </div>
+
+  <p>The notes state the key assumption plainly (p. 54): "if a branch behaved a certain way in the past, it's likely to behave the same way again". It is temporal locality applied to control flow. The hardware that exploits it is two tables, both consulted in the Instruction Fetch stage:</p>
+  <ul>
+    <li>the <mark class="key">Branch Outcome Predictor</mark> answers <em>whether</em> — Taken (T) or Not Taken (NT) — from the run-time history of this branch, or of other branches too. In this chapter it is a Branch History Table (BHT);</li>
+    <li>the <mark class="key">Branch Target Buffer</mark> (BTB) answers <em>where</em>: it returns the Predicted Target Address (PTA), the address the processor will fetch from if the branch is predicted taken. It is "useful only when BOP predicts Taken; irrelevant if Not Taken" (p. 54), because the not-taken successor is simply PC + 4.</li>
+  </ul>
+
+  <p>A fetch then works in three steps (p. 54): the outcome predictor says T or NT; if T, the BTB supplies the PTA; the next instruction is fetched from the PTA or from PC + 4. Notice <em>when</em>: at the end of IF, before the instruction is decoded. Both tables are indexed with the PC of the instruction being fetched — the hardware does not yet know that it is a branch. Keep that in mind: it is why one of the two tables needs tags and the other does not.</p>
+
+  <figure class="fig fig--plain" id="l05-fig-if">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="In the IF stage the PC indexes two tables at once: the BHT answers whether the branch is taken, the BTB answers where it goes; a multiplexer picks the next PC between the predicted target address and PC + 4">
+      <rect x="20" y="126" width="64" height="28" rx="4" class="fi-paper sw-2"/>
+      <text x="52" y="145" class="tx-mid tx-mono">PC</text>
+      <line x1="84" y1="140" x2="120" y2="140"/>
+      <line x1="120" y1="100" x2="120" y2="275"/>
+      <line x1="120" y1="100" x2="166" y2="100" marker-end="url(#arr)"/>
+      <line x1="120" y1="210" x2="166" y2="210" marker-end="url(#arr)"/>
+      <line x1="120" y1="275" x2="134" y2="275" marker-end="url(#arr)"/>
+      <circle cx="150" cy="275" r="13" class="fi-paper"/>
+      <text x="150" y="279" class="tx-mid tx-sm">+4</text>
+      <polyline points="163,275 380,275 380,185 398,185" marker-end="url(#arr)"/>
+      <text x="250" y="268" class="tx-mid tx-sm halo">PC + 4</text>
+      <rect x="170" y="40" width="100" height="24" class="fw-s3 st-s3"/>
+      <text x="220" y="57" class="tx-mid tx-mono tx-sm">BHT</text>
+      <rect x="170" y="64" width="100" height="24" class="fi-paper"/>
+      <rect x="170" y="88" width="100" height="24" class="fi-paper"/>
+      <rect x="170" y="112" width="100" height="24" class="fi-paper"/>
+      <line x1="174" y1="100" x2="266" y2="100" class="hl"/>
+      <text x="220" y="81" class="tx-mid tx-mono tx-sm">ST</text>
+      <text x="220" y="105" class="tx-mid tx-mono tx-sm">WT</text>
+      <text x="220" y="129" class="tx-mid tx-mono tx-sm">SNT</text>
+      <polyline points="270,100 420,100 420,118" marker-end="url(#arr)"/>
+      <text x="330" y="92" class="tx-mid tx-sm halo">T / NT</text>
+      <text x="220" y="28" class="tx-mid tx-hand">whether?</text>
+      <rect x="170" y="150" width="130" height="24" class="fw-s3 st-s3"/>
+      <text x="235" y="167" class="tx-mid tx-mono tx-sm">BTB</text>
+      <rect x="170" y="174" width="50" height="24" class="fi-paper"/><rect x="220" y="174" width="80" height="24" class="fi-paper"/>
+      <rect x="170" y="198" width="50" height="24" class="fi-paper"/><rect x="220" y="198" width="80" height="24" class="fi-paper"/>
+      <rect x="170" y="222" width="50" height="24" class="fi-paper"/><rect x="220" y="222" width="80" height="24" class="fi-paper"/>
+      <line x1="174" y1="210" x2="296" y2="210" class="hl"/>
+      <text x="195" y="191" class="tx-mid tx-mono tx-sm">tag</text><text x="260" y="191" class="tx-mid tx-mono tx-sm">PTA</text>
+      <text x="195" y="215" class="tx-mid tx-mono tx-sm">0x21</text><text x="260" y="215" class="tx-mid tx-mono tx-sm">0x200</text>
+      <text x="195" y="239" class="tx-mid tx-mono tx-sm">—</text><text x="260" y="239" class="tx-mid tx-mono tx-sm">—</text>
+      <polyline points="300,210 360,210 360,135 398,135" marker-end="url(#arr)"/>
+      <text x="330" y="203" class="tx-mid tx-sm halo">PTA</text>
+      <text x="318" y="250" class="tx-hand">where?</text>
+      <polygon points="400,110 400,210 440,195 440,125" class="fi-paper sw-2"/>
+      <line x1="440" y1="160" x2="496" y2="160" marker-end="url(#arr)"/>
+      <text x="480" y="118" class="tx-mid tx-sm">next PC</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The fetch stage with both predictors. The PC indexes the BHT (whether) and the BTB (where) in the same cycle; the BHT's Taken answer, together with a BTB hit, drives the multiplexer that chooses between the PTA and PC + 4. The highlighted rows are the entries the PC selected.</figcaption>
+  </figure>
+
+  <p>The notes list the four cases of a right or wrong guess (p. 55); with the branch resolved in ID a wrong guess always costs the same one cycle:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>The four execution scenarios of p. 55, with the course convention (branch resolved in ID).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Prediction</th><th>Actual outcome</th><th>What the pipeline does</th><th>Penalty</th></tr></thead>
+        <tbody>
+          <tr><td>Not Taken (fetch PC + 4)</td><td>Not Taken</td><td>correct: nothing</td><td class="num">0</td></tr>
+          <tr><td>Not Taken (fetch PC + 4)</td><td>Taken</td><td>flush the sequential instruction (NOP), fetch from the BTA computed in ID</td><td class="num">1 cycle</td></tr>
+          <tr><td>Taken (fetch from the PTA)</td><td>Taken</td><td>correct: nothing</td><td class="num">0</td></tr>
+          <tr><td>Taken (fetch from the PTA)</td><td>Not Taken</td><td>flush the target instruction (NOP), fetch PC + 4</td><td class="num">1 cycle</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Look at the symmetry of that table. A dynamic predictor does not change what a misprediction <em>costs</em> — the pipeline fixes that: one cycle here, fifteen to twenty in a deep out-of-order core (Agner Fog's measurements on real Intel and AMD cores; background, not in the notes). It changes how <em>often</em> you pay. In the formula sheet's "CPI = 1 + stall cycles per instruction" the branch term reads as follows (lesson 4 wrote the same thing as \(1 + f_b \cdot \text{penalty} \cdot p_{\text{mis}}\)):</p>
+
+  <div class="formula">
+    \[ \text{CPI} = \text{CPI}_{\text{ideal}} + f_b\,(1 - a)\,P \]
+    <dl class="legend">
+      <dt>\(f_b\)</dt><dd>fraction of the executed instructions that are branches</dd>
+      <dt>\(a\)</dt><dd>prediction accuracy; \(1 - a\) is the misprediction rate</dd>
+      <dt>\(P\)</dt><dd>misprediction penalty in cycles: 1 in this pipeline, since the branch is resolved in ID</dd>
+    </dl>
+  </div>
+
+  <p>Two predictors, two stakes. With one instruction in five a branch (\(f_b = 0.2\)) and \(P = 1\), a predictor that is right 80 % of the time adds \(0.2 \times 0.2 \times 1 = 0.04\) to the CPI; one that is right 90 % adds \(0.02\). Make the penalty 15 cycles and the same two numbers become \(0.60\) and \(0.30\) — a \(1.6\times\) against a \(1.3\times\) slowdown on a base CPI of 1. That is why the industry kept inventing predictors long after the first one worked.</p>
+
+  <p class="memo"><mark class="key">The predictor decides how often you pay for a branch; the pipeline decides how much.</mark></p>
+</section>
+
+<section id="l05-onebit">
+  <h2>One bit per branch: remember the last outcome</h2>
+
+  <p>The simplest learning machine remembers one thing per branch: what it did last time.</p>
+
+  <div class="def">
+    <p><dfn>Branch History Table</dfn> (BHT; Hennessy &amp; Patterson say <em>branch prediction buffer</em>) — a table indexed by the address of the branch instruction, whose entry is a tiny finite-state machine; the state of the machine is the prediction (notes, p. 56).</p>
+  </div>
+
+  <p>Two phrases of p. 56 are worth keeping verbatim for an open question: the BHT is "a cache-like structure that maps branch addresses to prediction states", and its history is <em>implicit</em> — "rather than storing an explicit sequence of past outcomes, each entry implicitly encodes the recent behavior of the branch through its FSM state". Explicit history registers come in the next lesson; here the whole past of a branch is compressed into one or two bits.</p>
+
+  <aside class="margin-note">Page 56 prints "Final State Machine". Read "Finite": the machine has a finite set of states, and the examiner knows the difference.</aside>
+
+  <p>With one bit the machine has two states. The bit is the last outcome: if it says T, predict Taken; if NT, predict Not Taken. After the branch resolves, a correct prediction leaves the bit alone and a wrong one flips it — which is the same as writing the actual outcome into the bit.</p>
+
+  <figure class="fig fig--plain" id="l05-fig-fsm1">
+    <svg class="dia" viewBox="0 0 560 150" role="img" aria-label="The two-state machine of the 1-bit predictor: in state T it predicts Taken and stays there on a Taken outcome; a Not Taken outcome moves it to state NT, and a Taken outcome moves it back">
+      <path d="M 150 61 C 110 45 110 105 150 89" marker-end="url(#arr)"/>
+      <path d="M 410 61 C 450 45 450 105 410 89" marker-end="url(#arr)"/>
+      <line x1="194" y1="68" x2="366" y2="68" marker-end="url(#arr)"/>
+      <line x1="366" y1="82" x2="194" y2="82" marker-end="url(#arr)"/>
+      <circle cx="170" cy="75" r="24" class="fi-paper sw-2"/>
+      <circle cx="390" cy="75" r="24" class="fi-paper sw-2"/>
+      <text x="170" y="80" class="tx-mid tx-bold">T</text>
+      <text x="390" y="80" class="tx-mid tx-bold">NT</text>
+      <text x="110" y="80" class="tx-mid tx-sm halo">T</text>
+      <text x="450" y="80" class="tx-mid tx-sm halo">NT</text>
+      <text x="280" y="60" class="tx-mid tx-sm halo">NT</text>
+      <text x="280" y="96" class="tx-mid tx-sm halo">T</text>
+      <text x="170" y="122" class="tx-mid tx-sm">predicts Taken</text>
+      <text x="390" y="122" class="tx-mid tx-sm">predicts Not Taken</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The 1-bit predictor as the notes draw it (p. 56). The label on an arrow is the outcome of the branch; after one surprise the prediction has already changed sides.</figcaption>
+  </figure>
+
+  <h3>Indexing: low-order bits of the PC, and no tags</h3>
+
+  <p>Which entry belongs to which branch? The notes (p. 57): "use k lower bits (right side) of the branch's address as the index", which gives \(2^k\) entries; and, in bold, "No tags: any branch with the same low-order bits shares the entry (can cause interference)". One practical detail: instructions are four bytes long and aligned, so the lowest two address bits are always 00 and a real table takes its \(k\) bits just above them; the exam phrase "low-order bits" is fine.</p>
+
+  <figure class="fig fig--plain" id="l05-fig-index">
+    <svg class="dia" viewBox="0 0 560 320" role="img" aria-label="The k index bits of the branch address select one row of the BHT, a column of 2 to the k one-bit entries; the upper address bits are not stored anywhere, so there is no tag column and two branches can share a row">
+      <text x="170" y="38" class="tx-mid tx-sm tx-muted">bits 31 … k+2</text>
+      <text x="360" y="38" class="tx-mid tx-sm tx-muted">bits k+1 … 2</text>
+      <text x="448" y="38" class="tx-mid tx-sm tx-muted">1 0</text>
+      <rect x="40" y="46" width="260" height="28" class="fi-soft"/>
+      <rect x="300" y="46" width="120" height="28" class="fi-paper"/>
+      <rect x="420" y="46" width="40" height="28" class="fi-soft"/>
+      <text x="170" y="65" class="tx-mid tx-mono tx-sm">not used: no tag</text>
+      <text x="360" y="65" class="tx-mid tx-mono tx-sm">k index bits</text>
+      <text x="440" y="65" class="tx-mid tx-mono tx-sm">00</text>
+      <polyline points="360,74 360,96 250,96 250,204 266,204" marker-end="url(#arr)"/>
+      <text x="462" y="104" class="tx-mid tx-hand">picks the row</text>
+      <rect x="130" y="144" width="60" height="120" class="st-muted dash"/>
+      <text x="160" y="137" class="tx-mid tx-sm tx-muted">tag?</text>
+      <path d="M 132 146 L 188 262 M 188 146 L 132 262" class="st-bad sw-2"/>
+      <text x="160" y="300" class="tx-mid tx-hand">no tag column</text>
+      <rect x="270" y="120" width="60" height="24" class="fw-s3 st-s3"/>
+      <text x="300" y="137" class="tx-mid tx-mono tx-sm">BHT</text>
+      <rect x="270" y="144" width="60" height="24" class="fi-paper"/>
+      <rect x="270" y="168" width="60" height="24" class="fi-paper"/>
+      <rect x="270" y="192" width="60" height="24" class="fi-paper"/>
+      <rect x="270" y="216" width="60" height="24" class="fi-paper"/>
+      <rect x="270" y="240" width="60" height="24" class="fi-paper"/>
+      <line x1="274" y1="204" x2="326" y2="204" class="hl"/>
+      <text x="300" y="160" class="tx-mid tx-mono tx-sm">T</text>
+      <text x="300" y="184" class="tx-mid tx-mono tx-sm">NT</text>
+      <text x="300" y="208" class="tx-mid tx-mono tx-sm">T</text>
+      <text x="300" y="232" class="tx-mid tx-mono tx-sm">NT</text>
+      <text x="300" y="256" class="tx-mid tx-mono tx-sm">T</text>
+      <line x1="330" y1="204" x2="400" y2="204" marker-end="url(#arr)"/>
+      <text x="392" y="190" class="tx-mid tx-sm halo">T / NT (1 bit)</text>
+      <text x="345" y="262" class="tx-sm tx-muted">2ᵏ rows</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> Figure 15 of the notes, redrawn. The \(k\) index bits pick a row; nothing records which branch wrote it. The crossed-out column is the tag a cache would have — the BHT deliberately does without it.</figcaption>
+  </figure>
+
+  <p>Why is a table without tags acceptable? Because the worst a wrong entry can do is a wrong <em>prediction</em>, which the pipeline catches when the branch resolves: correctness is never at stake, only accuracy — and a tag would cost more bits than the one or two it protects. Two branches whose addresses agree in the \(k\) index bits overwrite each other's state: the <mark class="key">conflict problem</mark> (p. 57), called <em>branch predictor aliasing</em> in the deepening on the next lesson's pages. The partial cures (p. 58) are the obvious ones: a bigger table, so that fewer branches collide, and hashing the address bits to spread out branches that share low-order bits.</p>
+
+  <h3>Example 5 of the notes: two misses on a loop</h3>
+
+  <p>Now the puzzle of the hook, on the loop the exam papers use. The 10 June 2025 paper writes it with <code>ADDI.U $R1, $R0, 0</code> and <code>ADDI.D $F2, $F0, $F0</code>; the 2026 paper drops the dollar signs, and so does this notebook:</p>
+
+<pre><code>INIT:  ADDUI R1, R0, 0
+       ADDUI R2, R0, 40      ; R2 = 20 in the June 2025 paper
+LOOP:  LD    F0, 0(R1)
+       FADD  F2, F0, F0
+       SD    F2, 0(R1)
+       ADDUI R1, R1, 4
+       BNE   R1, R2, LOOP</code></pre>
+
+  <p>With R2 = 40 the <code>BNE</code> is executed ten times: taken nine times and not taken at the exit — the pattern the notes write as T T T T T T T T T NT (p. 57). Suppose the loop has been run before, so the entry still holds the NT of the previous exit. Walk the ten executions:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>1-bit predictor on the ten-iteration loop, second run of the loop (the entry holds NT from the previous exit).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Execution of the BNE</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th></tr></thead>
+        <tbody>
+          <tr><th>Bit before (= prediction)</th><td>NT</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td></tr>
+          <tr><th>Branch outcome</th><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>NT</td></tr>
+          <tr class="is-key"><th>Result</th><td><b>miss</b></td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td><b>miss</b></td></tr>
+          <tr><th>Bit after</th><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>NT</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two misses, and both have a reason. At the exit the bit still says T, because the branch was taken nine times in a row; the NT is mispredicted and flips the bit. At the next entry the bit says NT, because that is what the branch did last — the T is mispredicted and flips it back. "With 100% of 10 iterations, the BHT only catches 8 out of 10 iterations, the accuracy is 80%" (p. 57). A one-off anomaly costs two misses: the surprise itself, and its echo one execution later, when the predictor has just learned the anomaly and the old behaviour resumes. A one-bit predictor is always exactly one step behind. That is half of the puzzle.</p>
+
+  <p>The notes name two shortcomings (p. 57): the bit flips after a single misprediction, unstable on exactly the loops it should excel at, and the conflicts above. A bigger table does nothing for the loop exit: that miss is not interference, it is the inability of one bit to represent "nine times T, then NT".</p>
+
+  <div class="tip">
+    <p>Counting rules for the exam. A loop closed by a <code>BNE</code> at the bottom with \(N\) iterations executes its branch \(N\) times (\(N - 1\) taken, then not taken). A loop tested at the top (<code>BEQ … DONE</code>, then <code>J LOOP</code> at the bottom) executes the exit branch \(N + 1\) times (\(N\) not taken, then taken). The misprediction rate divides by the number of <em>executions</em> of the branch — the number of BHT accesses, warm-up misses included — and "the state left in the BHT" is the state <em>after</em> the last update. The May 2025 midterm asked for a top-tested loop with R1 = 0 … 100 on a 1-bit entry initialised Taken: 101 accesses and 2 mispredictions, the first one because the entry said T and the branch fell through, the last one at the exit.</p>
+  </div>
+</section>
+
+<section id="l05-twobit">
+  <h2>Two bits: tolerate one surprise</h2>
+
+  <p>The cure is a predictor that does not change its mind after one surprise. The notes call the 1-bit behaviour <mark class="key">flip-flopping</mark>: "1 misprediction is enough to change the prediction", two misses per loop, "exiting the loop (NT mispredicted as T)" and "re-entering the loop (T mispredicted as NT)" (p. 59). The fix is a second bit that records not the last outcome but the predictor's confidence.</p>
+
+  <div class="def">
+    <p><dfn>2-bit Branch History Table</dfn> — each entry is a four-state machine: Strongly Taken (ST) and Weakly Taken (WT) predict Taken; Weakly Not Taken (WNT) and Strongly Not Taken (SNT) predict Not Taken (notes, p. 59). With the encoding ST = 11, WT = 10, WNT = 01, SNT = 00 the prediction is simply the high bit.</p>
+  </div>
+
+  <p>The rule of motion: an outcome that agrees with the prediction pushes the state toward the strong end; an outcome that contradicts it moves the state toward the other side. From a strong state it lands in the weak state of the <em>same</em> direction — the prediction survives one anomaly. From a weak state it crosses the line and the prediction flips; how far it crosses is where the two drawings of this machine differ. The notes' figure (p. 59) is reproduced below; the two dashed arcs are the alternative described right after it.</p>
+
+  <figure class="fig fig--plain" id="l05-fig-fsm2">
+    <svg class="dia" viewBox="0 0 560 320" role="img" aria-label="The four-state machine of the 2-bit predictor as drawn in the notes: Strongly Taken and Weakly Taken predict Taken, Weakly Not Taken and Strongly Not Taken predict Not Taken; from a weak state an outcome against the prediction jumps to the strong state of the other side, while a pure saturating counter, drawn dashed, would move only to the weak state">
+      <path d="M 130 66 C 90 50 90 110 130 94" marker-end="url(#arr)"/>
+      <path d="M 430 226 C 470 210 470 270 430 254" marker-end="url(#arr)"/>
+      <line x1="174" y1="72" x2="386" y2="72" marker-end="url(#arr)"/>
+      <line x1="386" y1="88" x2="174" y2="88" marker-end="url(#arr)"/>
+      <line x1="174" y1="232" x2="386" y2="232" marker-end="url(#arr)"/>
+      <line x1="386" y1="248" x2="174" y2="248" marker-end="url(#arr)"/>
+      <line x1="410" y1="104" x2="410" y2="216" marker-end="url(#arr)"/>
+      <line x1="150" y1="216" x2="150" y2="104" marker-end="url(#arr)"/>
+      <path d="M 393 97 Q 300 200 168 222" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <path d="M 160 217 Q 260 120 388 92" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <circle cx="150" cy="80" r="24" class="fi-paper sw-2"/>
+      <circle cx="410" cy="80" r="24" class="fi-paper sw-2"/>
+      <circle cx="150" cy="240" r="24" class="fi-paper sw-2"/>
+      <circle cx="410" cy="240" r="24" class="fi-paper sw-2"/>
+      <text x="150" y="85" class="tx-mid tx-bold">ST</text>
+      <text x="410" y="85" class="tx-mid tx-bold">WT</text>
+      <text x="150" y="245" class="tx-mid tx-bold">WNT</text>
+      <text x="410" y="245" class="tx-mid tx-bold">SNT</text>
+      <text x="150" y="118" class="tx-mid tx-sm">predict T</text>
+      <text x="410" y="118" class="tx-mid tx-sm">predict T</text>
+      <text x="150" y="278" class="tx-mid tx-sm">predict NT</text>
+      <text x="410" y="278" class="tx-mid tx-sm">predict NT</text>
+      <text x="90" y="84" class="tx-mid tx-sm halo">T</text>
+      <text x="470" y="244" class="tx-mid tx-sm halo">NT</text>
+      <text x="280" y="64" class="tx-mid tx-sm halo">NT</text>
+      <text x="280" y="102" class="tx-mid tx-sm halo">T</text>
+      <text x="280" y="224" class="tx-mid tx-sm halo">NT</text>
+      <text x="280" y="262" class="tx-mid tx-sm halo">T</text>
+      <text x="424" y="160" class="tx-sm halo">NT</text>
+      <text x="164" y="160" class="tx-sm halo">T</text>
+      <text x="302" y="194" class="tx-mid tx-sm tx-muted halo">NT</text>
+      <text x="256" y="132" class="tx-mid tx-sm tx-muted halo">T</text>
+      <text x="280" y="310" class="tx-mid tx-hand">dashed: pure saturating counter</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The 2-bit predictor of the notes (p. 59). Solid arrows: the notes' figure, which is Hennessy &amp; Patterson's. Dashed: where a pure saturating counter would go instead on the same two outcomes. Everything else is identical.</figcaption>
+  </figure>
+
+  <p>Look closely at the two vertical arrows of the notes' figure: from WT a Not Taken jumps straight to SNT, and from WNT a Taken jumps straight to ST. That is the machine of Hennessy &amp; Patterson's figure, the course's reference book. A <em>pure saturating counter</em> — count up on Taken, down on Not Taken, stop at 3 and at 0 — would instead go WT → WNT and WNT → WT, the dashed arcs. On every loop pattern of this course the two machines give identical tables; they differ only when the outcome alternates while the machine sits in a weak state:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>The one kind of pattern where the two 2-bit machines differ: outcomes NT T NT T NT T, both starting in WT.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Execution</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr></thead>
+        <tbody>
+          <tr><th>Branch outcome</th><td>NT</td><td>T</td><td>NT</td><td>T</td><td>NT</td><td>T</td></tr>
+          <tr><th>Saturating counter: state / prediction</th><td>WT / T</td><td>WNT / NT</td><td>WT / T</td><td>WNT / NT</td><td>WT / T</td><td>WNT / NT</td></tr>
+          <tr><th>Result</th><td><b>miss</b></td><td><b>miss</b></td><td><b>miss</b></td><td><b>miss</b></td><td><b>miss</b></td><td><b>miss</b></td></tr>
+          <tr><th>Notes' figure: state / prediction</th><td>WT / T</td><td>SNT / NT</td><td>WNT / NT</td><td>SNT / NT</td><td>WNT / NT</td><td>SNT / NT</td></tr>
+          <tr><th>Result</th><td><b>miss</b></td><td><b>miss</b></td><td>hit</td><td><b>miss</b></td><td>hit</td><td><b>miss</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Neither machine learns the alternation — the saturating counter is always one step behind, the notes' machine at least settles on NT and gets every other outcome right. Both are "2-bit predictors". For the exam: write the state names, which are unambiguous, reproduce the figure you were shown in class, and if a pattern alternates say which machine you use.</p>
+
+  <aside class="redpen" data-page="56">
+    <p class="claim">"dynamically predicts whether a branch will be taken or not taken using small finite-state machines (FSMs), such as 1-bit or 2-bit saturating counters"</p>
+    <p class="fix">the 2-bit machine drawn on p. 59 is not a saturating counter: a saturating counter moves one step at a time (WT → WNT on Not Taken, WNT → WT on Taken), while the figure jumps from a weak state to the strong state of the other side (WT → SNT, WNT → ST).</p>
+    <p class="because">Run the table above, or press NT T NT T NT T in the widget below from WT: the saturating counter visits WT and WNT only and mispredicts six times out of six, the figure's machine visits SNT and mispredicts four times. On the loops of the exam papers the two agree, so the figure is right to use — just do not call it a saturating counter.</p>
+  </aside>
+
+  <aside class="redpen" data-page="59">
+    <p class="claim">"It requires 2 consecutive mispredictions to change the predicted outcome, thus adding stability."</p>
+    <p class="fix">only from a <em>strong</em> state. From Weakly Taken a single Not Taken flips the prediction to Not Taken (to WNT in a saturating counter, to SNT in the notes' figure); from Weakly Not Taken a single Taken flips it to Taken.</p>
+    <p class="because">The weak states exist precisely so that one miss <em>does</em> flip the prediction when the predictor was not sure. An exam exercise that initialises the table in a weak state — "Weakly Not Taken" is a natural distractor — must be computed step by step, not with the "two misses" rule: start in WNT, one Taken, and the prediction is already Taken.</p>
+  </aside>
+
+  <div class="widget" id="l05-w-fsm">
+    <h3 class="widget-title">FSM clicker: press the outcome, watch the state</h3>
+    <p class="widget-intro">Choose a machine and a starting state, then press what the branch actually did. The current state wears the highlighter, so does the transition you just took. The machine not selected shows its two differing transitions dashed, so the difference is always in view.</p>
+    <ol class="tasks">
+      <li>Select the 1-bit machine, start in a Taken state and press Taken nine times, then Not Taken once, then Taken once (a loop exit and a re-entry). Before pressing: how many mispredictions will the counter show at the end?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Two: the exit (predicted T, outcome NT) and the re-entry (predicted NT, outcome T). One surprise, two misses — the second is the echo of the first.</p></details>
+      </li>
+      <li>Select the notes' 2-bit machine, start in Strongly Taken, and press the same sequence. How many misses now, and where does the state end up?
+        <details class="answer"><summary>What you should see</summary>
+          <p>One miss, at the exit: ST → WT and the prediction stays Taken. The re-entry is predicted right and returns the state to ST. The weak state absorbed the anomaly.</p></details>
+      </li>
+      <li>Still the notes' machine: start in Weakly Taken and press Not Taken once. Is it true that "two consecutive mispredictions are needed to change the prediction"?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No: after one Not Taken the state is SNT and the next prediction is Not Taken. The two-misses rule holds only from a strong state. (A saturating counter would land in WNT — same prediction, different state.)</p></details>
+      </li>
+      <li>Start in Weakly Taken and press NT, T, NT, T, NT, T, first with the notes' machine, then with the saturating counter. Which one mispredicts more?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The saturating counter misses all six (it bounces WT ↔ WNT, always one step behind); the notes' machine misses four and ends in WNT: after the first miss it bounces SNT ↔ WNT, predicting Not Taken and getting only the T outcomes wrong. The two variants differ on exactly one transition out of each weak state — the dashed arrows — and on nothing else.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l05-w-fsm', function (root, ui) {
+    var NAMES = ['Strongly Not Taken', 'Weakly Not Taken', 'Weakly Taken', 'Strongly Taken'];
+    var SHORT = ['SNT', 'WNT', 'WT', 'ST'];
+    var state, hist, last;
+
+    var machine = ui.select('machine', [
+      { value: '1', label: '1-bit: remember the last outcome' },
+      { value: 'hp', label: '2-bit, the notes’ figure (Hennessy & Patterson)' },
+      { value: 'sat', label: '2-bit, pure saturating counter' }
+    ], function () { reset(); }, 'hp');
+    var start = ui.select('start in', [
+      { value: '3', label: 'Strongly Taken (1-bit: T)' },
+      { value: '2', label: 'Weakly Taken (1-bit: T)' },
+      { value: '1', label: 'Weakly Not Taken (1-bit: NT)' },
+      { value: '0', label: 'Strongly Not Taken (1-bit: NT)' }
+    ], function () { reset(); }, '3');
+
+    function is1() { return machine.value === '1'; }
+    function initial() { var s = +start.value; return is1() ? (s >= 2 ? 1 : 0) : s; }
+    function predict(s) { return is1() ? s === 1 : s >= 2; }
+    function step(s, taken) {
+      if (is1()) return taken ? 1 : 0;
+      if (taken) return (machine.value === 'hp' && s === 1) ? 3 : Math.min(s + 1, 3);
+      return (machine.value === 'hp' && s === 2) ? 0 : Math.max(s - 1, 0);
+    }
+    function reset() { state = initial(); hist = []; last = null; }
+    function outcome(taken) {
+      var p = predict(state), ns = step(state, taken);
+      last = { from: state, to: ns, taken: taken, miss: p !== taken };
+      hist.push(last); state = ns;
+    }
+    reset();
+
+    ui.button('Taken', function () { outcome(true); }, { kind: 'primary' });
+    ui.button('Not Taken', function () { outcome(false); }, { kind: 'primary' });
+    ui.button('Reset', function () { reset(); }, { kind: 'ghost', icon: 'refresh' });
+    var roState = ui.readout('state'), roPred = ui.readout('next prediction'), roMiss = ui.readout('mispredictions'), roHist = ui.readout('outcomes so far');
+    var note = ui.note('');
+    var svg = ui.svg(560, 320, { label: 'The state machine of the selected predictor; the current state and the last transition are highlighted' });
+
+    /* geometry: 2-bit layout as in Fig. 4, 1-bit layout as in Fig. 2 */
+    var P2 = { 3: [150, 80], 2: [410, 80], 1: [150, 240], 0: [410, 240] };
+    var E2 = [
+      { f: 3, t: 3, o: true,  d: 'M 130 66 C 90 50 90 110 130 94',    lx: 90,  ly: 84,  l: 'T' },
+      { f: 0, t: 0, o: false, d: 'M 430 226 C 470 210 470 270 430 254', lx: 470, ly: 244, l: 'NT' },
+      { f: 3, t: 2, o: false, d: 'M 174 72 L 386 72',   lx: 280, ly: 64,  l: 'NT' },
+      { f: 2, t: 3, o: true,  d: 'M 386 88 L 174 88',   lx: 280, ly: 102, l: 'T' },
+      { f: 1, t: 0, o: false, d: 'M 174 232 L 386 232', lx: 280, ly: 224, l: 'NT' },
+      { f: 0, t: 1, o: true,  d: 'M 386 248 L 174 248', lx: 280, ly: 262, l: 'T' }
+    ];
+    var EHP = [
+      { f: 2, t: 0, o: false, d: 'M 410 104 L 410 216', lx: 424, ly: 160, l: 'NT', a: 'start' },
+      { f: 1, t: 3, o: true,  d: 'M 150 216 L 150 104', lx: 164, ly: 160, l: 'T',  a: 'start' }
+    ];
+    var ESAT = [
+      { f: 2, t: 1, o: false, d: 'M 393 97 Q 300 200 168 222', lx: 302, ly: 194, l: 'NT' },
+      { f: 1, t: 2, o: true,  d: 'M 160 217 Q 260 120 388 92', lx: 256, ly: 132, l: 'T' }
+    ];
+    var P1 = { 1: [170, 160], 0: [390, 160] };
+    var E1 = [
+      { f: 1, t: 1, o: true,  d: 'M 150 146 C 110 130 110 190 150 174', lx: 110, ly: 165, l: 'T' },
+      { f: 0, t: 0, o: false, d: 'M 410 146 C 450 130 450 190 410 174', lx: 450, ly: 165, l: 'NT' },
+      { f: 1, t: 0, o: false, d: 'M 194 153 L 366 153', lx: 280, ly: 145, l: 'NT' },
+      { f: 0, t: 1, o: true,  d: 'M 366 167 L 194 167', lx: 280, ly: 181, l: 'T' }
+    ];
+
+    function edge(e, other) {
+      var taken = last && last.from === e.f && last.to === e.t && last.taken === e.o && !other;
+      if (taken) Course.svg('path', { d: e.d, 'class': 'hl' }, svg);
+      Course.svg('path', { d: e.d, 'class': other ? 'st-muted dash' : (taken ? 'sw-2' : ''), 'marker-end': other ? 'url(#arr-muted)' : 'url(#arr)' }, svg);
+      Course.svg('text', { x: e.lx, y: e.ly, 'class': 'tx-sm halo' + (e.a === 'start' ? '' : ' tx-mid') + (other ? ' tx-muted' : ''), text: e.l }, svg);
+    }
+    function node(k, pos, name, sub) {
+      if (k === state) Course.svg('circle', { cx: pos[0], cy: pos[1], r: 30, 'class': 'hl' }, svg);
+      Course.svg('circle', { cx: pos[0], cy: pos[1], r: 24, 'class': 'fi-paper sw-2' }, svg);
+      Course.svg('text', { x: pos[0], y: pos[1] + 5, 'class': 'tx-mid tx-bold', text: name }, svg);
+      Course.svg('text', { x: pos[0], y: pos[1] + 38, 'class': 'tx-mid tx-sm', text: sub }, svg);
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      if (is1()) {
+        E1.forEach(function (e) { edge(e, false); });
+        node(1, P1[1], 'T', 'predicts Taken');
+        node(0, P1[0], 'NT', 'predicts Not Taken');
+        return;
+      }
+      var mine = machine.value === 'hp' ? EHP : ESAT, other = machine.value === 'hp' ? ESAT : EHP;
+      other.forEach(function (e) { edge(e, true); });
+      E2.concat(mine).forEach(function (e) { edge(e, false); });
+      node(3, P2[3], 'ST', 'predict T');
+      node(2, P2[2], 'WT', 'predict T');
+      node(1, P2[1], 'WNT', 'predict NT');
+      node(0, P2[0], 'SNT', 'predict NT');
+      Course.svg('text', { x: 280, y: 310, 'class': 'tx-mid tx-hand tx-muted', text: machine.value === 'hp' ? 'dashed: the saturating counter' : "dashed: the notes' figure" }, svg);
+    }
+    function name(s) { return is1() ? (s ? 'T (bit = 1)' : 'NT (bit = 0)') : NAMES[s] + ' (' + SHORT[s] + ')'; }
+
+    ui.onChange(function () {
+      draw();
+      var misses = hist.filter(function (h) { return h.miss; }).length;
+      roState.set(name(state));
+      roPred.set(predict(state) ? 'Taken' : 'Not Taken');
+      roMiss.set(misses + ' of ' + hist.length, hist.length && misses ? 'bad' : (hist.length ? 'good' : undefined));
+      roHist.set(hist.length ? hist.map(function (h) { return (h.taken ? 'T' : 'NT') + (h.miss ? ' miss' : ' ok'); }).join(' · ') : '—');
+      if (!last) { note.set('No outcome yet. The prediction is read from the state: Taken in the two Taken states, Not Taken in the other two.'); return; }
+      var txt = 'Outcome <b>' + (last.taken ? 'Taken' : 'Not Taken') + '</b> while in ' + name(last.from) + ', which predicted ' + (predict(last.from) ? 'Taken' : 'Not Taken') + ': ' + (last.miss ? '<b>misprediction</b>' : 'correct') + '. Transition ' + (is1() ? (last.from ? 'T' : 'NT') + ' → ' + (last.to ? 'T' : 'NT') : SHORT[last.from] + ' → ' + SHORT[last.to]) + '.';
+      if (!is1() && last.miss && (last.from === 1 || last.from === 2)) txt += machine.value === 'hp' ? ' From a weak state the notes’ figure jumps to the strong state of the other side; a saturating counter would stop at the weak one.' : ' A saturating counter moves one step; the notes’ figure would jump to the strong state of the other side.';
+      note.set(txt);
+    });
+  });
+  </script>
+
+  <h3>Effect on the loop: one miss instead of two</h3>
+
+  <p>Back to the ten-iteration loop, second run, the entry left in WT by the previous exit (p. 60):</p>
+
+  <figure class="tbl-fig">
+    <figcaption>2-bit predictor on the same loop, second run. Both machines give this table.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Execution of the BNE</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th></tr></thead>
+        <tbody>
+          <tr><th>State before</th><td>WT</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td></tr>
+          <tr><th>Prediction</th><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td></tr>
+          <tr><th>Branch outcome</th><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>NT</td></tr>
+          <tr class="is-key"><th>Result</th><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td><b>miss</b></td></tr>
+          <tr><th>State after</th><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>ST</td><td>WT</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>"Exit NT causes 1 misprediction, but FSM moves from Strongly Taken to Weakly Taken. So the prediction remains Taken" (p. 60). At the next entry the branch is taken, the prediction is Taken, and the state returns to ST. "Only 1 misprediction per loop, improving accuracy to 90% (from 80%)." The weak state absorbed the exit without forgetting the bias.</p>
+
+  <figure class="fig fig--pair" id="l05-fig-loop">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 170" role="img" aria-label="Ten executions of the loop branch with a 1-bit predictor: the prediction row shows NT then nine T; the first and the tenth predictions are crossed out as misses">
+        <text x="100" y="30" class="tx-mid tx-sm tx-muted">1</text><text x="120" y="30" class="tx-mid tx-sm tx-muted">2</text><text x="140" y="30" class="tx-mid tx-sm tx-muted">3</text><text x="160" y="30" class="tx-mid tx-sm tx-muted">4</text><text x="180" y="30" class="tx-mid tx-sm tx-muted">5</text><text x="200" y="30" class="tx-mid tx-sm tx-muted">6</text><text x="220" y="30" class="tx-mid tx-sm tx-muted">7</text><text x="240" y="30" class="tx-mid tx-sm tx-muted">8</text><text x="260" y="30" class="tx-mid tx-sm tx-muted">9</text><text x="280" y="30" class="tx-mid tx-sm tx-muted">10</text>
+        <text x="84" y="55" class="tx-end tx-sm">outcome</text>
+        <rect x="90" y="40" width="20" height="22" class="fi-paper"/><rect x="110" y="40" width="20" height="22" class="fi-paper"/><rect x="130" y="40" width="20" height="22" class="fi-paper"/><rect x="150" y="40" width="20" height="22" class="fi-paper"/><rect x="170" y="40" width="20" height="22" class="fi-paper"/><rect x="190" y="40" width="20" height="22" class="fi-paper"/><rect x="210" y="40" width="20" height="22" class="fi-paper"/><rect x="230" y="40" width="20" height="22" class="fi-paper"/><rect x="250" y="40" width="20" height="22" class="fi-paper"/><rect x="270" y="40" width="20" height="22" class="fi-paper"/>
+        <text x="100" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="120" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="140" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="160" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="180" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="200" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="220" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="240" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="260" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="280" y="55" class="tx-mid tx-mono tx-sm">NT</text>
+        <text x="84" y="95" class="tx-end tx-sm">1-bit says</text>
+        <rect x="90" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="110" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="130" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="150" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="170" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="190" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="210" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="230" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="250" y="80" width="20" height="22" class="fw-s4 st-s4"/><rect x="270" y="80" width="20" height="22" class="fw-s4 st-s4"/>
+        <text x="100" y="95" class="tx-mid tx-mono tx-sm">NT</text><text x="120" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="140" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="160" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="180" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="200" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="220" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="240" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="260" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="280" y="95" class="tx-mid tx-mono tx-sm">T</text>
+        <path d="M 92 82 l 16 18 M 108 82 l -16 18 M 272 82 l 16 18 M 288 82 l -16 18" class="st-s2 sw-3"/>
+        <text x="190" y="145" class="tx-mid tx-hand">2 misses: entry and exit</text>
+      </svg>
+      <p class="fig-label">Before: 1 bit — 80 %</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 170" role="img" aria-label="The same ten executions with a 2-bit predictor: all ten predictions are T and only the tenth is crossed out as a miss">
+        <text x="100" y="30" class="tx-mid tx-sm tx-muted">1</text><text x="120" y="30" class="tx-mid tx-sm tx-muted">2</text><text x="140" y="30" class="tx-mid tx-sm tx-muted">3</text><text x="160" y="30" class="tx-mid tx-sm tx-muted">4</text><text x="180" y="30" class="tx-mid tx-sm tx-muted">5</text><text x="200" y="30" class="tx-mid tx-sm tx-muted">6</text><text x="220" y="30" class="tx-mid tx-sm tx-muted">7</text><text x="240" y="30" class="tx-mid tx-sm tx-muted">8</text><text x="260" y="30" class="tx-mid tx-sm tx-muted">9</text><text x="280" y="30" class="tx-mid tx-sm tx-muted">10</text>
+        <text x="84" y="55" class="tx-end tx-sm">outcome</text>
+        <rect x="90" y="40" width="20" height="22" class="fi-paper"/><rect x="110" y="40" width="20" height="22" class="fi-paper"/><rect x="130" y="40" width="20" height="22" class="fi-paper"/><rect x="150" y="40" width="20" height="22" class="fi-paper"/><rect x="170" y="40" width="20" height="22" class="fi-paper"/><rect x="190" y="40" width="20" height="22" class="fi-paper"/><rect x="210" y="40" width="20" height="22" class="fi-paper"/><rect x="230" y="40" width="20" height="22" class="fi-paper"/><rect x="250" y="40" width="20" height="22" class="fi-paper"/><rect x="270" y="40" width="20" height="22" class="fi-paper"/>
+        <text x="100" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="120" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="140" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="160" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="180" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="200" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="220" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="240" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="260" y="55" class="tx-mid tx-mono tx-sm">T</text><text x="280" y="55" class="tx-mid tx-mono tx-sm">NT</text>
+        <text x="84" y="95" class="tx-end tx-sm">2-bit says</text>
+        <rect x="90" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="110" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="130" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="150" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="170" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="190" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="210" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="230" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="250" y="80" width="20" height="22" class="fw-s5 st-s5"/><rect x="270" y="80" width="20" height="22" class="fw-s5 st-s5"/>
+        <text x="100" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="120" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="140" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="160" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="180" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="200" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="220" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="240" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="260" y="95" class="tx-mid tx-mono tx-sm">T</text><text x="280" y="95" class="tx-mid tx-mono tx-sm">T</text>
+        <path d="M 272 82 l 16 18 M 288 82 l -16 18" class="st-s2 sw-3"/>
+        <text x="190" y="145" class="tx-mid tx-hand">1 miss: the exit only</text>
+      </svg>
+      <p class="fig-label">After: 2 bits — 90 %</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> The same loop, second run, two predictors. The orange crosses are mispredictions. The 1-bit predictor pays for the exit twice; the 2-bit predictor pays once, because Weakly Taken still predicts Taken at the re-entry.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="60">
+    <p class="claim">"Reduces misprediction penalty in typical branch-heavy code."</p>
+    <p class="fix">it reduces the misprediction <em>rate</em> — the number of mispredictions. The penalty of one misprediction is set by the pipeline (one cycle here) and no predictor touches it.</p>
+    <p class="because">In \(\text{CPI} = \text{CPI}_{\text{ideal}} + f_b (1 - a) P\) the predictor changes \(a\), never \(P\). An open answer that says "the 2-bit BHT reduces the penalty" claims the pipeline got shorter. Say "fewer mispredictions, so fewer penalty cycles in total".</p>
+  </aside>
+
+  <p>Why two bits and not four? The studies Hennessy &amp; Patterson report show that 2-bit counters get almost all the benefit of longer ones, and a longer counter is slower to follow a real change of behaviour — the balance between "prediction stability" and "adaptability" of p. 60. A bias of nine to one is as much as a counter can ever learn.</p>
+
+  <div class="story" data-year="1977–1981">
+    <p>The 2-bit counter was invented twice: by Tom McWilliams and Curt Widdoes in 1977 for the Lawrence Livermore S-1 supercomputer, and independently by Jim Smith at Control Data in 1979. Smith published it at ISCA 1981 in "A Study of Branch Prediction Strategies"; his 1999 Eckert–Mauchly award citation lists "saturating counters for branch prediction" first, and almost every microprocessor since builds on that paper.</p>
+  </div>
+
+  <h3>The exam table: 10 June 2025, Question 5</h3>
+
+  <p>The only official exercise on these pages is a quiz worth 3 points. The loop is the one above with R2 = 20, so R1 takes 4, 8, 12, 16, 20 at the <code>BNE</code>: five executions, outcomes T T T T NT. The twist: a "single-entry 2-bit Branch History Table initialized in the state Strongly Not-Taken" — the loop has never run, and the entry starts as far from Taken as it can. The paper's table has three rows and one column per iteration, with the first column filled in:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>The table of the 10 June 2025 quiz, completed with the saturating counter (with the notes' figure the 3rd state reads Strongly Taken — same prediction). The paper gives the first column; the last row is the one you keep in your head.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Iteration</th><th>1st</th><th>2nd</th><th>3rd</th><th>4th</th><th>5th</th></tr></thead>
+        <tbody>
+          <tr><th>Prediction State</th><td>Strongly Not Taken</td><td>Weakly Not Taken</td><td>Weakly Taken</td><td>Strongly Taken</td><td>Strongly Taken</td></tr>
+          <tr><th>Prediction</th><td>Not Taken</td><td>Not Taken</td><td>Taken</td><td>Taken</td><td>Taken</td></tr>
+          <tr><th>Branch Outcome</th><td>Taken</td><td>Taken</td><td>Taken</td><td>Taken</td><td>Not Taken</td></tr>
+          <tr class="is-key"><th>(hit or miss)</th><td><b>miss</b></td><td><b>miss</b></td><td>hit</td><td>hit</td><td><b>miss</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Three misses in five executions: a misprediction rate of 3/5 = 60 %, and the state left after the last update is ST → Weakly Taken. Three sanity checks save you from the distractors (60, 90, 99, 100, 80 %): 100 % and 99 % are impossible, because any counter that has seen two Taken in a row predicts the third right; 90 % is not a whole number of misses out of five (read as an accuracy, it is the notes' ten-iteration loop); 80 % would be four misses, and an entry started in SNT already predicts right at the third execution — read as an accuracy, 80 % is 1 miss in 5, the answer of someone who counted the exit and forgot that the two warm-up misses count. In the third column the notes' figure gives Strongly Taken instead of Weakly Taken (WNT → ST on a Taken); the prediction is Taken either way, and so is the rest of the table.</p>
+
+  <div class="widget" id="l05-w-bht">
+    <h3 class="widget-title">BHT playground: a counted loop, execution by execution</h3>
+    <p class="widget-intro">A single BHT entry follows the branch of a counted loop. The table has the rows of the June 2025 paper (Prediction State, Prediction, Branch Outcome) plus the hit-or-miss row, one column per execution of the branch. Change the predictor, the initial state, the loop length and how many times the loop is run.</p>
+    <ol class="tasks">
+      <li>Press the "10 June 2025" preset. Before looking: in which columns are the misses, and what is the state after the fifth execution?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Misses in the 1st, 2nd and 5th columns: 3 of 5, a 60 % misprediction rate; the state left is Weakly Taken. The two warm-up misses from Strongly Not Taken count as much as the exit miss. (The widget follows the notes' figure, so its 3rd column reads Strongly Taken; switch to the saturating counter for Weakly Taken — same predictions, same misses.)</p></details>
+      </li>
+      <li>Keep N = 5 and set "times the loop is run" to 2. The second run of the loop: how many misses does the 2-bit entry make, and how many would a 1-bit entry make? Predict, then switch the predictor.
+        <details class="answer"><summary>What you should see</summary>
+          <p>2-bit: one miss in the second run, at the exit (ST → WT, prediction stays Taken, the re-entry is right). 1-bit: two misses per run, at the exit and at the re-entry — 1-bit misses twice per loop execution, 2-bit once. That is the whole reason for the second bit.</p></details>
+      </li>
+      <li>Switch to the top-tested loop shape, 1-bit, initial state Taken, one run, and push N to the end of the slider, 12 (the May 2025 midterm had R1 = 0 … 100). How many columns, how many misses?
+        <details class="answer"><summary>What you should see</summary>
+          <p>13 columns: N + 1 = 13 executions (12 Not Taken, then the exit Taken) and 2 misses — the first, because the entry said Taken, and the last. With N = 100 the same reasoning gives 101 accesses and 2 misses.</p></details>
+      </li>
+      <li>Set N = 1 with the bottom-tested shape and a 2-bit entry in Strongly Taken. What happens?
+        <details class="answer"><summary>What you should see</summary>
+          <p>One execution, Not Taken at once: one miss out of one, 100 %, and the state drops to Weakly Taken. A loop that runs once is a branch that is never taken — an "always taken" bias is the wrong bias for it.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l05-w-bht', function (root, ui) {
+    var NAMES = ['Strongly Not Taken', 'Weakly Not Taken', 'Weakly Taken', 'Strongly Taken'];
+    var kind = ui.select('predictor', [
+      { value: '1', label: '1-bit' },
+      { value: 'hp', label: '2-bit, the notes’ figure' },
+      { value: 'sat', label: '2-bit, saturating counter' }
+    ], null, 'hp');
+    var init = ui.select('initial state', [
+      { value: '3', label: 'Strongly Taken (1-bit: T)' },
+      { value: '2', label: 'Weakly Taken (1-bit: T)' },
+      { value: '1', label: 'Weakly Not Taken (1-bit: NT)' },
+      { value: '0', label: 'Strongly Not Taken (1-bit: NT)' }
+    ], null, '0');
+    var shape = ui.select('loop shape', [
+      { value: 'bottom', label: 'BNE at the bottom: N executions (N − 1 taken, then not taken)' },
+      { value: 'top', label: 'BEQ exit test at the top: N + 1 executions (N not taken, then taken)' }
+    ], null, 'bottom');
+    var n = ui.slider({ label: 'iterations N', min: 1, max: 12, step: 1, value: 5 });
+    var runs = ui.slider({ label: 'times the loop is run', min: 1, max: 3, step: 1, value: 1 });
+    ui.button('Preset: 10 June 2025 quiz', function () { kind.value = 'hp'; init.value = '0'; shape.value = 'bottom'; n.set(5, true); runs.set(1, true); }, { kind: 'primary' });
+    ui.button('Preset: Example 5 of the notes', function () { kind.value = '1'; init.value = '0'; shape.value = 'bottom'; n.set(10, true); runs.set(2, true); }, { kind: 'ghost' });
+    var roExec = ui.readout('executions of the branch'), roMiss = ui.readout('mispredictions'), roRate = ui.readout('misprediction rate'), roFinal = ui.readout('state left in the BHT');
+    var note = ui.note('');
+    var wrap = Course.el('div', { 'class': 'scroll-x' });
+    ui.stage.appendChild(wrap);
+
+    function predict(k, s) { return k === '1' ? s === 1 : s >= 2; }
+    function step(k, s, taken) {
+      if (k === '1') return taken ? 1 : 0;
+      if (taken) return (k === 'hp' && s === 1) ? 3 : Math.min(s + 1, 3);
+      return (k === 'hp' && s === 2) ? 0 : Math.max(s - 1, 0);
+    }
+    function name(k, s) { return k === '1' ? (s ? 'Taken' : 'Not Taken') : NAMES[s]; }
+    function ord(i) { var r = i % 10, h = i % 100; return i + ((r === 1 && h !== 11) ? 'st' : (r === 2 && h !== 12) ? 'nd' : (r === 3 && h !== 13) ? 'rd' : 'th'); }
+    function simulate() {
+      var k = kind.value, s = +init.value, N = Math.max(1, Math.round(n.value)), R = Math.max(1, Math.round(runs.value));
+      if (k === '1') s = s >= 2 ? 1 : 0;
+      var rows = [], miss = 0, r, i, seq;
+      for (r = 1; r <= R; r++) {
+        seq = [];
+        if (shape.value === 'bottom') { for (i = 0; i < N - 1; i++) seq.push(true); seq.push(false); }
+        else { for (i = 0; i < N; i++) seq.push(false); seq.push(true); }
+        for (i = 0; i < seq.length; i++) {
+          var p = predict(k, s), m = p !== seq[i], ns = step(k, s, seq[i]);
+          if (m) miss++;
+          rows.push({ run: r, i: i + 1, before: s, pred: p, taken: seq[i], miss: m });
+          s = ns;
+        }
+      }
+      return { k: k, rows: rows, miss: miss, final: s, perRun: rows.length / R };
+    }
+    function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+    function render(sim) {
+      var h = '<table class="tbl tbl--center"><thead>';
+      var R = Math.max(1, Math.round(runs.value));
+      if (R > 1) {
+        h += '<tr><th></th>';
+        for (var r = 1; r <= R; r++) h += '<th colspan="' + sim.perRun + '">run ' + r + '</th>';
+        h += '</tr>';
+      }
+      h += '<tr><th>Iteration</th>' + sim.rows.map(function (x) { return '<th>' + ord(x.i) + '</th>'; }).join('') + '</tr></thead><tbody>';
+      h += '<tr><th>Prediction State</th>' + sim.rows.map(function (x) { return '<td>' + esc(name(sim.k, x.before)) + '</td>'; }).join('') + '</tr>';
+      h += '<tr><th>Prediction</th>' + sim.rows.map(function (x) { return '<td>' + (x.pred ? 'Taken' : 'Not Taken') + '</td>'; }).join('') + '</tr>';
+      h += '<tr><th>Branch Outcome</th>' + sim.rows.map(function (x) { return '<td>' + (x.taken ? 'Taken' : 'Not Taken') + '</td>'; }).join('') + '</tr>';
+      h += '<tr class="is-key"><th>(hit or miss)</th>' + sim.rows.map(function (x) { return '<td>' + (x.miss ? '<b>miss</b>' : 'hit') + '</td>'; }).join('') + '</tr>';
+      h += '</tbody></table>';
+      wrap.innerHTML = h;
+    }
+    ui.onChange(function () {
+      var sim = simulate();
+      render(sim);
+      var where = sim.rows.map(function (x, j) { return x.miss ? (j + 1) : null; }).filter(function (v) { return v !== null; });
+      roExec.set(String(sim.rows.length));
+      roMiss.set(sim.miss + ' of ' + sim.rows.length, sim.miss ? 'bad' : 'good');
+      roRate.set(Course.fmt(100 * sim.miss / sim.rows.length, 1) + ' %');
+      roFinal.set(name(sim.k, sim.final));
+      note.set((where.length ? 'Misses at execution' + (where.length > 1 ? 's ' : ' ') + where.join(', ') + ' of ' + sim.rows.length + '.' : 'No miss at all.') + ' Rate = mispredictions / executions of the branch; the state left is the one after the last update.');
+    });
+  });
+  </script>
+
+  <p>One thing no counter can do, whatever its width: predict a <em>pattern</em>. The exit of a counted loop is perfectly predictable — after nine Taken comes a Not Taken, every time — and so is a branch that alternates T NT T NT; both defeat every counter, because a counter stores a bias, not a sequence. Capturing the sequence needs explicit history: <a href="l06.html">lesson 6</a>.</p>
+</section>
+
+<section id="l05-btb">
+  <h2>Where to? The branch target buffer</h2>
+
+  <p>Suppose the BHT is perfect. In IF the processor knows the <code>BNE</code> will be taken. Where does it fetch from? The target is PC plus the offset encoded in the instruction, and in our pipeline that sum is computed in ID — one cycle too late. The notes' deepening says it in one sentence (p. 63): "even if we can predict that the branch will be taken, we still don't know where to fetch from". The fetch unit must "stall instruction fetch, or fetch sequentially and later flush": one bubble on every taken branch, <em>even when the direction was predicted correctly</em>.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l05-fig-fetch">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 165" role="img" aria-label="Fetch stream with a direction predictor only: the BNE is fetched in cycle 1, the sequential SUBI is fetched in cycle 2 while ID computes the target, the SUBI is flushed and the target LD is fetched only in cycle 3">
+        <text x="118" y="28" class="tx-mid tx-sm tx-muted">C1</text><text x="154" y="28" class="tx-mid tx-sm tx-muted">C2</text><text x="190" y="28" class="tx-mid tx-sm tx-muted">C3</text><text x="226" y="28" class="tx-mid tx-sm tx-muted">C4</text>
+        <text x="94" y="57" class="tx-end tx-mono tx-sm">BNE</text>
+        <rect x="100" y="40" width="36" height="26" class="fi-paper"/><text x="118" y="57" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="136" y="40" width="36" height="26" class="fi-paper"/><text x="154" y="57" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="172" y="40" width="36" height="26" class="fi-paper"/><text x="190" y="57" class="tx-mid tx-mono tx-sm">EX</text>
+        <text x="94" y="87" class="tx-end tx-mono tx-sm">SUBI</text>
+        <rect x="136" y="70" width="36" height="26" class="fi-paper"/><text x="154" y="87" class="tx-mid tx-mono tx-sm">IF</text>
+        <path d="M 140 73 l 28 20 M 168 73 l -28 20" class="st-bad sw-2"/>
+        <text x="94" y="117" class="tx-end tx-mono tx-sm">LD</text>
+        <rect x="172" y="100" width="36" height="26" class="fi-paper"/><text x="190" y="117" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="208" y="100" width="36" height="26" class="fi-paper"/><text x="226" y="117" class="tx-mid tx-mono tx-sm">ID</text>
+        <text x="170" y="156" class="tx-mid tx-hand">flushed: 1 cycle lost</text>
+      </svg>
+      <p class="fig-label">Before: BHT only, target unknown in IF</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 165" role="img" aria-label="Fetch stream with a BTB hit: the BNE is fetched in cycle 1 and the BTB supplies the target, so the LD at the target is fetched in cycle 2 with no bubble">
+        <text x="118" y="28" class="tx-mid tx-sm tx-muted">C1</text><text x="154" y="28" class="tx-mid tx-sm tx-muted">C2</text><text x="190" y="28" class="tx-mid tx-sm tx-muted">C3</text><text x="226" y="28" class="tx-mid tx-sm tx-muted">C4</text>
+        <text x="94" y="57" class="tx-end tx-mono tx-sm">BNE</text>
+        <rect x="100" y="40" width="36" height="26" class="fi-paper"/>
+        <line x1="104" y1="53" x2="132" y2="53" class="hl"/>
+        <text x="118" y="57" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="136" y="40" width="36" height="26" class="fi-paper"/><text x="154" y="57" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="172" y="40" width="36" height="26" class="fi-paper"/><text x="190" y="57" class="tx-mid tx-mono tx-sm">EX</text>
+        <text x="94" y="87" class="tx-end tx-mono tx-sm">LD</text>
+        <rect x="136" y="70" width="36" height="26" class="fi-paper"/><text x="154" y="87" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="172" y="70" width="36" height="26" class="fi-paper"/><text x="190" y="87" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="208" y="70" width="36" height="26" class="fi-paper"/><text x="226" y="87" class="tx-mid tx-mono tx-sm">EX</text>
+        <text x="170" y="156" class="tx-mid tx-hand">target in the next cycle</text>
+      </svg>
+      <p class="fig-label">After: BTB hit in IF</p>
+    </div>
+    <figcaption><b>Fig. 6.</b> The loop's <code>BNE</code>, correctly predicted taken, with and without a BTB. Without one, the fetch unit has nowhere to go until ID has computed the target: the sequential <code>SUBI</code> is fetched and thrown away. With a hit (highlighted) the PTA replaces PC + 4 at the end of C1 and the <code>LD</code> at the top of the loop follows at once.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn>Branch Target Buffer</dfn> (BTB) — "a specialized cache used to store target address of taken branches" (notes, p. 61): a table indexed by the branch address whose data is the Predicted Target Address, so that fetch can continue from the target in the same cycle. The core idea in one line, also from p. 61: the BHT "predicts <em>whether</em> a branch will be taken", the BTB "predicts <em>where</em> the program should go if the branch is taken".</p>
+  </div>
+
+  <p>The structure is that of a direct-mapped cache (p. 61). The branch address is split into a tag and an index; the index selects one entry; the stored tag is compared with the address tag, and only an equal tag is a hit — the tags "ensure the indexed entry really belongs to the current branch". Each entry holds the tag and the PTA, "often combined with T/NT bits from a Branch History Table (1-bit or 2-bit)" (Figure 17 of the notes), so one lookup answers both questions. Only taken branches are stored, and an entry is written when a taken branch resolves and its target is known (p. 64): the first execution of every branch is a cold miss, as in any cache.</p>
+
+  <div class="widget" id="l05-w-btb">
+    <h3 class="widget-title">BTB lookup: whether, where, and why the tag</h3>
+    <p class="widget-intro">A four-entry BTB indexed by address bits 3–2 serves the loop of this lesson and the code after it. Pick the instruction being fetched; the address splits into tag and index, the indexed entry lights up, the tag comparison and the BHT's bit decide what the multiplexer feeds into the PC. The readouts give the three cases of the notes' Table 4 and what each costs in this pipeline.</p>
+    <ol class="tasks">
+      <li>BTB empty, fetch the <code>BNE</code> at 0x210 with the BHT predicting Taken. What is the next PC, and what does the branch cost if it is taken?
+        <details class="answer"><summary>What you should see</summary>
+          <p>A miss: entry 0 is empty. The fetch unit defaults to PC + 4 = 0x214 even though the BHT said Taken — "predict Taken, BTB miss". If the branch is taken, 1 cycle is lost and the entry is allocated when the target is computed, so the next execution hits.</p></details>
+      </li>
+      <li>Switch the contents to "after the loop ran". Same fetch: next PC and cost?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Tag 0x21 matches entry 0: hit. The PTA 0x200 replaces PC + 4 in this same IF cycle — "predict Taken, BTB hit", 0 cycles if the branch is taken. Set the actual outcome to Not Taken and it costs 1 cycle: the instruction fetched from 0x200 is flushed.</p></details>
+      </li>
+      <li>Keep that BTB and fetch the <code>FMUL</code> at 0x230, which is not a branch. First with the tag compared, then with the comparison switched off. Where does fetch go?
+        <details class="answer"><summary>What you should see</summary>
+          <p>With tags: entry 0 holds tag 0x21, the address tag is 0x23 — miss, next PC 0x234, nothing happens. Without tags: a false hit, and the fetch unit jumps to 0x200 after a multiply. The BTB predicts <em>where</em>, and a wrong "where" redirects fetch — that is why the BTB carries tags while the untagged BHT, which only predicts <em>whether</em>, can afford to be wrong.</p></details>
+      </li>
+      <li>Fetch the <code>BNE</code> with the BTB full but the BHT predicting Not Taken. Is the BTB consulted?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No: "predict Not Taken, BTB not used", next PC 0x214. A BTB hit means nothing without a Taken prediction. If the branch is in fact taken, 1 cycle.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l05-w-btb', function (root, ui) {
+    var PROG = [
+      { pc: 0x200, txt: 'LOOP: LD F0, 0(R1)' },
+      { pc: 0x204, txt: 'FADD F2, F0, F0' },
+      { pc: 0x208, txt: 'SD F2, 0(R1)' },
+      { pc: 0x20C, txt: 'ADDUI R1, R1, 4' },
+      { pc: 0x210, txt: 'BNE R1, R2, LOOP', target: 0x200 },
+      { pc: 0x214, txt: 'SUBI R3, R3, 1' },
+      { pc: 0x218, txt: 'BEQ R3, R0, DONE', target: 0x230 },
+      { pc: 0x21C, txt: 'SD F2, 8(R1)' },
+      { pc: 0x230, txt: 'DONE: FMUL F4, F2, F2' }
+    ];
+    function hex(v) { return '0x' + v.toString(16).toUpperCase(); }
+    var pcSel = ui.select('instruction being fetched', PROG.map(function (p) { return { value: String(p.pc), label: hex(p.pc) + '  ' + p.txt }; }), null, String(0x210));
+    var fill = ui.select('BTB contents', [
+      { value: '0', label: 'empty (cold start)' },
+      { value: '1', label: 'after the loop ran: the BNE is allocated' },
+      { value: '2', label: 'after the loop and the exit test: BNE and BEQ allocated' }
+    ], null, '0');
+    var bhtT = ui.toggle('the BHT predicts Taken', true);
+    var tags = ui.toggle('compare the tag (a real BTB always does)', true);
+    var actual = ui.select('what the branch actually does', ['Taken', 'Not Taken'], null, 'Taken');
+    var roSplit = ui.readout('address split'), roBtb = ui.readout('BTB'), roCase = ui.readout('case'), roNext = ui.readout('next PC'), roCost = ui.readout('cycles lost');
+    var note = ui.note('');
+    var svg = ui.svg(560, 330, { label: 'The branch address is split into tag and index; the index selects a BTB entry, the tag is compared with the stored tag, and the multiplexer chooses the predicted target address or PC + 4' });
+
+    function entries() {
+      var e = [null, null, null, null];
+      if (+fill.value >= 1) e[0] = { tag: 0x21, pta: 0x200, who: 'BNE at 0x210' };
+      if (+fill.value >= 2) e[2] = { tag: 0x21, pta: 0x230, who: 'BEQ at 0x218' };
+      return e;
+    }
+    function compute() {
+      var pc = +pcSel.value, ins = PROG.filter(function (p) { return p.pc === pc; })[0] || PROG[0];
+      var idx = (pc >> 2) & 3, tag = pc >> 4, e = entries()[idx];
+      var hit = !!e && (!tags.value || e.tag === tag);
+      var isBr = ins.target != null, taken = isBr && actual.value === 'Taken';
+      var r = { pc: pc, ins: ins, idx: idx, tag: tag, e: e, hit: hit, isBr: isBr, taken: taken, predT: bhtT.value, falseHit: false };
+      if (!r.predT) { r.kase = 'predict Not Taken: BTB not used'; r.next = pc + 4; r.cost = taken ? 1 : 0; }
+      else if (hit) { r.kase = 'predict Taken, BTB hit'; r.next = e.pta; r.falseHit = !isBr || e.tag !== tag; r.cost = r.falseHit ? 1 : (taken ? 0 : 1); }
+      else { r.kase = 'predict Taken, BTB miss'; r.next = pc + 4; r.cost = taken ? 1 : 0; }
+      return r;
+    }
+    function T(x, y, cls, text) { Course.svg('text', { x: x, y: y, 'class': cls, text: text }, svg); }
+    function draw(r) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var ent = entries(), rowY = 124 + 24 * r.idx + 12, i;
+      /* address split */
+      T(20, 22, 'tx-mono tx-sm', 'PC = ' + hex(r.pc));
+      Course.svg('rect', { x: 20, y: 40, width: 120, height: 24, 'class': 'fw-s3 st-s3' }, svg);
+      Course.svg('rect', { x: 140, y: 40, width: 60, height: 24, 'class': 'fi-paper' }, svg);
+      Course.svg('rect', { x: 200, y: 40, width: 40, height: 24, 'class': 'fi-soft' }, svg);
+      T(80, 57, 'tx-mid tx-mono tx-sm', 'tag ' + hex(r.tag));
+      T(170, 57, 'tx-mid tx-mono tx-sm', 'idx ' + r.idx);
+      T(220, 57, 'tx-mid tx-mono tx-sm', '00');
+      /* index route and tag route */
+      Course.svg('polyline', { points: '170,64 170,80 230,80 230,' + rowY + ' 246,' + rowY, 'marker-end': 'url(#arr)' }, svg);
+      Course.svg('polyline', { points: '80,64 80,250 314,250', 'marker-end': 'url(#arr)', 'class': tags.value ? '' : 'st-muted dash' }, svg);
+      /* PC + 4 */
+      Course.svg('line', { x1: 240, y1: 52, x2: 288, y2: 52 }, svg);
+      Course.svg('circle', { cx: 300, cy: 52, r: 12, 'class': 'fi-paper' }, svg);
+      T(300, 56, 'tx-mid tx-sm', '+4');
+      Course.svg('polyline', { points: '312,52 470,52 470,180 478,180', 'marker-end': 'url(#arr)' }, svg);
+      T(420, 44, 'tx-mid tx-sm halo', 'PC + 4');
+      /* the table */
+      Course.svg('rect', { x: 250, y: 100, width: 190, height: 24, 'class': 'fw-s3 st-s3' }, svg);
+      T(270, 117, 'tx-mid tx-mono tx-sm', 'idx'); T(330, 117, 'tx-mid tx-mono tx-sm', 'tag'); T(405, 117, 'tx-mid tx-mono tx-sm', 'PTA');
+      for (i = 0; i < 4; i++) {
+        var y = 124 + 24 * i;
+        Course.svg('rect', { x: 250, y: y, width: 40, height: 24, 'class': 'fi-paper' }, svg);
+        Course.svg('rect', { x: 290, y: y, width: 80, height: 24, 'class': 'fi-paper' }, svg);
+        Course.svg('rect', { x: 370, y: y, width: 70, height: 24, 'class': 'fi-paper' }, svg);
+        if (i === r.idx) Course.svg('line', { x1: 254, y1: y + 12, x2: 436, y2: y + 12, 'class': 'hl' }, svg);
+        T(270, y + 16, 'tx-mid tx-mono tx-sm', String(i));
+        T(330, y + 16, 'tx-mid tx-mono tx-sm', ent[i] ? hex(ent[i].tag) : '—');
+        T(405, y + 16, 'tx-mid tx-mono tx-sm', ent[i] ? hex(ent[i].pta) : '—');
+      }
+      /* stored tag down to the comparator */
+      Course.svg('line', { x1: 330, y1: 220, x2: 330, y2: 234, 'marker-end': 'url(#arr)' }, svg);
+      Course.svg('circle', { cx: 330, cy: 250, r: 14, 'class': tags.value ? 'fi-paper sw-2' : 'fi-paper st-muted dash' }, svg);
+      T(330, 255, 'tx-mid tx-bold', '=');
+      Course.svg('line', { x1: 344, y1: 250, x2: 398, y2: 250, 'marker-end': 'url(#arr)' }, svg);
+      T(371, 243, 'tx-mid tx-sm tx-bold halo', tags.value ? (r.e && r.e.tag === r.tag ? 'hit' : 'miss') : (r.e ? 'hit?' : 'miss'));
+      /* AND with the BHT bit, then the mux select */
+      Course.svg('rect', { x: 400, y: 236, width: 40, height: 28, 'class': 'fi-paper' }, svg);
+      T(420, 254, 'tx-mid tx-sm', 'and');
+      Course.svg('rect', { x: 382, y: 290, width: 76, height: 24, 'class': 'fi-paper' }, svg);
+      T(420, 307, 'tx-mid tx-mono tx-sm', 'BHT: ' + (r.predT ? 'T' : 'NT'));
+      Course.svg('line', { x1: 420, y1: 290, x2: 420, y2: 266, 'marker-end': 'url(#arr)' }, svg);
+      Course.svg('polyline', { points: '440,250 500,250 500,194', 'marker-end': 'url(#arr)' }, svg);
+      /* PTA to the mux, the mux, the output */
+      Course.svg('polyline', { points: '440,' + rowY + ' 455,' + rowY + ' 455,140 478,140', 'marker-end': 'url(#arr)', 'class': r.hit && r.predT ? 'sw-2' : 'st-muted dash' }, svg);
+      Course.svg('polygon', { points: '480,120 480,200 520,185 520,135', 'class': 'fi-paper sw-2' }, svg);
+      Course.svg('line', { x1: 520, y1: 160, x2: 548, y2: 160, 'marker-end': 'url(#arr)' }, svg);
+      T(522, 112, 'tx-mid tx-sm', 'next PC');
+      T(150, 300, 'tx-hand', 'is it this branch?');
+    }
+    ui.onChange(function () {
+      var r = compute();
+      draw(r);
+      roSplit.set('tag ' + hex(r.tag) + ' · index ' + r.idx);
+      var where = 'entry ' + r.idx;
+      if (!r.e) roBtb.set('miss (' + where + ' is empty)');
+      else if (tags.value) roBtb.set(r.e.tag === r.tag ? 'hit (' + where + ': ' + r.e.who + ')' : 'miss (' + where + ' holds tag ' + hex(r.e.tag) + ', not ' + hex(r.tag) + ')');
+      else roBtb.set('"hit" without checking (' + where + ': ' + r.e.who + ')', r.e.tag === r.tag ? undefined : 'bad');
+      roCase.set(r.kase);
+      roNext.set(hex(r.next));
+      roCost.set(r.cost + (r.cost === 1 ? ' cycle' : ' cycles'), r.cost ? 'bad' : 'good');
+      var who = r.ins.txt.replace(/^\w+: /, ''), txt;
+      if (!r.predT) txt = 'The BHT says Not Taken, so the BTB is not consulted and the next PC is PC + 4 = ' + hex(r.pc + 4) + '.' + (r.isBr ? (r.taken ? ' The branch is in fact taken: ID computes the target, the fetched instruction is flushed, 1 cycle.' : ' The branch falls through: nothing lost.') : ' Not a branch: nothing to predict.');
+      else if (r.hit && r.falseHit) txt = 'Entry ' + r.idx + ' belongs to the ' + r.e.who + ', not to <code>' + who + '</code> at ' + hex(r.pc) + ' — without the tag comparison the BTB cannot tell them apart. The fetch unit would jump to ' + hex(r.e.pta) + ' instead of ' + hex(r.pc + 4) + ': a wrong-path fetch, undone only when ID decodes a non-branch. This is why the BTB has tags.';
+      else if (r.hit) txt = 'Tag ' + hex(r.tag) + ' matches entry ' + r.idx + ': hit. The BHT says Taken, so the mux selects the PTA ' + hex(r.e.pta) + ' in this same IF cycle.' + (r.taken ? ' The branch is taken: 0 cycles lost.' : ' But the branch falls through: the instruction fetched from ' + hex(r.e.pta) + ' is flushed, 1 cycle.');
+      else txt = (r.e ? 'Entry ' + r.idx + ' holds tag ' + hex(r.e.tag) + ', the address tag is ' + hex(r.tag) + ': no match, miss.' : 'Entry ' + r.idx + ' is empty: miss.') + (r.isBr ? ' The BHT says Taken but there is nowhere to go: fetch defaults to PC + 4 = ' + hex(r.pc + 4) + ' and ID computes the target.' + (r.taken ? ' 1 cycle lost — and the entry is then allocated for next time.' : ' The branch falls through, so the default was right: 0 cycles.') : ' Not a branch, so the miss is the right answer: PC + 4 = ' + hex(r.pc + 4) + '.');
+      note.set(txt);
+    });
+  });
+  </script>
+
+  <p>The notes summarise the behaviour in their Table 4 (p. 62). The cost column is the one you add yourself, for the course pipeline:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Table 4 of the notes, with the cost of each case when the branch is resolved in ID.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Prediction</th><th>BTB use</th><th>Action</th><th>Cost if taken</th><th>Cost if not taken</th></tr></thead>
+        <tbody>
+          <tr><td>Predict Not Taken</td><td>BTB not used</td><td>Fetch from PC + 4</td><td class="num">1 cycle</td><td class="num">0</td></tr>
+          <tr class="is-key"><td>Predict Taken (BTB hit)</td><td>BTB used</td><td>Fetch from the PTA stored in the BTB</td><td class="num">0</td><td class="num">1 cycle</td></tr>
+          <tr><td>Predict Taken (BTB miss)</td><td>BTB miss</td><td>Stall or default to PC + 4, then calculate the BTA in ID; allocate the entry</td><td class="num">1 cycle</td><td class="num">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>On a hit with a Taken prediction "the next PC is immediately set to the target address, in the same cycle" (p. 64): a correctly predicted taken branch now costs nothing. On a miss "it's as if there's no BTB for that branch at all" (p. 64): fetch defaults to PC + 4, ID computes the real target, a taken branch costs its usual cycle — and the entry is allocated, so the next execution hits. "Clearly, the best option is to have a BTB with a certain rate of misses rather than no BTB at all." The two advantages the notes list (p. 62) are the words for an open question: it "eliminates delay from calculating the branch target address manually" and "enables speculative instruction fetch from correct target, improving pipeline efficiency".</p>
+
+  <h3>Why the BTB has tags and the BHT has none</h3>
+
+  <p>Here the "indexed before decode" remark pays off. A BTB hit <em>means</em> "the instruction at this address is a taken branch, and here is where it goes" — and the fetch unit acts on it at once. Without tags, any instruction whose low-order address bits match a stored branch would hit, and the fetch of an ordinary <code>FMUL</code> would be redirected into the middle of a loop: a wrong-path fetch that must be detected and undone. With tags a miss safely means "treat this as not a branch". The BHT can live without tags because its one or two bits are only <em>used</em> once the instruction is known to be a branch, and a wrong bit costs accuracy, never correctness.</p>
+
+  <p class="memo"><mark class="key">The BHT predicts whether and may be wrong; the BTB predicts where and must not redirect a non-branch — so the BTB carries tags.</mark></p>
+
+  <aside class="redpen" data-page="61">
+    <p class="claim">"The PTA is typically stored in PC-relative format (offset from current PC)."</p>
+    <p class="fix">the BTB stores the predicted <em>next PC</em> — an absolute instruction address — precisely so that the fetch unit can load it into the PC in the same cycle without an addition. The PC-relative offset lives in the instruction encoding; it is what the ID-stage adder uses to compute the BTA.</p>
+    <p class="because">The whole point of the structure (p. 64, "the next PC is immediately set to the target address, in the same cycle") is to skip the PC + offset addition in IF. Storing an offset would put that adder back on the fetch path. Hennessy &amp; Patterson's figure labels the field "predicted PC".</p>
+  </aside>
+
+  <div class="pitfall">
+    <p>"The BTB is a direct-mapped cache … tags are used for associative lookup." The notes (p. 61) mix two words. In a direct-mapped structure the index selects one entry and a <em>single</em> tag comparison validates it — what Figures 16 and 17 draw. "Associative lookup" means comparing the address with all stored tags in parallel, a fully associative buffer. Both organisations exist; at the exam write "a cache: index, tag compare, hit or miss" and you are safe either way.</p>
+  </div>
+
+  <h3>What a BTB is worth, in cycles and in bits</h3>
+
+  <p>Hennessy &amp; Patterson's textbook example gives the expected penalty per branch when a BTB is present. Call \(p_{hit}\) the hit rate, \(p_{ok}\) the accuracy of the prediction on a hit and \(p_{taken}\) the fraction of taken branches. A branch costs \(P\) cycles in two situations only:</p>
+
+  <ol class="steps" id="l05-steps-btb">
+    <li>
+      <p>A branch costs \(P\) cycles exactly when fetch went the wrong way. With a BTB there are two ways for that to happen; a miss on a not-taken branch is not one of them, because PC + 4 was the right choice anyway.</p>
+    </li>
+    <li>
+      <p>Case A — a hit whose prediction was wrong. Probability \(p_{hit}\,(1 - p_{ok})\), cost \(P\):</p>
+      \[ p_{hit}\,(1 - p_{ok})\,P \]
+    </li>
+    <li>
+      <p>Case B — a miss on a branch that turns out taken: fetch defaulted to PC + 4. Probability \((1 - p_{hit})\,p_{taken}\), cost \(P\):</p>
+      \[ (1 - p_{hit})\,p_{taken}\,P \]
+    </li>
+    <li>
+      <p>Add the two. With the textbook's numbers — 90 % hits, 90 % accuracy on a hit, 60 % of branches taken — and \(P = 1\):</p>
+      \[ \begin{aligned} \text{penalty} &amp;= p_{hit}\,(1 - p_{ok})\,P \\ &amp;\quad + (1 - p_{hit})\,p_{taken}\,P \end{aligned} \]
+      \[ = 0.9 \times 0.1 + 0.1 \times 0.6 = 0.15 \]
+      <p>cycles per branch. (The textbook's own pipeline resolves branches a stage later, \(P = 2\), and gets 0.30.) Multiply by \(f_b\) for the contribution to the CPI.</p>
+    </li>
+  </ol>
+
+  <p>And why keep two tables instead of one big BTB with direction bits? Count the bits. With 32-bit addresses and 1024 entries the tag has \(32 - 10 - 2 = 20\) bits, the PTA 30 (word-aligned) and the counter 2: 52 bits per entry, 6.5 KB for the table. A 2-bit BHT with 4096 entries — four times as many branches — costs \(4096 \times 2\) bits = 1 KB. Direction is cheap and tolerates collisions, so it gets a large untagged table; targets are expensive and must not collide, so they get a small tagged one. Hence what the BTB does <em>not</em> do (p. 64): it does not decide the direction, does not compute the target, does not replace the BHT; "it simply remembers previously computed target addresses for quick access during fetch, like a cache for branch targets". And only taken branches, because the "target" of a not-taken branch is PC + 4, which the fetch unit already has.</p>
+</section>
+
+<section id="l05-puzzle">
+  <h2>The puzzle resolved, and the words for the open question</h2>
+
+  <p>Back to the loop of the hook: always taken 90 %, one bit 80 %, two bits 90 %. The dynamic predictor only ties with the static rule — so what was it for? For every branch whose bias the compiler cannot know: the loop that runs twice in one run and a million times in another, the <code>if</code> that follows the data. There the static rule is a coin toss and the counter learns in two executions — with no delay slots, no profiling run, no recompilation. And with a BTB beside it the nine correctly predicted taken branches cost 0 cycles instead of 1 each. The simplest learner lost to the dumbest rule on the one loop where that rule was already perfect; the second bit and the target buffer are what make learning pay.</p>
+
+  <p>The January 2026 paper asked "What are the main benefits to introduce the dynamic branch prediction in a modern microprocessor?", and the June 2026 paper wants "the main concepts and benefits" of "dynamic branch prediction and speculative execution" in five lines. Five lines, each with its why:</p>
+  <ul>
+    <li><b>Fewer mispredictions, lower CPI.</b> The predictor shrinks \(1 - a\) in \(\text{CPI} = \text{CPI}_{\text{ideal}} + f_b(1 - a)P\); the penalty \(P\) is untouched.</li>
+    <li><b>Adapts at run time.</b> Input-dependent branches, trip counts and program phases that no compile-time rule can know; "if a branch changes its behavior at runtime, future predictions adjust accordingly" (p. 55).</li>
+    <li><b>Essential in deep and wide pipelines.</b> The work lost per misprediction grows with depth times issue width: in Onur Mutlu's ETH Zürich example (background, not in the notes) a 20-stage, 5-wide machine with a branch every five instructions fetches 500 instructions in 100 cycles at 100 % accuracy, 120 at 99 %, 300 at 90 %, 900 at 60 %.</li>
+    <li><b>Enables speculative execution.</b> Instructions beyond an unresolved branch are fetched, issued and executed, and must not update registers or memory before it resolves — here the flush before WB guarantees it, in a speculative Tomasulo machine the reorder buffer does (<a href="l17.html">lesson 17</a>).</li>
+    <li><b>Independent of compiler and ISA.</b> No delay slots to fill, no profile, no hints; the same binary runs faster on a better core.</li>
+  </ul>
+
+  <p>The matching five lines for "Explain the main purpose to introduce the Branch Target Buffer" (January 2026, Question 2) are the model answer in the exam section below. Their skeleton: whether versus where; the target is computed in ID; a tagged cache read in IF; the stored target in the same cycle, zero cycles on a hit; filled when a taken branch resolves; PC + 4 and the normal penalty on a miss.</p>
+</section>
+
+<section id="l05-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" id="l05-exam-benefits">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the Dynamic Branch Prediction techniques used in modern microprocessors. (a) What are the main benefits to introduce the dynamic branch prediction in a modern microprocessor? (b) Explain how works a Branch History Table.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) The hardware predicts each branch at run time from its past behaviour, so the pipeline keeps fetching instead of stalling. Benefits: fewer mispredictions and hence a lower CPI (in \(\text{CPI} = \text{CPI}_{\text{ideal}} + f_b (1 - a) P\) the predictor raises the accuracy \(a\), the penalty \(P\) is fixed by the pipeline); adaptation to the actual input data and program phases, which a static compile-time rule cannot see; it is essential in deep and wide pipelines, where every misprediction wastes depth × width instructions; it enables speculative execution past unresolved branches, with results committed only when the branch resolves; it needs no compiler support, delay slots or profiling, so existing binaries benefit.</p>
+        <p>(b) A Branch History Table is a table indexed by the low-order bits of the branch PC, without tags (so two branches may share an entry: aliasing). Each entry is a small finite-state machine: 1 bit storing the last outcome, or a 2-bit machine with the states Strongly Taken, Weakly Taken, Weakly Not Taken, Strongly Not Taken, predicting Taken in the first two. The table is read in IF with the fetch PC and the prediction decides whether to fetch PC + 4 or the target; when the branch resolves the entry is updated with the outcome. With 2 bits a single anomaly, such as a loop exit, moves a strong state to the weak state of the same direction without changing the prediction, so a loop branch is mispredicted once per execution of the loop instead of twice.</p>
+      </div>
+      <div class="exam-note">
+        <p>The first two of the five sub-points of Question 2 of the January 2026 paper; the June 2026 paper asks the same in one sub-point of the 8-point question. A complete answer has the mechanism (indexed by the PC, no tags, FSM per entry, read in IF, updated at resolution), the 1-bit vs 2-bit contrast with the loop-exit argument, and benefits stated as cause and effect, not as adjectives. Do not write "reduces the penalty": it reduces the rate.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l05-exam-btb">
+    <div class="exam-q" lang="en">
+      <p>Explain the main purpose to introduce the Branch Target Buffer.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The branch target address is computed in the ID stage, so even a correct Taken prediction in IF leaves the fetch unit without an address: one bubble on every taken branch. The Branch Target Buffer removes this control hazard. It is a small cache indexed by the branch PC, with tags, whose data is the predicted target address of taken branches (often together with the T/NT prediction bits). On a hit with a Taken prediction the next PC is set to the stored target in the same IF cycle, so a correctly predicted taken branch costs zero cycles. An entry is written when a taken branch resolves and its target is known; on a miss, fetch defaults to PC + 4 and the branch pays the normal penalty if taken. The tags are necessary because a false hit would redirect the fetch of a non-branch instruction — unlike the BHT, which only predicts the direction and can be untagged.</p>
+      </div>
+      <div class="exam-note">
+        <p>The third sub-point of Question 2 of the January 2026 paper. The examiner looks for "whether versus where", "in the same cycle", "indexed by the PC with tags", "stores taken branches, filled at resolution", and the three cases (predict NT; predict T and hit; predict T and miss). Do not write "eliminates the control hazard" without qualification: it eliminates it on a hit with a correct prediction.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l05-exam-rate">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the following LOOP to be executed on a processor with a single-entry 2-bit Branch History Table initialized in the state Strongly Not-Taken:</p>
+<pre><code>INIT: ADDUI R1, R0, 0
+      ADDUI R2, R0, 20
+LOOP: LD    F0, 0(R1)
+      FADD  F2, F0, F0
+      SD    F2, 0(R1)
+      ADDUI R1, R1, 4
+      BNE   R1, R2, LOOP</code></pre>
+      <p>After the last iteration, how much is the misprediction rate on the BNE instruction? Motivate your answer by completing the table (rows Prediction State / Prediction / Branch Outcome, one column per iteration; the first column is given: Strongly Not Taken, Not Taken, Taken).</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>60 % <span class="fb">Five executions (R1 = 4, 8, 12, 16, 20), misses at the 1st, 2nd and 5th: 3/5.</span></li>
+      <li>90 % <span class="fb">Impossible on five executions (it would be 4.5 misses); read as an accuracy, 90 % is the notes' ten-iteration steady state, not this cold start.</span></li>
+      <li>99 % <span class="fb">Impossible: after two Taken in a row any 2-bit counter predicts the third Taken correctly.</span></li>
+      <li>100 % <span class="fb">Impossible for the same reason: the 3rd and 4th executions are predicted right.</span></li>
+      <li>80 % <span class="fb">Four misses would need the warm-up to last four executions; from SNT it lasts two.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The BNE is executed with R1 = 4, 8, 12, 16, 20: five times, Taken four times and Not Taken at the exit.</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Iteration</th><th>1st</th><th>2nd</th><th>3rd</th><th>4th</th><th>5th</th></tr></thead>
+            <tbody>
+              <tr><th>Prediction State</th><td>Strongly Not Taken</td><td>Weakly Not Taken</td><td>Weakly Taken</td><td>Strongly Taken</td><td>Strongly Taken</td></tr>
+              <tr><th>Prediction</th><td>Not Taken</td><td>Not Taken</td><td>Taken</td><td>Taken</td><td>Taken</td></tr>
+              <tr><th>Branch Outcome</th><td>Taken</td><td>Taken</td><td>Taken</td><td>Taken</td><td>Not Taken</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Mispredictions at the 1st, 2nd and 5th execution: misprediction rate = 3 / 5 = 60 % (Answer 1). With the FSM of the lecture figure the 3rd state is Strongly Taken (WNT → ST on a Taken); the predictions and the rate are the same.</p>
+      </div>
+      <div class="exam-note">
+        <p>The 10 June 2025 paper, Question 5, worth 1 point for the answer and 1 for the table. Count the executions from the register values, not from the word "iterations", and count the warm-up misses. Write the state names in full, as the paper does.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l05-exam-state">
+    <div class="exam-q" lang="en">
+      <p>Same loop and same Branch History Table. After the last iteration, what is the state of the prediction left in the Branch History Table?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Strongly Taken <span class="fb">That is the state before the 5th execution; the exit Not Taken moves it one step down.</span></li>
+      <li data-correct>Weakly Taken <span class="fb">After four Taken the entry is in Strongly Taken; the final Not Taken moves it to Weakly Taken, in both FSM variants.</span></li>
+      <li>Strongly Not Taken <span class="fb">The initial state; after four Taken the counter is at the other end.</span></li>
+      <li>Weakly Not Taken <span class="fb">One Not Taken from Strongly Taken reaches only the weak Taken state; a second one would be needed.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Before the 5th execution the state is Strongly Taken (after four Taken). The outcome is Not Taken, so the state moves one step: Strongly Taken → Weakly Taken (Answer 2). The question asks for the state <em>after</em> the last update, one transition beyond the last column of the table.</p>
+      </div>
+      <div class="exam-note">
+        <p>Second part of the same quiz. The trap is to answer with the state used for the last prediction (Strongly Taken) instead of the state left by it.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="2" data-tol="0" id="l05-exam-midterm">
+    <div class="exam-q" lang="en">
+      <p>Let's consider a processor with a 1-entry 1-bit Branch History Table initialized as Taken, executing the following code (only the BEQ accesses the BHT):</p>
+<pre><code>      ADDUI R1, R0, 0
+      ADDUI R2, R0, 100
+LOOP: BEQ   R1, R2, DONE
+      ADD   R5, R5, R4
+      ADDUI R1, R1, 1
+      J     LOOP
+DONE:</code></pre>
+      <p>How many mispredictions occur on the BEQ? (State also the number of BHT accesses.)</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The BEQ is executed with R1 = 0, 1, …, 100: 101 accesses to the BHT. Outcomes: Not Taken 100 times, then Taken at R1 = 100. The entry starts as Taken: 1st access, predict Taken, outcome Not Taken → misprediction, bit ← NT; accesses 2 to 100 predict Not Taken correctly; 101st access, predict Not Taken, outcome Taken → misprediction. Total: 101 accesses, 2 mispredictions (rate 2/101 ≈ 2 %).</p>
+      </div>
+      <div class="exam-note">
+        <p>Quiz 5 of the May 2025 midterm as the notes report it (its options paired accesses and mispredictions; "101 and 2" is the right pair). A top-tested loop executes its exit branch N + 1 times; the first miss comes from the initialisation, the second from the exit — both are changes of direction, and a 1-bit entry pays one miss per change.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l05-exam-nested">
+    <div class="exam-q" lang="en">
+      <p>An inner loop of 8 iterations, closed by a BNE (taken 7 times, then not taken), is executed 3 times by an outer loop. Only the inner BNE accesses a single-entry Branch History Table. (a) With a 1-bit BHT initialized Not Taken, give the number of BHT accesses, the number of mispredictions, the misprediction rate and the final state. (b) Same with a 2-bit BHT initialized Strongly Not Taken. (c) How many mispredictions per execution of the inner loop does each predictor make in steady state?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) 3 × 8 = 24 accesses; outcomes T T T T T T T NT, three times. The 1-bit entry mispredicts at access 1 (NT predicted, T), at 8 (exit), at 9 (re-entry: the entry holds NT), at 16, 17 and 24: 6 mispredictions, 6/24 = 25 %, final state Not Taken (the last outcome).</p>
+        <p>(b) From Strongly Not Taken: access 1 predicts NT (miss, → WNT), access 2 predicts NT (miss, → WT with a saturating counter, → ST with the lecture figure), accesses 3–7 predict T correctly (the state is ST from access 4 at the latest), access 8 predicts T but the branch exits (miss, ST → WT); access 9 predicts T from WT correctly (→ ST), accesses 10–15 hit, 16 misses (→ WT), 17 hits, 18–23 hit, 24 misses (→ WT). Mispredictions at 1, 2, 8, 16, 24: 5, rate 5/24 ≈ 21 %, final state Weakly Taken.</p>
+        <p>(c) Steady state: 2 per inner-loop execution with 1 bit (exit and re-entry), 1 with 2 bits (exit only). The 2-bit predictor also paid one extra warm-up miss from Strongly Not Taken.</p>
+      </div>
+      <div class="exam-note">
+        <p>An exercise in the style of the June 2025 quiz with the counting extended over several executions of the loop. The examiner checks the three sources of misses — initialisation, exit, re-entry — and that you know which one the second bit removes. Both 2-bit variants give the same numbers here.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l05-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>During the execution of a program, the number of mispredictions depends on the initialization and the size of the Branch History Table (BHT). True or False? Motivate your answer.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">Initialisation sets the warm-up misses (a 2-bit entry started Strongly Not Taken misses the first two taken executions of a loop; started Strongly Taken it misses none); the size sets how many branches share an untagged entry, so a small table makes unrelated branches overwrite each other's state (aliasing) and mispredict.</span></li>
+      <li>False <span class="fb">Both effects are real: the June 2025 quiz counts the two warm-up misses from Strongly Not Taken, and an untagged table of 2^k entries aliases every pair of branches with equal low-order PC bits.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>True. (1) Initialization: the initial state of the entry decides whether the first executions of a branch are predicted correctly — a loop branch whose entry starts Strongly Not Taken costs two warm-up mispredictions, one that starts Weakly Not Taken costs one, one that starts Taken costs none. (2) Size: the BHT is indexed by k low-order bits of the PC without tags, so with 2^k entries all branches sharing those bits share the entry and interfere (aliasing); a larger table spreads the branches over more entries and reduces the interference. (The number of mispredictions also depends on the predictor's FSM, 1-bit or 2-bit, and on the program's branch patterns.)</p>
+      </div>
+      <div class="exam-note">
+        <p>Quiz 4 of the May 2025 midterm, a True/False with "motivate". The motivation earns the point: name both mechanisms and the word aliasing.</p>
+      </div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l05-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A loop branch is taken 9 times and not taken once, and the loop is executed many times. In steady state, what accuracy does a 1-bit BHT reach on this branch?</p>
+    <ul class="options">
+      <li>90 % <span class="fb">That is the accuracy of "always taken" and of the 2-bit predictor: one miss per loop. The 1-bit predictor misses twice.</span></li>
+      <li data-correct>80 % <span class="fb">Two misses in ten executions: the exit (predicted T) and the re-entry (predicted NT, the echo of the exit).</span></li>
+      <li>100 % <span class="fb">No counter predicts the exit: it has no way to know that the ninth Taken is the last one.</span></li>
+      <li>10 % <span class="fb">The predictor is wrong twice, not eight times — it tracks the bias, just one step late.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A 2-bit entry is in the state Weakly Taken. Which statements are true?</p>
+    <ul class="options">
+      <li data-correct>Its prediction is Taken <span class="fb">Both Taken states predict Taken; "weak" says how the next update behaves, not how sure the guess is.</span></li>
+      <li data-correct>A single Not Taken outcome makes the next prediction Not Taken <span class="fb">From a weak state one contradicting outcome flips the prediction: to WNT in a saturating counter, to SNT in the notes' figure.</span></li>
+      <li>Its prediction is "undecided" <span class="fb">The prediction is binary; the fetch unit needs a direction, and WT gives Taken.</span></li>
+      <li>Two consecutive Not Taken outcomes are needed before it predicts Not Taken <span class="fb">That holds only from Strongly Taken. From Weakly Taken one is enough.</span></li>
+    </ul>
+    <p class="q-fb">A picture to remember: strong = "I am sure, one surprise will not move me"; weak = "I am still Taken, but one more and I switch".</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In \(\text{CPI} = \text{CPI}_{\text{ideal}} + f_b (1 - a) P\), what does replacing a 1-bit BHT by a 2-bit BHT change?</p>
+    <ul class="options">
+      <li data-correct>Only \(a\), the accuracy <span class="fb">The predictor changes how often a branch is mispredicted; nothing else in the formula is its business.</span></li>
+      <li>\(P\), the penalty <span class="fb">The penalty is set by the pipeline — where the branch resolves. The notes' "reduces misprediction penalty" is the red-pen error of this lesson.</span></li>
+      <li>\(f_b\), the branch fraction <span class="fb">The program has as many branches as before; the predictor executes none of them.</span></li>
+      <li>\(a\) and \(P\) together <span class="fb">Only \(a\). A shorter penalty would need a different pipeline, not a different predictor.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does the BTB need tags while the BHT does not?</p>
+    <ul class="options">
+      <li data-correct>A false BTB hit would redirect the fetch of a non-branch; a wrong BHT bit only lowers accuracy on a real branch <span class="fb">The BTB is consulted before decode and its hit changes the next PC at once; the BHT's bit is only acted on for an instruction that is a branch, and the pipeline corrects a wrong direction at resolution.</span></li>
+      <li>Because the BTB is bigger <span class="fb">It is smaller: its entries hold a 30-bit address, so there are fewer of them. Size is not the reason for the tags.</span></li>
+      <li>Because the BHT is read in ID, after decode, and the BTB in IF <span class="fb">Both are read in IF with the fetch PC. The difference is what a hit does: the BTB's hit redirects fetch, the BHT's bit is just a direction.</span></li>
+      <li>Because tags are needed for 2-bit counters <span class="fb">The counters have nothing to do with it: a tagged BHT would work, it would just cost more bits than it protects.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The BHT predicts Taken, the BTB misses (the fetch unit defaults to PC + 4), and the branch turns out Not Taken. How many cycles are lost in this pipeline?</p>
+    <ul class="options">
+      <li data-correct>0 <span class="fb">On a BTB miss the fetch unit defaults to PC + 4, which is exactly where a not-taken branch goes. The "Taken" prediction was wrong but could not be acted on.</span></li>
+      <li>1 <span class="fb">One cycle would be lost if the branch were taken (the default PC + 4 was wrong) — not here.</span></li>
+      <li>2 <span class="fb">The course pipeline resolves branches in ID; the maximum cost of any case is one cycle.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">When does a branch get an entry in the BTB?</p>
+    <ul class="options">
+      <li data-correct>When it resolves as taken and its target is known <span class="fb">The target is computed in ID and written into the BTB with the branch's tag; the first execution is a cold miss.</span></li>
+      <li>When the compiler emits it <span class="fb">The BTB is hardware filled at run time; the compiler knows nothing about it.</span></li>
+      <li>When it is fetched for the first time <span class="fb">At fetch the target is unknown — that is the whole problem the BTB solves.</span></li>
+      <li>Every branch, taken or not, when it resolves <span class="fb">Only taken branches are stored: the "target" of a not-taken branch is PC + 4, which the fetch unit already has.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these branch behaviours are perfectly predictable in principle, yet defeat every 1-bit or 2-bit counter even after warm-up?</p>
+    <ul class="options">
+      <li data-correct>Strictly alternating: T NT T NT … <span class="fb">A counter is always one step behind an alternation; the notes' machine gets half right, the saturating counter none.</span></li>
+      <li data-correct>The exit of a counted loop of 10 iterations, run many times <span class="fb">The exit is predictable in principle (after nine T comes NT) but a counter stores a bias, not a position in a sequence; it misses the exit every time.</span></li>
+      <li>A branch taken 99 % of the time <span class="fb">Its rare exceptions are not predictable from the past, so nothing could beat a counter here: it learns the bias in two executions and misses only those exceptions — that is what it is for.</span></li>
+      <li>A branch that is always taken <span class="fb">After at most two warm-up executions a counter predicts it right forever.</span></li>
+    </ul>
+    <p class="q-fb">Patterns need history, not wider counters — the subject of the next lesson.</p>
+  </div>
+</section>
+
+<section class="recap" id="l05-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Dynamic prediction is hardware that learns each branch's behaviour at run time; it changes how often a branch is mispredicted, never what a misprediction costs — one cycle in this pipeline, set by where the branch resolves.</li>
+    <li>The BHT is indexed by k low-order PC bits without tags: two branches with the same bits share an entry (aliasing), which costs accuracy but never correctness.</li>
+    <li>A 1-bit entry repeats the last outcome and pays two misses for every change of direction: 80 % on a ten-iteration loop, worse than "always taken".</li>
+    <li>A 2-bit entry (ST, WT, WNT, SNT) tolerates one anomaly from a strong state and flips after one from a weak state: one miss per loop, 90 %. The notes' figure is Hennessy &amp; Patterson's machine, not a pure saturating counter; they agree on every loop and differ on alternation.</li>
+    <li>The exam table: count the executions of the branch from the register values, start from the given state, count the warm-up misses, and report the state <em>after</em> the last update — 60 % and Weakly Taken in the June 2025 quiz.</li>
+    <li>The BTB is a tagged cache indexed by the branch PC that stores the predicted target of taken branches and supplies it in IF, so a correctly predicted taken branch costs zero cycles; it carries tags because a false hit would redirect the fetch of a non-branch.</li>
+  </ul>
+
+  <aside class="cheat" id="l05-cheat">
+    <dl>
+      <dt>CPI with branches</dt><dd>\(\text{CPI} = \text{CPI}_{\text{ideal}} + f_b (1 - a) P\) — \(f_b\) branch fraction, \(a\) accuracy, \(P\) penalty (1 here)</dd>
+      <dt>Misprediction rate</dt><dd>\(r = \dfrac{\text{mispredictions}}{\text{executions of the branch}}\), warm-up included; \(a = 1 - r\)</dd>
+      <dt>Executions of a loop branch</dt><dd>bottom-tested (BNE at the end): \(N\); top-tested (BEQ exit at the top): \(N + 1\)</dd>
+      <dt>1-bit on a loop of \(N\), re-run</dt><dd>2 misses (exit + re-entry): accuracy \((N - 2) / N\)</dd>
+      <dt>2-bit on the same loop</dt><dd>1 miss (exit): \((N - 1) / N\); from SNT add 2 warm-up misses, from WNT add 1</dd>
+      <dt>2-bit rule</dt><dd>strong state: one anomaly moves to the weak state, prediction unchanged; weak state: one anomaly flips the prediction</dd>
+      <dt>BHT size</dt><dd>\(2^k\) entries \(\times\) \(n\) bits, no tags</dd>
+      <dt>BTB entry</dt><dd>tag + predicted target address (+ T/NT bits); only taken branches, written at resolution</dd>
+      <dt>BTB cases</dt><dd>predict NT → PC + 4; predict T and hit → PTA, 0 cycles if taken; predict T and miss → PC + 4, then BTA in ID, 1 cycle if taken</dd>
+      <dt>Penalty per branch with a BTB</dt><dd>\(p_{hit}(1 - p_{ok})P + (1 - p_{hit})\,p_{taken}P\)</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l05-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=nczJ58WvtYo" target="_blank" rel="noopener">How Branch Prediction Works in CPUs</a>
+      <span class="res-by">Computerphile, Matt Godbolt</span><span class="res-dur">26 min</span>
+      <p class="res-why">The whole idea in one sitting, with drawings: why the pipeline must guess, from "always guess the same" to counters. The intuition this lesson builds on.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=JTXIhNQwhyw" target="_blank" rel="noopener">2 Bit Predictor</a>
+      <span class="res-by">Georgia Tech HPCA (Udacity)</span><span class="res-dur">6 min</span>
+      <p class="res-why">The four-state counter on a whiteboard and why it beats one bit on loops — watch it after the FSM clicker, before the exam table.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=0b7T_035pRs" target="_blank" rel="noopener">BTB: Branch Target Buffer</a>
+      <span class="res-by">Georgia Tech HPCA (Udacity)</span><span class="res-dur">2 min</span>
+      <p class="res-why">Two minutes on why the direction is not enough: the target must be predicted too. Pairs with the BTB lookup widget.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://aca-iiith.vlabs.ac.in/exp/branch-prediction-one-two-bit/simulation.html" target="_blank" rel="noopener">One-Two Bit Branch Prediction simulation</a>
+      <span class="res-by">Virtual Labs, IIIT Hyderabad</span><span class="res-dur">15 min</span>
+      <p class="res-why">Paste a small assembly program, generate its branch trace and run a 1-bit or 2-bit predictor on it: check a hand-made exam table against the tool.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.ardent-tool.com/CPU/docs/AMD/anatomy/misc/articles/smith2.pdf" target="_blank" rel="noopener">A Study of Branch Prediction Strategies</a>
+      <span class="res-by">James E. Smith, ISCA 1981</span><span class="res-dur">9 pages</span>
+      <p class="res-why">The paper that started dynamic prediction: the 1-bit-versus-2-bit story in the author's own words, with accuracies that swing from 35 % to 98 % between programs.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>A counter remembers a bias, not a pattern: it will miss the exit of a counted loop forever, and it cannot see that two branches test the same condition. Next, one extra bit — the outcome of the previous branch — turns 0 of 8 right into 8 of 8 on every pass after two warm-up misses.</p>
+</aside>
+
+</main>
+</body>
+</html>

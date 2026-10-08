@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The day the caches disagreed: coherence, snooping and the MSI machine · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+  /* page-local (tokens only): the tables the widgets build in their stage, and the wide exam tables whose headers must wrap */
+  .l35-tw { padding: 0.4rem 1rem 0.9rem; }
+  .l35-tw .tbl th, .l35-tw .tbl td { padding: 0.3rem 0.6rem 0.3rem 0; }
+  .l35-wrap .tbl thead th { white-space: normal; vertical-align: bottom; line-height: 1.25; }
+  .l35-wrap .tbl th, .l35-wrap .tbl td { padding-right: 0.6rem; }
+  .l35-op .tbl td:nth-child(2) { white-space: nowrap; }
+  @media (max-width: 640px) { .l35-tw { padding-inline: 0.5rem; } }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l35">
+
+<header class="lesson-head">
+  <h1>The day the caches disagreed: coherence, snooping and the MSI machine</h1>
+  <p class="lede">After this lesson you will explain why two private caches can return different values for one address, state what a coherent memory promises, choose between write-invalidate and write-update, and run the MSI state machine of a snooping bus — replacements and write-backs included.</p>
+</header>
+
+<div class="hook" data-label="A silent wrong answer">
+  <p>Two cores, A and B, each with a private cache, share one variable X; memory holds X = 1. A reads X, then B reads X: each cache now keeps its own copy of the 1. Then A writes X = 0. A moment later B reads X — and gets 1. No exception, no crash, no warning: an old value, served at cache speed. The notes print this story as Table 31 (p. 448), up to A's write.</p>
+  <p>Now the stranger part. "Almost all modern multiprocessors use write-back caches" (p. 448), so after A's write memory still holds 1 as well. Two of the three copies of X are wrong, and the only right one sits inside A's cache. A correct machine must still hand B the 0. Who warns B, and where does the 0 come from? By the end of the lesson you will trace the answer step by step.</p>
+</div>
+
+<section id="l35-problem">
+  <h2>Two caches, one X</h2>
+
+  <p>Start from your first course: main memory is far too slow for the processor, so a cache keeps recently used blocks close to it. It lowers the average memory access latency and raises the effective bandwidth (p. 444). In a multiprocessor every core has private caches — L1 and L2 — and often shares an L3.</p>
+
+  <p>For <mark class="key">private data</mark> — a thread's stack, its local variables — a private cache works exactly as in a single processor: no other core cares about the block. Shared data is different, and Hennessy &amp; Patterson name two reasons to cache it anyway (§5.2; the notes do not use the words):</p>
+  <ul>
+    <li><mark class="key">Migration</mark>: a block moves into the cache of the core that uses it, so its accesses stop travelling to memory or across the interconnect — lower latency, less traffic.</li>
+    <li><mark class="key">Replication</mark>: a block that several cores read gets a copy in each of their caches, so the readers do not queue for one copy.</li>
+  </ul>
+
+  <p>Both benefits have one price: the same block now lives in several places. Table 31 of the notes shows what that costs, for one location X and two processors.</p>
+
+  <figure class="tbl-fig" id="l35-tbl-31">
+    <figcaption>Table 31 of the notes (p. 448), completed. Its memory column holds for write-through caches; the last column is the same story with write-back caches. Row 4 is added: it is the read that goes wrong.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>T</th><th>Processor A</th><th>Processor B</th><th>Memory (X), write-through</th><th>Memory (X), write-back</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0</td><td></td><td></td><td class="num">1</td><td class="num">1</td></tr>
+          <tr><td class="num">1</td><td>Read X (1) → cache A = 1</td><td></td><td class="num">1</td><td class="num">1</td></tr>
+          <tr><td class="num">2</td><td>Cache: A = 1</td><td>Read X (1) → cache B = 1</td><td class="num">1</td><td class="num">1</td></tr>
+          <tr><td class="num">3</td><td>Write X = 0 → cache A = 0</td><td>Cache: B = 1</td><td class="num">0</td><td class="num">1</td></tr>
+          <tr class="is-key"><td class="num">4</td><td>Cache: A = 0</td><td>Read X → hit → 1 (stale)</td><td class="num">0</td><td class="num">1</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>At T = 3 A writes 0 into its own copy. Nothing touches B's copy, so at T = 4 B reads 1 at hit speed. This is the <mark class="key">cache coherence problem</mark>: "If one processor updates its cached copy, others may see an old value", and without extra mechanisms "this breaks the shared-memory programming model" (p. 444).</p>
+
+  <p>With write-back caches, the last column, memory keeps the 1 too: the only correct copy of X is in A's cache. The two write policies are those of <a href="l23.html#l23-write">lesson 23</a>.</p>
+
+  <aside class="redpen" data-page="448">
+    <p class="claim">Table 31, row 3: "Write \(X = 0\) → cache A=0", and Memory (X) = 0.</p>
+    <p class="fix">The memory column is right only for write-through caches, as the caption of Hennessy &amp; Patterson's original table says; the notes drop that assumption. With write-back caches memory still holds 1 at T = 3.</p>
+    <p class="because">Two lines above, the notes say that modern multiprocessors use write-back caches, and Table 32's caption says "with write-back caches": a reader assumes write-back here too. A write-back write hit changes only the cache line and its dirty bit (lesson 23). Check it in the widget of section 3: no protocol, write-back, and memory stays 1 after T = 3.</p>
+  </aside>
+</section>
+
+<section id="l35-define">
+  <h2>What a coherent memory promises</h2>
+
+  <p>Table 31 breaks a promise. The notes state it in three conditions (p. 447), the same as Hennessy &amp; Patterson's.</p>
+
+  <div class="def">
+    <p><dfn>Coherent memory system</dfn> — one in which:</p>
+    <ol>
+      <li><b>Program order preserved locally.</b> If a processor writes X and then reads X, with no write by another processor in between, it reads back its own last write.</li>
+      <li><b>Read sees the latest write (globally).</b> A read of X by P2 after a write to X by P1 returns P1's value, provided enough time has passed and no other write to X happened in between.</li>
+      <li><b>Write serialization.</b> All processors see the writes to one location in the same order: if P1 writes X = 1 and then P2 writes X = 2, no core observes 2 and later 1.</li>
+    </ol>
+  </div>
+
+  <p>On p. 444 the notes sum coherence up in two terms: condition 2 is <mark class="key">write propagation</mark> — every processor eventually sees the new value — and condition 3 is <mark class="key">write serialization</mark>. Condition 1 is the uniprocessor rule that you read back your own writes. Table 31 fails condition 2: B reads its stale 1 for as long as the block stays in its cache.</p>
+
+  <p class="memo"><mark class="key">Coherence in one line: reads return the most recent value written to the address, and only one writer can "own" the data at a time; all other copies must be invalidated or updated (p. 447).</mark></p>
+
+  <h3>Coherence is not consistency</h3>
+
+  <p>Coherence speaks about one location at a time. <mark class="key">Memory consistency</mark> is a separate question: when does a write become visible to the other processors, and in what order do writes to different locations appear (p. 444)? The notes' example (pp. 444–445):</p>
+
+<pre><code>P0:  A = 1;          P1:  print(B);
+     B = 2;               print(A);</code></pre>
+
+  <p>A and B start at 0. If P1 prints B = 2, must it then print A = 1? Under sequential consistency, yes: the result must look like one interleaving of the two programs, each in its own order, so P1 can print (B, A) = (0, 0), (0, 1) or (2, 1), never (2, 0). Weaker, relaxed models allow (2, 0), for example when write buffers or out-of-order execution reorder P0's writes or P1's reads. Each location stays coherent all the while — A and B receive one write each. So "even if the system is coherent, without consistency rules we don't know when other processors see writes, or in what order" (p. 445). The "enough time" of condition 2 is what a consistency model pins down; this lesson is about coherence.</p>
+</section>
+
+<section id="l35-cures">
+  <h2>Two cures: invalidate or update</h2>
+
+  <p>To stop B from reading its 1, the hardware must act when A writes. Two independent questions decide how (p. 445): <em>what</em> the other caches are told — the coherence policy — and <em>how</em> they are told — the hardware organisation (Fig. 1).</p>
+
+  <figure class="fig fig--plain" id="l35-fig-axes">
+    <svg class="dia" viewBox="0 0 560 236" role="img" aria-label="Two independent axes: the hardware organisation, snooping or directory, and the policy, write-invalidate or write-update; snooping with write-invalidate is the common choice of MSI and MESI, snooping with write-update the historical Firefly and Dragon, directory with write-invalidate the large DSM machines, directory with write-update rarely used">
+      <rect x="172" y="72" width="183" height="74" class="fw-key"/>
+      <line x1="170" y1="16" x2="170" y2="224" class="st-line"/>
+      <line x1="357" y1="16" x2="357" y2="224" class="st-line"/>
+      <line x1="16" y1="70" x2="544" y2="70" class="st-line"/>
+      <line x1="16" y1="148" x2="544" y2="148" class="st-line"/>
+      <text x="263" y="36" class="tx-mid tx-bold">write-invalidate</text>
+      <text x="450" y="36" class="tx-mid tx-bold">write-update</text>
+      <text x="263" y="58" class="tx-mid tx-sm tx-muted">"drop your copy"</text>
+      <text x="450" y="58" class="tx-mid tx-sm tx-muted">"take my new value"</text>
+      <text x="24" y="104" class="tx-bold">snooping</text>
+      <text x="24" y="124" class="tx-sm tx-muted">broadcast</text>
+      <text x="24" y="182" class="tx-bold">directory</text>
+      <text x="24" y="202" class="tx-sm tx-muted">point-to-point</text>
+      <text x="263" y="104" class="tx-mid">MSI, MESI</text>
+      <text x="263" y="124" class="tx-mid tx-sm tx-muted">lessons 35–36</text>
+      <text x="450" y="104" class="tx-mid">Firefly, Dragon</text>
+      <text x="450" y="124" class="tx-mid tx-sm tx-muted">historical</text>
+      <text x="263" y="182" class="tx-mid">DSM / NUMA</text>
+      <text x="263" y="202" class="tx-mid tx-sm tx-muted">lessons 37–38</text>
+      <text x="450" y="182" class="tx-mid">rarely used</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> Policy (columns) and organisation (rows) are independent choices. The highlighted cell — snooping with write-invalidate, on write-back caches — is the usual one on a small machine, and the subject of this lesson.</figcaption>
+  </figure>
+
+  <aside class="margin-note">SMP is the symmetric multiprocessor of lesson 34. The notes write "simultaneously multiprocessors" on p. 449: a slip. Keep it apart from SMT, simultaneous multithreading.</aside>
+
+  <p>Snooping broadcasts every request on a shared bus and suits small symmetric multiprocessors with one uniform memory (SMP/UMA); a directory sends messages only to the caches that hold a copy and suits large DSM/NUMA machines (p. 445; the machines are those of <a href="l34.html">lesson 34</a>, the directory is <a href="l37.html">lessons 37–38</a>). The policy says what those messages carry:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Write-invalidate: drop your copy">
+      <p>Before writing, the writer puts an invalidate on the bus. Every other cache that holds the block marks it Invalid; the writer now has exclusive ownership, and its further writes are local and silent until another processor asks for the block (pp. 447, 452).</p>
+      <p>Cost: a reader that wants the block later misses and must fetch it from the writer or from memory.</p>
+    </div>
+    <div class="compare-col" data-label="Write-update: take my new value">
+      <p>On every write, the writer broadcasts the new value to all caches that hold the block, which update their copies in place; memory is usually updated too (p. 452).</p>
+      <p>Readers never miss and never see stale data. Cost: every single write uses the bus.</p>
+    </div>
+  </div>
+
+  <p>The before / after pair shows the invalidate cure at the moment of B's read.</p>
+
+  <figure class="fig fig--pair" id="l35-fig-ab">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Before, no protocol, at T = 4: A's cache holds the new value 0, dirty; B's cache still holds 1, and B's read hits that stale copy; memory still holds 1">
+        <line x1="66" y1="70" x2="66" y2="88"/>
+        <line x1="234" y1="70" x2="234" y2="88"/>
+        <line x1="66" y1="112" x2="66" y2="150"/>
+        <line x1="234" y1="112" x2="234" y2="150"/>
+        <line x1="150" y1="150" x2="150" y2="180"/>
+        <line x1="14" y1="150" x2="258" y2="150" class="st-ink sw-4"/>
+        <text x="264" y="155" class="tx-sm">bus</text>
+        <rect x="34" y="34" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+        <text x="66" y="57" class="tx-mid tx-mono">A</text>
+        <rect x="202" y="34" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+        <text x="234" y="57" class="tx-mid tx-mono">B</text>
+        <rect x="36" y="88" width="60" height="24" rx="3" class="fw-s1 st-s1"/>
+        <text x="66" y="105" class="tx-mid tx-mono tx-sm">X = 0</text>
+        <rect x="204" y="88" width="60" height="24" rx="3" class="fi-paper"/>
+        <text x="234" y="105" class="tx-mid tx-mono tx-sm">X = 1</text>
+        <ellipse cx="234" cy="100" rx="42" ry="19" class="st-bad sw-2"/>
+        <rect x="110" y="180" width="80" height="36" rx="3" class="fi-paper sw-2"/>
+        <text x="150" y="203" class="tx-mid tx-mono tx-sm">X = 1</text>
+        <text x="150" y="234" class="tx-mid tx-sm tx-muted">memory</text>
+        <text x="66" y="24" class="tx-mid tx-sm">wrote X = 0</text>
+        <text x="234" y="24" class="tx-mid tx-sm">reads X: hit, 1</text>
+        <text x="148" y="106" class="tx-mid tx-hand">stale</text>
+      </svg>
+      <p class="fig-label">Before: no protocol</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="After, write-invalidate, at T = 4: B's copy was invalidated at T = 3, so B's read misses and puts a Read Miss on the bus; A supplies the 0 over the bus, B takes it and memory takes it too">
+        <line x1="66" y1="70" x2="66" y2="88"/>
+        <line x1="234" y1="70" x2="234" y2="88"/>
+        <line x1="66" y1="112" x2="66" y2="150"/>
+        <line x1="234" y1="112" x2="234" y2="150"/>
+        <line x1="150" y1="150" x2="150" y2="180"/>
+        <line x1="14" y1="150" x2="258" y2="150" class="st-ink sw-4"/>
+        <text x="264" y="155" class="tx-sm">bus</text>
+        <line x1="248" y1="113" x2="248" y2="146" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="80" y1="113" x2="80" y2="146" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="220" y1="148" x2="220" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="164" y1="153" x2="164" y2="177" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="34" y="34" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+        <text x="66" y="57" class="tx-mid tx-mono">A</text>
+        <rect x="202" y="34" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+        <text x="234" y="57" class="tx-mid tx-mono">B</text>
+        <rect x="36" y="88" width="60" height="24" rx="3" class="fi-paper"/>
+        <text x="66" y="105" class="tx-mid tx-mono tx-sm">X = 0</text>
+        <rect x="204" y="88" width="60" height="24" rx="3" class="fi-paper"/>
+        <text x="234" y="105" class="tx-mid tx-mono tx-sm">X = 0</text>
+        <rect x="110" y="180" width="80" height="36" rx="3" class="fi-paper sw-2"/>
+        <text x="150" y="203" class="tx-mid tx-mono tx-sm">X = 0</text>
+        <text x="150" y="234" class="tx-mid tx-sm tx-muted">memory</text>
+        <text x="66" y="24" class="tx-mid tx-sm">supplies 0</text>
+        <text x="234" y="24" class="tx-mid tx-sm">reads X: miss</text>
+        <circle cx="266" cy="128" r="8" class="fi-paper"/>
+        <text x="266" y="132" class="tx-mid tx-sm tx-bold">1</text>
+        <circle cx="98" cy="128" r="8" class="fi-paper"/>
+        <text x="98" y="132" class="tx-mid tx-sm tx-bold">2</text>
+        <circle cx="202" cy="128" r="8" class="fi-paper"/>
+        <text x="202" y="132" class="tx-mid tx-sm tx-bold">2</text>
+        <circle cx="182" cy="166" r="8" class="fi-paper"/>
+        <text x="182" y="170" class="tx-mid tx-sm tx-bold">2</text>
+      </svg>
+      <p class="fig-label">After: write-invalidate</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> The same read at T = 4. Before: B hits its stale copy and nothing signals the error. After: A's write at T = 3 invalidated B's copy, so ① B misses and puts a Read Miss on the bus; ② A, the only cache with the new value, puts its 0 on the bus — B takes it, and so does memory.</figcaption>
+  </figure>
+
+  <p>Table 32 of the notes (p. 448) is this cure with write-back caches; its numbers are swapped — X starts at 0 and A writes 1. The notes drop the bus column of Hennessy &amp; Patterson's original. It is back here, because the bus is what you must reason about.</p>
+
+  <figure class="tbl-fig" id="l35-tbl-32">
+    <figcaption>Table 32 of the notes (p. 448) with the bus-activity column restored. Write-invalidate, write-back caches, one block X.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>T</th><th>Processor A</th><th>Processor B</th><th>Bus activity</th><th>Mem (X)</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0</td><td></td><td></td><td></td><td class="num">0</td></tr>
+          <tr><td class="num">1</td><td>Read X → cache miss → A = 0</td><td></td><td>Read Miss for X; memory supplies 0</td><td class="num">0</td></tr>
+          <tr><td class="num">2</td><td>Cache: A = 0</td><td>Read X → cache miss → B = 0</td><td>Read Miss for X; memory supplies 0</td><td class="num">0</td></tr>
+          <tr class="is-key"><td class="num">3</td><td>Write X = 1 → cache A = 1 (dirty)</td><td>B's copy of X invalidated</td><td>Invalidate for X</td><td class="num">0</td></tr>
+          <tr><td class="num">4</td><td>Cache: A = 1</td><td>Read X → cache miss → B = 1</td><td>Read Miss for X; A supplies 1, memory written back</td><td class="num">1</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="448">
+    <p class="claim">Table 32, row 3, column Processor B: "Cache invalidated A".</p>
+    <p class="fix">It is B's copy of X that is invalidated, by A's Invalidate on the bus. A keeps the new value 1, dirty.</p>
+    <p class="because">A is the writer and, after T = 3, the only cache with the fresh value: at T = 4 it supplies the 1 to B. Had A's copy been invalidated, nobody could supply the 1 — memory still holds 0.</p>
+  </aside>
+
+  <p>Row 4 holds two facts that everything below relies on. The data comes from A's cache, not from memory: A holds the only fresh copy. And memory becomes 1 although no processor stored to it: while A answers, memory takes the block from the bus — A's block is written back.</p>
+
+  <div class="widget" id="l35-w-stepper">
+    <h3 class="widget-title">The coherence stepper</h3>
+    <p class="widget-intro">Two caches and a memory on one bus, playing Table 31's story: memory holds X = 1, A reads X, B reads X, A writes X = 0, B reads X. Choose the write policy of the caches and the coherence protocol, then step. Orange arrows are requests on the bus, blue arrows data moving, the red arrow an invalidation; a blue cell is a dirty copy. The table under the picture is the notes' table with the bus column.</p>
+    <ol class="tasks">
+      <li>Keep "none" and write-through. Before stepping, predict what memory holds after T = 3 and what B reads at T = 4.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Memory 0, B reads 1: Table 31 exactly. Memory and A agree, B is wrong, and <b>nothing signals the error — the wrong answer is silent</b>.</p></details>
+      </li>
+      <li>Switch the caches to write-back and replay. Which copies of X are right after T = 3?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only A's: memory keeps the 1, B keeps the 1. The problem is the same, and memory is stale too. Still no bus traffic at T = 3.</p></details>
+      </li>
+      <li>Choose write-invalidate, write-back caches. Predict the bus activity at T = 3 and who supplies the data at T = 4.
+        <details class="answer"><summary>What you should see</summary>
+          <p>T = 3: one Invalidate, and B's copy is crossed out. T = 4: B misses, puts a Read Miss on the bus, and A supplies the 0 while memory takes it too. B reads 0 after four bus transactions — Table 32's mechanism. With write-through caches, memory itself supplies the 0, because it is already current.</p></details>
+      </li>
+      <li>Choose write-update. Predict B's read and the number of bus transactions.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Three transactions; at T = 3 the new value reaches B and memory, and at T = 4 B hits on 0. <b>Invalidate and update are the two ways to make B's read right</b>. Update looks cheaper here, but it pays one transaction for every write: the meter further down shows when that hurts.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l35-w-stepper', function (root, ui) {
+    var S = Course.svg, el = Course.el, AX = 112, BX = 448, X0 = 1, NEW = 0;
+    var pol = ui.select('caches', [{ value: 'WT', label: 'write-through' }, { value: 'WB', label: 'write-back' }], null, 'WT');
+    var pro = ui.select('coherence protocol', [{ value: 'none', label: 'none' }, { value: 'inv', label: 'write-invalidate' }, { value: 'upd', label: 'write-update' }], null, 'none');
+    var step = ui.stepper({ steps: ['T = 0: memory holds X = 1; both caches are empty.', 'T = 1: A reads X.', 'T = 2: B reads X.', 'T = 3: A writes X = 0.', 'T = 4: B reads X.'], play: 1300 });
+    var roRead = ui.readout('B reads at T = 4'), roTx = ui.readout('bus transactions so far', { digits: 0 }), roMem = ui.readout('memory holds');
+    var note = ui.note('');
+    var svg = ui.svg(560, 250, { label: 'Processors A and B, each above its cache, both caches on one bus with the memory below; the arrows show the bus activity of the current step and the cells show the copies of X' });
+    var box = el('div', { 'class': 'scroll-x l35-tw l35-wrap' }); ui.stage.appendChild(box);
+    ui.legend([
+      { label: 'request on the bus', color: 's2', mark: 'line' },
+      { label: 'data moving', color: 's1', mark: 'line' },
+      { label: 'invalidation of a copy', color: 'bad', mark: 'line' },
+      { label: 'dirty copy', color: 's1', mark: 'area' },
+      { label: 'stale value read', color: 'bad', mark: 'ring' }
+    ]);
+
+    /* the tested model: one run of the five steps for a write policy and a protocol */
+    function run(policy, proto) {
+      var st = { mem: X0, A: { v: false, val: null, d: false }, B: { v: false, val: null, d: false }, tx: 0 };
+      function cp(o) { return { v: o.v, val: o.val, d: o.d }; }
+      function snap(x) { x.mem = st.mem; x.A = cp(st.A); x.B = cp(st.B); x.tx = st.tx; return x; }
+      var out = [snap({ t: 0, bus: '', rowA: '', rowB: '', ev: [] })];
+      st.tx++; st.A = { v: true, val: st.mem, d: false };
+      out.push(snap({ t: 1, bus: 'Read Miss for X; memory supplies ' + st.mem, rowA: 'Read X → miss → A = ' + st.A.val, rowB: '', ev: [['req', 'A', 'Read Miss'], ['memUp', st.mem], ['up', 'A', st.mem]], act: ['reads X', ''] }));
+      st.tx++; st.B = { v: true, val: st.mem, d: false };
+      out.push(snap({ t: 2, bus: 'Read Miss for X; memory supplies ' + st.mem, rowA: 'Cache: A = ' + st.A.val, rowB: 'Read X → miss → B = ' + st.B.val, ev: [['req', 'B', 'Read Miss'], ['memUp', st.mem], ['up', 'B', st.mem]], act: ['', 'reads X'] }));
+      var bus3, rowB3, ev3;
+      st.A.val = NEW;
+      if (proto === 'none') {
+        if (policy === 'WT') { st.mem = NEW; st.tx++; bus3 = 'write of X = ' + NEW + ' to memory; nobody listens'; ev3 = [['down', 'A', NEW], ['memDown', NEW]]; }
+        else { st.A.d = true; bus3 = '— (the write stays in A)'; ev3 = []; }
+        rowB3 = 'Cache: B = ' + st.B.val;
+      } else if (proto === 'inv') {
+        st.tx++; st.B.v = false;
+        if (policy === 'WT') { st.mem = NEW; bus3 = 'write of X = ' + NEW + ' to memory; B snoops it and invalidates'; ev3 = [['down', 'A', NEW], ['memDown', NEW], ['inv']]; }
+        else { st.A.d = true; bus3 = 'Invalidate for X'; ev3 = [['req', 'A', 'Invalidate'], ['inv']]; }
+        rowB3 = 'B’s copy of X invalidated';
+      } else {
+        st.tx++; st.mem = NEW; st.B.val = NEW;
+        bus3 = 'update X = ' + NEW + '; B and memory take it'; ev3 = [['down', 'A', NEW], ['up', 'B', NEW], ['memDown', NEW]];
+        rowB3 = 'Cache: B = ' + st.B.val + ' (updated)';
+      }
+      out.push(snap({ t: 3, bus: bus3, rowA: 'Write X = ' + NEW + ' → A = ' + NEW + (st.A.d ? ' (dirty)' : ''), rowB: rowB3, ev: ev3, act: ['writes X = 0', ''] }));
+      var bus4, rowB4, ev4, read;
+      if (st.B.v) { read = st.B.val; bus4 = '— (hit)'; rowB4 = 'Read X → hit → ' + read; ev4 = [['hit', 'B', read]]; }
+      else {
+        st.tx++;
+        if (st.A.d) { st.mem = st.A.val; st.A.d = false; bus4 = 'Read Miss for X; A supplies ' + st.A.val + ', memory written back'; ev4 = [['req', 'B', 'Read Miss'], ['down', 'A', st.A.val], ['up', 'B', st.A.val], ['memDown', st.A.val]]; }
+        else { bus4 = 'Read Miss for X; memory supplies ' + st.mem; ev4 = [['req', 'B', 'Read Miss'], ['memUp', st.mem], ['up', 'B', st.mem]]; }
+        st.B = { v: true, val: st.mem, d: false };
+        read = st.B.val; rowB4 = 'Read X → miss → B = ' + read;
+      }
+      out.push(snap({ t: 4, bus: bus4, rowA: 'Cache: A = ' + st.A.val, rowB: rowB4, ev: ev4, read: read, stale: read !== NEW, act: ['', 'reads X'] }));
+      return out;
+    }
+
+    function L(x1, y1, x2, y2, c, m) { var a = { x1: x1, y1: y1, x2: x2, y2: y2, 'class': c }; if (m) a['marker-end'] = 'url(#' + m + ')'; S('line', a, svg); }
+    function T(x, y, s, c) { S('text', { x: x, y: y, 'class': c, text: s }, svg); }
+    function cache(cx, c, stale) {
+      var cls = !c.v && c.val === null ? 'fi-paper' : !c.v ? 'fi-soft' : c.d ? 'fw-s1 st-s1' : 'fi-paper';
+      S('rect', { x: cx - 30, y: 84, width: 60, height: 26, rx: 3, 'class': cls }, svg);
+      T(cx, 102, c.val === null ? '—' : 'X = ' + c.val, 'tx-mid tx-mono tx-sm' + (c.v ? '' : ' tx-muted'));
+      if (!c.v && c.val !== null) S('path', { d: 'M ' + (cx - 26) + ' 87 L ' + (cx + 26) + ' 107 M ' + (cx + 26) + ' 87 L ' + (cx - 26) + ' 107', 'class': 'st-bad sw-2' }, svg);
+      if (c.v && c.d) T(cx + 38, 102, 'dirty', 'tx-sm tx-muted');
+      if (stale) S('ellipse', { cx: cx, cy: 97, rx: 44, ry: 21, 'class': 'st-bad sw-2' }, svg);
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      [AX, BX].forEach(function (cx) { L(cx, 66, cx, 84, ''); L(cx, 110, cx, 160, ''); });
+      L(280, 160, 280, 190, '');
+      L(30, 160, 512, 160, 'st-ink sw-4');
+      T(520, 165, 'bus', 'tx-sm');
+      [[AX, 'A'], [BX, 'B']].forEach(function (p) {
+        S('rect', { x: p[0] - 32, y: 30, width: 64, height: 36, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+        T(p[0], 53, p[1], 'tx-mid tx-mono');
+      });
+      if (st.act) { if (st.act[0]) T(AX, 20, st.act[0], 'tx-mid tx-sm'); if (st.act[1]) T(BX, 20, st.act[1], 'tx-mid tx-sm'); }
+      cache(AX, st.A, false);
+      cache(BX, st.B, st.t === 4 && st.stale);
+      S('rect', { x: 230, y: 190, width: 100, height: 36, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+      T(280, 213, 'X = ' + st.mem, 'tx-mid tx-mono tx-sm');
+      T(280, 244, 'memory', 'tx-mid tx-sm tx-muted');
+      st.ev.forEach(function (e) {
+        var cx = e[1] === 'A' ? AX : BX;
+        if (e[0] === 'req') { L(cx + 14, 112, cx + 14, 155, 'st-s2 sw-2', 'arr-s2'); T(e[1] === 'A' ? cx + 24 : cx + 24, 140, e[2], 'tx-sm halo'); }
+        if (e[0] === 'up') { L(cx - 14, 157, cx - 14, 113, 'st-s1 sw-2', 'arr-s1'); T(cx - 24, 140, String(e[2]), 'tx-end tx-mono tx-sm halo'); }
+        if (e[0] === 'down') { L(cx - 14, 112, cx - 14, 155, 'st-s1 sw-2', 'arr-s1'); T(cx - 24, 140, String(e[2]), 'tx-end tx-mono tx-sm halo'); }
+        if (e[0] === 'memUp') { L(296, 188, 296, 165, 'st-s1 sw-2', 'arr-s1'); T(306, 182, String(e[1]), 'tx-mono tx-sm halo'); }
+        if (e[0] === 'memDown') { L(264, 165, 264, 188, 'st-s1 sw-2', 'arr-s1'); T(254, 182, String(e[1]), 'tx-end tx-mono tx-sm halo'); }
+        if (e[0] === 'inv') L(BX - 14, 157, BX - 14, 113, 'st-bad sw-2', 'arr-bad');
+        if (e[0] === 'hit') { L(cx + 14, 83, cx + 14, 68, 'st-s1 sw-2', 'arr-s1'); T(cx + 36, 80, String(e[2]), 'tx-mono tx-sm halo'); }
+      });
+    }
+    function table(states, k) {
+      box.textContent = '';
+      var t = el('table', { 'class': 'tbl' }), tb = el('tbody');
+      t.appendChild(el('thead', null, el('tr', null, ['T', 'Processor A', 'Processor B', 'Bus activity', 'Memory (X)'].map(function (h) { return el('th', { text: h }); }))));
+      for (var i = 0; i <= k; i++) {
+        var s = states[i];
+        tb.appendChild(el('tr', { 'class': i === k && k > 0 ? 'is-key' : '' }, [el('td', { 'class': 'num', text: String(i) }), el('td', { text: s.rowA }), el('td', { text: s.rowB }), el('td', { text: s.bus }), el('td', { 'class': 'num', text: String(s.mem) })]));
+      }
+      t.appendChild(tb); box.appendChild(t);
+    }
+    function explain(k, p, r, st) {
+      if (k === 0) return 'Memory holds X = 1 and both caches are empty. Press "Next".';
+      if (k === 1) return 'A misses and puts a Read Miss on the bus; memory supplies the 1.';
+      if (k === 2) return 'B misses too, and memory supplies the 1 again. Two caches now hold copies of the same block.';
+      if (k === 3) {
+        if (r === 'none') return p === 'WT' ? 'A writes 0 into its copy and, write-through, into memory as well. No cache listens to the bus, so B keeps its 1.' : 'A writes 0 into its copy only and marks it dirty: memory keeps the 1, and B keeps its 1. Two of the three copies are now wrong.';
+        if (r === 'inv') return p === 'WT' ? 'A’s write goes over the bus to memory anyway (write-through); B snoops that write and drops its copy.' : 'Before writing, A puts an Invalidate on the bus; B snoops it and drops its copy. A now holds the only copy, dirty; memory keeps the 1.';
+        return 'A broadcasts the new value: B and memory take X = 0. Every copy agrees, and the write cost one bus transaction.';
+      }
+      if (r === 'none') return 'B hits on its own copy and reads 1, the value from before A’s write' + (p === 'WT' ? ', while memory holds 0' : '; memory holds 1 as well') + '. Nothing signals the error: this is the coherence problem.';
+      if (r === 'inv') return p === 'WB' ? 'B misses — its copy is invalid — and puts a Read Miss on the bus. A has the only fresh copy: it supplies the 0, and memory takes it too (write-back). B reads 0.' : 'B misses and puts a Read Miss on the bus; memory, which write-through kept current, supplies the 0. B reads 0.';
+      return 'B hits on its updated copy and reads 0 with no bus traffic.';
+    }
+    ui.onChange(function () {
+      var states = run(pol.value, pro.value), k = Course.clamp(step.index, 0, 4), st = states[k];
+      draw(st); table(states, k);
+      if (k < 4) roRead.set('—'); else roRead.set(st.read + (st.stale ? ' — stale' : ' — correct'), st.stale ? 'bad' : 'good');
+      roTx.set(st.tx); roMem.set('X = ' + st.mem);
+      note.set(explain(k, pol.value, pro.value, st));
+    });
+  });
+  </script>
+
+  <h3>Why invalidate won</h3>
+
+  <p>Both cures are correct; they differ in traffic. Hennessy &amp; Patterson trace the difference to three characteristics of programs, and the first two favour invalidation:</p>
+  <ol>
+    <li>Several writes to the same word with no read in between: invalidate pays one transaction, update pays one per write.</li>
+    <li>Writes to several words of the same block: invalidate pays once per block, update once per word.</li>
+    <li>The delay between a write and another processor's read of the value is shorter with update, because the value is already in the reader's cache: the reader hits instead of missing. That is update's one advantage, and it pays off for producer–consumer sharing.</li>
+  </ol>
+  <p>Programs write the same blocks again and again, so the notes' verdict holds: invalidate saves bandwidth and dominates, update lowers read latency "but consumes lots of bandwidth" (p. 452). Update protocols did exist — Firefly and Dragon are the classic ones — but today's processors invalidate. The meter makes the three characteristics countable.</p>
+
+  <div class="widget" id="l35-w-traffic">
+    <h3 class="widget-title">Invalidate against update: the traffic meter</h3>
+    <p class="widget-intro">Two processors share one block of 8 words, and the same round of accesses repeats forever; the meter counts one round in the steady state. Choose the pattern and w. The plot shows the cost of a round for every w from 1 to 8, the table under it the bus transaction each access causes. For bytes the meter assumes an 8-byte address, 8-byte words and 64-byte blocks: an Invalidate moves 8 bytes, a miss 8 + 64, an update 8 + 8.</p>
+    <ol class="tasks">
+      <li>Pattern "same word", w = 1: one write, then one read. Predict which protocol puts fewer transactions on the bus.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Write-update, 1 against 2: the reader hits on the updated copy, while invalidate pays an Invalidate and then the reader's miss. Producer and consumer is update's best case.</p></details>
+      </li>
+      <li>Now move w to 8. Predict both counts first.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Invalidate still 2, update 8: the line of update climbs one transaction per write, the line of invalidate stays flat. <b>Update protocols lost because writes repeat.</b> Pattern "one block" gives the same numbers: update pays per word, invalidate per block.</p></details>
+      </li>
+      <li>Switch the count to bytes. Up to which w is update still cheaper or equal?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Up to w = 5: 16 × 5 = 80 bytes against 8 + 72 = 80. From w = 6 on update costs more (96 bytes). An invalidate-protocol miss moves a whole block, so in bytes update holds out a little longer — but loops write far more than five times.</p></details>
+      </li>
+      <li>Choose false sharing with w = 4: P0 and P1 write different words of the same block, in bursts. Predict the transactions per round.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Invalidate: 2 Write Misses per round — the block ping-pongs between the caches (144 bytes) although neither processor ever reads the other's word. Update: 8 broadcasts (128 bytes, 160 at w = 5). Both pay for sharing that is not real; with longer bursts update loses again.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l35-w-traffic', function (root, ui) {
+    var el = Course.el, ADDR = 8, WORD = 8, BLOCK = 64;
+    var pat = ui.select('access pattern', [
+      { value: 'A', label: 'same word: w writes, then one read' },
+      { value: 'B', label: 'one block: w words written, then read' },
+      { value: 'C', label: 'false sharing: bursts of w writes' }
+    ], null, 'A');
+    var wS = ui.slider({ label: 'w', min: 1, max: 8, step: 1, value: 4 });
+    var meas = ui.select('count', [{ value: 'tx', label: 'bus transactions' }, { value: 'bytes', label: 'bytes on the bus' }], null, 'tx');
+    var roInv = ui.readout('write-invalidate, one round'), roUpd = ui.readout('write-update, one round'), roWin = ui.readout('cheaper here'), roSt = ui.readout('stale reads');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0.5, 8.5], y: [0, 17], xLabel: 'w', yLabel: 'cost of one round', aspect: 1.9, xTicks: [1, 2, 3, 4, 5, 6, 7, 8], label: 'Cost of one round of the chosen access pattern under write-invalidate and write-update, for w from 1 to 8; the current w is marked' });
+    var box = el('div', { 'class': 'scroll-x l35-tw l35-wrap' }); ui.stage.appendChild(box);
+    ui.legend([
+      { label: 'write-update', color: 's4', mark: 'line' },
+      { label: 'write-invalidate', color: 's5', mark: 'line' },
+      { label: 'the chosen w', color: 'muted', mark: 'dash' }
+    ]);
+
+    /* the tested model: one round in the steady state (A, B: both copies Shared; C: P1 holds the block Modified) */
+    function round(p, w, proto) {
+      var rows = [], s, i;
+      function push(k, op, word, bus, bytes) { rows.push({ k: k, op: op, word: word, bus: bus, bytes: bytes }); }
+      if (proto === 'inv') {
+        s = p === 'C' ? ['I', 'M'] : ['S', 'S'];
+        var wr = function (k, word) {
+          var q = 1 - k;
+          if (s[k] === 'M') { push(k, 'writes', word, '—', 0); return; }
+          if (s[k] === 'S') { s[k] = 'M'; s[q] = 'I'; push(k, 'writes', word, 'Invalidate', ADDR); return; }
+          var sup = s[q] === 'M' ? ' (P' + q + ' supplies the block)' : '';
+          s[k] = 'M'; s[q] = 'I'; push(k, 'writes', word, 'Write Miss' + sup, ADDR + BLOCK);
+        };
+        var rd = function (k, word) {
+          var q = 1 - k;
+          if (s[k] !== 'I') { push(k, 'reads', word, '— (hit)', 0); return; }
+          var sup = s[q] === 'M' ? ' (P' + q + ' supplies the block)' : '';
+          if (s[q] === 'M') s[q] = 'S';
+          s[k] = 'S'; push(k, 'reads', word, 'Read Miss' + sup, ADDR + BLOCK);
+        };
+        if (p === 'A') { for (i = 0; i < w; i++) wr(0, 0); rd(1, 0); }
+        if (p === 'B') { for (i = 0; i < w; i++) wr(0, i); for (i = 0; i < w; i++) rd(1, i); }
+        if (p === 'C') { for (i = 0; i < w; i++) wr(0, 0); for (i = 0; i < w; i++) wr(1, 1); }
+      } else {
+        if (p === 'A') { for (i = 0; i < w; i++) push(0, 'writes', 0, 'update', ADDR + WORD); push(1, 'reads', 0, '— (hit)', 0); }
+        if (p === 'B') { for (i = 0; i < w; i++) push(0, 'writes', i, 'update', ADDR + WORD); for (i = 0; i < w; i++) push(1, 'reads', i, '— (hit)', 0); }
+        if (p === 'C') { for (i = 0; i < w; i++) push(0, 'writes', 0, 'update', ADDR + WORD); for (i = 0; i < w; i++) push(1, 'writes', 1, 'update', ADDR + WORD); }
+      }
+      var tx = 0, by = 0;
+      rows.forEach(function (r) { if (r.bytes > 0) tx++; by += r.bytes; });
+      return { rows: rows, tx: tx, bytes: by };
+    }
+    /* one table row per run of identical accesses: same processor, operation and bus actions */
+    function groups(ri, ru) {
+      var out = [], i = 0, n = ri.rows.length;
+      while (i < n) {
+        var a = ri.rows[i], b = ru.rows[i], j = i + 1;
+        while (j < n && ri.rows[j].k === a.k && ri.rows[j].op === a.op && ri.rows[j].bus === a.bus && ru.rows[j].bus === b.bus) j++;
+        var cnt = j - i, w0 = a.word, w1 = ri.rows[j - 1].word, same = w0 === w1;
+        var more = i > 0 && ri.rows[i - 1].k === a.k && ri.rows[i - 1].op === a.op ? ' more' : '';
+        var acc = 'P' + a.k + ' ' + a.op + ' ' + (same ? 'word ' + w0 + (cnt > 1 ? ', ' + cnt + more + ' times' : '') : 'words ' + w0 + '–' + w1);
+        var bi = a.bus + (cnt > 1 && a.bus !== '—' && a.bus !== '— (hit)' ? ' × ' + cnt : '');
+        var bu = b.bus === 'update' ? (cnt === 1 ? 'update word ' + w0 : same ? cnt + ' updates of word ' + w0 : cnt + ' updates, one per word') : b.bus;
+        out.push([acc, bi, bu]);
+        i = j;
+      }
+      return out;
+    }
+    function W() { return Course.clamp(Math.round(wS.value), 1, 8); }
+    function val(r) { return meas.value === 'tx' ? r.tx : r.bytes; }
+
+    plot.draw(function (g) {
+      var p = pat.value, w = W(), inv = [], upd = [], k, top = meas.value === 'tx' ? 17 : 270;
+      for (k = 1; k <= 8; k++) { inv.push([k, val(round(p, k, 'inv'))]); upd.push([k, val(round(p, k, 'upd'))]); }
+      g.line([[w, 0], [w, top]], { color: 'muted', dash: true, width: 1.5 });
+      g.line(upd, { color: 's4', width: 2.5 });
+      g.line(inv, { color: 's5', width: 2.5 });
+      g.points(upd, { color: 's4', r: 3.5, shape: 'square' });
+      g.points(inv, { color: 's5', r: 3.5 });
+      g.points([upd[w - 1]], { color: 's4', r: 7, shape: 'square' });
+      g.points([inv[w - 1]], { color: 's5', r: 7 });
+    });
+
+    ui.onChange(function () {
+      var p = pat.value, w = W(), ri = round(p, w, 'inv'), ru = round(p, w, 'upd'), vi = val(ri), vu = val(ru);
+      plot.setView({ x: [0.5, 8.5], y: [0, meas.value === 'tx' ? 17 : 270] });
+      function fmt(r) { return r.tx + ' transaction' + (r.tx === 1 ? '' : 's') + ' · ' + r.bytes + ' bytes'; }
+      roInv.set(fmt(ri)); roUpd.set(fmt(ru));
+      roWin.set(vi === vu ? 'a tie' : vi < vu ? 'write-invalidate' : 'write-update');
+      roSt.set('0 with either protocol', 'good');
+      box.textContent = '';
+      var t = el('table', { 'class': 'tbl' }), tb = el('tbody');
+      t.appendChild(el('thead', null, el('tr', null, ['Access', 'write-invalidate: bus', 'write-update: bus'].map(function (h) { return el('th', { text: h }); }))));
+      groups(ri, ru).forEach(function (g) { tb.appendChild(el('tr', null, [el('td', { text: g[0] }), el('td', { text: g[1] }), el('td', { text: g[2] })])); });
+      tb.appendChild(el('tr', { 'class': 'is-key' }, [el('td', { text: 'one round' }), el('td', { text: fmt(ri) }), el('td', { text: fmt(ru) })]));
+      t.appendChild(tb); box.appendChild(t);
+      var msg;
+      if (p === 'A') msg = 'Invalidate: the first write finds the block Shared and sends one Invalidate; the other ' + (w - 1) + ' write' + (w === 2 ? '' : 's') + ' hit the Modified copy silently; P1’s read misses and P0 supplies the block. Update: every write is broadcast, and P1 hits. Without any protocol P1 would read a stale value once per round.';
+      else if (p === 'B') msg = 'Invalidate pays once for the whole block: one Invalidate, then one Read Miss brings all ' + w + ' new word' + (w === 1 ? '' : 's') + ' to P1. Update broadcasts each word written. Without any protocol P1 would read ' + w + ' stale word' + (w === 1 ? '' : 's') + ' per round.';
+      else msg = 'Nobody reads the other processor’s word, yet the block is shared. Invalidate: each burst starts with a Write Miss that drags the whole block over from the other cache. Update: every write is broadcast to the other copy. Without any protocol the two dirty copies would overwrite each other’s word when written back.';
+      note.set(msg);
+    });
+  });
+  </script>
+
+  <aside class="redpen" data-page="452">
+    <p class="claim">Write-update is "Rare in modern multiprocessors (too much bandwidth cost), but more common in small-scale systems or in some vector machines / GPUs where data are broadcasted naturally"</p>
+    <p class="fix">Today's mainstream processors keep their caches coherent by invalidation, and GPUs do not use write-update either. Update protocols belong to older bus-based designs such as Firefly and Dragon.</p>
+    <p class="because">GPU L1 caches are typically not kept coherent by hardware at all: they are write-through or write-evict, with coherence handled at the shared L2 or by software. The classic vector machines had little or no data cache to update (lesson 30). And the meter above shows why: update traffic grows with every write.</p>
+  </aside>
+</section>
+
+<section id="l35-snoop">
+  <h2>Snooping: every cache listens to the bus</h2>
+
+  <p>In a small multiprocessor all processors and the memory hang on one bus (p. 449). The bus is a <mark class="key">broadcast medium</mark>: a request placed on it is seen by every cache controller at the same time. So every controller <mark class="key">snoops</mark>: it watches every transaction, and if one concerns a block it holds, it reacts — it invalidates its copy, or supplies its data. One transaction informs everybody, and no directory or central record is needed.</p>
+
+  <p>The bus gives one more thing, which the notes file under the costs with only a nod to correctness: a <mark class="key">single global order</mark>. One transaction at a time means that every controller sees all requests in the same order — and that is write serialization, condition 3, for free. If two processors write the same block at once, both ask for the bus; the winner's Invalidate kills the loser's copy, and the loser's write becomes a miss that fetches the winner's value.</p>
+
+  <p>The same broadcast is why snooping does not scale (p. 449):</p>
+  <ul>
+    <li><b>Bandwidth.</b> Every coherence transaction goes to all processors; with more processors the traffic grows until the bus saturates.</li>
+    <li><b>Electrical limits.</b> Every attached controller adds load — fan-out — and capacitance, so a signal needs longer to reach the farthest receiver and the bus cycle must slow down.</li>
+    <li><b>Serialization.</b> The global order that gives correctness also forbids two coherence actions in parallel.</li>
+  </ul>
+  <p>In practice snooping serves "2-8 CPUs" (p. 449); the notes' answer to the January 2026 paper allows "typically up to 16 or 32" (p. 495). Tens or hundreds of cores need a directory (lessons 37–38); why one bus saturates is in <a href="l33.html">lesson 33</a>.</p>
+
+  <h3>Duplicate tags: snooping without stealing cycles</h3>
+
+  <p>Every bus transaction must be checked against the tags of every cache (p. 450). But the tag array is already busy: the local processor looks it up on every load and store. Without help, either the processor stalls while the snoop uses the tags, or the snoop waits — and a late reaction risks a coherence violation. Two users, one resource, one cycle: a structural hazard.</p>
+
+  <p>The fix is a <mark class="key">duplicate tag array</mark>, the snoop tag store, used only by the snooper (Fig. 3). Each entry holds the tag and the coherence state, no data, so it has as many entries as the main tag array but is far smaller than the cache. Bus transactions are checked there, every cycle, while the main tags keep serving the processor; every allocation, eviction and state change is written into both copies. The price is silicon area; the gain is a pipeline that does not stall "just from coherence traffic" (p. 451).</p>
+
+  <figure class="fig fig--plain" id="l35-fig-snoop">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="Three processors P0, P1 and P2; each cache has tags and data on the processor side and a duplicate snoop tag store on the bus side. P0 puts a Write Miss for X on the bus; P1's snoop tags find X and invalidate it, P2's snoop tags find no copy, while P1's processor uses its own tags for a load in the same cycle">
+      <line x1="240" y1="56" x2="240" y2="76" class="hl"/>
+      <line x1="70" y1="56" x2="70" y2="76" marker-end="url(#arr)"/>
+      <line x1="240" y1="56" x2="240" y2="76" marker-end="url(#arr)"/>
+      <line x1="410" y1="56" x2="410" y2="76" marker-end="url(#arr)"/>
+      <line x1="110" y1="148" x2="110" y2="200"/>
+      <line x1="280" y1="148" x2="280" y2="200"/>
+      <line x1="450" y1="148" x2="450" y2="200"/>
+      <line x1="280" y1="200" x2="280" y2="232"/>
+      <line x1="20" y1="200" x2="510" y2="200" class="st-ink sw-4"/>
+      <text x="518" y="205" class="tx-sm">bus</text>
+      <rect x="78" y="20" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+      <text x="110" y="43" class="tx-mid tx-mono">P0</text>
+      <rect x="248" y="20" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+      <text x="280" y="43" class="tx-mid tx-mono">P1</text>
+      <rect x="418" y="20" width="64" height="36" rx="3" class="fi-paper sw-2"/>
+      <text x="450" y="43" class="tx-mid tx-mono">P2</text>
+      <rect x="50" y="76" width="40" height="34" class="fi-paper"/>
+      <rect x="90" y="76" width="80" height="34" class="fi-paper"/>
+      <rect x="220" y="76" width="40" height="34" class="fi-paper"/>
+      <rect x="260" y="76" width="80" height="34" class="fi-paper"/>
+      <rect x="390" y="76" width="40" height="34" class="fi-paper"/>
+      <rect x="430" y="76" width="80" height="34" class="fi-paper"/>
+      <text x="70" y="97" class="tx-mid tx-sm">tags</text>
+      <text x="130" y="97" class="tx-mid tx-sm">data</text>
+      <text x="240" y="97" class="tx-mid tx-sm">tags</text>
+      <text x="300" y="97" class="tx-mid tx-sm">data</text>
+      <text x="410" y="97" class="tx-mid tx-sm">tags</text>
+      <text x="470" y="97" class="tx-mid tx-sm">data</text>
+      <rect x="50" y="124" width="120" height="24" class="fw-s3 st-s3"/>
+      <rect x="220" y="124" width="120" height="24" class="fw-s3 st-s3"/>
+      <rect x="390" y="124" width="120" height="24" class="fw-s3 st-s3"/>
+      <text x="110" y="141" class="tx-mid tx-sm">snoop tags</text>
+      <text x="280" y="141" class="tx-mid tx-sm">snoop tags</text>
+      <text x="450" y="141" class="tx-mid tx-sm">snoop tags</text>
+      <line x1="124" y1="150" x2="124" y2="195" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="134" y="180" class="tx-sm halo">Write Miss X</text>
+      <line x1="294" y1="197" x2="294" y2="152" class="st-bad sw-2" marker-end="url(#arr-bad)"/>
+      <text x="304" y="180" class="tx-sm halo">X: S → I</text>
+      <line x1="464" y1="197" x2="464" y2="152" class="st-muted" marker-end="url(#arr-muted)"/>
+      <text x="474" y="180" class="tx-sm halo">no copy</text>
+      <text x="228" y="70" class="tx-end tx-sm">LD hits</text>
+      <rect x="230" y="232" width="100" height="36" rx="3" class="fi-paper sw-2"/>
+      <text x="280" y="255" class="tx-mid tx-sm">memory</text>
+      <text x="430" y="262" class="tx-mid tx-hand">no stall</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> P0's Write Miss for X is broadcast on the bus. Every cache checks it in its snoop tags: P1 holds X and invalidates it, P2 has no copy. In the same cycle P1's processor looks up its own tags for a load — two lookups, two tag arrays, no stall.</figcaption>
+  </figure>
+</section>
+
+<section id="l35-msi">
+  <h2>The MSI machine</h2>
+
+  <p>MSI is the basic write-invalidate protocol for write-back caches on a snooping bus (p. 453). Each block of each private cache runs its own small finite-state machine. A cache block already carries a valid bit and a dirty bit; MSI gives that pair three meanings (p. 453):</p>
+
+  <figure class="tbl-fig" id="l35-tbl-states">
+    <figcaption>The three states of a block in a private cache.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>State</th><th>valid</th><th>dirty</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><b>M</b> — Modified</td><td class="num">1</td><td class="num">1</td><td>the only copy, dirty (different from memory); written back before it leaves the cache</td></tr>
+          <tr><td><b>S</b> — Shared</td><td class="num">1</td><td class="num">0</td><td>a clean copy, identical to memory; other caches may hold copies too</td></tr>
+          <tr><td><b>I</b> — Invalid</td><td class="num">0</td><td>—</td><td>no valid copy</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>"Shared means that two or more caches hold the block." No: Shared means clean and <em>possibly</em> shared. In MSI every read miss ends in S, even when no other cache has a copy, so the first write must still send an Invalidate.</p></div>
+
+  <p>Two sources move the machine (p. 453): requests of the local processor, and requests of other caches seen on the bus. The notes and Hennessy &amp; Patterson call the bus transactions Read Miss, Write Miss and Invalidate, the names the exam papers give the directory messages. This lesson keeps them, writes the local processor's read and write as PrRd and PrWr, and labels every arrow "event / action".</p>
+
+  <figure class="tbl-fig" id="l35-tbl-vocab">
+    <figcaption>One vocabulary, three spellings. At the exam, write Read Miss, Write Miss and Invalidate.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>This lesson</th><th>Meaning; the notes' Fig. 38 (p. 456) and other texts</th></tr></thead>
+        <tbody>
+          <tr><td>PrRd, PrWr</td><td>the local processor reads or writes the block. Fig. 38: read / write hit or miss, straight arrows</td></tr>
+          <tr><td>Read Miss</td><td>on the bus: another cache wants a readable copy. Fig. 38: Read Miss, wavy arrow; other texts: BusRd</td></tr>
+          <tr><td>Write Miss</td><td>on the bus: another cache wants to write a block it does not hold — one transaction fetches it and invalidates all other copies. Other texts: BusRdX</td></tr>
+          <tr><td>Invalidate</td><td>on the bus: another cache holds the block in S and wants to write it — invalidation only, no data. Fig. 38: Inv.; other texts: BusUpgr</td></tr>
+          <tr><td>write-back</td><td>the owner of an M block puts it on the bus and memory takes it. Other texts: Flush</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Walk the warm-up's block through the machine before the general picture: two caches, memory holds X = 1.</p>
+
+  <figure class="tbl-fig" id="l35-tbl-trace">
+    <figcaption>The warm-up with MSI. In each row the requester follows a CPU arrow of Fig. 4, and a cache that holds X follows a bus arrow.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>T</th><th>After operation</th><th>A</th><th>B</th><th>Bus transaction</th><th>Memory up to date?</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>A: read X</td><td>Shared</td><td>Invalid</td><td>Read Miss; memory supplies 1</td><td>Yes</td></tr>
+          <tr><td class="num">2</td><td>B: read X</td><td>Shared</td><td>Shared</td><td>Read Miss; memory supplies 1</td><td>Yes</td></tr>
+          <tr><td class="num">3</td><td>A: write X = 0</td><td>Mod</td><td>Invalid</td><td>Invalidate</td><td>No</td></tr>
+          <tr class="is-key"><td class="num">4</td><td>B: read X</td><td>Shared</td><td>Shared</td><td>Read Miss; A supplies 0 and writes it back</td><td>Yes</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="fig fig--plain" id="l35-fig-msi">
+    <svg class="dia" viewBox="0 0 560 530" role="img" aria-label="The MSI state machine of one cache block in two halves. CPU requests: from I a PrRd sends a Read Miss and leads to S, a PrWr sends a Write Miss and leads to M; from S a PrWr sends an Invalidate and leads to M; hits stay put; a replacement takes M to I with a write-back and S to I silently. Bus requests: a Read Miss takes M to S with a write-back and leaves S unchanged; a Write Miss takes M to I with a write-back; a Write Miss or an Invalidate takes S to I">
+      <line x1="16" y1="262" x2="544" y2="262" class="st-muted dash"/>
+      <path d="M 124 100 L 436 100" marker-end="url(#arr)"/>
+      <path d="M 439.1 88.2 Q 280 -2 120.9 88.2" class="dots" marker-end="url(#arr)"/>
+      <path d="M 117.9 117.9 L 255 186.4" marker-end="url(#arr)"/>
+      <path d="M 262.1 172.1 L 125 103.6" class="dots" marker-end="url(#arr)"/>
+      <path d="M 301.5 179.3 L 438.5 110.7" marker-end="url(#arr)"/>
+      <path d="M 451 77.7 C 420.9 42 499.1 42 469 77.7" marker-end="url(#arr)"/>
+      <path d="M 289 212.3 C 315.8 243.1 244.2 243.1 271 212.3" marker-end="url(#arr)"/>
+      <path d="M 436 370 L 124 370" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+      <path d="M 258.5 449.3 L 121.5 380.7" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+      <path d="M 438.5 380.7 L 301.5 449.3" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+      <path d="M 289 482.3 C 315.8 513.1 244.2 513.1 271 482.3" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+      <circle cx="100" cy="100" r="24" class="fi-paper sw-2"/>
+      <text x="100" y="105" class="tx-mid tx-bold">I</text>
+      <circle cx="280" cy="190" r="24" class="fi-paper sw-2"/>
+      <text x="280" y="195" class="tx-mid tx-bold">S</text>
+      <circle cx="460" cy="100" r="24" class="fi-paper sw-2"/>
+      <text x="460" y="105" class="tx-mid tx-bold">M</text>
+      <circle cx="100" cy="370" r="24" class="fi-paper sw-2"/>
+      <text x="100" y="375" class="tx-mid tx-bold">I</text>
+      <circle cx="280" cy="460" r="24" class="fi-paper sw-2"/>
+      <text x="280" y="465" class="tx-mid tx-bold">S</text>
+      <circle cx="460" cy="370" r="24" class="fi-paper sw-2"/>
+      <text x="460" y="375" class="tx-mid tx-bold">M</text>
+      <text x="280" y="90" class="tx-sm halo tx-mid">PrWr / Write Miss</text>
+      <text x="280" y="44" class="tx-sm halo tx-mid">replace / write-back</text>
+      <text x="178" y="180" class="tx-sm halo tx-end">PrRd / Read Miss</text>
+      <text x="216" y="128" class="tx-sm halo">replace / —</text>
+      <text x="384" y="174" class="tx-sm halo">PrWr / Invalidate</text>
+      <text x="552" y="30" class="tx-sm halo tx-end">PrRd, PrWr / —</text>
+      <text x="320" y="240" class="tx-sm halo">PrRd / —</text>
+      <text x="280" y="360" class="tx-sm halo tx-mid">Write Miss / write-back</text>
+      <text x="180" y="440" class="tx-sm halo tx-end">Write Miss or</text>
+      <text x="180" y="459" class="tx-sm halo tx-end">Invalidate / —</text>
+      <text x="382" y="440" class="tx-sm halo">Read Miss /</text>
+      <text x="382" y="459" class="tx-sm halo">write-back</text>
+      <text x="320" y="510" class="tx-sm halo">Read Miss / —</text>
+      <text x="16" y="248" class="tx-sm tx-bold">CPU requests</text>
+      <text x="16" y="286" class="tx-sm tx-bold">bus requests</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> MSI, one block of one cache, drawn in two halves with the same three states. Top: requests of the local processor — solid arrows are the notes' Fig. 38, dotted arrows the two replacements it leaves out. Bottom: requests of other caches snooped on the bus (dashed). In I the snooper has nothing to do.</figcaption>
+  </figure>
+
+  <h3>The whole machine in two tables</h3>
+
+  <figure class="tbl-fig" id="l35-tbl-cpu">
+    <figcaption>MSI, requests of the local processor; a replacement is a miss on another block that maps to the same line. Arrow = new state; in brackets what goes on the bus.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>State</th><th>PrRd</th><th>PrWr</th><th>replacement</th></tr></thead>
+        <tbody>
+          <tr><td><b>I</b></td><td>→ S [Read Miss]</td><td>→ M [Write Miss]</td><td>— (nothing to evict)</td></tr>
+          <tr><td><b>S</b></td><td>hit, stay S</td><td>→ M [Invalidate]</td><td>→ I, silent</td></tr>
+          <tr><td><b>M</b></td><td>hit, stay M</td><td>hit, stay M</td><td>→ I [write-back]</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="tbl-fig" id="l35-tbl-bus">
+    <figcaption>MSI, requests of other caches snooped on the bus.</figcaption>
+    <div class="scroll-x l35-wrap">
+      <table class="tbl">
+        <thead><tr><th>State</th><th>Read Miss</th><th>Write Miss</th><th>Invalidate</th></tr></thead>
+        <tbody>
+          <tr><td><b>I</b></td><td>nothing to do</td><td>nothing to do</td><td>nothing to do</td></tr>
+          <tr><td><b>S</b></td><td>stay S; memory supplies</td><td>→ I</td><td>→ I</td></tr>
+          <tr><td><b>M</b></td><td>→ S [supply, write-back]</td><td>→ I [supply, write-back]</td><td>cannot happen</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">Exactly three processor accesses put a request on the bus (p. 457): a read miss (I → S, Read Miss), a write miss (I → M, Write Miss) and a write hit in S (S → M, Invalidate). Every other hit is silent.</mark></p>
+
+  <p>A write hit in M needs nothing: the cache already owns the only copy. The one other CPU-side use of the bus is not a request but a write-back, when a block in M is replaced. On the bus side, a Read Miss leaves a Shared copy alone — memory supplies the data — but makes a Modified copy supply the block and drop to S; a Write Miss kills any copy, an Invalidate a Shared one.</p>
+
+  <aside class="redpen" data-page="457">
+    <p class="claim">"M → I on a Write Miss or explicit Invalidate from another core."</p>
+    <p class="fix">Only a snooped Write Miss (or a replacement) takes a block from M to I. No Invalidate can arrive while you hold the block in M.</p>
+    <p class="because">An Invalidate is sent by a cache that holds the block in S and wants to write it. While your copy is M, no other cache holds a valid copy, so none can send one. Try it in the widget below: with P0 in M, P1's write is always a Write Miss.</p>
+  </aside>
+
+  <h3>The hidden arrows: replacement</h3>
+
+  <p>Fig. 38 of the notes leaves out the transitions that every exam table uses. The papers assume "one cache block per processor", so an access to the other block misses and evicts the block that is there. From the evicted block's point of view: <mark class="key">M → I with a write-back</mark> — memory becomes up to date — and <mark class="key">S → I silently</mark>, because a clean copy loses nothing. Then the new block enters through the normal miss arrow, I → S or I → M.</p>
+
+  <aside class="redpen" data-page="454">
+    <p class="claim">"Read/Write miss: place a request (read miss or write miss) on the bus. If we were in I, we move to S (read miss) or M (write miss). If we were in S, we remain in S."</p>
+    <p class="fix">A miss while the line holds a block in S is a miss on another block that maps to the same line. The old block leaves, S → I silently; the new one enters through I → S on a read miss or I → M on a write miss. A block in M is written back first.</p>
+    <p class="because">The notes contradict the sentence themselves: "Read/Write Miss in M and S are not possible because we already have the block" (p. 456). Read as a statement about the cache line, it holds only for a read miss — the line stays Shared, holding a different block. Check cycle 5 of the exam exercise below: P0 holds Shared (0), writes block 1, and ends in Mod (1).</p>
+  </aside>
+
+  <h3>Three ways to leave M, three write-backs</h3>
+
+  <p>A block is written back only when it leaves M (p. 457; the eviction case appears only in the notes' definition of M, p. 453):</p>
+  <ol>
+    <li>M → S on a snooped Read Miss: the owner supplies the block, and memory takes it.</li>
+    <li>M → I on a snooped Write Miss: the owner supplies the block, then drops its copy.</li>
+    <li>M → I on a replacement: the dirty block is written back before the line is reused.</li>
+  </ol>
+
+  <p>Hence the rule behind the column "Memory at bl. 0 up to date?" of every exam table: <b>memory is up to date exactly while no cache holds the block in M</b>. It turns No at the write that moves a block into M, and back to Yes at the write-back that moves it out.</p>
+
+  <aside class="redpen" data-page="455">
+    <p class="claim">"However, if we don’t write to the memory, but instead just forward it over the bus, the memory will still be stale! That’s fine because the guarantee of coherence (page 447) means that at least one cache has the correct clean copy. If later all shared copies are evicted, one of them will write back to memory before discarding, so memory is eventually updated."</p>
+    <p class="fix">In MSI a Shared copy is clean by definition and is evicted silently: nobody writes it back. So when the M owner answers a Read Miss, memory takes the block at the same time; both copies end in S and memory is up to date — the convention of the exam tables, which the notes' own footnote calls "the most common type of MSI on exams".</p>
+    <p class="because">Follow the notes' version to the end: A holds X = 1 in M, memory 0; A forwards the 1 to B without updating memory, and both go to S; A evicts X silently, then B does; the next read gets 0 from memory, and the write is lost. Sharing a dirty block needs a further state that remembers who must write it back — Owned, in AMD's MOESI — and MSI has none. Nor does coherence promise "a clean copy": it promises that reads return the latest write.</p>
+  </aside>
+
+  <div class="widget" id="l35-w-fsm">
+    <h3 class="widget-title">MSI, one block, two caches</h3>
+    <p class="widget-intro">The state machine of block X in P0's cache, drawn as in Fig. 4; P1 is another core with its own copy. P0's buttons fire CPU requests; P1's buttons put requests on the bus that P0 snoops. "Miss on another block" is a replacement: the line is needed for a different block that maps to it. The yellow ring marks P0's state, the yellow stroke the arrow just taken; the table logs every step in the exam's columns.</p>
+    <ol class="tasks">
+      <li>From the start, press "P0: read X", "P0: write X", "P0: write X". Predict how many bus transactions that costs.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Two: a Read Miss (I → S) and an Invalidate (S → M); the second write is a silent hit in M. <b>Only three processor accesses ever put a request on the bus</b>, and this run used two of them. The Invalidate went out although P1 had no copy — MSI cannot know that; lesson 36 fixes it.</p></details>
+      </li>
+      <li>Now press "P1: read X". Predict P0's new state and the memory column.
+        <details class="answer"><summary>What you should see</summary>
+          <p>P0 goes M → S and writes the block back; P1 gets Shared; memory is up to date again. Every arrow out of M writes back.</p></details>
+      </li>
+      <li>Press "P0: write X", then "P0: miss on another block". What happens to X, and what does the bus carry each time?
+        <details class="answer"><summary>What you should see</summary>
+          <p>First an Invalidate (S → M, P1 goes to I), then a write-back on the dotted arrow M → I: the replacement row that every exam table needs. Had X been in S, it would have left without any bus transaction.</p></details>
+      </li>
+      <li>Try to make P0 receive an Invalidate while it holds X in M.
+        <details class="answer"><summary>What you should see</summary>
+          <p>You cannot. With P0 in M, P1 is always in I, so P1's write is a Write Miss: P0 supplies the block, writes it back and goes to I. An Invalidate comes only from a Shared copy — the "explicit Invalidate" of the notes' p. 457 never happens.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l35-w-fsm', function (root, ui) {
+    var S = Course.svg, el = Course.el, R = 24;
+    var NODES = { cpu: { I: [100, 100], M: [460, 100], S: [280, 190] }, bus: { I: [100, 370], M: [460, 370], S: [280, 460] } };
+    /* [id, half, kind, from, to, path, label] — the geometry of Fig. 4 */
+    var ARCS = [["c-IM","cpu","cpu","I","M","M 124 100 L 436 100",[280,90,"mid","PrWr / Write Miss"]],["c-MI","cpu","repl","M","I","M 439.1 88.2 Q 280 -2 120.9 88.2",[280,44,"mid","replace / write-back"]],["c-IS","cpu","cpu","I","S","M 117.9 117.9 L 255 186.4",[178,180,"end","PrRd / Read Miss"]],["c-SI","cpu","repl","S","I","M 262.1 172.1 L 125 103.6",[216,128,"start","replace / —"]],["c-SM","cpu","cpu","S","M","M 301.5 179.3 L 438.5 110.7",[384,174,"start","PrWr / Invalidate"]],["c-MM","cpu","cpu","M","M","M 451 77.7 C 420.9 42 499.1 42 469 77.7",[552,30,"end","PrRd, PrWr / —"]],["c-SS","cpu","cpu","S","S","M 289 212.3 C 315.8 243.1 244.2 243.1 271 212.3",[320,240,"start","PrRd / —"]],["b-MI","bus","bus","M","I","M 436 370 L 124 370",[280,360,"mid","Write Miss / write-back"]],["b-SI","bus","bus","S","I","M 258.5 449.3 L 121.5 380.7",[180,440,"end","Write Miss or","Invalidate / —"]],["b-MS","bus","bus","M","S","M 438.5 380.7 L 301.5 449.3",[382,440,"start","Read Miss /","write-back"]],["b-SS","bus","bus","S","S","M 289 482.3 C 315.8 513.1 244.2 513.1 271 482.3",[320,510,"start","Read Miss / —"]]];
+    var NAME = { I: 'Invalid', S: 'Shared', M: 'Mod' };
+    var s, log, tx, wb, last, hist;
+    function reset() { s = ['I', 'I']; log = []; tx = 0; wb = 0; last = null; hist = []; }
+    reset();
+    function fresh() { return s[0] !== 'M' && s[1] !== 'M'; }
+
+    /* the tested model: processor p does op ('rd' | 'wr' | 'ev') on X */
+    function act(p, op) {
+      hist.push({ s: s.slice(), n: log.length, tx: tx, wb: wb, last: last });
+      var q = 1 - p, b = s.slice(), bus = null, who = null, msg = '';
+      if (op === 'rd') {
+        if (s[p] === 'I') { bus = 'Read Miss'; tx++; if (s[q] === 'M') { who = q; wb++; s[q] = 'S'; } s[p] = 'S'; }
+      } else if (op === 'wr') {
+        if (s[p] === 'I') { bus = 'Write Miss'; tx++; if (s[q] === 'M') { who = q; wb++; } s[q] = 'I'; s[p] = 'M'; }
+        else if (s[p] === 'S') { bus = 'Invalidate'; tx++; s[q] = 'I'; s[p] = 'M'; }
+      } else if (s[p] === 'M') { bus = 'write-back'; tx++; wb++; who = p; s[p] = 'I'; }
+      else s[p] = 'I';
+      var arc = null;
+      if (p === 0) {
+        if (op === 'ev') { if (b[0] !== 'I') arc = 'c-' + b[0] + 'I'; }
+        else arc = 'c-' + b[0] + s[0];
+      } else if (bus && bus !== 'write-back' && b[0] !== 'I') arc = 'b-' + b[0] + s[0];
+      var P = 'P' + p, Q = 'P' + q;
+      if (p === 0 && op === 'rd') msg = b[0] === 'I' ? 'P0 misses: PrRd / Read Miss, I → S. ' + (who === 1 ? 'P1 held X in M: it snoops the Read Miss, supplies the block and writes it back (M → S), so memory is up to date again.' : 'Memory supplies the block.') : 'Read hit: no bus transaction; P0 stays in ' + b[0] + '.';
+      if (p === 0 && op === 'wr') msg = b[0] === 'I' ? 'P0 misses on a write: PrWr / Write Miss, I → M. The Write Miss fetches the block and invalidates every other copy' + (who === 1 ? ': P1 supplies its dirty block (write-back) and goes to I.' : b[1] === 'S' ? ': P1’s Shared copy goes to I.' : '; P1 had none.') + ' Memory is now stale.' : b[0] === 'S' ? 'Write hit in S: PrWr / Invalidate, S → M. No data moves — P0 has the block — but every other copy must go' + (b[1] === 'S' ? ': P1 goes to I.' : '. P1 had none: MSI cannot know that, so the Invalidate is spent anyway.') + ' Memory is now stale.' : 'Write hit in M: silent. P0 already owns the only copy.';
+      if (p === 0 && op === 'ev') msg = b[0] === 'M' ? 'P0 needs the line for another block. X is dirty, so it is written back first: replace / write-back, M → I. Memory is up to date.' : b[0] === 'S' ? 'P0 needs the line for another block. X is clean, so it leaves silently: S → I. Nobody is told' + (b[1] === 'S' ? ', and P1 stays in S.' : '.') : 'X is not valid in P0’s cache: nothing to evict.';
+      if (p === 1 && op === 'rd') msg = b[1] !== 'I' ? 'P1 hits on its own copy: nothing appears on the bus, and P0 never notices.' : 'P1 misses and puts a Read Miss on the bus. ' + (b[0] === 'I' ? 'P0 has no copy: nothing to do.' : b[0] === 'S' ? 'P0 keeps its Shared copy (Read Miss / —); memory supplies the block.' : 'P0 holds the only fresh copy: it supplies the block and writes it back (Read Miss / write-back), M → S.');
+      if (p === 1 && op === 'wr') msg = b[1] === 'M' ? 'P1 writes its own Modified copy: silent, P0 sees nothing.' : b[1] === 'S' ? 'P1 holds X in S, so it puts an Invalidate on the bus. ' + (b[0] === 'S' ? 'P0 drops its copy: S → I.' : 'P0 has no copy.') + ' P1 goes to M.' : 'P1 misses and puts a Write Miss on the bus. ' + (b[0] === 'M' ? 'P0 supplies its dirty block (write-back) and drops it: M → I. (P1 had no copy, so this could not be an Invalidate.)' : b[0] === 'S' ? 'P0’s copy is killed: S → I.' : 'P0 has no copy: nothing to do.') + ' P1 goes to M; memory is stale.';
+      if (p === 1 && op === 'ev') msg = b[1] === 'M' ? 'P1 writes its dirty block back (a bus transaction) and drops it. P0’s copy is not involved.' : b[1] === 'S' ? 'P1 drops its clean copy silently; P0 is not told.' : 'X is not valid in P1’s cache: nothing to evict.';
+      last = { p: p, op: op, b: b, a: s.slice(), bus: bus, who: who, arc: arc, msg: msg };
+      log.push(last);
+    }
+    function undo() {
+      if (!hist.length) return;
+      var h = hist.pop(); s = h.s; log.length = h.n; tx = h.tx; wb = h.wb; last = h.last;
+    }
+    ui.button('P0: read X', function () { act(0, 'rd'); }, { kind: 'primary' });
+    ui.button('P0: write X', function () { act(0, 'wr'); }, { kind: 'primary' });
+    ui.button('P0: miss on another block', function () { act(0, 'ev'); }, { kind: 'primary' });
+    ui.controls.appendChild(el('div', { 'class': 'ctl ctl-wide' }, el('span', { 'class': 'ctl-label', text: 'Another core, P1, on the same bus:' })));
+    ui.button('P1: read X', function () { act(1, 'rd'); });
+    ui.button('P1: write X', function () { act(1, 'wr'); });
+    ui.button('P1: miss on another block', function () { act(1, 'ev'); });
+    ui.controls.appendChild(el('div', { 'class': 'ctl ctl-wide' }));
+    ui.button('Undo', undo, { kind: 'ghost', icon: 'back' });
+    ui.button('Reset', reset, { kind: 'ghost', icon: 'refresh' });
+    var roP0 = ui.readout('P0’s copy of X'), roP1 = ui.readout('P1’s copy of X'), roMem = ui.readout('memory up to date?'), roTx = ui.readout('bus transactions', { digits: 0 }), roWb = ui.readout('write-backs', { digits: 0 });
+    var note = ui.note('');
+    var svg = ui.svg(560, 530, { label: 'The MSI state machine of block X in P0’s cache, CPU requests above and bus requests below; the current state and the transition just taken are highlighted' });
+    var box = el('div', { 'class': 'scroll-x l35-tw l35-wrap' }); ui.stage.appendChild(box);
+    ui.legend([
+      { label: 'request of P0’s processor', color: 'ink', mark: 'line' },
+      { label: 'replacement (dotted)', color: 'ink', mark: 'dash' },
+      { label: 'request snooped on the bus', color: 's2', mark: 'dash' },
+      { label: 'P0’s state and the arrow just taken', color: 'ink', mark: 'hl' }
+    ]);
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      S('line', { x1: 16, y1: 262, x2: 544, y2: 262, 'class': 'st-muted dash' }, svg);
+      ARCS.forEach(function (a) {
+        if (last && last.arc === a[0]) S('path', { d: a[5], 'class': 'hl' }, svg);
+        S('path', { d: a[5], 'class': a[2] === 'bus' ? 'st-s2 dash' : a[2] === 'repl' ? 'dots' : (last && last.arc === a[0] ? 'sw-2' : ''), 'marker-end': a[2] === 'bus' ? 'url(#arr-s2)' : 'url(#arr)' }, svg);
+      });
+      ['cpu', 'bus'].forEach(function (h) {
+        ['I', 'S', 'M'].forEach(function (k) {
+          var c = NODES[h][k];
+          if (s[0] === k) S('circle', { cx: c[0], cy: c[1], r: 30, 'class': 'hl' }, svg);
+          S('circle', { cx: c[0], cy: c[1], r: R, 'class': 'fi-paper sw-2' }, svg);
+          S('text', { x: c[0], y: c[1] + 5, 'class': 'tx-mid tx-bold', text: k }, svg);
+        });
+      });
+      ARCS.forEach(function (a) {
+        var L = a[6], anc = L[2] === 'mid' ? ' tx-mid' : L[2] === 'end' ? ' tx-end' : '';
+        S('text', { x: L[0], y: L[1], 'class': 'tx-sm halo' + anc, text: L[3] }, svg);
+        if (L[4]) S('text', { x: L[0], y: L[1] + 19, 'class': 'tx-sm halo' + anc, text: L[4] }, svg);
+      });
+      S('text', { x: 16, y: 248, 'class': 'tx-sm tx-bold', text: 'CPU requests' }, svg);
+      S('text', { x: 16, y: 286, 'class': 'tx-sm tx-bold', text: 'bus requests' }, svg);
+    }
+    function table() {
+      box.textContent = '';
+      var t = el('table', { 'class': 'tbl' }), tb = el('tbody'), from = Math.max(0, log.length - 8);
+      t.appendChild(el('thead', null, el('tr', null, ['#', 'After operation', 'P0 cache', 'P1 cache', 'Bus transaction', 'Memory up to date?'].map(function (h) { return el('th', { text: h }); }))));
+      if (!log.length) tb.appendChild(el('tr', null, [el('td', { 'class': 'num', text: '0' }), el('td', { text: 'start' }), el('td', { text: 'Invalid' }), el('td', { text: 'Invalid' }), el('td', { text: '—' }), el('td', { text: 'Yes' })]));
+      for (var i = from; i < log.length; i++) {
+        var e = log[i], op = e.op === 'rd' ? 'read X' : e.op === 'wr' ? 'write X' : 'miss on another block';
+        var busTxt = e.bus ? (e.bus === 'write-back' ? 'write-back of X by P' + e.p : e.bus + (e.who !== null ? '; P' + e.who + ' writes back' : '')) : '—';
+        var fr = e.a[0] !== 'M' && e.a[1] !== 'M';
+        tb.appendChild(el('tr', { 'class': i === log.length - 1 ? 'is-key' : '' }, [el('td', { 'class': 'num', text: String(i + 1) }), el('td', { text: 'P' + e.p + ': ' + op }), el('td', { text: NAME[e.a[0]] }), el('td', { text: NAME[e.a[1]] }), el('td', { text: busTxt }), el('td', { text: fr ? 'Yes' : 'No' })]));
+      }
+      t.appendChild(tb); box.appendChild(t);
+    }
+    function bits(k) { return k === 'I' ? 'I · valid 0' : k === 'S' ? 'S · valid 1, dirty 0' : 'M · valid 1, dirty 1'; }
+    ui.onChange(function () {
+      draw(); table();
+      roP0.set(bits(s[0])); roP1.set(s[1]); roMem.set(fresh() ? 'Yes' : 'No');
+      roTx.set(tx); roWb.set(wb);
+      note.set(last ? last.msg : 'X is Invalid in both caches and memory is up to date. Press a button: P0’s buttons are CPU requests, P1’s reach P0 through the bus.');
+    });
+  });
+  </script>
+
+  <p>Back to the warm-up. With MSI, A's write at T = 3 found X in S and put an Invalidate on the bus: B's copy went to I. B's read at T = 4 missed and put a Read Miss on the bus; A snooped it, supplied the 0 and wrote the block back, M → S. Between T = 3 and T = 4 memory was wrong and nothing broke, because no processor could read the wrong copy. Coherence is a promise about what every read returns, not about what memory holds.</p>
+</section>
+
+<section id="l35-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l35-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used to keep the private caches of a shared-memory multiprocessor coherent:</p>
+      <p>1. Caching of shared data (migration and replication); 2. Cache coherence; 3. Memory consistency; 4. Write-invalidate protocol; 5. Write-update protocol; 6. Snooping protocol; 7. Duplicate snoop tags; 8. MSI protocol.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> A private cache keeps a copy of a block next to the core. For shared data it gives migration — the block moves to the cache of the core using it, so accesses no longer go to memory or over the interconnect — and replication — a read-shared block gets a copy in every reader's cache, so readers do not contend for one copy. Benefit: lower latency, less bus and memory traffic. Cost: several copies of one block, hence the coherence problem.</p>
+        <p><b>2.</b> A memory system is coherent if (1) a processor that writes X and then reads X, with no other write in between, reads its own value; (2) a read of X by P2 after a write by P1 returns P1's value if enough time has passed and no other write intervened; (3) writes to the same location are serialized: all processors see them in the same order. It concerns one location at a time.</p>
+        <p><b>3.</b> Consistency defines when a write becomes visible to the other processors and in which order loads and stores to different addresses may be observed. Example: P0 writes A = 1 then B = 2, P1 reads B then A: sequential consistency forbids reading B = 2 and A = 0, relaxed models allow it. A coherent memory need not be sequentially consistent.</p>
+        <p><b>4.</b> Before writing a shared block, the writer broadcasts an invalidate; all other copies become Invalid and the writer gets exclusive ownership. Further writes are local and silent until another processor requests the block; that processor misses and gets the data from the owner or from memory. Benefit: traffic only on the first write — the choice of almost all modern multiprocessors, with write-back caches.</p>
+        <p><b>5.</b> Every write broadcasts the new value to all caches holding the block (and usually to memory), which update their copies. Benefit: readers never miss and never see stale data. Cost: one bus transaction per write, also for repeated writes to one word or to the words of one block, so it wastes bandwidth; it pays off only for producer–consumer sharing.</p>
+        <p><b>6.</b> The caches share a bus, which is a broadcast medium: every cache controller monitors every transaction and reacts if it holds the block (invalidates it or supplies the data). No central directory; one transaction informs all caches; the bus order serializes the writes. Suitable for small symmetric (UMA) multiprocessors; it does not scale, because broadcast traffic, electrical load and serialization grow with the number of processors.</p>
+        <p><b>7.</b> A second copy of the cache's tag array — tag and coherence state, no data — used only by the snooper. Bus transactions are checked there while the processor keeps using the main tags, so snooping does not stall the pipeline: it removes the structural hazard on the tag array. Cost: area, and both copies must be updated together.</p>
+        <p><b>8.</b> Each block is Modified (only copy, dirty), Shared (clean, possibly in other caches) or Invalid. A read miss puts a Read Miss on the bus (→ S), a write miss a Write Miss (→ M), a write hit in S an Invalidate (→ M); read hits and write hits in M are silent. A snooped Read Miss turns M into S with a write-back; a snooped Write Miss turns S or M into I (M supplies the block and writes it back first); a snooped Invalidate turns S into I. A replaced Modified block is written back, a replaced Shared block leaves silently.</p>
+      </div>
+      <div class="exam-note"><p>This is the format of the 8-point question of the 22 June 2026 paper, with about five lines per sub-point. Each line should name the mechanism and its benefit; points 4–6 together answer the snooping half of Question 1 of the January 2026 paper as the notes reproduce it (pp. 495–497). The usual slip is in point 2: "every processor sees a write immediately" — the definition says "after enough time", and the timing belongs to consistency.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l35-exam-dual">
+    <div class="exam-q" lang="en">
+      <p>Let's consider a single-chip dual-core shared-memory architecture where each core is a dual-issue superscalar processor with multi-threading up to 2 threads per core. Explain the preferred technique used to manage the cache coherency problem in the dual core chip.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A snooping, write-invalidate protocol with write-back caches (MSI, in practice MESI). The private caches of the two cores sit on a shared on-chip bus that acts as a broadcast medium: each cache controller monitors every transaction, with duplicate snoop tags, and keeps a coherence state per block. Before a core writes a block that the other core may hold, it broadcasts an invalidate, so the other copy becomes Invalid and later writes stay local. A read miss on a block that the other cache holds Modified is served by that cache, which writes the block back and goes to Shared. With two cores the broadcast is cheap and the bus serializes the writes, so no directory is needed — directories are for many nodes with distributed memory.</p>
+      </div>
+      <div class="exam-note"><p>This is the last row of Question 2 (5 points in all) of the 10 June 2025 paper. A good answer names snooping, write-invalidate and write-back, and gives the reason: two cores on one chip share a broadcast medium. Naming MESI, the refinement of lesson 36, adds precision; a directory answers a different machine.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l35-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the following access patterns on a dual processor system with a direct-mapped, write-back cache with one cache block per processor and a two cache block memory. Assume the MSI protocol is used, with write-back caches, write-allocate, and write-invalidate of other caches. Please complete the following table. How many times is a block written back to memory, and in which cycles?</p>
+      <div class="scroll-x l35-wrap l35-op">
+        <table class="tbl">
+          <thead><tr><th>Cycle</th><th>After Operation</th><th>P0 cache block state</th><th>P1 cache block state</th><th>Memory at bl. 0 up to date?</th><th>Memory at bl. 1 up to date?</th></tr></thead>
+          <tbody>
+            <tr><td class="num">0</td><td>P0: Read Bl. 0</td><td>Shared (0)</td><td>Invalid</td><td>Yes</td><td>Yes</td></tr>
+            <tr><td class="num">1</td><td>P1: Read Bl. 0</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">2</td><td>P1: Write Bl. 0</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">3</td><td>P1: Write Bl. 0</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">4</td><td>P0: Read Bl. 0</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">5</td><td>P0: Write Bl. 1</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">6</td><td>P1: Read Bl. 1</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">7</td><td>P1: Write Bl. 0</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">8</td><td>P1: Read Bl. 1</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">9</td><td>P0: Write Bl. 1</td><td></td><td></td><td></td><td></td></tr>
+            <tr><td class="num">10</td><td>P1: Write Bl. 1</td><td></td><td></td><td></td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x l35-wrap l35-op">
+          <table class="tbl">
+            <thead><tr><th>Cycle</th><th>After Operation</th><th>P0 cache block state</th><th>P1 cache block state</th><th>Memory at bl. 0 up to date?</th><th>Memory at bl. 1 up to date?</th><th>Bus transaction (comment)</th></tr></thead>
+            <tbody>
+              <tr><td class="num">0</td><td>P0: Read Bl. 0</td><td>Shared (0)</td><td>Invalid</td><td>Yes</td><td>Yes</td><td>Read Miss; memory supplies</td></tr>
+              <tr><td class="num">1</td><td>P1: Read Bl. 0</td><td>Shared (0)</td><td>Shared (0)</td><td>Yes</td><td>Yes</td><td>Read Miss; memory supplies</td></tr>
+              <tr><td class="num">2</td><td>P1: Write Bl. 0</td><td>Invalid</td><td>Mod (0)</td><td>No</td><td>Yes</td><td>write hit in S: Invalidate</td></tr>
+              <tr><td class="num">3</td><td>P1: Write Bl. 0</td><td>Invalid</td><td>Mod (0)</td><td>No</td><td>Yes</td><td>write hit in M: none</td></tr>
+              <tr><td class="num">4</td><td>P0: Read Bl. 0</td><td>Shared (0)</td><td>Shared (0)</td><td>Yes</td><td>Yes</td><td>Read Miss; P1 supplies and writes back</td></tr>
+              <tr><td class="num">5</td><td>P0: Write Bl. 1</td><td>Mod (1)</td><td>Shared (0)</td><td>Yes</td><td>No</td><td>P0 drops Shared (0) silently; Write Miss</td></tr>
+              <tr><td class="num">6</td><td>P1: Read Bl. 1</td><td>Shared (1)</td><td>Shared (1)</td><td>Yes</td><td>Yes</td><td>P1 drops Shared (0) silently; Read Miss; P0 supplies and writes back</td></tr>
+              <tr><td class="num">7</td><td>P1: Write Bl. 0</td><td>Shared (1)</td><td>Mod (0)</td><td>No</td><td>Yes</td><td>P1 drops Shared (1) silently; Write Miss</td></tr>
+              <tr><td class="num">8</td><td>P1: Read Bl. 1</td><td>Shared (1)</td><td>Shared (1)</td><td>Yes</td><td>Yes</td><td>P1 writes back block 0 (replacement); Read Miss; memory supplies</td></tr>
+              <tr><td class="num">9</td><td>P0: Write Bl. 1</td><td>Mod (1)</td><td>Invalid</td><td>Yes</td><td>No</td><td>write hit in S: Invalidate</td></tr>
+              <tr><td class="num">10</td><td>P1: Write Bl. 1</td><td>Invalid</td><td>Mod (1)</td><td>Yes</td><td>No</td><td>Write Miss; P0 supplies, writes back, invalidates</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Four write-backs: cycles 4 and 6 (a Modified block answers a Read Miss: M → S), cycle 8 (a Modified block is replaced: M → I) and cycle 10 (a Modified block answers a Write Miss: M → I).</p>
+      </div>
+      <div class="exam-note"><p>The wording is that of the MESI tables of the papers (Exercise 3 of January 2026 as the notes reproduce it, Quiz 7 of June 2026) with MSI in place of MESI. The traps: the silent write hit in M (cycle 3); the owner's write-back that turns "up to date" back to Yes (cycles 4, 6); the silent eviction of a Shared block, which leaves the other copy untouched (cycles 5–7); the write-back on the replacement of a Modified block (cycle 8). The four write-backs cover all three ways of leaving M. Under MESI (lesson 36) only cycle 0 would change: Excl (0).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l35-exam-ten">
+    <div class="exam-q" lang="en">
+      <p>Processors P0 and P1 both hold block X in their write-back caches. P0 then writes X ten times in a row, while P1 does not access it. How many coherence transactions appear on the bus under a write-invalidate protocol and under a write-update protocol?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>10 and 10 <span class="fb">Invalidate pays only for the first write: afterwards P0 owns the block and the other nine writes are silent hits.</span></li>
+      <li data-correct>1 and 10 <span class="fb">One Invalidate, then nine silent hits in M; update must broadcast each of the ten new values because P1 still holds a copy.</span></li>
+      <li>10 and 1 <span class="fb">The other way round: update cannot batch writes, every new value must reach P1's copy.</span></li>
+      <li>0 and 0 <span class="fb">P1 holds a copy, so at least the first write must invalidate or update it; otherwise P1 could read a stale value.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer: 1 and 10. Write-invalidate sends one invalidation for the first write; the block is then exclusively owned and the remaining writes are local. Write-update broadcasts every write.</p></div>
+      <div class="exam-note"><p>This is the first of Hennessy &amp; Patterson's three characteristics, in numbers, and the slope of the traffic meter. A "motivate your answer" line would be: invalidation is per block and per ownership, update per write.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l35-exam-hit">
+    <div class="exam-q" lang="en">
+      <p>How does an MSI write-invalidate write-back protocol manage a Write Hit on a cache block which is Shared in another cache? (Multiple answers.)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>The status of the cache block becomes Modified <span class="fb">S → M: after the write this cache holds the only, dirty copy.</span></li>
+      <li>The cache block is retrieved from memory <span class="fb">It is a hit: the data is already in the cache, nothing is fetched.</span></li>
+      <li>The cache block is retrieved from another cache <span class="fb">Same reason: a write hit needs permission, not data.</span></li>
+      <li data-correct>An invalidate is broadcasted on the bus to the other copies of the block <span class="fb">The other sharer must drop its copy: that is the S → M arrow, PrWr / Invalidate.</span></li>
+      <li data-correct>The cache block is overwritten in the processor's cache <span class="fb">Write-back: the new value goes into the cache line only, and memory becomes stale.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 4 and 5: an invalidate is broadcast, the block is written in the cache and becomes Modified; nothing is retrieved because the block is already present.</p></div>
+      <div class="exam-note"><p>Quiz 2 of the 22 June 2026 paper asks exactly this for MESI, and in MESI the answer is the same. Its Quiz 1 — a write hit on an Exclusive block — needs the E state of <a href="l36.html">lesson 36</a>.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l35-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: in an MSI snooping protocol with write-back caches, after a cache that holds a block in Modified state answers another processor's read miss, main memory holds an up-to-date copy of the block.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">The owner supplies the block and memory takes it from the bus: M → S with a write-back. Both copies are Shared, that is clean.</span></li>
+      <li>False <span class="fb">Memory could stay stale only if a dirty block could be shared, which needs the Owned state of MOESI. In MSI a Shared copy is clean by definition.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True. On the snooped read miss the Modified copy is written back while it is supplied; both caches end in Shared and memory is up to date.</p></div>
+      <div class="exam-note"><p>Row 3 of the table in Quiz 7 of the 22 June 2026 paper — one of its correct rows — prints exactly this: P3 reads block 0 while P1 holds it Modified, and "Memory at bl. 0 up to date?" becomes Yes. The notes argue the opposite on p. 455; see the red pen in section 5.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l35-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Table 31 with write-back caches: right after A writes X = 0 (T = 3), where is the value 0?</p>
+    <ul class="options">
+      <li data-correct>Only in A's cache <span class="fb">Write-back updates only the cache line and sets its dirty bit; memory and B keep the 1.</span></li>
+      <li>In A's cache and in memory <span class="fb">That is the write-through version of the table, the one the notes print.</span></li>
+      <li>In A's and B's caches <span class="fb">Without a protocol nobody tells B anything: its copy keeps the 1.</span></li>
+      <li>Nowhere yet: the write waits for the bus <span class="fb">A write hit completes in the cache; write-back delays only the copy to memory.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">P0 runs A = 1; B = 2; and P1 runs print(B); print(A). The machine is coherent but not sequentially consistent, and P1 prints 2 and then 0. Is coherence violated?</p>
+    <ul class="options">
+      <li data-correct>No: coherence speaks about one location at a time; the order between A and B is a matter of consistency <span class="fb">Each location received one write and saw it in one order. Seeing B's new value before A's is allowed by a relaxed model.</span></li>
+      <li>Yes: condition 2 failed, P1 did not see the latest A <span class="fb">Condition 2 holds "provided enough time has passed"; when that time is up is exactly what consistency defines.</span></li>
+      <li>Yes: the writes were not serialized <span class="fb">Serialization concerns the writes to one location. Here each location had a single write.</span></li>
+      <li>It depends on whether the caches are write-back <span class="fb">The write policy does not change what coherence promises; the reordering comes from buffers or out-of-order execution.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which events of P0's own processor make P0's MSI controller put something on the bus? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>A read of a block that is Invalid <span class="fb">PrRd / Read Miss, I → S.</span></li>
+      <li data-correct>A write of a block that is Shared <span class="fb">PrWr / Invalidate, S → M.</span></li>
+      <li>A write of a block that is Modified <span class="fb">A silent hit: P0 already owns the only copy.</span></li>
+      <li>A read of a block that is Shared <span class="fb">A hit: the clean copy serves it, no bus.</span></li>
+      <li data-correct>A miss on another block that evicts this block from Modified <span class="fb">The replacement writes the dirty block back: M → I with a write-back.</span></li>
+      <li>A miss on another block that evicts this block from Shared <span class="fb">A clean copy leaves silently: S → I, nothing on the bus.</span></li>
+    </ul>
+    <p class="q-fb">Three processor accesses put a request on the bus: I → S, S → M and I → M (a write of an Invalid block, not listed here). The eviction of a dirty block adds a write-back.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">P0 holds X in M. P1 puts a Read Miss for X on the bus. After the transaction:</p>
+    <ul class="options">
+      <li data-correct>P0 and P1 are both in S, and memory is up to date <span class="fb">P0 supplies the block and memory takes it: M → S with a write-back.</span></li>
+      <li>P0 goes to I and P1 to M <span class="fb">That is what a Write Miss does; a reader only needs a shared copy.</span></li>
+      <li>P0 stays in M and memory supplies the data to P1 <span class="fb">Memory is stale while P0 is in M: P1 would read an old value.</span></li>
+      <li>Both are in S, but memory stays stale until someone evicts the block <span class="fb">The notes' p. 455 version. A Shared copy is clean and evicted silently, so the new value would be lost.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does a snooping bus give write serialization, condition 3 of coherence, without extra hardware?</p>
+    <ul class="options">
+      <li data-correct>Only one transaction uses the bus at a time, so every controller sees the writes to a block in the same order <span class="fb">Two writers race for the bus; the winner's Invalidate makes the loser's write a miss that sees the winner's value.</span></li>
+      <li>Every cache keeps a duplicate copy of its tags <span class="fb">Duplicate tags avoid stalls; they do not order anything.</span></li>
+      <li>Memory always holds the latest value <span class="fb">With write-back caches it often does not.</span></li>
+      <li>Write-back caches delay the writes <span class="fb">Delaying writes does not make all processors agree on their order.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">What does a duplicate (snoop) tag array hold, and which problem does it solve?</p>
+    <ul class="options">
+      <li data-correct>Tags and coherence states, no data; snoops no longer steal tag-array cycles from the processor <span class="fb">It removes the structural hazard between the processor's lookups and the snooper's.</span></li>
+      <li>A copy of the data, so that other caches can be served faster <span class="fb">No data is duplicated: only the tag and the state are needed to decide whether to react.</span></li>
+      <li>The tags of the other caches, so a cache knows who shares a block <span class="fb">That would be a directory, the subject of lesson 37.</span></li>
+      <li>Only the tags, to double the associativity <span class="fb">Associativity does not change: the copy mirrors the same entries.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">For which access pattern does write-update put fewer transactions on the bus than write-invalidate?</p>
+    <ul class="options">
+      <li data-correct>P0 writes a flag once, then P1 reads it, and this repeats <span class="fb">Update: 1 per round. Invalidate: an Invalidate plus P1's miss, 2 per round.</span></li>
+      <li>P0 writes the same word eight times before P1 reads it <span class="fb">Update pays 8 per round, invalidate still 2.</span></li>
+      <li>P0 fills the eight words of a block, then P1 reads the block <span class="fb">Update pays one broadcast per word, 8; invalidate pays once per block, 2.</span></li>
+      <li>P0 and P1 write different words of one block in long bursts <span class="fb">False sharing: update pays every write, invalidate one Write Miss per burst.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l35-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Private caches serve private data as in a single processor; for shared data they bring migration and replication, at the price of several copies of one block — and without a protocol a processor silently reads a stale copy.</li>
+    <li>A coherent memory guarantees that a processor reads back its own writes, that a read sees another processor's write after enough time, and that writes to one location are serialized; consistency is the separate question of ordering across locations.</li>
+    <li>Write-invalidate pays one transaction for the first write and makes later readers miss; write-update pays one per write; invalidation won because writes repeat.</li>
+    <li>A snooping bus broadcasts every request and gives one global order, hence write serialization for free; broadcast traffic, electrical load and serialization limit it to small machines, and duplicate snoop tags keep the snooper from stalling the processor.</li>
+    <li>In MSI exactly three processor accesses put a request on the bus (read miss: Read Miss, I → S; write miss: Write Miss, I → M; write hit in S: Invalidate, S → M); a snooped Read Miss turns M into S, a snooped Write Miss turns S or M into I, and a snooped Invalidate turns S into I.</li>
+    <li>Replacements are the hidden arrows of every exam table: M → I with a write-back, S → I silently; memory is up to date exactly while no cache holds the block in M.</li>
+  </ul>
+
+  <aside class="cheat" id="l35-cheat">
+    <dl>
+      <dt>Coherent memory</dt><dd>(1) a processor reads back its own last write; (2) a read after another processor's write returns it, given enough time and no other write; (3) writes to one location are seen in the same order by all</dd>
+      <dt>Coherence vs consistency</dt><dd>coherence: one location, which value; consistency: order and timing of writes across locations (sequential consistency vs relaxed)</dd>
+      <dt>Write-invalidate</dt><dd>first write → Invalidate on the bus, other copies Invalid, later writes silent; a later reader misses and gets the data from the owner</dd>
+      <dt>Write-update</dt><dd>every write broadcast to all copies (and memory); readers hit; one bus transaction per write</dd>
+      <dt>Traffic per round, w writes then one read</dt><dd>invalidate: 2 transactions (Invalidate + Read Miss); update: w</dd>
+      <dt>Snooping</dt><dd>bus = broadcast medium + single global order; every controller checks every transaction; limits: bandwidth, fan-out, serialization; 2–8 CPUs</dd>
+      <dt>Duplicate snoop tags</dt><dd>tag + state, no data; snoops checked every cycle without stalling the processor's lookups</dd>
+      <dt>MSI states</dt><dd>I: valid 0 · S: valid 1, dirty 0, clean, may be shared · M: valid 1, dirty 1, only copy</dd>
+      <dt>MSI, CPU side</dt><dd>I —PrRd / Read Miss→ S · I —PrWr / Write Miss→ M · S —PrWr / Invalidate→ M · hits silent</dd>
+      <dt>MSI, bus side</dt><dd>S —Read Miss→ S · S —Write Miss or Invalidate→ I · M —Read Miss / write-back→ S · M —Write Miss / write-back→ I</dd>
+      <dt>Replacement</dt><dd>M → I with write-back · S → I silently · then the new block enters through I</dd>
+      <dt>Memory up to date?</dt><dd>No exactly while some cache holds the block in M; write-back on M → S, M → I (snooped Write Miss) and M → I (replacement)</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l35-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=7xtGwQAMABc" target="_blank" rel="noopener">Coherence Definition</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech (Udacity)</span>
+      <p class="res-why">A few minutes on what "coherent" means, from Georgia Tech's architecture course — a warm-up for section 2.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://aca-iiith.vlabs.ac.in/exp/cache-coherence-msi-mesi/simulation/index.html" target="_blank" rel="noopener">MSI Cache Coherence Protocol Simulator</a>
+      <span class="res-by">IIIT Hyderabad, Virtual Labs</span>
+      <p class="res-why">Two processors, PrRd and PrWr buttons, a state diagram that lights up and a log that separates processor and bus activity. Replay the widget's runs there, predicting each state first. It implements MSI only, despite its address.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=ex4JjTW2ztA" target="_blank" rel="noopener">Update VS Invalidate Coherence</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech (Udacity)</span>
+      <p class="res-why">The comparison of section 3 from the same course. Watch it after the traffic meter and check its argument against your own counts.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=gAUVAel-2Fg" target="_blank" rel="noopener">MSI Coherence</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech (Udacity)</span>
+      <p class="res-why">The MSI state machine built transition by transition — compare it with Fig. 4 and check that the bus actions match.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=9k6UMsIDvBk" target="_blank" rel="noopener">Computer Architecture — Lecture 20: Cache Coherence (Fall 2021)</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span>
+      <p class="res-why">The whole arc of lessons 35–38 in one lecture: the coherence problem, snooping against directories, MSI to MESI. Good preparation for the 8-point open question.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>In the widget, a block that only P0 ever touched cost two bus transactions: a Read Miss, and an Invalidate that nobody needed to hear. Most data is private. Could a cache know that it holds the only copy, and write without asking?</p>
+</aside>
+
+</main>
+</body>
+</html>

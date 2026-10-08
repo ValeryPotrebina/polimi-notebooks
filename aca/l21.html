@@ -1,0 +1,1280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Same loop, three shapes: unrolling, software pipelining and betting on the hot path · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+  /* page-local: the code listing and the schedule table that the conveyor widget generates under its drawing (no colours) */
+  .l21-out { margin-top: 0.9rem; padding: 0 1.1rem 1.1rem; display: grid; gap: 0.6rem; }
+  .l21-out pre { margin: 0; }
+  .l21-cap { font-size: var(--t-sm); color: var(--ink-2); margin: 0; }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l21">
+
+<header class="lesson-head">
+  <h1>Same loop, three shapes: unrolling, software pipelining and betting on the hot path</h1>
+  <p class="lede">After this lesson you will unroll a loop and count, stall by stall, what it gains; turn a loop into its software-pipelined form and back again; schedule the papers' SP_LOOP on the VLIW table with its four metrics; and explain what trace scheduling, superblocks and predication buy and what each of them costs.</p>
+</header>
+
+<div class="hook" data-label="A puzzle from the June 2026 paper">
+  <p>Exercise 2 of the 22 June 2026 paper prints two loops side by side. LOOP1 is the plainest loop there is: <code>LD</code>, <code>FADD</code>, <code>SD</code>, <code>ADDUI</code>, <code>BNE</code>. LOOP2 is made of the same five operations with the first three in reverse order: <code>SD</code>, <code>FADD</code>, <code>LD</code>. On the paper's 3-issue VLIW, scheduled by the same rules, LOOP1 needs 10 cycles per iteration and LOOP2 needs 5.</p>
+  <p>Read LOOP2 as a program and it looks absurd. It stores F6 before the FADD that computes F6, and the FADD reads F2 before the LD that loads F2. Nothing was added and nothing was removed, yet the loop runs twice as fast. Where did the waiting go — and what does that store actually store?</p>
+  <p>LOOP1 and LOOP2 are two shapes of one loop. Unrolling, which you met in lesson 15, gives it a third. And when a loop has an <code>if</code> inside, the compiler has one more move: it bets on the side that usually wins.</p>
+</div>
+
+<section id="l21-unroll">
+  <h2>Unrolling, counted cycle by cycle</h2>
+
+  <p>A machine that issues several operations per cycle is only as fast as the independent operations it is offered, and one iteration of a short loop offers almost none: every instruction waits for the one before it. The compiler's oldest remedy is <mark class="key">loop unrolling</mark>: copy the body u times into one straight-line block, fold the addresses of the copies into the displacements, and keep a single index update and a single branch. <a href="l15.html#l15-unroll">Lesson 15</a> counted what that saves in instructions — N/u iterations of u·w + o instructions, (u − 1)·ρ extra registers. Here you count what it buys in cycles, on the notes' own example (p. 285), <code>x[i] = x[i] + s</code>:</p>
+
+  <aside class="margin-note">The notes write ADD for the floating-point add and Loop for the label. The papers write FADD and LOOP; older papers also put a dollar sign before the register, <code>$F2</code>.</aside>
+
+<pre><code>LOOP: LD    F0, 0(R1)  ; F0 &#8592; x[i]
+      FADD  F4, F0, F2 ; F2 = s
+      SD    F4, 0(R1)  ; x[i] &#8592; F4
+      SUBI  R1, R1, 8  ; i &#8592; i &#8722; 1
+      BNE   R1, R2, LOOP</code></pre>
+
+  <p>The notes give three numbers for this loop — 10 cycles per iteration, 16 for four iterations once unrolled and renamed, efficiency 87.5 % — but not the machine they were counted on. The first is Hennessy and Patterson's classic count for this very loop (third edition), on a single-issue pipeline whose branch has one delay slot; the other two follow from the same rules:</p>
+
+  <figure class="tbl-fig" id="l21-tbl-lat">
+    <figcaption>The delayed-branch latency model of this section: a single-issue, in-order pipeline. Lesson 15 counts the same loop with the same latencies but no delay slot, hence its 9 cycles against 10 here; the papers' VLIW, from section 2 on, has its own numbers.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Producer</th><th>Consumer</th><th>Stall cycles between them</th></tr></thead>
+        <tbody>
+          <tr><td>LD</td><td>FADD that uses the loaded value</td><td class="num">1</td></tr>
+          <tr><td>FADD</td><td>SD that stores the result</td><td class="num">2</td></tr>
+          <tr><td>SUBI</td><td>BNE that tests the new index</td><td class="num">1</td></tr>
+          <tr><td>BNE</td><td>the next instruction</td><td>1 delay slot, always spent: it holds an independent instruction or nothing</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="tbl-fig" id="l21-tbl-cycles">
+    <figcaption>Issue cycle by issue cycle. Column 2: the original loop, one element. Column 3: unrolled four times, renamed and regrouped, four elements — the notes' 16 cycles. Column 4: the same body with the last two stores moved into the stall and the delay slot — 14 cycles.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Cycle</th><th>Original</th><th>×4, regrouped</th><th>×4, stores moved</th></tr></thead>
+        <tbody>
+          <tr><td>C1</td><td>LD F0, 0(R1)</td><td>LD F0, 0(R1)</td><td>LD F0, 0(R1)</td></tr>
+          <tr><td>C2</td><td>stall</td><td>LD F6, -8(R1)</td><td>LD F6, -8(R1)</td></tr>
+          <tr><td>C3</td><td>FADD F4, F0, F2</td><td>LD F10, -16(R1)</td><td>LD F10, -16(R1)</td></tr>
+          <tr><td>C4</td><td>stall</td><td>LD F14, -24(R1)</td><td>LD F14, -24(R1)</td></tr>
+          <tr><td>C5</td><td>stall</td><td>FADD F4, F0, F2</td><td>FADD F4, F0, F2</td></tr>
+          <tr><td>C6</td><td>SD F4, 0(R1)</td><td>FADD F8, F6, F2</td><td>FADD F8, F6, F2</td></tr>
+          <tr><td>C7</td><td>SUBI R1, R1, 8</td><td>FADD F12, F10, F2</td><td>FADD F12, F10, F2</td></tr>
+          <tr><td>C8</td><td>stall</td><td>FADD F16, F14, F2</td><td>FADD F16, F14, F2</td></tr>
+          <tr><td>C9</td><td>BNE R1, R2, LOOP</td><td>SD F4, 0(R1)</td><td>SD F4, 0(R1)</td></tr>
+          <tr class="is-key"><td>C10</td><td>(delay slot)</td><td>SD F8, -8(R1)</td><td>SD F8, -8(R1)</td></tr>
+          <tr><td>C11</td><td></td><td>SD F12, -16(R1)</td><td>SUBI R1, R1, 32</td></tr>
+          <tr><td>C12</td><td></td><td>SD F16, -24(R1)</td><td>SD F12, 16(R1)</td></tr>
+          <tr><td>C13</td><td></td><td>SUBI R1, R1, 32</td><td>BNE R1, R2, LOOP</td></tr>
+          <tr class="is-key"><td>C14</td><td></td><td>stall</td><td>SD F16, 8(R1) (delay slot)</td></tr>
+          <tr><td>C15</td><td></td><td>BNE R1, R2, LOOP</td><td></td></tr>
+          <tr class="is-key"><td>C16</td><td></td><td>(delay slot)</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Cycles per pass in the steady state: the formula sheet's \(m + k\), with \(m = 5\) instructions and \(k = 5\) lost cycles; one pass alone would add the \(+4\) of the pipeline fill.</aside>
+
+  <p>Read the second column first: five instructions, three data stalls, one stall before the branch and an empty delay slot — 10 cycles, half of them wasted. Now copy the body four times in the order of the listing, with F0 and F4 reused. Every copy brings its stalls along: 6 cycles per copy, plus 4 for SUBI, stall, BNE and the slot, makes 28 cycles, 7 per element. Unrolling alone buys little.</p>
+
+  <p>What makes the third column possible is renaming. Once each copy has its own registers — F0/F4, F6/F8, F10/F12, F14/F16 — the compiler may regroup: four loads, four adds, four stores. Every consumer now stands four instructions after its producer, more than any latency asks, so the data stalls vanish; left are the stall before BNE and the empty delay slot: 14 instructions in 16 cycles. The fourth column fills both holes with the last two stores, whose displacements grow by 32 because SUBI has already moved R1 (the offset rule of lesson 15): four elements in 14 cycles.</p>
+
+  <div class="formula" data-label="(66), (67)">
+    \[ T_{\text{iter}} = \frac{\text{cycles of the unrolled body}}{\text{original iterations it covers}} \]
+    \[ \begin{aligned} \text{Efficiency} &amp;= \frac{\text{useful operations}}{\text{issue slots}} \\ &amp;= \frac{IC}{\#\text{cycles} \times \#\text{issues}} \end{aligned} \]
+    <dl class="legend">
+      <dt>\(T_{\text{iter}}\)</dt><dd>execution time per original iteration, stalls and empty slots included</dd>
+      <dt>\(IC\)</dt><dd>instructions issued by the body; stalls and empty slots are not instructions</dd>
+      <dt>\(\#\text{cycles}\)</dt><dd>length of the body's schedule, delay slot included</dd>
+      <dt>\(\#\text{issues}\)</dt><dd>issue width: 1 here, 3 or 4 on the VLIW of the papers (it is the code-efficiency line of the example formula sheet)</dd>
+    </dl>
+  </div>
+
+  <figure class="tbl-fig" id="l21-tbl-eff">
+    <figcaption>Equations (66) and (67) on the four versions of the loop. Loop control = SUBI, its stall, BNE and the delay slot when they are not filled with work.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Version</th><th>Cycles</th><th>Elements</th><th>\(T_{\text{iter}}\) (66)</th><th>Efficiency (67)</th><th>Loop control per element</th></tr></thead>
+        <tbody>
+          <tr><td>original</td><td class="num">10</td><td class="num">1</td><td class="num">10</td><td class="num">5/10 = 50&nbsp;%</td><td class="num">4</td></tr>
+          <tr><td>×4, copies in order</td><td class="num">28</td><td class="num">4</td><td class="num">7</td><td class="num">14/28 = 50&nbsp;%</td><td class="num">1</td></tr>
+          <tr><td>×4, regrouped</td><td class="num">16</td><td class="num">4</td><td class="num">4</td><td class="num">14/16 = 87.5&nbsp;%</td><td class="num">1</td></tr>
+          <tr class="is-key"><td>×4, stores moved</td><td class="num">14</td><td class="num">4</td><td class="num">3.5</td><td class="num">14/14 = 100&nbsp;%</td><td class="num">0.5</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="286">
+    <p class="claim">"Now all instructions use unique registers, and only true dependencies remain."</p>
+    <p class="fix">Renaming removes the WAW and WAR dependences on F0 and F4 between the copies, and only those. Besides the true chains LD → FADD → SD of each copy and SUBI → BNE, the anti-dependences on R1 remain: every LD and SD reads R1, and SUBI rewrites it.</p>
+    <p class="because">In the fourth column of the cycle table SUBI moves above the last two stores only because their displacements grow by 32: the offsets, not a new register, handle the anti-dependence on R1. The exam's dependence table asks for these entries — for the midterm's index update (notes, p. 513), "Anti-dependence with I1 for R1" and "Anti-dependence with I5 for R1".</p>
+  </aside>
+
+  <aside class="redpen" data-page="287">
+    <p class="claim">"Original loop: 1 useful instruction per cycle."</p>
+    <p class="fix">The original loop issues 5 instructions in 10 cycles: 0.5 per cycle, as page 285 itself says (IPC = 0.5). One per cycle is the ceiling of a single-issue pipeline, reached only by the fully scheduled unrolled body (14 in 14). "Up to 4 useful instructions per cycle" needs a machine that issues four.</p>
+    <p class="because">Count the second column of the cycle table: 5 cycles with an instruction, 5 without.</p>
+  </aside>
+
+  <p>On a 3-issue VLIW the regrouped body pays off more: the four copies are independent of one another, so loads, adds and stores of different copies share bundles — 13 cycles for four elements against 10 for one (section 4). The price is the one lesson 15 named: eight FP registers instead of two, fourteen instructions instead of five (a bigger instruction-cache footprint), and a remainder loop when the trip count is not a multiple of 4.</p>
+
+  <p class="memo"><mark class="key">Unrolling buys independent operations; renaming is what lets the scheduler use them; registers and code size pay for both.</mark></p>
+</section>
+
+<section id="l21-swp">
+  <h2>Software pipelining: one body, three elements in flight</h2>
+
+  <p>Unrolling makes the body bigger so that the scheduler finds independent work inside it. <mark class="key">Software pipelining</mark> finds independent work without making anything bigger: it takes it from other iterations. Picture three people washing up. In every minute the stacker puts away plate i while the dryer dries plate i + 1 and the washer starts plate i + 2: three plates in progress, one leaving every minute. In the loop, LD washes, FADD dries, SD stacks — and the minute is one pass of the loop body, however many cycles that pass takes.</p>
+
+  <div class="def">
+    <p><dfn>Software pipelining</dfn> — reorganising a loop so that each execution of its body holds stages of several consecutive iterations. In Monica Lam's words (1988), "iterations of a loop in the source program are continuously initiated at constant intervals, before the preceding iterations complete". Hennessy and Patterson call it symbolic loop unrolling.</p>
+  </div>
+
+  <p>From here on the loop walks upwards, as the papers' loops do — <span class="nw"><code>ADDUI R1, R1, 8</code></span> instead of <code>SUBI</code> — and the construction takes five steps.</p>
+
+  <ol class="steps" id="l21-steps-swp">
+    <li><p>Unroll symbolically. Write iterations i, i + 1 and i + 2 under each other, each one step later than the one above: LD, FADD, SD of iteration i in steps 1–3, of i + 1 in steps 2–4, of i + 2 in steps 3–5.</p></li>
+    <li><p>Look at step 3. It holds the SD of iteration i, the FADD of i + 1 and the LD of i + 2 — one instruction from each, and none waits for another, because each consumes what an earlier step produced. That column becomes the loop body.</p></li>
+    <li><p>Write the body in that order, SD first. Each instruction must read its register before the next one overwrites it: SD reads the F4 that FADD is about to replace, FADD reads the F0 that LD is about to replace. Both are WAR dependences, and on the papers' VLIW a writer may share the cycle of its reader. No register was added: F0 and F4 serve three elements in turn.</p></li>
+    <li><p>Fix the offsets. R1 moves by 8 once per body. The SD works on the element R1 points at, 0(R1); the LD works two elements ahead:</p> \[ \text{LD offset} = 2 \times 8 = 16 . \]</li>
+    <li><p>Fill and drain. Before the first body, elements 0 and 1 must already be under way: LD x[0], FADD x[0], LD x[1] — the prologue. After the last body, elements n − 2 and n − 1 still owe their last stages: SD x[n−2], FADD x[n−1], SD x[n−1] — the epilogue. The body itself runs n − 2 times, so the exit test compares R1 with R5, the address of x[n−2].</p></li>
+  </ol>
+
+<pre><code>START_UP:
+  LD    F0, 0(R1)       ; x[0]
+  FADD  F4, F0, F2      ; x[0]
+  LD    F0, 8(R1)       ; x[1]
+SP_LOOP:
+  SD    F4, 0(R1)       ; x[i]
+  FADD  F4, F0, F2      ; x[i+1]
+  LD    F0, 16(R1)      ; x[i+2]
+  ADDUI R1, R1, 8
+  BNE   R1, R5, SP_LOOP
+FINISH_UP:
+  SD    F4, 0(R1)       ; x[n-2]
+  FADD  F4, F0, F2      ; x[n-1]
+  SD    F4, 8(R1)       ; x[n-1]</code></pre>
+
+  <figure class="fig fig--plain" id="l21-fig-stair">
+    <svg class="dia" viewBox="0 0 560 456" role="img" aria-label="Pipeline diagram of a software-pipelined loop over five elements: rows are the elements x[0] to x[4], columns are seven steps of the program; each element is loaded, added and stored in three consecutive steps; steps 1 and 2 are the prologue, steps 3 to 5 the loop body, steps 6 and 7 the epilogue; the highlighted step 4 holds the SD of x[1], the FADD of x[2] and the LD of x[3]">
+      <rect x="280" y="30" width="68" height="388" class="fw-key st-none"/>
+      <path d="M80,30 V24 H208 V30" class="st-muted"/>
+      <text x="144" y="17" class="tx-sm tx-mid">prologue</text>
+      <path d="M216,30 V24 H412 V30" class="st-muted"/>
+      <text x="314" y="17" class="tx-sm tx-mid">loop body × 3</text>
+      <path d="M420,30 V24 H548 V30" class="st-muted"/>
+      <text x="484" y="17" class="tx-sm tx-mid">epilogue</text>
+      <text x="110" y="45" class="tx-sm tx-mid tx-muted">1</text>
+      <text x="178" y="45" class="tx-sm tx-mid tx-muted">2</text>
+      <text x="246" y="45" class="tx-sm tx-mid tx-muted">3</text>
+      <text x="314" y="45" class="tx-sm tx-mid tx-muted">4</text>
+      <text x="382" y="45" class="tx-sm tx-mid tx-muted">5</text>
+      <text x="450" y="45" class="tx-sm tx-mid tx-muted">6</text>
+      <text x="518" y="45" class="tx-sm tx-mid tx-muted">7</text>
+      <text x="64" y="95" class="tx-mono tx-sm tx-end">x[0]</text>
+      <rect x="80" y="59" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="110" y="74" class="tx-mono tx-sm tx-mid">LD</text>
+      <rect x="148" y="81" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="178" y="96" class="tx-mono tx-sm tx-mid">FADD</text>
+      <rect x="216" y="103" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="246" y="118" class="tx-mono tx-sm tx-mid">SD</text>
+      <line x1="8" y1="127" x2="552" y2="127" class="st-grid sw-1"/>
+      <text x="64" y="167" class="tx-mono tx-sm tx-end">x[1]</text>
+      <rect x="148" y="131" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="178" y="146" class="tx-mono tx-sm tx-mid">LD</text>
+      <rect x="216" y="153" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="246" y="168" class="tx-mono tx-sm tx-mid">FADD</text>
+      <rect x="284" y="175" width="60" height="20" rx="3" class="fw-s1 st-s1"/>
+      <text x="314" y="190" class="tx-mono tx-sm tx-mid">SD</text>
+      <line x1="8" y1="199" x2="552" y2="199" class="st-grid sw-1"/>
+      <text x="64" y="239" class="tx-mono tx-sm tx-end">x[2]</text>
+      <rect x="216" y="203" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="246" y="218" class="tx-mono tx-sm tx-mid">LD</text>
+      <rect x="284" y="225" width="60" height="20" rx="3" class="fw-s1 st-s1"/>
+      <text x="314" y="240" class="tx-mono tx-sm tx-mid">FADD</text>
+      <rect x="352" y="247" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="382" y="262" class="tx-mono tx-sm tx-mid">SD</text>
+      <line x1="8" y1="271" x2="552" y2="271" class="st-grid sw-1"/>
+      <text x="64" y="311" class="tx-mono tx-sm tx-end">x[3]</text>
+      <rect x="284" y="275" width="60" height="20" rx="3" class="fw-s1 st-s1"/>
+      <text x="314" y="290" class="tx-mono tx-sm tx-mid">LD</text>
+      <rect x="352" y="297" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="382" y="312" class="tx-mono tx-sm tx-mid">FADD</text>
+      <rect x="420" y="319" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="450" y="334" class="tx-mono tx-sm tx-mid">SD</text>
+      <line x1="8" y1="343" x2="552" y2="343" class="st-grid sw-1"/>
+      <text x="64" y="383" class="tx-mono tx-sm tx-end">x[4]</text>
+      <rect x="352" y="347" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="382" y="362" class="tx-mono tx-sm tx-mid">LD</text>
+      <rect x="420" y="369" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="450" y="384" class="tx-mono tx-sm tx-mid">FADD</text>
+      <rect x="488" y="391" width="60" height="20" rx="3" class="fi-paper"/>
+      <text x="518" y="406" class="tx-mono tx-sm tx-mid">SD</text>
+      <text x="314" y="446" class="tx-hand tx-mid">one element in, one element out</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The software-pipelined loop over five elements drawn like a pipeline diagram: rows are elements, columns are steps of the program. Each element is loaded, added and stored in three consecutive steps. The highlighted column is one execution of the body — the SD of x[1], the FADD of x[2], the LD of x[3]. Left of the body the prologue fills the line, right of it the epilogue drains it.</figcaption>
+  </figure>
+
+  <figure class="tbl-fig" id="l21-tbl-track">
+    <figcaption>Which iteration each instruction of the body works on. The midterm solution in the notes (p. 508) writes the same table with every index one lower: load i + 1, compute i, store i − 1.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Body instruction</th><th>Works on</th><th>Address</th></tr></thead>
+        <tbody>
+          <tr><td>SD F4, 0(R1)</td><td>x[i], computed in the previous pass</td><td>R1</td></tr>
+          <tr><td>FADD F4, F0, F2</td><td>x[i+1], loaded in the previous pass</td><td>— (registers only)</td></tr>
+          <tr><td>LD F0, 16(R1)</td><td>x[i+2]</td><td>R1 + 2 × 8</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>How fast is it? Every execution of the body finishes one element — the SD at its top stores a completed result. The cycles between the starts of two consecutive bodies are the <mark class="key">initiation interval</mark>, <abbr title="initiation interval">II</abbr>, simply the length of the body's schedule: 5 cycles on the papers' VLIW (section 4), so one element every 5 cycles against 10 for the original loop. Each element now spends three passes between its load and its store, longer than before: only the rate improved, not the time of one element.</p>
+
+  <div class="formula">
+    \[ \begin{aligned} T(n) &amp;= T_{\text{pro}} + (n - 2)\,II + T_{\text{epi}} \\ &amp;\approx n \cdot II \quad \text{for large } n \end{aligned} \]
+    <dl class="legend">
+      <dt>\(II\)</dt><dd>initiation interval: cycles of one execution of the body</dd>
+      <dt>\(n - 2\)</dt><dd>executions of a three-stage body; with S stages, \(n - S + 1\)</dd>
+      <dt>\(T_{\text{pro}},\ T_{\text{epi}}\)</dt><dd>cycles of the prologue and epilogue, paid once per loop</dd>
+    </dl>
+  </div>
+
+  <aside class="redpen" data-page="289">
+    <p class="claim">"the processor starts a new iteration every cycle"</p>
+    <p class="fix">A new iteration starts — and one completes — once per execution of the loop body, every II cycles: 5 for LOOP2 on the papers' VLIW, 8 for the midterm's SP_LOOP. One iteration per cycle would need a machine wide enough to issue the whole body, branch included, in a single bundle.</p>
+    <p class="because">The claim returns four more times: "every cycle completes one iteration" and Table 24's "1 iteration per cycle" (p. 289), "one full result per cycle" (p. 290), "1 result per cycle" (p. 291). In the widget below the readout "one element finishes every" never drops below 5 cycles; in an exam answer, "one iteration per cycle" contradicts the CPI you compute.</p>
+  </aside>
+
+  <aside class="redpen" data-page="290">
+    <p class="claim">"LD F0, 0(R1) # I0 · ADD F4, F0, F2 # I1 from previous iteration · SD F4, -8(R1) # I2 from 2 iterations ago"</p>
+    <p class="fix">In this order the three lines are one iteration, not three: the ADD reads the F0 just loaded, the SD stores the F4 just computed, so every latency stays inside the body — and the −8 makes the SD write x[i] + s into x[i − 1]. The body must list the stages in reverse order, SD, FADD, LD, as both official software-pipelined loops do.</p>
+    <p class="because">Follow F0: written by the LD, read by the ADD on the next line — the same element. The "corrected" loop of p. 291 loads ahead into F6 and copies it back with a MOV after the BNE, which runs on every pass only thanks to the delay slot. It is a two-stage pipeline (S = 2 in the widget below): its ADD → SD latency stays inside the body, and the SD that its table assigns to "i − 1" stores iteration i. The reversed body needs neither F6 nor the MOV.</p>
+  </aside>
+
+  <div class="widget" id="l21-w-conveyor">
+    <h3 class="widget-title">The software-pipelining conveyor</h3>
+    <p class="widget-intro">Rows are elements x[0] … x[4], columns are steps of the program, as in Fig. 1. The slider spreads the three stages of every element over S consecutive steps: S = 1 is the original loop, S = 3 the three-stage loop above. Below the drawing, the code that S produces and the schedule of one pass of its body on the papers' 3-issue VLIW (Memory 3, FP 3, Integer 1 or 2 to a branch, one delay slot). The insight to take away: one element completes per execution of the body, so the cycles per element are the body's schedule length — and the body keeps its size and its registers.</p>
+    <ol class="tasks">
+      <li>Choose the June 2026 loop with S = 1: this is LOOP1, 10 cycles per element. Before you move the slider, predict the schedule length at S = 3, and whether the code needs more FP registers.
+        <details class="answer"><summary>What you should see</summary>
+          <p>5 cycles: the body is the paper's LOOP2. The registers are still F2 and F6; only the static code grows, from 5 to 11 instructions (3 in the prologue, 3 in the epilogue). One element still finishes per execution of the body, now every 5 cycles instead of every 10: CPI 2.00 → 1.00.</p></details>
+      </li>
+      <li>Stay at S = 3 and walk the steps with the buttons. In which steps is x[2] loaded, added and stored? How many elements are in flight during a body step, and how many in the first step?
+        <details class="answer"><summary>What you should see</summary>
+          <p>x[2] is loaded in step 3, added in step 4, stored in step 5. Every body step works on three elements at once (x[i], x[i+1], x[i+2]); the first step of the prologue on one. That is the line filling up — and the epilogue is the line emptying.</p></details>
+      </li>
+      <li>Set S = 2: the load runs one pass ahead, and FADD and SD stay together. Is the schedule halfway between 10 and 5?
+        <details class="answer"><summary>What you should see</summary>
+          <p>7 cycles. The LD → FADD latency has left the body, but FADD → SD (3 cycles) is still inside it. This two-stage loop is what the notes build on p. 291, with an extra register and a MOV that the reversed body does not need.</p></details>
+      </li>
+      <li>Choose the midterm 2025 loop. At S = 3 it is the exam's SP_LOOP: 8 cycles, CPI 0.80, efficiency 41.7 %. No true dependence links its LD, FADD and SD any more — so what limits it? Compare with S = 1.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The single memory unit (four memory operations need C1–C4) and the integer tail ADDUI → ADD → BNE (1 + 2 cycles) plus the delay slot. At S = 1 — the original loop — it takes 12 cycles, CPI 1.20: software pipelining gives a speed-up of 1.5 in CPI with the same ten instructions in the body.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l21-w-conveyor', function (root, ui) {
+    var N = 5, CW = 68, X0 = 76, Y0 = 58, BH = 72, SH = 22;
+    var STAGE = ['LD', 'FADD', 'SD'];
+    var ORDER = { 1: [0, 1, 2], 2: [1, 2, 0], 3: [2, 1, 0] };          // the order of the stages in the body
+    var PRE = {
+      xs:  { stride: 8, lab: ['LOOP', 'SP_LOOP'], bound: 'R2', regs: 'F0, F4 (and F2 = s)',
+             streams: [{ ld: 'F0', base: 'R1', res: 'F4', a: 'F0', b: 'F2' }],
+             control: ['ADDUI R1, R1, 8', 'BNE R1, R2, @'] },
+      j26: { stride: 4, lab: ['LOOP1', 'LOOP2'], bound: 'R3', regs: 'F2, F6',
+             streams: [{ ld: 'F2', base: 'R1', res: 'F6', a: 'F2', b: 'F2' }],
+             control: ['ADDUI R1, R1, 4', 'BNE R1, R3, @'] },
+      mid: { stride: 8, lab: ['LOOP', 'SP_LOOP'], bound: 'R4', regs: 'F0, F2, F4, F6',
+             streams: [{ ld: 'F0', base: 'R1', res: 'F4', a: 'F0', b: 'F0' }, { ld: 'F2', base: 'R2', res: 'F6', a: 'F2', b: 'F2' }],
+             control: ['ADDUI R1, R1, 8', 'ADDUI R2, R2, 8', 'ADD R3, R2, R1', 'BNE R3, R4, @'] }
+    };
+    function colOf(S, s) { return S === 1 ? 0 : S === 2 ? (s === 0 ? 0 : 1) : s; }
+
+    /* ---- the code that S produces ---- */
+    function gen(p, S) {
+      var d = p.stride, pro = [], body = [], epi = [], lab = S === 1 ? p.lab[0] : S === 3 ? p.lab[1] : 'SP_LOOP';   // LOOP2 is the paper's three-stage loop only
+      function each(f) { p.streams.forEach(f); }
+      function LD(s, off) { return 'LD ' + s.ld + ', ' + off + '(' + s.base + ')'; }
+      function OP(s) { return 'FADD ' + s.res + ', ' + s.a + ', ' + s.b; }
+      function SD(s, off) { return 'SD ' + s.res + ', ' + off + '(' + s.base + ')'; }
+      if (S === 1) {
+        each(function (s) { body.push([LD(s, 0), 'x[i]']); });
+        each(function (s) { body.push([OP(s), 'x[i]']); });
+        each(function (s) { body.push([SD(s, 0), 'x[i]']); });
+      } else if (S === 2) {
+        each(function (s) { pro.push([LD(s, 0), 'x[0]']); });
+        each(function (s) { body.push([OP(s), 'x[i]']); });
+        each(function (s) { body.push([SD(s, 0), 'x[i]']); });
+        each(function (s) { body.push([LD(s, d), 'x[i+1]']); });
+        each(function (s) { epi.push([OP(s), 'x[n-1]']); });
+        each(function (s) { epi.push([SD(s, 0), 'x[n-1]']); });
+      } else {
+        each(function (s) { pro.push([LD(s, 0), 'x[0]']); });
+        each(function (s) { pro.push([OP(s), 'x[0]']); });
+        each(function (s) { pro.push([LD(s, d), 'x[1]']); });
+        each(function (s) { body.push([SD(s, 0), 'x[i]']); });
+        each(function (s) { body.push([OP(s), 'x[i+1]']); });
+        each(function (s) { body.push([LD(s, 2 * d), 'x[i+2]']); });
+        each(function (s) { epi.push([SD(s, 0), 'x[n-2]']); });
+        each(function (s) { epi.push([OP(s), 'x[n-1]']); });
+        each(function (s) { epi.push([SD(s, d), 'x[n-1]']); });
+      }
+      p.control.forEach(function (c) { body.push([c.replace('@', lab), '']); });
+      return { pro: pro, body: body, epi: epi, lab: lab };
+    }
+    function pad(s, n) { s = String(s); while (s.length < n) s += ' '; return s; }
+    function line(ins, cmt) {
+      var m = /^(\S+)\s+(.*)$/.exec(ins), txt = '  ' + pad(m[1], 6) + m[2];
+      return cmt ? pad(txt, 22) + '; ' + cmt : txt;
+    }
+    function listing(g) {
+      var out = [];
+      function block(label, lines) {
+        if (!lines.length) return;
+        out.push(label + ':');
+        lines.forEach(function (l) { out.push(line(l[0], l[1])); });
+      }
+      block('START_UP', g.pro); block(g.lab, g.body); block('FINISH_UP', g.epi);
+      return out.join('\n');
+    }
+    function exitText(p, S) {
+      var runs = S === 1 ? 'n times' : S === 2 ? 'n − 1 times' : 'n − 2 times';
+      var last = S === 1 ? 'x[n]' : S === 2 ? 'x[n−1]' : 'x[n−2]';
+      return 'The body runs ' + runs + '; ' + (p.bound === 'R4'
+        ? 'R4 holds the value of R1 + R2 after the last pass, when R1 points at ' + last + '.'
+        : p.bound + ' holds the address of ' + last + ', where R1 stops.');
+    }
+
+    /* ---- list scheduling of one pass on the papers' 3-issue VLIW ---- */
+    function parse(t) {
+      var m = /^([A-Z]+)\s+(.*)$/.exec(t), op = m[1], a = m[2].split(',').map(function (x) { return x.trim(); });
+      var x = { op: op, text: t, dst: null, srcs: [] };
+      function base(s) { return /\((R\d+)\)/.exec(s)[1]; }
+      if (op === 'LD') { x.unit = 'M'; x.dst = a[0]; x.srcs = [base(a[1])]; }
+      else if (op === 'SD') { x.unit = 'M'; x.srcs = [a[0], base(a[1])]; }
+      else if (op === 'FADD') { x.unit = 'F'; x.dst = a[0]; x.srcs = [a[1], a[2]]; }
+      else if (op === 'ADDUI') { x.unit = 'I'; x.dst = a[0]; x.srcs = [a[1]]; }
+      else if (op === 'ADD') { x.unit = 'I'; x.dst = a[0]; x.srcs = [a[1], a[2]]; }
+      else { x.unit = 'I'; x.branch = true; x.srcs = [a[0], a[1]]; }
+      return x;
+    }
+    function lat(p, c) { return p.unit === 'I' ? (c.branch ? 2 : 1) : 3; }
+    function schedule(texts) {
+      var ins = texts.map(parse), n = ins.length, E = [], j, i, k;
+      for (j = 0; j < n; j++) {
+        ins[j].srcs.forEach(function (r) {                         // RAW: the nearest earlier writer
+          for (var q = j - 1; q >= 0; q--) if (ins[q].dst === r) { E.push([q, j, lat(ins[q], ins[j])]); break; }
+        });
+        if (ins[j].dst) for (i = j - 1; i >= 0; i--) {
+          if (ins[i].srcs.indexOf(ins[j].dst) >= 0) E.push([i, j, 0]);   // WAR: the same cycle is allowed
+          if (ins[i].dst === ins[j].dst) E.push([i, j, 1]);             // WAW (none in these loops)
+        }
+        if (ins[j].branch) for (i = 0; i < j; i++) E.push([i, j, 0]);    // the branch closes the iteration
+      }
+      var pr = [];
+      for (j = n - 1; j >= 0; j--) {
+        var best0 = ins[j].branch ? 2 : 0;
+        for (k = 0; k < E.length; k++) if (E[k][0] === j) best0 = Math.max(best0, E[k][2] + pr[E[k][1]]);
+        pr[j] = best0;
+      }
+      var cyc = [], done = 0, c = 1;
+      while (done < n && c < 40) {
+        var use = { M: 0, F: 0, I: 0 };
+        for (;;) {
+          var best = -1;
+          for (j = 0; j < n; j++) {
+            if (cyc[j] || use[ins[j].unit] >= 1) continue;
+            var ok = true;
+            for (k = 0; k < E.length && ok; k++) if (E[k][1] === j && !(cyc[E[k][0]] && cyc[E[k][0]] + E[k][2] <= c)) ok = false;
+            if (ok && (best < 0 || pr[j] > pr[best])) best = j;
+          }
+          if (best < 0) break;
+          cyc[best] = c; use[ins[best].unit]++; done++;
+        }
+        c++;
+      }
+      var bc = 1;
+      ins.forEach(function (x, q) { if (x.branch) bc = cyc[q] || bc; });
+      var rows = [];
+      for (c = 1; c <= bc + 1; c++) {
+        var r = { c: c, M: [], F: [], I: [] };
+        ins.forEach(function (x, q) { if (cyc[q] === c) r[x.unit].push(x.text); });
+        if (c === bc + 1) r.M.push('(delay slot)');
+        rows.push(r);
+      }
+      return { cycles: bc + 1, rows: rows, fp: ins.filter(function (x) { return x.unit === 'F'; }).length };
+    }
+
+    /* ---- controls and outputs ---- */
+    var which = ui.select('loop', [
+      { value: 'j26', label: 'June 2026 paper: LOOP1, stride 4' },
+      { value: 'xs', label: 'the notes: x[i] = x[i] + s, stride 8' },
+      { value: 'mid', label: 'midterm 2025: two arrays, stride 8' }], null, 'j26');
+    var S = ui.slider({ label: 'stages per element S', min: 1, max: 3, step: 1, value: 1,
+      format: function (v) { return v === 1 ? '1 · not pipelined' : v === 2 ? '2 · load one pass ahead' : '3 · load two passes ahead'; } });
+    var step = 0;
+    function K() { return N + Math.round(S.value) - 1; }
+    ui.button('Step back', function () { step = (step - 1 + K()) % K(); }, { kind: 'ghost', icon: 'back' });
+    ui.button('Next step', function () { step = (step + 1) % K(); }, { kind: 'primary', icon: 'next' });
+    var roII = ui.readout('one element finishes every'), roCPI = ui.readout('CPI of one pass'),
+        roEff = ui.readout('code efficiency (3-issue)'), roReg = ui.readout('FP registers'), roSize = ui.readout('static code');
+    var note = ui.note('');
+    var svgEl = ui.svg(560, 426, { label: 'Pipeline diagram of the loop: rows are the elements x[0] to x[4], columns are the steps of the program; each element passes through LD, FADD and SD spread over S consecutive steps; the highlighted column is the current step' });
+    var code = Course.el('code'), tblWrap = Course.el('div', { 'class': 'scroll-x' });
+    var cap = Course.el('p', { 'class': 'l21-cap', text: '' }), bnd = Course.el('p', { 'class': 'l21-cap', text: '' });
+    ui.stage.appendChild(Course.el('div', { 'class': 'l21-out' }, [Course.el('pre', null, [code]), bnd, cap, tblWrap]));
+    ui.legend([{ label: 'the step shown', color: 'key', mark: 'area' }, { label: 'stages running in that step', color: 's1', mark: 'square' }]);
+
+    function draw(Sv, Kv) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var c, e, s, y;
+      Course.svg('rect', { x: X0 + step * CW, y: 30, width: CW, height: Y0 + N * BH - 30, 'class': 'fw-key st-none' }, svgEl);
+      var phases = Sv === 1 ? [['loop body × ' + N, 0, Kv - 1]] :
+        [['prologue', 0, Sv - 2], ['loop body × ' + (N - Sv + 1), Sv - 1, N - 1], ['epilogue', N, Kv - 1]];
+      phases.forEach(function (ph) {
+        var xa = X0 + ph[1] * CW + 4, xb = X0 + (ph[2] + 1) * CW - 4;
+        Course.svg('path', { d: 'M' + xa + ',30 V24 H' + xb + ' V30', 'class': 'st-muted' }, svgEl);
+        Course.svg('text', { x: (xa + xb) / 2, y: 17, 'class': 'tx-sm tx-mid', text: ph[0] }, svgEl);
+      });
+      for (c = 0; c < Kv; c++) Course.svg('text', { x: X0 + c * CW + CW / 2, y: 45, 'class': 'tx-sm tx-mid tx-muted', text: String(c + 1) }, svgEl);
+      for (e = 0; e < N; e++) {
+        y = Y0 + e * BH;
+        if (e > 0) Course.svg('line', { x1: 8, y1: y - 3, x2: 552, y2: y - 3, 'class': 'st-grid sw-1' }, svgEl);
+        Course.svg('text', { x: 64, y: y + 37, 'class': 'tx-mono tx-sm tx-end', text: 'x[' + e + ']' }, svgEl);
+        for (s = 0; s < 3; s++) {
+          c = e + colOf(Sv, s);
+          Course.svg('rect', { x: X0 + c * CW + 4, y: y + 1 + s * SH, width: CW - 8, height: SH - 2, rx: 3, 'class': c === step ? 'fw-s1 st-s1' : 'fi-paper' }, svgEl);
+          Course.svg('text', { x: X0 + c * CW + CW / 2, y: y + 16 + s * SH, 'class': 'tx-mono tx-sm tx-mid', text: STAGE[s] }, svgEl);
+        }
+      }
+    }
+    function buildTable(rows) {
+      var th = function (t) { return Course.el('th', { text: t }); }, td = function (t) { return Course.el('td', { text: t }); };
+      var tb = Course.el('tbody');
+      rows.forEach(function (r) { tb.appendChild(Course.el('tr', null, [th('C' + r.c), td(r.M.join('; ')), td(r.F.join('; ')), td(r.I.join('; '))])); });
+      var t = Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, [Course.el('tr', null, [th(''), th('Memory Unit'), th('Floating Point Unit'), th('Integer Unit')])]), tb]);
+      tblWrap.textContent = '';
+      tblWrap.appendChild(t);
+    }
+    function describe(Sv, Kv, key) {
+      var items = [], e, q, s;
+      for (q = 0; q < 3; q++) { s = ORDER[Sv][q]; for (e = 0; e < N; e++) if (e + colOf(Sv, s) === step) items.push(STAGE[s] + ' of x[' + e + ']'); }
+      var txt;
+      if (Sv === 1) txt = 'Step ' + (step + 1) + ' of ' + Kv + ' (loop body, pass ' + (step + 1) + ' of ' + N + '): LD, FADD and SD all work on x[' + step + '].';
+      else {
+        var phase = step < Sv - 1 ? 'prologue' : step <= N - 1 ? 'loop body, pass ' + (step - Sv + 2) + ' of ' + (N - Sv + 1) : 'epilogue';
+        txt = 'Step ' + (step + 1) + ' of ' + Kv + ' (' + phase + '): ' + items.join(', ') + '.';
+      }
+      if (key === 'j26' && Sv === 3) txt += ' This body is the paper’s LOOP2, which the paper prints with R2 and LD F2, 0(R2); a loop that computes LOOP1’s result loads two elements ahead, 8(R1). Same schedule.';
+      if (key === 'mid' && Sv === 3) txt += ' This is the midterm’s SP_LOOP; each row stands for element e of both arrays.';
+      return txt;
+    }
+
+    ui.onChange(function () {
+      var key = which.value, p = PRE[key], Sv = Math.round(S.value), Kv = K();
+      if (step > Kv - 1) step = Kv - 1;
+      if (step < 0) step = 0;
+      var g = gen(p, Sv), sch = schedule(g.body.map(function (l) { return l[0]; })), ic = g.body.length;
+      draw(Sv, Kv);
+      code.textContent = listing(g);
+      bnd.textContent = exitText(p, Sv);
+      cap.textContent ='One pass of ' + g.lab + ' on the papers’ 3-issue VLIW (list scheduling, delay slot counted):';
+      buildTable(sch.rows);
+      roII.set(sch.cycles + ' cycles');
+      roCPI.set((sch.cycles / ic).toFixed(2));
+      roEff.set((100 * ic / (3 * sch.cycles)).toFixed(1) + ' %');
+      roReg.set(p.regs);
+      var tot = g.pro.length + ic + g.epi.length;
+      roSize.set(Sv === 1 ? ic + ' instructions (the body)' : tot + ' instructions (' + g.pro.length + ' + ' + ic + ' + ' + g.epi.length + ')');
+      note.set(describe(Sv, Kv, key));
+    });
+  });
+  </script>
+
+  <h3>Unrolling or software pipelining?</h3>
+
+  <aside class="margin-note">The notes' Table 24 (p. 289) rates the register pressure of software pipelining "very high". This loop needs the same two registers as the original; extra ones are needed only when a value must live longer than one pass.</aside>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Unrolling by u">
+      <p>The body grows with u: 14 instructions instead of 5 for u = 4.</p>
+      <p>Removes the loop control of u − 1 iterations: one SUBI and one BNE per four elements.</p>
+      <p>Needs (u − 1)·ρ more registers: F6 … F16.</p>
+      <p>The overlap starts and stops inside every unrolled body; a remainder loop is needed when the trip count is not a multiple of u.</p>
+    </div>
+    <div class="compare-col" data-label="Software pipelining">
+      <p>The body keeps its size, five instructions, plus a prologue and an epilogue once per loop.</p>
+      <p>Removes the waiting inside an iteration, not the loop control: one ADDUI and one BNE per element.</p>
+      <p>Same registers, unless a value must outlive one pass.</p>
+      <p>The overlap ramps up and down once per loop; the loop must have at least as many elements as stages.</p>
+    </div>
+  </div>
+
+  <p>Hennessy and Patterson put it in one line: the two techniques remove different overheads — unrolling the loop-control instructions, software pipelining the time spent below full speed, which an unrolled loop pays at both ends of every unrolled body and a pipelined loop only once. Compilers often do both: unroll a little, then pipeline the unrolled body.</p>
+</section>
+
+<section id="l21-global">
+  <h2>Betting on the hot path: traces, superblocks, predication</h2>
+
+  <p>Loops are the easy case: their body repeats, so the next iteration is always there to borrow from. Ordinary code is cut into short basic blocks — "only around 4 to 7 instructions are found between branches", the notes say (p. 273) — and a block that short, with its own dependences inside, cannot keep a 3-issue VLIW busy. <mark class="key">Global scheduling</mark> moves instructions across the branches. Profiling finds the path the program takes most often; the compiler schedules that path as if the branches were not there and pays only when the bet fails.</p>
+
+  <p><mark class="key">Trace scheduling</mark> (Fisher, 1981) does it in two steps. <em>Trace selection</em> picks the most likely sequence of basic blocks, the trace. <em>Trace compaction</em> then list-schedules the whole trace as if it were one block, moving instructions up and down across the branches inside it — loads first of all, to start their long latency early.</p>
+
+  <aside class="margin-note">The notes (p. 292) let a trace include "backward branches" and call it a "super-block". A trace stops at a loop's back edge (loops are unrolled first to get long traces), and a superblock is the single-entry region below.</aside>
+
+  <p>Moving an instruction across a branch makes it run where the original program did not run it, or stop running where it did. Three moves recur, and the sandbox below shows each on a four-block loop:</p>
+  <ul>
+    <li><b>Up above a branch</b> — speculation. The instruction now runs on the off-trace path too: allowed without repair only if its result is dead there and it does no harm — no store, no exception the original program would not raise.</li>
+    <li><b>Down below a branch</b>, into the on-trace block. The off-trace path no longer executes it, so a copy must go on the exit path: <mark class="key">compensation code</mark>.</li>
+    <li><b>Up above a join</b>, where an off-trace block enters the trace from the side. The entering path would skip the instruction, so a copy goes on that path.</li>
+  </ul>
+
+  <aside class="redpen" data-page="293">
+    <p class="claim">"Compiler speculatively moves A = B + C above the if. Then in the else block, it inserts: A = D + E; // compensation code"</p>
+    <p class="fix">Nothing was inserted: <span class="nw"><code>A = D + E</code></span> is the original else-branch, still executing as it always did. Hoisting <span class="nw"><code>A = B + C</code></span> is a speculation that needs no compensation, because the else-path overwrites A before anyone reads it. Compensation code is extra code on an off-trace path that repairs a move — typically the copies of the list above.</p>
+    <p class="because">Run the else-path of the hoisted code: A = B + C, then A = D + E — the same A as before, without any added line. Example 7 (p. 295) repeats the label. In an open question, explain compensation code as the repair of a move, which this example never needs.</p>
+  </aside>
+
+  <p>Side entrances make trace scheduling expensive: every move above one costs a copy on every entering path. A <mark class="key">superblock</mark> (Hwu et al., 1993) is a trace with a single entry and any number of exits, obtained by <mark class="key">tail duplication</mark>: the part of the trace below a side entrance is copied, and the off-trace path jumps to the copy. Repairs are then needed only at the exits, outside the superblock; the price is the duplicated tail.</p>
+
+  <div class="widget" id="l21-w-trace">
+    <h3 class="widget-title">Speculation sandbox: where the repair goes</h3>
+    <p class="widget-intro">A loop body with an if inside, in the papers' mnemonics. B1 loads two elements and branches on a condition held in R4 (where R4 comes from does not matter here); B2 adds them (90 % of the passes, the hot path); B3 squares the first (10 %); B4 advances the pointers and closes the loop. The thick blue path is the trace B1 → B2 → B4. Pick what the compiler does: the code is redrawn with the moved instruction on a highlighter stroke and every repair the move needs. Every variant was checked to compute the same results as the original on both paths. Unconditional jumps between the blocks are left out of the counts. The insight: every way of betting on the hot path pays somewhere — in copies, in a duplicated tail, or in issue slots.</p>
+    <ol class="tasks">
+      <li>Choose "hoist FADD above the branch". Predict before looking: does the cold path B3 need a repair?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. On the cold path the FMUL overwrites F4 before anyone reads it, and an add writes no memory, so the hoisted FADD is harmless: no copy, still 11 instructions. The cold path now issues 10 instead of 9 — one wasted add. This is the notes' Example 6, which needed no compensation code either.</p></details>
+      </li>
+      <li>Now "sink LD F0 below the branch", then "hoist ADDUI R3 above the join". Where does the copy go in each case, and why on that side?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Sinking LD F0 into B2 leaves B3 without the F0 it multiplies: a copy goes into B3, on the exit path. Hoisting ADDUI R3 from B4 into B2 means the path B3 → B4 would skip it: a copy goes at the end of B3, on the entering path. Each costs one instruction: 12 in total.</p></details>
+      </li>
+      <li>Choose "superblock". How many compensation copies, how many instructions?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No copy: B3 now continues into its own copy B4′, which still holds ADDUI R3, so the hot region B1 → B2 → B4 has a single entry. But 15 instructions instead of 12: the duplicated tail costs four to save one repair here — and it saves one repair for every move above the join.</p></details>
+      </li>
+      <li>Choose "if-convert". How many branches are left inside the loop body, and how many instructions run on the hot path?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only the loop branch: the if has become a compare that sets P1 and P2. Ten instructions run on every pass, hot or cold — one more than the branchy hot path, because the FADD and the FMUL are both issued and one of them is thrown away. The cost has moved from code size to issue slots; the next widget shows when that pays.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l21-w-trace', function (root, ui) {
+    function L(t, k) { return { t: t, k: k || '' }; }
+    var B1 = [L('LD F0, 0(R1)'), L('LD F2, 0(R2)'), L('BNE R4, R0, B3')];
+    var B2 = [L('FADD F4, F0, F2'), L('SD F4, 0(R3)')];
+    var B3 = [L('FMUL F4, F0, F0'), L('SD F4, 0(R3)')];
+    var B4 = [L('ADDUI R1, R1, 8'), L('ADDUI R2, R2, 8'), L('ADDUI R3, R3, 8'), L('BNE R1, R5, B1')];
+    var ST = {
+      orig:  { b1: B1, b2: B2, b3: B3, b4: B4, size: 11, comp: 0, side: '1 (B3 into B4)', iss: '9 / 9',
+               note: 'Four basic blocks. The trace is B1 → B2 → B4; B3 enters it from the side at B4.' },
+      hoist: { b1: [B1[0], B1[1], L('FADD F4, F0, F2', 'moved'), B1[2]], b2: [B2[1]], b3: B3, b4: B4, size: 11, comp: 0, side: '1 (B3 into B4)', iss: '9 / 10',
+               note: 'FADD now runs before the branch on every pass. On the cold path FMUL overwrites F4 before anyone reads it, and an add writes no memory: a safe speculation, no repair.' },
+      sink:  { b1: [B1[1], B1[2]], b2: [L('LD F0, 0(R1)', 'moved'), B2[0], B2[1]], b3: [L('LD F0, 0(R1)', 'comp'), B3[0], B3[1]], b4: B4, size: 12, comp: 1, side: '1 (B3 into B4)', iss: '9 / 9',
+               note: 'LD F0 moved down into B2, to fill an empty slot there. B3 still multiplies F0, so a copy goes on the exit path: compensation code.' },
+      join:  { b1: B1, b2: [B2[0], B2[1], L('ADDUI R3, R3, 8', 'moved')], b3: [B3[0], B3[1], L('ADDUI R3, R3, 8', 'comp')], b4: [B4[0], B4[1], B4[3]], size: 12, comp: 1, side: '1 (B3 into B4)', iss: '9 / 9',
+               note: 'ADDUI R3 moved up from B4 into B2, above the join. The path B3 → B4 would now skip it, so a copy goes at the end of B3, on the entering path: compensation code.' },
+      sb:    { b1: B1, b2: [B2[0], B2[1], L('ADDUI R3, R3, 8', 'moved')], b3: B3, b4: [B4[0], B4[1], B4[3]], b4x: B4, size: 15, comp: 0, side: '0: a superblock', iss: '9 / 9',
+               note: 'B4 was copied into B4′ for the cold path, so B1 → B2 → B4 has one entry: a superblock. The same move needs no copy in B3, since B4′ still holds ADDUI R3 — four instructions more instead of one.' },
+      ifc:   { one: [B1[0], B1[1], L('CMPNE P1, P2, R4, R0', 'moved'), L('(P2) FADD F4, F0, F2'), L('(P1) FMUL F4, F0, F0'), L('SD F4, 0(R3)')], b4: B4, size: 10, comp: 0, side: '0: no branch left', iss: '10 / 10',
+               note: 'The branch is gone: CMPNE sets P1 = (R4 ≠ 0) and P2 = not P1, and each arm runs under its predicate. One block, no compensation, but both arms are issued on every pass. (Itanium-style notation; not in the papers.)' }
+    };
+    var what = ui.select('what the compiler does', [
+      { value: 'orig', label: 'nothing yet: four basic blocks' },
+      { value: 'hoist', label: 'hoist FADD above the branch' },
+      { value: 'sink', label: 'sink LD F0 below the branch' },
+      { value: 'join', label: 'hoist ADDUI R3 above the join' },
+      { value: 'sb', label: 'superblock: duplicate B4, then hoist ADDUI R3' },
+      { value: 'ifc', label: 'if-convert the diamond' }], null, 'orig');
+    var roSize = ui.readout('static code'), roComp = ui.readout('compensation copies', { digits: 0 }),
+        roSide = ui.readout('side entrances into the trace'), roIss = ui.readout('issued per pass, hot / cold');
+    var note = ui.note('');
+    var svgEl = ui.svg(560, 470, { label: 'Control-flow graph of a loop body with an if: block B1 branches to the hot block B2 or the cold block B3, both join at B4; the drawing changes with the chosen transformation and shows moved instructions, compensation copies, a duplicated tail or the predicated block' });
+    ui.legend([{ label: 'hot path (the trace)', color: 's1', mark: 'line' }, { label: 'moved or new instruction', color: 'ink', mark: 'hl' },
+               { label: 'compensation copy', color: 's2', mark: 'area' }, { label: 'duplicated tail', color: 's2', mark: 'dash' }]);
+
+    function block(x, y, w, title, lines, dup) {
+      var h = 20 * (lines.length + 1) + 8;
+      Course.svg('rect', { x: x, y: y, width: w, height: h, rx: 6, 'class': dup ? 'fi-paper st-s2 dash sw-2' : 'fi-paper sw-2' }, svgEl);
+      Course.svg('text', { x: x + 10, y: y + 18, 'class': 'tx-sm tx-bold', text: title }, svgEl);
+      lines.forEach(function (l, i) {
+        var base = y + 18 + 20 * (i + 1);
+        if (l.k === 'comp') Course.svg('rect', { x: x + 4, y: base - 14, width: w - 8, height: 19, rx: 3, 'class': 'fw-s2 st-s2 dash' }, svgEl);
+        if (l.k === 'moved') Course.svg('line', { x1: x + 8, y1: base - 4, x2: x + w - 8, y2: base - 4, 'class': 'hl' }, svgEl);
+        Course.svg('text', { x: x + 10, y: base, 'class': 'tx-mono tx-sm', text: l.t }, svgEl);
+      });
+      return { x: x, y: y, w: w, b: y + h };
+    }
+    function arrow(x1, y1, x2, y2, hot) {
+      Course.svg('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': hot ? 'st-s1 sw-3' : 'st-muted sw-2', 'marker-end': hot ? 'url(#arr-s1)' : 'url(#arr-muted)' }, svgEl);
+    }
+    function label(x, y, t, extra) { Course.svg('text', { x: x, y: y, 'class': 'tx-sm halo' + (extra ? ' ' + extra : ''), text: t }, svgEl); }
+
+    function draw(st) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      if (st.one) {
+        var one = block(150, 30, 260, 'B1–B3, if-converted', st.one);
+        var b4i = block(192, one.b + 50, 176, 'B4', st.b4);
+        arrow(280, one.b, 280, b4i.y - 3, true);
+        arrow(280, b4i.b, 280, b4i.b + 24, true);
+        label(292, b4i.b + 20, 'next element', 'tx-muted');
+        return;
+      }
+      var b1 = block(192, 30, 176, 'B1', st.b1);
+      var b2 = block(8, 196, 176, 'B2 · hot', st.b2);
+      var b3 = block(376, 196, 176, 'B3 · cold', st.b3);
+      var b4 = block(192, 336, 176, 'B4', st.b4);
+      arrow(236, b1.b, 120, 193, true);
+      arrow(324, b1.b, 440, 193, false);
+      label(30, 186, '90 %');
+      label(490, 186, '10 %');
+      arrow(110, b2.b, 236, 333, true);
+      if (st.b4x) {
+        var bx = block(376, 336, 176, 'B4′ · copy of B4', st.b4x, true);
+        arrow(464, b3.b, 464, 333, false);
+        arrow(464, bx.b, 464, bx.b + 24, false);
+      } else arrow(450, b3.b, 324, 333, false);
+      arrow(280, b4.b, 280, b4.b + 24, true);
+      label(292, b4.b + 20, 'next element', 'tx-muted');
+    }
+    ui.onChange(function () {
+      var st = ST[what.value];
+      draw(st);
+      roSize.set(st.size + ' instructions');
+      roComp.set(st.comp);
+      roSide.set(st.side);
+      roIss.set(st.iss);
+      note.set(st.note);
+    });
+  });
+  </script>
+
+  <p>The notes stop here. Hennessy and Patterson add a fourth tool, which removes the branch instead of scheduling around it — background, not in the notes. A <mark class="key">predicated instruction</mark> names a one-bit predicate register: it is always issued, but writes its result only when the predicate is true. <mark class="key">If-conversion</mark> turns the diamond of the sandbox into one block: a compare sets P1 and its complement P2, then (P2) FADD and (P1) FMUL follow without a branch. The control dependence has become a data dependence on a predicate: a bigger block, nothing to mispredict, nothing to compensate. The cost: both arms occupy issue slots on every pass, whichever way the condition goes.</p>
+
+  <div class="widget" id="l21-w-ifconv">
+    <h3 class="widget-title">When does if-conversion pay?</h3>
+    <p class="widget-intro">A toy model to see the trade-off, not an exam formula. One instruction per cycle. The branchy code issues the branch and one arm; the pipeline always guesses the hot arm and loses P cycles when the cold arm runs. The if-converted code issues one instruction that sets the predicates, then both arms, on every pass. With a hot arm of a instructions taken with probability p and a cold arm of b instructions, the branchy code costs 1 + p·a + (1 − p)·(b + P) cycles per pass and the if-converted code 1 + a + b. The insight: if-conversion wins only for short, balanced arms behind a hard-to-predict branch.</p>
+    <ol class="tasks">
+      <li>Start with the sandbox's diamond: a = b = 2 and a 6-cycle penalty. At p = 0.9, which version is faster? Below which p does if-conversion win?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At p = 0.9 the branchy code needs 3.6 cycles, the if-converted 5: keep the branch. If-conversion wins only below p ≈ 0.67 — when the branch is close to a coin toss.</p></details>
+      </li>
+      <li>Lengthen both arms to 6. Is there still a p where if-conversion wins?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. The if-converted block costs 13 cycles on every pass, the branchy code at most 10 (at p = 0.5). Executing two long arms costs more than an occasional wrong guess.</p></details>
+      </li>
+      <li>Make the diamond unbalanced: a = 1, b = 7. And then try a deeper pipeline: back to a = b = 2 with P = 10.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Unbalanced: never — the hot path would pay for the long cold arm on every pass (9 cycles against at most 8). Deeper pipeline: the break-even moves up to p = 0.8. In this model if-conversion can win at all only when the penalty exceeds the two arms together, P &gt; a + b.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l21-w-ifconv', function (root, ui) {
+    var a = ui.slider({ label: 'hot arm a (instructions)', min: 1, max: 8, step: 1, value: 2 });
+    var b = ui.slider({ label: 'cold arm b (instructions)', min: 1, max: 8, step: 1, value: 2 });
+    var P = ui.slider({ label: 'penalty of a wrong guess P (cycles)', min: 0, max: 12, step: 1, value: 6 });
+    var roPred = ui.readout('if-converted, every pass'), roBr = ui.readout('branchy at p = 0.9'), roWin = ui.readout('if-conversion wins for');
+    var plot = ui.plot({ x: [0.5, 1], y: [0, 18], xLabel: 'p (probability of the hot arm)', yLabel: 'cycles per pass', aspect: 1.9,
+      xTicks: [0.5, 0.6, 0.7, 0.8, 0.9, 1], label: 'Cycles per pass of the branchy and of the if-converted code as a function of the probability of the hot arm' });
+    function br(p) { return 1 + p * a.value + (1 - p) * (b.value + P.value); }
+    function pr() { return 1 + a.value + b.value; }
+    function breakEven() {                                   // the branchy line minus the flat line is linear in p and negative at p = 1
+      if (P.value <= a.value + b.value) return null;           // no win at p = 0.5, so none above it
+      return (P.value - a.value) / (P.value + b.value - a.value);
+    }
+    plot.draw(function (g) {
+      var ps = breakEven();
+      if (ps !== null) g.poly([[0.5, pr()], [0.5, br(0.5)], [ps, pr()]], { color: 's5', alpha: 0.16, stroke: false });
+      g.line(function (p) { return br(p); }, { color: 's4', width: 2.5 });
+      g.line(function () { return pr(); }, { color: 's5', width: 2.5, dash: [8, 5] });
+      if (ps !== null) g.vline(ps, { color: 'soft', dash: true, label: 'break-even' });
+    });
+    ui.legend([{ label: 'branchy: 1 + p·a + (1 − p)(b + P)', color: 's4', mark: 'line' }, { label: 'if-converted: 1 + a + b', color: 's5', mark: 'dash' },
+               { label: 'if-conversion wins', color: 's5', mark: 'area' }]);
+    ui.onChange(function () {
+      var ps = breakEven();
+      roPred.set(Course.fmt(pr(), 0) + ' cycles');
+      roBr.set(Course.fmt(br(0.9), 2) + ' cycles');
+      roWin.set(ps === null ? 'no p ≥ 0.5 (P ≤ a + b)' : 'p below ' + Course.fmt(ps, 2));
+    });
+  });
+  </script>
+
+  <div class="story" data-year="1999–2021">
+    <p>Intel's Itanium put hardware under every idea of this lesson: bundles of three operations with explicit stop bits, predication of almost every instruction, speculative loads, and rotating registers that give a software-pipelined loop fresh register names on every pass. Intel announced the name on 4 October 1999; the nickname "Itanic" appeared the same day. The last Itanium shipments ended on 29 July 2021.</p>
+  </div>
+
+  <div class="pitfall">
+    <p>"A loop over 260 elements that does not fit a vector register? Software-pipeline it." The papers ask exactly this (July 2024, quiz 5; June 2026, quiz 3) with trace scheduling and software pipelining, two VLIW compiler techniques, as distractors. A vector processor whose registers hold 64 or 32 elements needs <em>strip mining</em>: strips of at most one register length — <a href="l31.html">lesson 31</a>.</p>
+  </div>
+</section>
+
+<section id="l21-papers">
+  <h2>How the papers ask it: LOOP1 against LOOP2, and the midterm's SP_LOOP</h2>
+
+  <p>Every paper of 2024–2026 has a 5-point VLIW exercise, and two of them schedule a software-pipelined loop. The rules are those of <a href="l20.html">lesson 20</a>: latency 3 for Memory and FP, 1 from the Integer unit to the next Int/FP/L/S instruction and 2 to a branch; one delay slot after the branch, counted; a WAR writer may share the cycle of the last reader of its register ("in the Register File, it is possible to read and write at the same address at the same clock cycle"); no NOPs written. In the solved papers the "critical path for a single iteration" is the schedule length including the delay slot, CPI = cycles / instructions, code efficiency = IC / (cycles × issue width).</p>
+
+  <aside class="margin-note">The 2024 and 2026 papers print the index update as ADDDUI; it is ADDUI.</aside>
+
+  <p>The 22 June 2026 paper asks for both loops of the hook, with C1 already filled in, and then for the four metrics of each and the speed-up in CPI:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="LOOP1">
+<pre><code>LOOP1: LD    F2, 0(R1)
+       FADD  F6, F2, F2
+       SD    F6, 0(R1)
+       ADDUI R1, R1, 4
+       BNE   R1, R3, LOOP1</code></pre>
+    </div>
+    <div class="compare-col" data-label="LOOP2">
+<pre><code>LOOP2: SD    F6, 0(R2)
+       FADD  F6, F2, F2
+       LD    F2, 0(R2)
+       ADDUI R2, R2, 4
+       BNE   R2, R3, LOOP2</code></pre>
+    </div>
+  </div>
+
+  <figure class="tbl-fig" id="l21-tbl-loop1">
+    <figcaption>LOOP1 on the 3-issue VLIW (C1 given). The chain LD → FADD → SD waits 3 + 3 cycles; ADDUI shares C7 with SD, the last reader of R1; BNE comes 2 cycles later.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Memory Unit</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+        <tbody>
+          <tr><th>C1</th><td>LD F2, 0(R1)</td><td></td><td></td></tr>
+          <tr><th>C2</th><td></td><td></td><td></td></tr>
+          <tr><th>C3</th><td></td><td></td><td></td></tr>
+          <tr><th>C4</th><td></td><td>FADD F6, F2, F2</td><td></td></tr>
+          <tr><th>C5</th><td></td><td></td><td></td></tr>
+          <tr><th>C6</th><td></td><td></td><td></td></tr>
+          <tr><th>C7</th><td>SD F6, 0(R1)</td><td></td><td>ADDUI R1, R1, 4</td></tr>
+          <tr><th>C8</th><td></td><td></td><td></td></tr>
+          <tr><th>C9</th><td></td><td></td><td>BNE R1, R3, LOOP1</td></tr>
+          <tr class="is-key"><th>C10</th><td>(delay slot)</td><td></td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="tbl-fig" id="l21-tbl-loop2">
+    <figcaption>LOOP2 on the same machine (C1 given; C6–C10 stay empty). SD and FADD share C1 (WAR on F6); LD waits for the memory unit and rewrites F2 after FADD read it; ADDUI shares C2 with LD; BNE in C4.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Memory Unit</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+        <tbody>
+          <tr><th>C1</th><td>SD F6, 0(R2)</td><td>FADD F6, F2, F2</td><td></td></tr>
+          <tr><th>C2</th><td>LD F2, 0(R2)</td><td></td><td>ADDUI R2, R2, 4</td></tr>
+          <tr><th>C3</th><td></td><td></td><td></td></tr>
+          <tr><th>C4</th><td></td><td></td><td>BNE R2, R3, LOOP2</td></tr>
+          <tr class="is-key"><th>C5</th><td>(delay slot)</td><td></td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="tbl-fig" id="l21-tbl-cmp26">
+    <figcaption>The answer form of the June 2026 paper, filled in.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>LOOP1</th><th>LOOP2</th></tr></thead>
+        <tbody>
+          <tr><td>How long is the critical path for a single iteration?</td><td class="num">10 cycles</td><td class="num">5 cycles</td></tr>
+          <tr><td>What performance did you achieve in CPI?</td><td class="num">10/5 = 2</td><td class="num">5/5 = 1</td></tr>
+          <tr><td>What performance did you achieve in FP ops per cycles?</td><td class="num">1/10 = 0.1</td><td class="num">1/5 = 0.2</td></tr>
+          <tr><td>How much is the code efficiency?</td><td class="num">5/30 = 0.17</td><td class="num">5/15 = 0.33</td></tr>
+          <tr class="is-key"><td>How much is the speed up in terms of CPI?</td><td class="num" colspan="2">2 / 1 = 2</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="fig fig--pair fig--plain" id="l21-fig-dag">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 296" role="img" aria-label="LOOP1 as a dependence graph: LD F2 feeds FADD F6 with a 3-cycle true dependence, FADD F6 feeds SD F6 with another 3 cycles, ADDUI must not precede the two readers of R1, and BNE waits 2 cycles for ADDUI; scheduled in cycles 1, 4, 7, 7 and 9">
+        <line x1="150" y1="40" x2="150" y2="73" class="hl"/>
+        <line x1="150" y1="40" x2="150" y2="73" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="60.5" class="tx-mono tx-sm halo">F2 · 3</text>
+        <line x1="150" y1="100" x2="150" y2="133" class="hl"/>
+        <line x1="150" y1="100" x2="150" y2="133" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="120.5" class="tx-mono tx-sm halo">F6 · 3</text>
+        <line x1="150" y1="160" x2="150" y2="193" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="158" y="180.5" class="tx-mono tx-sm halo">R1 · 0</text>
+        <path d="M225,28 C276,28 276,208 229,208" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="270" y="122" class="tx-mono tx-sm halo">R1</text>
+        <line x1="150" y1="220" x2="150" y2="253" class="hl"/>
+        <line x1="150" y1="220" x2="150" y2="253" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="240.5" class="tx-mono tx-sm halo">R1 · 2</text>
+        <rect x="75" y="16" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="32" class="tx-mono tx-mid">LD F2, 0(R1)</text>
+        <text x="66" y="32" class="tx-sm tx-end tx-muted">C1</text>
+        <rect x="75" y="76" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="92" class="tx-mono tx-mid">FADD F6, F2, F2</text>
+        <text x="66" y="92" class="tx-sm tx-end tx-muted">C4</text>
+        <rect x="75" y="136" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="152" class="tx-mono tx-mid">SD F6, 0(R1)</text>
+        <text x="66" y="152" class="tx-sm tx-end tx-muted">C7</text>
+        <rect x="75" y="196" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="212" class="tx-mono tx-mid">ADDUI R1, R1, 4</text>
+        <text x="66" y="212" class="tx-sm tx-end tx-muted">C7</text>
+        <rect x="75" y="256" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="272" class="tx-mono tx-mid">BNE R1, R3, LOOP1</text>
+        <text x="66" y="272" class="tx-sm tx-end tx-muted">C9</text>
+      </svg>
+      <p class="fig-label">Before: LOOP1, 10 cycles</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 296" role="img" aria-label="LOOP2 as a dependence graph: SD F6, FADD F6 and LD F2 are linked only by anti-dependences, which may share a cycle; ADDUI follows the two readers of R2 and BNE waits 2 cycles for ADDUI; scheduled in cycles 1, 1, 2, 2 and 4">
+        <line x1="150" y1="40" x2="150" y2="73" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="158" y="60.5" class="tx-mono tx-sm halo">F6 · 0</text>
+        <line x1="150" y1="100" x2="150" y2="133" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="158" y="120.5" class="tx-mono tx-sm halo">F2 · 0</text>
+        <line x1="150" y1="160" x2="150" y2="193" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="158" y="180.5" class="tx-mono tx-sm halo">R2 · 0</text>
+        <path d="M225,28 C276,28 276,208 229,208" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="270" y="122" class="tx-mono tx-sm halo">R2</text>
+        <line x1="150" y1="220" x2="150" y2="253" class="hl"/>
+        <line x1="150" y1="220" x2="150" y2="253" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="240.5" class="tx-mono tx-sm halo">R2 · 2</text>
+        <rect x="75" y="16" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="32" class="tx-mono tx-mid">SD F6, 0(R2)</text>
+        <text x="66" y="32" class="tx-sm tx-end tx-muted">C1</text>
+        <rect x="75" y="76" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="92" class="tx-mono tx-mid">FADD F6, F2, F2</text>
+        <text x="66" y="92" class="tx-sm tx-end tx-muted">C1</text>
+        <rect x="75" y="136" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="152" class="tx-mono tx-mid">LD F2, 0(R2)</text>
+        <text x="66" y="152" class="tx-sm tx-end tx-muted">C2</text>
+        <rect x="75" y="196" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="212" class="tx-mono tx-mid">ADDUI R2, R2, 4</text>
+        <text x="66" y="212" class="tx-sm tx-end tx-muted">C2</text>
+        <rect x="75" y="256" width="150" height="24" rx="4" class="fi-paper"/>
+        <text x="150" y="272" class="tx-mono tx-mid">BNE R2, R3, LOOP2</text>
+        <text x="66" y="272" class="tx-sm tx-end tx-muted">C4</text>
+      </svg>
+      <p class="fig-label">After: LOOP2, 5 cycles</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> One pass of each loop as a dependence graph, with the cycle each instruction gets. Left: two true dependences of 3 cycles chain LD, FADD and SD, and the branch waits 2 more after ADDUI — 10 cycles with the delay slot. Right: the same instructions in reverse order are linked only by anti-dependences (dashed), which may share a cycle; LD waits one cycle for the single memory unit, the branch 2 for ADDUI — 5 cycles.</figcaption>
+  </figure>
+
+  <aside class="margin-note">The paper prints LOOP2's load as LD F2, 0(R2). With one memory unit the offset does not change the schedule; a LOOP2 that computes what LOOP1 computes loads two elements ahead, 8(R2).</aside>
+
+  <p>Add the third shape. LOOP1 unrolled by four with renamed registers schedules on the same machine in 13 cycles: four loads in C1–C4, four adds in C4–C7, four stores in C7–C10 with ADDUI in C10, BNE in C12 and the delay slot in C13.</p>
+
+  <figure class="tbl-fig" id="l21-tbl-shapes">
+    <figcaption>Same loop, three shapes, on the papers' 3-issue VLIW (all three schedules recomputed). LOOP2's 11 instructions are 3 of prologue, 5 of body, 3 of epilogue; ×4 is LOOP1 unrolled by four with renamed registers; efficiency = IC / (cycles × 3).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>LOOP1</th><th>LOOP2</th><th>×4</th></tr></thead>
+        <tbody>
+          <tr><td>static instructions</td><td class="num">5</td><td class="num">11</td><td class="num">14</td></tr>
+          <tr><td>FP registers</td><td class="num">2</td><td class="num">2</td><td class="num">8</td></tr>
+          <tr><td>cycles per pass</td><td class="num">10</td><td class="num">5</td><td class="num">13</td></tr>
+          <tr><td>elements per pass</td><td class="num">1</td><td class="num">1</td><td class="num">4</td></tr>
+          <tr class="is-key"><td>cycles per element</td><td class="num">10</td><td class="num">5</td><td class="num">3.25</td></tr>
+          <tr><td>code efficiency</td><td class="num">0.17</td><td class="num">0.33</td><td class="num">0.36</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>The midterm of 5 May 2025: backwards, then forwards</h3>
+
+  <p>Exercise 1 of the 2025 midterm (notes pp. 506–512) runs the construction backwards. Part A gives a two-array software-pipelined loop and asks for the original:</p>
+
+<pre><code>START_UP:
+  LD    F0, 0(R1)
+  LD    F2, 0(R2)
+  FADD  F4, F0, F0
+  FADD  F6, F2, F2
+  LD    F0, 8(R1)
+  LD    F2, 8(R2)
+SP_LOOP:
+  SD    F4, 0(R1)       ; I1
+  SD    F6, 0(R2)       ; I2
+  FADD  F4, F0, F0      ; I3
+  FADD  F6, F2, F2      ; I4
+  LD    F0, 16(R1)      ; I5
+  LD    F2, 16(R2)      ; I6
+  ADDUI R1, R1, 8       ; I7
+  ADDUI R2, R2, 8       ; I8
+  ADD   R3, R2, R1      ; I9
+  BNE   R3, R4, SP_LOOP ; I10</code></pre>
+
+  <aside class="margin-note">The notes' FINISH_UP stores at 8(R1) and 16(R1); after the last pass R1 has already moved, so the two pending elements sit at 0(R1) and 8(R1). The question asks only for the original loop.</aside>
+
+  <p>Follow one element. <code>LD F0, 16(R1)</code> loads it; one pass later, when R1 has moved by 8, <code>FADD F4, F0, F0</code> doubles it; one pass after that, when R1 has moved by 16, <code>SD F4, 0(R1)</code> stores it — at the address it was loaded from. Put the three stages of one element back into one pass, in natural order and with offset 0, and keep the loop control. START_UP and FINISH_UP disappear:</p>
+
+<pre><code>LOOP:  LD    F0, 0(R1)
+       LD    F2, 0(R2)
+       FADD  F4, F0, F0
+       FADD  F6, F2, F2
+       SD    F4, 0(R1)
+       SD    F6, 0(R2)
+       ADDUI R1, R1, 8
+       ADDUI R2, R2, 8
+       ADD   R3, R2, R1
+       BNE   R3, R4, LOOP</code></pre>
+
+  <p>Part B schedules SP_LOOP on the 3-issue VLIW. Its only true dependences are in the tail ADDUI → ADD → BNE.</p>
+
+  <figure class="tbl-fig" id="l21-tbl-mid">
+    <figcaption>Midterm 2025, Exercise 1.B: SP_LOOP on the 3-issue VLIW (recomputed; it matches the notes' table on p. 511).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Memory Unit</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+        <tbody>
+          <tr><th>C1</th><td>SD F4, 0(R1)</td><td>FADD F4, F0, F0</td><td></td></tr>
+          <tr><th>C2</th><td>SD F6, 0(R2)</td><td>FADD F6, F2, F2</td><td></td></tr>
+          <tr><th>C3</th><td>LD F0, 16(R1)</td><td></td><td>ADDUI R1, R1, 8</td></tr>
+          <tr><th>C4</th><td>LD F2, 16(R2)</td><td></td><td>ADDUI R2, R2, 8</td></tr>
+          <tr><th>C5</th><td></td><td></td><td>ADD R3, R2, R1</td></tr>
+          <tr><th>C6</th><td></td><td></td><td></td></tr>
+          <tr><th>C7</th><td></td><td></td><td>BNE R3, R4, SP_LOOP</td></tr>
+          <tr class="is-key"><th>C8</th><td>(delay slot)</td><td></td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <ol>
+    <li>C1–C2: each SD shares its cycle with the FADD that rewrites its register (WAR: the SD reads the old F4 or F6). The single memory unit pushes SD F6 to C2.</li>
+    <li>C3–C4: the loads take the memory unit in turn. ADDUI R1 may not precede the last reader of the old R1, LD F0 in C3, so it shares C3 with it; ADDUI R2 shares C4 with LD F2. (The notes say ADDUI starts "when the first SD store finishes": that the store's 3 cycles end in C3 is a coincidence.)</li>
+    <li>C5: ADD R3, one cycle after ADDUI R2. C6 stays empty because the text gives the Integer ALU a "2 cycle latency to next Branch": the branch reads R3 in ID, so a BNE in C6 would still see the old value. BNE goes to C7, the delay slot to C8. In the exam, give the stated latency as the reason.</li>
+  </ol>
+
+  <p>Eight cycles: CPI = 8/10 = 0.8, FP ops per cycle = 2/8 = 0.25, code efficiency = 10/(8 × 3) = 0.417. The original loop of Part A, scheduled by the same rules, needs 12 cycles (LD C1 and C2, FADD C4 and C5, SD with ADDUI in C7 and C8, ADD C9, BNE C11, delay slot C12): CPI 1.2, a speed-up of 1.5.</p>
+
+  <div class="pitfall">
+    <p>"In our case, there are 8 cycles for each iteration, so the critical path is 8." The notes' solution (p. 512) defines the critical path as "the longest chain of dependent operations that must be executed in sequence because of true data dependencies (RAW)", then answers with the schedule length. 8 is the number the solved papers give, but the true-dependence chain ADDUI → ADD → BNE plus the delay slot is only 5 cycles long; the other 3 come from the single memory unit. Write: "8 cycles, C1–C8 including the delay slot, set by the four memory operations on one memory unit and the tail ADDUI → ADD → BNE".</p>
+  </div>
+
+  <p>Back to the puzzle of the hook. LOOP2's SD stores the F6 that the previous pass's FADD computed, and its FADD doubles the F2 that the previous pass's LD loaded: one pass holds three different elements (Fig. 1), linked only by anti-dependences that cost nothing on the papers' machine (Fig. 2). The 3 + 3 cycles of waiting have not disappeared; they now elapse between one pass and the next, while other elements are worked on. What remains inside a pass — SD with FADD, the LD behind them on the single memory unit, the branch 2 cycles after ADDUI, the delay slot — is 5 cycles: one element out of the loop every 5 cycles.</p>
+</section>
+
+<section id="l21-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="5" id="l21-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following static scheduling techniques used by compilers for VLIW processors, and state the main drawback of each: (1) Loop unrolling; (2) Software pipelining; (3) Trace scheduling; (4) Superblock scheduling; (5) Predication (if-conversion).</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(1) Loop unrolling replicates the loop body u times in one block, adjusts the displacements of the copies (0, 8, 16, …) and keeps a single index update and a single branch. The compiler renames the registers of each copy, removing the WAR and WAW dependences between copies, so the scheduler can interleave u independent chains and hide latencies. Benefits: fewer branches and index updates per element, fewer stalls, more operations per bundle (x[i] = x[i] + s: 10 cycles per element → 3.5 on a single-issue pipeline with a delay slot). Costs: code size, (u − 1) times the registers a copy writes, a remainder loop when the trip count is not a multiple of u.</p>
+        <p>(2) Software pipelining reorganises the loop so that each execution of the body contains stages of different iterations — store of i, compute of i + 1, load of i + 2 — in reverse order. The true dependences of an iteration no longer lie inside one body; only anti-dependences and the loop control do. A prologue fills and an epilogue drains the pipeline. Benefits: one iteration completes per execution of the body, with the body's original size and the same registers (June 2026: LOOP1 10 cycles, LOOP2 5 cycles, CPI speed-up 2). Costs: prologue and epilogue code, extra registers when a value must live longer than one pass, at least as many iterations as stages, compiler complexity.</p>
+        <p>(3) Trace scheduling is global scheduling across basic blocks: profiling selects the most likely path (the trace, acyclic), which is list-scheduled as one block; instructions move across branches (above them speculatively) and across joins. Compensation code — copies of moved instructions on the off-trace exit and entry paths — keeps the other paths correct. Benefits: fills wide instructions beyond the 4 to 7 instructions of a basic block and starts long-latency loads early. Costs: code growth from compensation code, slower off-trace paths, dependence on predictable branches, a complex compiler; stores and instructions that may raise exceptions cannot be speculated freely.</p>
+        <p>(4) Superblock scheduling restricts the region to a single entry and multiple exits, obtained by tail duplication: the part of the trace below a side entrance is copied for the entering path. Moves then need compensation only at the exits, outside the superblock, so speculation is simpler and safer. Cost: the duplicated code.</p>
+        <p>(5) Predication removes a branch instead of scheduling around it: a compare sets a predicate register and its complement, and the instructions of each arm are guarded by one of them — always issued, but writing their result only when their predicate is true. The control dependence becomes a data dependence on the predicate, so both arms form one larger basic block that the scheduler can fill, with nothing to mispredict and no compensation code. Cost: both arms take issue slots on every pass, so it pays only for short, balanced, hard-to-predict branches; it needs predicate registers in the ISA (IA-64).</p>
+      </div>
+      <div class="exam-note"><p>The June 2026 paper asked eight such sub-points for 8 points, about five lines each. A complete sub-point has three things: the mechanism in one or two sentences, the benefit with a number from an exercise, the cost. The contrasts make the answer crisp — unrolling replicates while software pipelining interleaves; trace scheduling repairs at entries and exits, a superblock only at exits, predication nowhere — and so does one sentence saying that the compiler applies all five, the VLIW doing no dependence checking at run time.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l21-exam-jun25">
+    <div class="exam-q" lang="en">
+      <p>Given the following software pipelined loop:</p>
+<pre><code>SP_LOOP: SD    F6, 0(R1)
+         SD    F8, 0(R2)
+         SD    F10, 0(R3)
+         FADD  F6, F0, F0
+         FADD  F8, F2, F2
+         FADD  F10, F4, F4
+         LD    F0, 16(R1)
+         LD    F2, 16(R2)
+         LD    F4, 16(R3)
+         ADDUI R1, R1, 8
+         ADDUI R2, R2, 8
+         ADDUI R3, R3, 8
+         BNE   R1, R4, SP_LOOP</code></pre>
+      <p>Consider a 4-issue VLIW machine with fully pipelined functional units: 2 Memory Units with 3 cycles latency; 1 FP ALU with 3 cycles latency; 1 Integer ALU with 1 cycle latency to next Int/FP and 2 cycle latency to next Branch. The branch is completed with 1 cycle delay slot (branch solved in ID stage). No branch prediction. In the Register File, it is possible to read and write at the same address at the same clock cycle. Considering one iteration of the SP_LOOP, complete the table (Memory Unit 1, Memory Unit 2, Floating Point Unit, Integer Unit; C1 given: SD F6, 0(R1)) by using the list-based scheduling (do NOT introduce any loop transformation), including the branch delay slot. Then: how long is the critical path for a single iteration? What performance did you achieve in CPI and in FP ops per cycle? How much is the code efficiency?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>There is no true dependence among the SDs, FADDs and LDs: each SD reads the value its FADD rewrites (WAR), each FADD reads the value its LD rewrites (WAR), and every ADDUI may share the cycle of the last instruction that reads its register. The integer unit has four instructions to issue (three ADDUI and BNE), so each stream's SD and LD are placed together to free its ADDUI as early as possible.</p>
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th></th><th>Memory Unit 1</th><th>Memory Unit 2</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+            <tbody>
+              <tr><th>C1</th><td>SD F6, 0(R1)</td><td>LD F0, 16(R1)</td><td>FADD F6, F0, F0</td><td>ADDUI R1, R1, 8</td></tr>
+              <tr><th>C2</th><td>SD F8, 0(R2)</td><td>LD F2, 16(R2)</td><td>FADD F8, F2, F2</td><td>ADDUI R2, R2, 8</td></tr>
+              <tr><th>C3</th><td>SD F10, 0(R3)</td><td>LD F4, 16(R3)</td><td>FADD F10, F4, F4</td><td>ADDUI R3, R3, 8</td></tr>
+              <tr><th>C4</th><td></td><td></td><td></td><td>BNE R1, R4, SP_LOOP</td></tr>
+              <tr><th>C5</th><td>(delay slot)</td><td></td><td></td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Critical path = 5 cycles. CPI = 5/13 ≈ 0.38. FP ops per cycle = 3/5 = 0.6. Code efficiency = 13/(5 × 4) = 0.65.</p>
+      </div>
+      <div class="exam-note"><p>Five cycles is optimal: six memory operations need three cycles on two units, the ADDUI of the stream loaded last cannot precede C3, and the single integer unit needs a fourth cycle for BNE. A pure program-order tie-break (SD F6 and SD F8 together in C1) is also a list schedule, but it delays LD F2 and LD F4, pushes ADDUI R3 to C4 and BNE to C5: 6 cycles, CPI 0.46, 0.5 FP ops per cycle, efficiency 0.54. Write the reasoning about the integer unit next to the table: it is what justifies pairing each SD and LD in one cycle. Lesson 20 drills the same table as a list-scheduling exercise.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l21-exam-recon">
+    <div class="exam-q" lang="en">
+      <p>Consider the following software pipelined loop SP_LOOP and its start-up code; R1 points to the first element of an array of n doubles.</p>
+<pre><code>START_UP: LD    F0, 0(R1)
+          FADD  F4, F0, F2
+          LD    F0, 8(R1)
+SP_LOOP:  SD    F4, 0(R1)
+          FADD  F4, F0, F2
+          LD    F0, 16(R1)
+          ADDUI R1, R1, 8
+          BNE   R1, R5, SP_LOOP</code></pre>
+      <p>(a) Reconstruct the original (non-pipelined) loop. (b) For each of the first three instructions of SP_LOOP, state which iteration of the original loop it belongs to. (c) Write the finish-up code. (d) For n = 100, how many times is the body of SP_LOOP executed, and which value must R5 hold?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) With R3 = initial R1 + 8n:</p>
+<pre><code>LOOP: LD    F0, 0(R1)
+      FADD  F4, F0, F2
+      SD    F4, 0(R1)
+      ADDUI R1, R1, 8
+      BNE   R1, R3, LOOP</code></pre>
+        <p>(b) SD F4, 0(R1): iteration i, whose sum was computed in the previous pass. FADD F4, F0, F2: iteration i + 1, whose operand was loaded in the previous pass. LD F0, 16(R1): iteration i + 2 — two strides ahead, 16 = 2 × 8.</p>
+        <p>(c) FINISH_UP: SD F4, 0(R1) (element n − 2); FADD F4, F0, F2 (element n − 1); SD F4, 8(R1) (element n − 1).</p>
+        <p>(d) The body handles i = 0 … n − 3: it runs n − 2 = 98 times. R5 = initial R1 + 8 × 98 = R1 + 784, the address of element 98.</p>
+      </div>
+      <div class="exam-note"><p>The classic mistake is to read SD as "store the result of this pass" and put it first in the reconstructed loop. Follow one value through the passes instead. In (c), remember that the last ADDUI of the body has already moved R1.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="2.5" data-tol="0.01" id="l21-exam-num">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the two following loops, where LOOP2 is the software-pipelined form of LOOP1 (its load fetches the element two iterations ahead):</p>
+<pre><code>LOOP1: LD    F2, 0(R1)
+       FADD  F6, F2, F2
+       SD    F6, 0(R1)
+       ADDUI R1, R1, 4
+       BNE   R1, R3, LOOP1</code></pre>
+<pre><code>LOOP2: SD    F6, 0(R2)
+       FADD  F6, F2, F2
+       LD    F2, 8(R2)
+       ADDUI R2, R2, 4
+       BNE   R2, R3, LOOP2</code></pre>
+      <p>Both are scheduled by list-based scheduling, including the branch delay slot, on a 4-issue VLIW machine with fully pipelined units: 2 Memory Units with 3 cycles latency, 1 FP ALU with 3 cycles latency, 1 Integer ALU with 1 cycle latency to next Int/FP and 2 cycle latency to next Branch; branch solved in ID with 1 delay slot; read and write at the same register-file address in the same clock cycle. How much is the speed up of LOOP2 over LOOP1 in terms of CPI?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>LOOP1 does not change: its chain LD (C1) → FADD (C4) → SD with ADDUI (C7) → BNE (C9) → delay slot (C10) uses one memory unit at a time. 10 cycles, CPI = 10/5 = 2.</p>
+        <p>LOOP2: SD F6, 0(R2) and LD F2, 8(R2) both fit in C1 (two memory units, two different addresses), with FADD F6 (WAR on F6 and F2) and ADDUI R2 (WAR on R2) in the same cycle; BNE in C3, delay slot in C4. 4 cycles, CPI = 4/5 = 0.8.</p>
+        \[ \text{speed-up} = \frac{2}{0.8} = 2.5 \]
+      </div>
+      <div class="exam-note"><p>The second memory unit helps only the software-pipelined loop: LOOP1 is bound by its true-dependence chain, LOOP2 by resources and the branch. The paper itself prints LOOP2's load as LD F2, 0(R2): then the store and the load of one pass touch the same address, the load must not move up beside the store that precedes it, it stays in C2, and LOOP2 takes 5 cycles — a speed-up of 2. With one memory unit, as in the paper, the question never arises.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l21-exam-strip">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the following code: <code>for (i=0; i&lt;260; i++) Y[i] = X[i] + Y[i];</code> Which code transformation can be applied to be executed by the VMIPS processor with a Vector Register File composed of 16 Vector registers of 32 elements and 64 bits/element? Motivate your answer.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Trace scheduling <span class="fb">A VLIW compiler technique for scheduling across branches; this loop has no branch inside and the problem is the vector length.</span></li>
+      <li>Software pipelining <span class="fb">It overlaps iterations of a scalar loop on a statically scheduled machine; it does not make 260 elements fit 32-element registers.</span></li>
+      <li data-correct>Strip mining <span class="fb">260 &gt; 32, so the loop is cut into strips of at most 32 elements, with the vector length register set for each strip.</span></li>
+      <li>Apply a mask register <span class="fb">A mask handles conditional statements inside a vector loop; there is no condition here.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Strip mining. The loop has 260 elements and a vector register holds 32: 260 = 8 × 32 + 4, so a first strip of 4 elements and then eight strips of 32, setting VLR for each strip.</p></div>
+      <div class="exam-note"><p>The distractors are the techniques of this lesson; strip mining itself is lesson 31. The motivation point is the arithmetic 260 = 8 × 32 + 4.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l21-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: in the steady state, a software-pipelined loop completes one iteration every clock cycle.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">That holds only if the whole body, branch included, fits one bundle; LOOP2 of June 2026 completes one iteration every 5 cycles.</span></li>
+      <li data-correct>False <span class="fb">One iteration completes per execution of the body, every II cycles, where II is the length of the body's schedule.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. Each execution of the body finishes one iteration, so the throughput is one iteration per initiation interval — 5 cycles for LOOP2 on the 3-issue VLIW of June 2026, 8 cycles for the midterm's SP_LOOP.</p></div>
+      <div class="exam-note"><p>The notes repeat the wrong version five times (pp. 289–291); the CPI you compute in the VLIW exercise contradicts it.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l21-exam-trace">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about trace and superblock scheduling are true? (MULTIPLE ANSWERS)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>An instruction moved from below a branch to above it needs no compensation code if its result is dead on the other path and it cannot store or raise an exception. <span class="fb">Speculation is free exactly in this case: the off-trace path simply never uses the value.</span></li>
+      <li data-correct>An instruction moved above a side entrance into the trace needs a copy on the entering path. <span class="fb">Otherwise the path that enters from the side would skip it.</span></li>
+      <li>A superblock may have several entries but only one exit. <span class="fb">The other way round: one entry, any number of exits.</span></li>
+      <li data-correct>Tail duplication removes side entrances at the price of code size. <span class="fb">The tail below the entrance is copied for the entering path.</span></li>
+      <li>A trace may contain a loop's back edge. <span class="fb">Traces are acyclic; a back edge ends a trace, which is why loops are unrolled first.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 2 and 4.</p></div>
+      <div class="exam-note"><p>The two directions of compensation are what the question checks: copies go on the exit path for moves below a branch and on the entering path for moves above a join.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l21-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">The notes' loop unrolled four times, renamed and regrouped (four LD, four FADD, four SD, SUBI, BNE) takes 16 cycles on the delayed-branch pipeline. Which lost cycles are left?</p>
+    <ul class="options">
+      <li data-correct>The stall between SUBI and BNE and the empty delay slot <span class="fb">Every data consumer is now four instructions after its producer; only the loop control still wastes two cycles.</span></li>
+      <li>One LD → FADD stall per copy <span class="fb">Each FADD issues four cycles after its LD; the latency asks for a distance of two (one stall), so no stall is left.</span></li>
+      <li>The WAR hazards between the copies <span class="fb">Renaming removed them, and an in-order single-issue pipeline never stalls on WAR anyway.</span></li>
+      <li>Two FADD → SD stalls in the last copy <span class="fb">SD F16 issues at cycle 12, four cycles after its FADD at 8; three would suffice.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In LOOP2 (<code>SD F6, 0(R2)</code>; <code>FADD F6, F2, F2</code>; <code>LD F2, 0(R2)</code>; …), what does the SD store in a pass?</p>
+    <ul class="options">
+      <li data-correct>The F6 computed by the FADD of the previous pass <span class="fb">The SD reads F6 before the FADD below it overwrites it: a WAR, not a RAW.</span></li>
+      <li>The F6 computed by the FADD just below it <span class="fb">That value is written after the SD has read the register; it is stored in the next pass.</span></li>
+      <li>Garbage, in every pass <span class="fb">Only the very first pass would store garbage without a prologue; that is why the prologue computes a first F6.</span></li>
+      <li>The F2 loaded by the LD <span class="fb">The SD stores F6; F2 is the operand of the FADD.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does the three-stage loop load with <code>LD F0, 16(R1)</code> while it stores with <code>SD F4, 0(R1)</code>?</p>
+    <ul class="options">
+      <li data-correct>The load works for the element two passes ahead, and R1 moves by 8 per pass <span class="fb">Stage distance × stride = 2 × 8 = 16.</span></li>
+      <li>A double is 16 bytes long <span class="fb">A double is 8 bytes: that is the stride.</span></li>
+      <li>The FADD needs two operands, so the load fetches two doubles <span class="fb">LD fetches one double; the second operand F2 is the scalar s.</span></li>
+      <li>The memory unit has a latency of 3, rounded to two elements <span class="fb">Latencies are measured in cycles, not in addresses; the offset follows from the stage distance only.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these are costs of software pipelining compared with the original loop?</p>
+    <ul class="options">
+      <li data-correct>A prologue and an epilogue <span class="fb">The pipeline must be filled before the first body and drained after the last.</span></li>
+      <li data-correct>Extra registers when a value must live longer than one pass <span class="fb">Then two names are needed for one variable — compilers unroll the body or use rotating registers.</span></li>
+      <li>A body that grows with the number of stages <span class="fb">The body keeps its five instructions; that is the advantage over unrolling.</span></li>
+      <li>More branches executed per element <span class="fb">Still one BNE per execution of the body, that is, per element.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">During trace scheduling, an instruction of B1 (above a branch) is moved down into B2, the on-trace successor. The off-trace block B3 also needs its result. What must the compiler do?</p>
+    <ul class="options">
+      <li data-correct>Put a copy of the instruction in B3 <span class="fb">The exit path no longer executes it, so it gets its own copy: compensation code.</span></li>
+      <li>Nothing: the branch still reads the right values <span class="fb">The branch may not care, but B3 uses the result.</span></li>
+      <li>Put a copy in B4, after the join <span class="fb">Too late: B3 reads the value before reaching B4, and the hot path would execute it twice.</span></li>
+      <li>Undo the instruction in B2 when the branch goes to B3 <span class="fb">B2 does not run on that path; there is nothing to undo there.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">What does tail duplication buy a trace?</p>
+    <ul class="options">
+      <li data-correct>A single entry, so moves above the former join need no copies on entering paths — paid with code size <span class="fb">The off-trace path enters its own copy of the tail; the trace becomes a superblock.</span></li>
+      <li>A single exit, so speculation needs no repair at all <span class="fb">A superblock keeps all its exits, and moves below a branch still need copies there.</span></li>
+      <li>A shorter hot path <span class="fb">The hot path is unchanged; only the cold path gets new code.</span></li>
+      <li>It makes profiling unnecessary <span class="fb">The hot path still has to be chosen, usually from a profile.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">When is if-conversion (predication) likely to beat keeping the branch?</p>
+    <ul class="options">
+      <li data-correct>Both arms are short <span class="fb">Both arms are issued on every pass; short arms make that cheap.</span></li>
+      <li data-correct>The arms have similar lengths <span class="fb">With a long cold arm the hot path would pay for it on every pass.</span></li>
+      <li data-correct>The branch is hard to predict, close to 50/50 <span class="fb">That is when wrong guesses are frequent and expensive.</span></li>
+      <li>The branch goes the same way 99 % of the time <span class="fb">A strongly biased branch is almost never mispredicted: keep it, or schedule the hot path as a trace.</span></li>
+      <li>One arm is forty instructions long <span class="fb">Forty wasted slots on every pass cost more than an occasional misprediction.</span></li>
+    </ul>
+    <p class="q-fb">Short, balanced, unpredictable: the three words to write next to if-conversion.</p>
+  </div>
+</section>
+
+<section class="recap" id="l21-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Unrolling by u copies the body with renamed registers and corrected displacements and keeps one index update and one branch. On the single-issue delayed-branch pipeline the notes' loop goes from 10 cycles per element to 7 (copies in order), 4 (renamed and regrouped: the notes' 16 for four) and 3.5 (stores moved into the stall and the delay slot).</li>
+    <li>A software-pipelined body holds the SD of element i, the FADD of i + 1 and the LD of i + 2, in that reverse order: only anti-dependences link the three, the load runs two strides ahead (16 for stride 8), a prologue fills and an epilogue drains the line, and the body runs n − 2 times.</li>
+    <li>One element completes per execution of the body, every II cycles, not every cycle: LOOP2 needs 5 cycles per element on the papers' VLIW against 10 for LOOP1, with the same five instructions and two registers.</li>
+    <li>In the exam, schedule the given body as it is: a true dependence waits the producer's latency (Memory and FP 3, Integer 1, 2 to a branch), a WAR writer may share its reader's cycle, BNE is followed by a counted delay slot, and the critical path for a single iteration is the schedule length — 8 cycles for the midterm's SP_LOOP, CPI 0.8, efficiency 0.417.</li>
+    <li>Trace scheduling bets on the hot path and repairs the other paths: copies on the exit path for moves below a branch, on the entering path for moves above a join. A superblock removes the entering paths by tail duplication; if-conversion removes the branch and pays in issue slots, so it wins only for short, balanced, hard-to-predict diamonds.</li>
+    <li>A 260-element loop on a vector machine is a strip-mining question, not a software-pipelining one.</li>
+  </ul>
+  <aside class="cheat" id="l21-cheat">
+    <dl>
+      <dt>Unrolling by u</dt><dd>\(N/u\) iterations of \(u\,w + o\) instructions (N trip count, w useful, o overhead instructions per original iteration); \((u - 1)\,\rho\) extra registers, ρ = registers one copy writes</dd>
+      <dt>Execution time per iteration (66)</dt><dd>cycles of the unrolled body / original iterations it covers</dd>
+      <dt>Code efficiency (67)</dt><dd>\(IC / (\#\text{cycles} \times \#\text{issues})\): instructions over issue slots, delay slot counted</dd>
+      <dt>CPI of one iteration (VLIW)</dt><dd>cycles including the delay slot (the papers' "critical path for a single iteration") / instructions of the iteration; speed-up in CPI = \(CPI_1 / CPI_2\)</dd>
+      <dt>FP ops per cycle</dt><dd>FP operations of the iteration / cycles</dd>
+      <dt>Delayed-branch pipeline</dt><dd>LD → FADD 1 stall · FADD → SD 2 · SUBI → BNE 1 · one delay slot</dd>
+      <dt>Software-pipelined loop</dt><dd>body = SD x[i] at 0(R1) · FADD x[i+1] · LD x[i+2] at 2 × stride; prologue LD, FADD, LD; epilogue SD, FADD, SD at stride; body runs n − 2 times</dd>
+      <dt>Throughput</dt><dd>one element per body: every II cycles, \(T \approx n \cdot II\)</dd>
+      <dt>Compensation code</dt><dd>below a branch → copy on the exit path · above a join → copy on the entering path · above a branch → free only if dead elsewhere, no store, no exception</dd>
+      <dt>Superblock / if-conversion</dt><dd>one entry via tail duplication, repairs at exits only · predication pays for short, balanced, unpredictable branches</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l21-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.lighterra.com/papers/modernmicroprocessors/" target="_blank" rel="noopener">Modern Microprocessors: A 90-Minute Guide!</a>
+      <span class="res-by">Jason Robert Carey Patterson (Lighterra)</span>
+      <p class="res-why">Read the sections "Explicit Parallelism – VLIW" and "Eliminating Branches with Predication": the static side of the story and predication in plain English, with real processors.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.cs.princeton.edu/courses/archive/spring15/cos320/lectures/12-CyclicScheduling.pdf" target="_blank" rel="noopener">Topic 12: Cyclic Instruction Scheduling</a>
+      <span class="res-by">David August, Princeton COS 320</span><span class="res-dur">21 pp.</span>
+      <p class="res-why">Software pipelining explained as hardware pipelining of iterations: prologue, kernel and epilogue, the initiation interval and the two bounds that keep it from shrinking further.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://people.eecs.berkeley.edu/~kubitron/courses/cs252-S12/lectures/lec07-dynasched2.pdf" target="_blank" rel="noopener">Lecture 7: Scoreboard, Tomasulo, Register Renaming</a>
+      <span class="res-by">John Kubiatowicz, Berkeley CS252</span><span class="res-dur">25 pp.</span>
+      <p class="res-why">It opens with the loop-unrolling and software-pipelining examples in the same mnemonics as the notes, including a before/after of the pipelined loop.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://ocw.mit.edu/courses/6-823-computer-system-architecture-fall-2005/d90b42c3bf0f65f9ab8e652040cc9f0d_l21_vliw.pdf" target="_blank" rel="noopener">L21: VLIW/EPIC — Statically Scheduled ILP</a>
+      <span class="res-by">MIT 6.823 (Arvind, Asanović, Emer)</span><span class="res-dur">34 slides</span>
+      <p class="res-why">The whole lesson as one line of argument: loop unrolling, software pipelining, trace scheduling, rotating register files and IA-64.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://fg-kastens.cs.uni-paderborn.de/lehre/pgrekonf/seminar/Lam1988.pdf" target="_blank" rel="noopener">Software Pipelining: An Effective Scheduling Technique for VLIW Machines</a>
+      <span class="res-by">Monica Lam, PLDI 1988</span><span class="res-dur">11 pp.</span>
+      <p class="res-why">The paper behind the definition quoted in section 2, with modulo variable expansion — how a pipelined loop gets more registers when a value outlives one pass.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Every schedule in this lesson rested on a promise: a load returns its value after a fixed latency — 3 cycles on the papers' VLIW — every time. The next lesson looks at what stands behind that promise — a main memory far slower than any functional unit, made to look fast by caches.</p>
+</aside>
+
+</main>
+</body>
+</html>

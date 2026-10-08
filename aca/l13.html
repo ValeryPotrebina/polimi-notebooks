@@ -1,0 +1,1090 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tomasulo cycle by cycle, and what it fixes compared with the scoreboard · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+  /* page-local: the Tomasulo tables drawn by the stepper widget (tokens only) */
+  .l13-sb { display: grid; gap: 0.9rem; padding: 0.9rem 1rem 0.6rem; }
+  .l13-sb h4 { margin: 0 0 0.35rem; font-family: var(--f-display); font-size: var(--t-sm); font-weight: 650; color: var(--ink-2); }
+  .l13-sb .tbl { width: auto; min-width: 100%; }
+  .l13-sb .tbl th, .l13-sb .tbl td { padding: 0.26rem 0.5rem; white-space: nowrap; text-align: center; vertical-align: middle; }
+  .l13-sb .tbl td.l13-left, .l13-sb .tbl th.l13-left { text-align: left; }
+  .l13-sb .tbl td.l13-mono { font-family: var(--f-mono); font-size: 0.82rem; }
+  .l13-sb .tbl td.l13-haz { white-space: normal; min-width: 13rem; text-align: left; font-size: var(--t-xs); line-height: 1.35; }
+  .l13-sb td.l13-chg { background: var(--key-bg); color: var(--key-fg); }
+  .l13-sb td.l13-dim { color: var(--ink-3); }
+  .l13-sb tr.l13-cdb td { box-shadow: inset 0 0 0 2px var(--s1); }
+  .l13-log { margin: 0; padding-left: 1.2rem; font-family: var(--f-display); font-size: var(--t-sm); line-height: 1.5; }
+  .l13-log li + li { margin-top: 0.2rem; }
+  .l13-log li.l13-wait { color: var(--ink-2); }
+  .l13-log li.l13-wait::marker { color: var(--s2); font-weight: 700; }
+  .l13-log li.l13-wait > b { color: var(--ink); }
+  .l13-key { font-family: var(--f-display); font-size: var(--t-xs); color: var(--ink-3); margin: 0; }
+  .l13-key span { display: inline-block; margin-right: 0.9rem; }
+  .l13-key .l13-sw { display: inline-block; width: 0.9em; height: 0.9em; vertical-align: -0.1em; margin-right: 0.3em; border: 1px solid var(--line-2); }
+  .l13-key .l13-sw.l13-chg { background: var(--key-bg); }
+  .l13-key .l13-sw.l13-cdb { box-shadow: inset 0 0 0 2px var(--s1); }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l13">
+
+<header class="lesson-head">
+  <h1>Tomasulo cycle by cycle, and what it fixes compared with the scoreboard</h1>
+  <p class="lede">After this lesson you will run the notes' six-instruction example through Tomasulo's stations to cycle 59 with four timing rules, fill the exam's table for it on whatever hardware the text gives, and say in numbers what the scoreboard lost on the same code.</p>
+</header>
+
+<div class="hook" data-label="A warm-up puzzle">
+  <p>Six instructions: two loads, a multiply, a subtract, an add, and a divide that takes 40 cycles. On the scoreboard of <a href="l10.html">lesson 10</a> they took 62 cycles. The scoreboard needed 13 cycles just to issue the six, and it kept the result of the last one, <code>FADD</code>, locked in the adder until cycle 22 although the sum was ready at 16 — five idle cycles, because <code>FDIV</code> would read F6 from the register file only at 21 and the scoreboard has no other way to protect that read.</p>
+  <p>Tomasulo's machine issues the same six in six cycles and writes <code>FADD</code>'s result at cycle 13. So how long does the whole program take now? Guess a number before you read on.</p>
+  <p>The answer is 59. Seven cycles of issue stalls gone, five cycles of a pointless wait gone — and the finish line moved by three. Where did the savings go? Keep the question: by the end of the lesson you will answer it with one sum.</p>
+</div>
+
+<section id="l13-rules">
+  <h2>The machine behind the tables, and the four rules</h2>
+
+  <p>The example is the one Hennessy and Patterson use for Tomasulo's algorithm; the notes run it from page 163 to page 182, a fresh set of tables for every cycle in which something changes. It is also the program the scoreboard ran in lesson 10, with the same latencies, so the two runs compare like with like. Here it is in the papers' mnemonics (the notes write <code>MULTD</code>, <code>SUBD</code>, <code>DIVD</code>, <code>ADDD</code> and number the instructions 1 to 6; the papers count from <code>I0</code>, and so does this lesson):</p>
+
+<pre><code>I0: LD   F6, 34(R2)
+I1: LD   F2, 45(R3)
+I2: FMUL F0, F2, F4      ; RAW on F2 with I1
+I3: FSUB F8, F6, F2      ; RAW on F6 with I0, on F2 with I1
+I4: FDIV F10, F0, F6     ; RAW on F0 with I2, on F6 with I0
+I5: FADD F6, F8, F2      ; RAW on F8 with I3, on F2 with I1
+                         ; WAR on F6 with I3 and I4, WAW on F6 with I0</code></pre>
+
+  <p>The notes never state the hardware; you have to read it off their tables, and you must, because one number of the run changes with it. Two load buffers, <code>Load1</code> and <code>Load2</code>, feed one load unit with a latency of 2 cycles. Two stations <code>ADD1</code> and <code>ADD2</code> feed one adder, which does <code>FADD</code> and <code>FSUB</code> in 2 cycles. Two stations <code>MUL1</code> and <code>MUL2</code> feed one multiplier that also divides: 10 cycles for <code>FMUL</code>, 40 for <code>FDIV</code>. One common data bus. <code>R2</code>, <code>R3</code> and <code>F4</code> hold valid values from the start, so nothing in the window writes them. Fig. 1 is this machine; the fields of a station and the register-status row are the bookkeeping of <a href="l11.html">lesson 11</a>, the three stages are those of <a href="l12.html">lesson 12</a>.</p>
+
+  <figure class="fig fig--plain" id="l13-fig-machine">
+    <svg class="dia" viewBox="0 0 560 320" role="img" aria-label="The machine of the example: a register file with a tag field Qi per register, two reservation stations in front of each of three units (load unit, adder, multiplier-divider), and one common data bus that carries every result back to the stations and the register file">
+      <text x="70" y="16" class="tx-mid tx-sm tx-muted">register file</text>
+      <text x="350" y="16" class="tx-mid tx-sm tx-muted">reservation stations</text>
+      <text x="93" y="38" class="tx-mid tx-sm tx-muted">Qi</text>
+      <rect x="20" y="44" width="50" height="18" class="fi-paper"/><rect x="70" y="44" width="46" height="18" class="fw-s3"/>
+      <rect x="20" y="62" width="50" height="18" class="fi-paper"/><rect x="70" y="62" width="46" height="18" class="fw-s3"/>
+      <rect x="20" y="80" width="50" height="18" class="fi-paper"/><rect x="70" y="80" width="46" height="18" class="fw-s3"/>
+      <rect x="20" y="98" width="50" height="18" class="fi-paper"/><rect x="70" y="98" width="46" height="18" class="fw-s3"/>
+      <rect x="20" y="116" width="50" height="18" class="fi-paper"/><rect x="70" y="116" width="46" height="18" class="fw-s3"/>
+      <rect x="20" y="134" width="50" height="18" class="fi-paper"/><rect x="70" y="134" width="46" height="18" class="fw-s3"/>
+      <text x="25" y="57" class="tx-mono tx-sm">F0</text>
+      <text x="25" y="75" class="tx-mono tx-sm">F2</text>
+      <text x="25" y="93" class="tx-mono tx-sm">F4</text>
+      <text x="25" y="111" class="tx-mono tx-sm">F6</text>
+      <text x="25" y="129" class="tx-mono tx-sm">F8</text>
+      <text x="25" y="147" class="tx-mono tx-sm">F10</text>
+      <rect x="150" y="44" width="120" height="22" class="fw-s3 st-s3"/>
+      <rect x="150" y="70" width="120" height="22" class="fw-s3 st-s3"/>
+      <rect x="290" y="44" width="120" height="22" class="fw-s3 st-s3"/>
+      <rect x="290" y="70" width="120" height="22" class="fw-s3 st-s3"/>
+      <rect x="430" y="44" width="120" height="22" class="fw-s3 st-s3"/>
+      <rect x="430" y="70" width="120" height="22" class="fw-s3 st-s3"/>
+      <text x="210" y="59" class="tx-mid tx-mono">Load1</text>
+      <text x="210" y="85" class="tx-mid tx-mono">Load2</text>
+      <text x="350" y="59" class="tx-mid tx-mono">ADD1</text>
+      <text x="350" y="85" class="tx-mid tx-mono">ADD2</text>
+      <text x="490" y="59" class="tx-mid tx-mono">MUL1</text>
+      <text x="490" y="85" class="tx-mid tx-mono">MUL2</text>
+      <line x1="210" y1="92" x2="210" y2="120" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="350" y1="92" x2="350" y2="120" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="490" y1="92" x2="490" y2="120" class="st-ink" marker-end="url(#arr)"/>
+      <rect x="165" y="124" width="90" height="40" class="fi-paper sw-2"/>
+      <rect x="305" y="124" width="90" height="40" class="fi-paper sw-2"/>
+      <rect x="445" y="124" width="90" height="40" class="fi-paper sw-2"/>
+      <text x="210" y="149" class="tx-mid">Load unit</text>
+      <text x="350" y="149" class="tx-mid">Adder</text>
+      <text x="490" y="149" class="tx-mid">Mult / Div</text>
+      <text x="210" y="184" class="tx-mid tx-sm tx-muted">2 cycles</text>
+      <text x="350" y="184" class="tx-mid tx-sm tx-muted">2 cycles</text>
+      <text x="490" y="184" class="tx-mid tx-sm tx-muted">10 / 40</text>
+      <line x1="248" y1="164" x2="248" y2="228" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="388" y1="164" x2="388" y2="228" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="528" y1="164" x2="528" y2="228" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="20" y1="236" x2="540" y2="236" class="st-ink sw-4"/>
+      <text x="540" y="258" class="tx-end tx-sm">CDB</text>
+      <line x1="156" y1="232" x2="156" y2="98" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="296" y1="232" x2="296" y2="98" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="436" y1="232" x2="436" y2="98" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="28" y1="232" x2="28" y2="158" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="280" y="258" class="tx-mid tx-mono tx-sm">⟨MUL1, v(F0)⟩</text>
+      <text x="96" y="178" class="tx-mid tx-hand">tags here</text>
+      <text x="300" y="296" class="tx-mid tx-hand">one broadcast per cycle</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The machine the notes' tables describe: two stations per unit, one unit per class, one bus. The plain arrows carry operands down to the units and results to the bus; the blue arrows are the broadcast — every station and the register file hear the same ⟨tag, value⟩ in the same cycle.</figcaption>
+  </figure>
+
+  <p>If you want a picture to hang the rules on: issuing an instruction is handing in an order at a cloakroom with numbered tickets. For every input that is not ready you get a <mark class="key">ticket number</mark> — the tag of the station that will produce it — instead of the value, and you hang your own number on the hook of your destination register: "F6 will be filled by ADD2". When a worker finishes, the number is called once over the loudspeaker, the <mark class="key">common data bus</mark>: everybody holding that number copies the value, and the hook takes it only if it still shows that number. An older ticket called late is ignored; someone who already collected a value is not disturbed when the hook's label changes. Everything below is this picture with cycle numbers.</p>
+
+  <aside class="margin-note">Three verbs again: issue in order, execute out of order, complete out of order. Tomasulo keeps the first and frees the other two from every name conflict.</aside>
+  <p>The rules that turn the picture into numbers are the stage conditions of lesson 12, read as arithmetic. They are also the conventions of the papers' solved exercises (the pre-filled row <code>LD: 1 / 2 / 6</code> with latency 4 is these rules at work):</p>
+
+  <div class="formula">
+    \[ S = \max(I + 1,\ W_{\text{prod}} + 1,\ U) \]
+    \[ W = S + L \]
+    \[ \text{CPI} = W_{\text{last}} / N \]
+    <dl class="legend">
+      <dt>\(I\)</dt><dd>issue cycle: in program order, one per cycle, and only into a free station of the right class — a station is busy from its issue through its write cycle</dd>
+      <dt>\(S\)</dt><dd>start of execution</dd>
+      <dt>\(W_{\text{prod}}\)</dt><dd>write-result cycle of the producer of each operand that was still pending at issue: the value travels on the bus in that cycle and is used from the next one</dd>
+      <dt>\(U\)</dt><dd>first cycle in which a unit of the class is free; in these tables a unit is busy from the start through the write cycle of its instruction</dd>
+      <dt>\(L\)</dt><dd>latency of the unit; execution occupies the cycles \(S, \dots, S + L - 1\)</dd>
+      <dt>\(W\)</dt><dd>write-result cycle: one write per cycle on a single CDB — when two instructions are ready, the older goes first and the younger slips by one</dd>
+      <dt>\(N\)</dt><dd>number of instructions in the table (one iteration, in a loop)</dd>
+    </dl>
+  </div>
+
+  <p class="memo"><mark class="key">Start = the cycle after the last thing you were waiting for; write = start + latency; the bus serves one result per cycle, oldest first.</mark></p>
+</section>
+
+<section id="l13-run">
+  <h2>Fifty-nine cycles, and the six moments that matter</h2>
+
+  <p>Before touching the stepper, derive the six rows with the rules alone. This is what you do on the paper: row by row, each row's three numbers depending only on the rows above it and on the units.</p>
+
+  <ol class="steps" id="l13-steps-rows">
+    <li>
+      <p><code>I0 LD F6, 34(R2)</code> issues at 1 into <code>Load1</code>: R2 is ready, so Vj = v(R2) and A = 34; the register status says F6.Qi = Load1. Nothing to wait for, the load unit is free:</p>
+      \[ S_0 = 2, \qquad W_0 = 2 + 2 = 4 . \]
+    </li>
+    <li>
+      <p><code>I1 LD F2, 45(R3)</code> issues at 2 into <code>Load2</code> (F2.Qi = Load2). Its operand is ready, but the one load unit is busy with <code>I0</code> through <code>I0</code>'s write cycle 4, so it waits in its buffer:</p>
+      \[ S_1 = \max(3,\ 5) = 5, \qquad W_1 = 7 . \]
+      <p>With a second load unit it would be \(S_1 = 3\), \(W_1 = 5\) — section 3.</p>
+    </li>
+    <li>
+      <p><code>I2 FMUL F0, F2, F4</code> issues at 3 into <code>MUL1</code>: F2 is pending, so Qj = Load2; F4 is ready, so Vk = v(F4); F0.Qi = MUL1. It waits for the tag Load2, which is called at 7:</p>
+      \[ S_2 = \max(4,\ 7 + 1) = 8 \]
+      \[ W_2 = 8 + 10 = 18 . \]
+    </li>
+    <li>
+      <p><code>I3 FSUB F8, F6, F2</code> issues at 4 into <code>ADD1</code>: F6 is pending from Load1 — but Load1 broadcasts in this very cycle, so by the end of cycle 4 the station holds v(F6) (the notes strike the tag out, page 169); F2 is pending, Qk = Load2; F8.Qi = ADD1:</p>
+      \[ S_3 = \max(5,\ 4 + 1,\ 7 + 1) = 8 \]
+      \[ W_3 = 8 + 2 = 10 . \]
+      <p>It starts in the same cycle as <code>I2</code>: a different unit, so no conflict.</p>
+    </li>
+    <li>
+      <p><code>I4 FDIV F10, F0, F6</code> issues at 5 into <code>MUL2</code>: F0 is pending, Qj = MUL1; F6 has been in the register file since cycle 4, Vk = v(F6); F10.Qi = MUL2. It needs F0, written at 18, and the multiplier, busy with <code>I2</code> through that same cycle:</p>
+      \[ S_4 = \max(6,\ 18 + 1,\ 19) = 19 \]
+      \[ W_4 = 19 + 40 = 59 . \]
+    </li>
+    <li>
+      <p><code>I5 FADD F6, F8, F2</code> issues at 6 into <code>ADD2</code>: F8 pending, Qj = ADD1; F2 pending, Qk = Load2; F6.Qi = ADD2 — the second rename of F6; the WAR with <code>I3</code> and <code>I4</code> and the WAW with <code>I0</code> cost nothing. It needs F8 (written at 10), F2 (at 7) and the adder, busy with <code>I3</code> through 10:</p>
+      \[ S_5 = \max(7,\ 11,\ 8,\ 11) = 11 \]
+      \[ W_5 = 11 + 2 = 13 . \]
+      <p>Six instructions, last write at 59: \(\text{CPI} = 59 / 6 \approx 9.83\).</p>
+    </li>
+  </ol>
+
+  <figure class="tbl-fig" id="l13-tbl-final">
+    <figcaption>The notes' run (page 182) in the paper's table. The hazards are written as the paper writes them; the station names are the notes' — an exam text names its own, RS1 to RS6.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>INSTRUCTION</th><th>ISSUE</th><th>START EXEC</th><th>WRITE RESULT</th><th>Hazards Type</th><th>RSi</th><th>UNIT</th></tr></thead>
+        <tbody>
+          <tr><td><code>I0: LD F6, 34(R2)</code></td><td class="num">1</td><td class="num">2</td><td class="num">4</td><td>None</td><td>Load1</td><td>Load unit</td></tr>
+          <tr><td><code>I1: LD F2, 45(R3)</code></td><td class="num">2</td><td class="num">5</td><td class="num">7</td><td>Structural: the load unit is busy with I0 through its write at 4</td><td>Load2</td><td>Load unit</td></tr>
+          <tr><td><code>I2: FMUL F0, F2, F4</code></td><td class="num">3</td><td class="num">8</td><td class="num">18</td><td>RAW with I1 for F2</td><td>MUL1</td><td>Mult / Div</td></tr>
+          <tr><td><code>I3: FSUB F8, F6, F2</code></td><td class="num">4</td><td class="num">8</td><td class="num">10</td><td>RAW with I0 for F6; RAW with I1 for F2</td><td>ADD1</td><td>Adder</td></tr>
+          <tr><td><code>I4: FDIV F10, F0, F6</code></td><td class="num">5</td><td class="num">19</td><td class="num">59</td><td>RAW with I2 for F0 (F6 already in the register file at issue)</td><td>MUL2</td><td>Mult / Div</td></tr>
+          <tr class="is-key"><td><code>I5: FADD F6, F8, F2</code></td><td class="num">6</td><td class="num">11</td><td class="num">13</td><td>RAW with I3 for F8; RAW with I1 for F2; WAR with I3, I4 and WAW with I0 for F6 solved by renaming</td><td>ADD2</td><td>Adder</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Read the three number columns top to bottom. Issue: 1, 2, 3, 4, 5, 6 — in order, without a gap. Start: 2, 5, 8, 8, 19, 11 — out of order, <code>I5</code> before <code>I4</code>. Write: 4, 7, 18, 10, 59, 13 — out of order again: the instruction issued last finishes fourth, ahead of <code>FMUL</code>, and the one issued fifth finishes last. The bus is used at 4, 7, 10, 13, 18 and 59, never twice in one cycle, so the single CDB cost nothing in this run. And the hazards column holds nothing but RAW and one structural wait: every WAR and WAW of the code is in the last row with the words "solved by renaming".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l13-fig-cdb">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="End of cycle 6: three stations and the register F2 hold the tag Load2 and wait; the bus is idle">
+        <rect x="62" y="30" width="44" height="22" class="fw-s3"/><rect x="106" y="30" width="44" height="22" class="fw-s3"/><rect x="150" y="30" width="44" height="22" class="fw-s3"/><rect x="194" y="30" width="44" height="22" class="fw-s3"/>
+        <text x="84" y="45" class="tx-mid tx-mono tx-sm">Vj</text><text x="128" y="45" class="tx-mid tx-mono tx-sm">Qj</text><text x="172" y="45" class="tx-mid tx-mono tx-sm">Vk</text><text x="216" y="45" class="tx-mid tx-mono tx-sm">Qk</text>
+        <rect x="62" y="56" width="44" height="22" class="fi-paper"/><rect x="106" y="56" width="44" height="22" class="fi-paper"/><rect x="150" y="56" width="44" height="22" class="fi-paper"/><rect x="194" y="56" width="44" height="22" class="fi-paper"/>
+        <rect x="62" y="84" width="44" height="22" class="fi-paper"/><rect x="106" y="84" width="44" height="22" class="fi-paper"/><rect x="150" y="84" width="44" height="22" class="fi-paper"/><rect x="194" y="84" width="44" height="22" class="fi-paper"/>
+        <rect x="62" y="112" width="44" height="22" class="fi-paper"/><rect x="106" y="112" width="44" height="22" class="fi-paper"/><rect x="150" y="112" width="44" height="22" class="fi-paper"/><rect x="194" y="112" width="44" height="22" class="fi-paper"/>
+        <text x="16" y="71" class="tx-mono tx-sm">MUL1</text><text x="16" y="99" class="tx-mono tx-sm">ADD1</text><text x="16" y="127" class="tx-mono tx-sm">ADD2</text>
+        <text x="84" y="71" class="tx-mid tx-sm tx-muted">—</text><text x="128" y="71" class="tx-mid tx-mono tx-sm">Load2</text><text x="172" y="71" class="tx-mid tx-mono tx-sm">v(F4)</text><text x="216" y="71" class="tx-mid tx-sm tx-muted">—</text>
+        <text x="84" y="99" class="tx-mid tx-mono tx-sm">v(F6)</text><text x="128" y="99" class="tx-mid tx-sm tx-muted">—</text><text x="172" y="99" class="tx-mid tx-sm tx-muted">—</text><text x="216" y="99" class="tx-mid tx-mono tx-sm">Load2</text>
+        <text x="84" y="127" class="tx-mid tx-sm tx-muted">—</text><text x="128" y="127" class="tx-mid tx-mono tx-sm">ADD1</text><text x="172" y="127" class="tx-mid tx-sm tx-muted">—</text><text x="216" y="127" class="tx-mid tx-mono tx-sm">Load2</text>
+        <rect x="62" y="156" width="44" height="22" class="fi-paper"/><rect x="106" y="156" width="88" height="22" class="fw-s3"/>
+        <text x="16" y="171" class="tx-mono tx-sm">F2</text><text x="84" y="171" class="tx-mid tx-sm tx-muted">old</text><text x="150" y="171" class="tx-mid tx-mono tx-sm">Qi: Load2</text>
+        <line x1="280" y1="28" x2="280" y2="216" class="st-muted sw-4"/>
+        <text x="280" y="236" class="tx-mid tx-sm tx-muted">CDB</text>
+        <text x="126" y="236" class="tx-mid tx-hand">waiting for LD F2</text>
+      </svg>
+      <p class="fig-label">Before: end of cycle 6</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Cycle 7: the tag Load2 and the value of F2 go on the bus once; MUL1, ADD1, ADD2 and the register F2 all take the value in the same cycle">
+        <text x="296" y="18" class="tx-end tx-mono tx-sm">⟨Load2, v(F2)⟩</text>
+        <rect x="62" y="30" width="44" height="22" class="fw-s3"/><rect x="106" y="30" width="44" height="22" class="fw-s3"/><rect x="150" y="30" width="44" height="22" class="fw-s3"/><rect x="194" y="30" width="44" height="22" class="fw-s3"/>
+        <text x="84" y="45" class="tx-mid tx-mono tx-sm">Vj</text><text x="128" y="45" class="tx-mid tx-mono tx-sm">Qj</text><text x="172" y="45" class="tx-mid tx-mono tx-sm">Vk</text><text x="216" y="45" class="tx-mid tx-mono tx-sm">Qk</text>
+        <rect x="62" y="56" width="44" height="22" class="hl"/><rect x="150" y="84" width="44" height="22" class="hl"/><rect x="150" y="112" width="44" height="22" class="hl"/><rect x="106" y="156" width="88" height="22" class="hl"/>
+        <rect x="62" y="56" width="44" height="22" class="fi-paper"/><rect x="106" y="56" width="44" height="22" class="fi-paper"/><rect x="150" y="56" width="44" height="22" class="fi-paper"/><rect x="194" y="56" width="44" height="22" class="fi-paper"/>
+        <rect x="62" y="84" width="44" height="22" class="fi-paper"/><rect x="106" y="84" width="44" height="22" class="fi-paper"/><rect x="150" y="84" width="44" height="22" class="fi-paper"/><rect x="194" y="84" width="44" height="22" class="fi-paper"/>
+        <rect x="62" y="112" width="44" height="22" class="fi-paper"/><rect x="106" y="112" width="44" height="22" class="fi-paper"/><rect x="150" y="112" width="44" height="22" class="fi-paper"/><rect x="194" y="112" width="44" height="22" class="fi-paper"/>
+        <text x="16" y="71" class="tx-mono tx-sm">MUL1</text><text x="16" y="99" class="tx-mono tx-sm">ADD1</text><text x="16" y="127" class="tx-mono tx-sm">ADD2</text>
+        <text x="84" y="71" class="tx-mid tx-mono tx-sm">v(F2)</text><text x="128" y="71" class="tx-mid tx-sm tx-muted">—</text><text x="172" y="71" class="tx-mid tx-mono tx-sm">v(F4)</text><text x="216" y="71" class="tx-mid tx-sm tx-muted">—</text>
+        <text x="84" y="99" class="tx-mid tx-mono tx-sm">v(F6)</text><text x="128" y="99" class="tx-mid tx-sm tx-muted">—</text><text x="172" y="99" class="tx-mid tx-mono tx-sm">v(F2)</text><text x="216" y="99" class="tx-mid tx-sm tx-muted">—</text>
+        <text x="84" y="127" class="tx-mid tx-sm tx-muted">—</text><text x="128" y="127" class="tx-mid tx-mono tx-sm">ADD1</text><text x="172" y="127" class="tx-mid tx-mono tx-sm">v(F2)</text><text x="216" y="127" class="tx-mid tx-sm tx-muted">—</text>
+        <rect x="62" y="156" width="44" height="22" class="fi-paper"/><rect x="106" y="156" width="88" height="22" class="fw-s3"/>
+        <text x="16" y="171" class="tx-mono tx-sm">F2</text><text x="84" y="171" class="tx-mid tx-mono tx-sm">v(F2)</text><text x="150" y="171" class="tx-mid tx-mono tx-sm">Qi: —</text>
+        <line x1="280" y1="28" x2="280" y2="216" class="st-ink sw-4"/>
+        <line x1="278" y1="67" x2="246" y2="67" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="278" y1="95" x2="246" y2="95" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="278" y1="123" x2="246" y2="123" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="278" y1="167" x2="246" y2="167" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="280" y="236" class="tx-mid tx-sm">CDB</text>
+        <text x="110" y="236" class="tx-mid tx-hand">four listeners</text>
+      </svg>
+      <p class="fig-label">After: cycle 7</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> One broadcast, four deliveries. At the end of cycle 6 four cells hold the ticket number Load2. In cycle 7 the number is called once: the three stations copy the value into Vj or Vk and clear the tag, the register file writes F2 because its Qi still says Load2. MUL2 (Vk = v(F6)) and F6 (Qi = ADD2) are not listening and are untouched.</figcaption>
+  </figure>
+
+  <p>Cycle 7 is the one to remember. <code>LD F2</code> finishes and ⟨Load2, v(F2)⟩ goes on the bus once. Four listeners take it in the same cycle: the register file (Qi[F2] = Load2 matches, the value lands, the tag is cleared), <code>MUL1</code> (Qj = Load2 becomes Vj = v(F2)), <code>ADD1</code> and <code>ADD2</code> (Qk becomes Vk). One write, four deliveries — that is what the word <em>common</em> in common data bus buys. It is also why <code>FMUL</code> and <code>FSUB</code> both start in cycle 8: each was waiting for exactly this tag, and they use different units. The bus is a bottleneck for <em>writes</em>, never for starts.</p>
+
+  <div class="widget" id="l13-w-stepper">
+    <h3 class="widget-title">The Tomasulo stepper: the notes' example, cycles 1 to 59</h3>
+    <p class="widget-intro">The notes' tables, as they stand at the end of each cycle: the instruction status in the paper's columns, the six stations with their fields, the units, and the register-status row Qi. Cells that changed in this cycle are highlighted; a row with a blue frame is broadcasting on the CDB; the log under the controls narrates the cycle.</p>
+    <ol class="tasks">
+      <li>Before you step to cycle 5: <code>LD F2</code> was issued at cycle 2 and needs nothing but R3. Predict its START EXEC with one load unit; then step and read the wait line of cycles 3 and 4.
+        <details class="answer"><summary>What you should see</summary>
+          <p>5. The unit is busy with <code>LD F6</code> through its write cycle 4, so <code>LD F2</code> waits in its buffer — a structural wait inside a station, not a stall at issue: <code>FMUL</code>, <code>FSUB</code> and the rest keep issuing behind it. Switch to two load units and it starts at 3.</p></details>
+      </li>
+      <li>Stop at cycle 6 and count the cells that hold the tag Load2. Predict what changes at the end of cycle 7; then step once.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Four cells: F2's Qi, MUL1.Qj, ADD1.Qk and ADD2.Qk. At cycle 7 all four are cleared and three values appear: one broadcast serves three stations and a register at once, and nothing else moves — MUL2 and F6 are not listening. The one insight this widget exists for: the bus carries one result, every listener takes it in the same cycle.</p></details>
+      </li>
+      <li>At cycle 6 F6's Qi becomes ADD2, although Load1's value landed in F6 at cycle 4 and both <code>FSUB</code> (issued at 4) and <code>FDIV</code> (issued at 5) read F6. Predict whether <code>FADD</code>'s write at 13 can harm either; then step to 13 and look at MUL2.Vk.
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. Both copied v(F6) at issue — <code>FSUB</code> from the broadcast of cycle 4, <code>FDIV</code> from the register file in cycle 5 — and MUL2.Vk still says v(F6) at 13 and at 19, when <code>FDIV</code> starts. The write at 13 is accepted by the register file because Qi[F6] = ADD2, the youngest writer. That is renaming: a reader is tied to its producer's ticket, never to the name F6.</p></details>
+      </li>
+      <li>Switch to two independent load units and step to the end. Which rows move, by how much, and why does <code>FSUB</code>'s start move too?
+        <details class="answer"><summary>What you should see</summary>
+          <p><code>LD F2</code> starts at 3 and writes at 5; everything that waited for F2 moves up by two: <code>FMUL</code> 6 → 16, <code>FSUB</code> 6 → 8, <code>FDIV</code> 17 → 57, <code>FADD</code> 9 → 11. Same program, same latencies, one assumption changed: 57 instead of 59. An exam text states its load units for exactly this reason.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  /* Tomasulo engine of this lesson — a pure function of the program and the machine, shared by the two widgets.
+     Decisions of a cycle are taken on the state at the START of the cycle; the updates are applied together at its end,
+     in the order issue → write result (the broadcast also reaches the station issued in this cycle) → start execution.
+     Conventions (official brief, section 3.0, and the notes' tables): issue in order, one per cycle, only into a free station;
+     a station is busy from issue through write result; start = max(issue + 1, producer's write + 1, unit free);
+     write = start + latency; a unit is busy from start through its write cycle; one CDB write per cycle, the oldest first. */
+  function l13Simulate(cfg) {
+    var regs = cfg.regs.slice(), regQ = {}, r;
+    for (r = 0; r < regs.length; r++) regQ[regs[r]] = '';
+    var st = cfg.stations.map(function (s) { return { name: s.name, cls: s.cls, busy: false, op: '', Vj: '', Vk: '', Qj: '', Qk: '', A: '', time: '', ins: -1, phase: '' }; });
+    var un = cfg.units.map(function (u) { return { name: u.name, cls: u.cls, ins: -1, writing: -1 }; });
+    var ins = cfg.instrs.map(function (x, i) { return { i: i, txt: x.txt, op: x.op, cls: x.cls, dst: x.dst || '', j: x.j || '', k: x.k || '', imm: x.imm == null ? '' : String(x.imm), lat: cfg.lat[x.op], I: 0, S: 0, W: 0, rs: '', unit: '', hz: [], slip: 0 }; });
+    var tagOf = {};
+    ins.forEach(function (x) {
+      var war = [], waw = [], p;
+      if (!x.dst) return;
+      for (p = 0; p < x.i; p++) {
+        if (ins[p].j === x.dst || ins[p].k === x.dst) war.push('I' + p);
+        if (ins[p].dst === x.dst) waw.push('I' + p);
+      }
+      x.nameDeps = (war.length ? 'WAR with ' + war.join(', ') : '') + (war.length && waw.length ? ' and ' : '') + (waw.length ? 'WAW with ' + waw.join(', ') : '') + (war.length || waw.length ? ' for ' + x.dst : '');
+    });
+    function cp(o) { var n = {}, k; for (k in o) n[k] = Array.isArray(o[k]) ? o[k].slice() : o[k]; return n; }
+    function snapshot(c, events, waits) { return { c: c, st: st.map(cp), un: un.map(cp), regQ: cp(regQ), ins: ins.map(cp), events: events, waits: waits, changed: [] }; }
+    function hz(x, label) { if (x.hz.indexOf(label) < 0) x.hz.push(label); }
+    var cycles = [snapshot(0, [], [])], next = 0, c, maxC = cfg.maxCycles || 120, cdbLog = [];
+    for (c = 1; c <= maxC; c++) {
+      st.forEach(function (w) { if (w.phase === 'write') { w.op = ''; w.Vj = ''; w.Vk = ''; w.Qj = ''; w.Qk = ''; w.A = ''; w.time = ''; w.ins = -1; w.phase = ''; } });
+      un.forEach(function (u) { u.writing = -1; });
+      var S0 = { st: st.map(cp), un: un.map(cp), regQ: cp(regQ) }, events = [], waits = [], changed = [], k, x, s;
+      /* 1 · write result: the oldest instruction whose execution finished in an earlier cycle takes the CDB */
+      var writer = -1, slipped = [];
+      for (k = 0; k < ins.length; k++) {
+        x = ins[k];
+        if (x.S > 0 && x.W === 0 && x.S + x.lat <= c) { if (writer < 0) writer = k; else slipped.push(k); }
+      }
+      /* 2 · start execution: operands present at the start of the cycle, a free unit of the class, program order */
+      var starts = [], unitTaken = {};
+      for (k = 0; k < ins.length; k++) {
+        x = ins[k];
+        if (!(x.I > 0 && x.I < c && x.S === 0)) continue;
+        s = S0.st[x.rsIdx];
+        if (s.Qj || s.Qk) {
+          var need = [s.Qj ? x.j + ' (tag ' + s.Qj + ', I' + tagOf[s.Qj] + ')' : '', s.Qk ? x.k + ' (tag ' + s.Qk + ', I' + tagOf[s.Qk] + ')' : ''].filter(Boolean);
+          waits.push({ i: k, kind: 'RAW', text: 'I' + k + ' waits in ' + x.rs + ' for ' + need.join(' and ') });
+          continue;
+        }
+        var free = -1, holder = -1, u;
+        for (u = 0; u < S0.un.length; u++) if (S0.un[u].cls === x.cls) { if (S0.un[u].ins < 0 && !unitTaken[u]) { if (free < 0) free = u; } else if (holder < 0 && S0.un[u].ins >= 0) holder = S0.un[u].ins; }
+        if (free < 0) {
+          var hu = holder >= 0 ? ins[holder] : null;
+          waits.push({ i: k, kind: 'STR', text: 'I' + k + ' has both operands in ' + x.rs + ' but its unit is busy' + (hu ? ' with I' + hu.i + ' through the write at ' + (hu.S + hu.lat + hu.slip) : '') });
+          hz(x, 'Structural (unit)');
+          continue;
+        }
+        unitTaken[free] = true; starts.push({ i: k, u: free });
+      }
+      /* 3 · issue: the next instruction in program order into a free station of its class */
+      var issue = null;
+      if (next < ins.length) {
+        x = ins[next];
+        var fs = -1, busyNames = [];
+        for (k = 0; k < S0.st.length; k++) if (S0.st[k].cls === x.cls) { if (!S0.st[k].busy) { if (fs < 0) fs = k; } else busyNames.push(S0.st[k].name + ' (I' + S0.st[k].ins + ')'); }
+        if (fs < 0) { waits.push({ i: next, kind: 'STR', text: 'I' + next + ' cannot issue: no free station of its class — ' + busyNames.join(' and ') + ' are busy through their write cycles' }); hz(x, 'Structural (RS)'); }
+        else issue = { i: next, s: fs };
+      }
+      /* apply · issue */
+      if (issue) {
+        x = ins[issue.i]; s = st[issue.s];
+        x.I = c; x.rs = s.name; x.rsIdx = issue.s; next++;
+        s.busy = true; s.op = x.op; s.ins = x.i; s.time = ''; s.A = x.imm; s.phase = 'wait';
+        var parts = [];
+        if (x.j) { if (regQ[x.j]) { s.Qj = regQ[x.j]; s.Vj = ''; parts.push(x.j + ' is pending from ' + s.Qj + ' → Qj = ' + s.Qj); hz(x, 'RAW with I' + tagOf[s.Qj] + ' for ' + x.j); } else { s.Vj = 'v(' + x.j + ')'; s.Qj = ''; parts.push(x.j + ' is in the register file → Vj = v(' + x.j + ')'); } }
+        if (x.k) { if (regQ[x.k]) { s.Qk = regQ[x.k]; s.Vk = ''; parts.push(x.k + ' is pending from ' + s.Qk + ' → Qk = ' + s.Qk); hz(x, 'RAW with I' + tagOf[s.Qk] + ' for ' + x.k); } else { s.Vk = 'v(' + x.k + ')'; s.Qk = ''; parts.push(x.k + ' is in the register file → Vk = v(' + x.k + ')'); } }
+        if (x.imm) parts.push('A = ' + x.imm);
+        if (x.dst) { regQ[x.dst] = s.name; parts.push(x.dst + '.Qi = ' + s.name + (x.nameDeps ? ' (renames ' + x.dst + ': ' + x.nameDeps + ' — harmless)' : '')); changed.push('rq:' + x.dst); }
+        tagOf[s.name] = x.i;
+        ['busy', 'op', 'Vj', 'Vk', 'Qj', 'Qk', 'A'].forEach(function (f) { changed.push('st:' + s.name + ':' + f); });
+        changed.push('is:' + x.i + ':I');
+        events.push({ i: x.i, kind: 'I', text: 'I' + x.i + ' ' + x.txt + ' issues to ' + s.name + ': ' + parts.join('; ') });
+      }
+      /* apply · write result (the broadcast) */
+      if (writer >= 0) {
+        x = ins[writer]; s = st[x.rsIdx];
+        var tag = s.name, val = 'v(' + (x.dst || 'mem') + ')', woke = [], rf = '';
+        x.W = c; changed.push('is:' + x.i + ':W');
+        cdbLog.push({ c: c, tag: tag, i: x.i });
+        if (x.dst) {
+          st.forEach(function (w) {
+            if (w === s || !w.busy) return;
+            if (w.Qj === tag) { w.Qj = ''; w.Vj = val; woke.push(w.name + '.Vj'); changed.push('st:' + w.name + ':Vj', 'st:' + w.name + ':Qj'); }
+            if (w.Qk === tag) { w.Qk = ''; w.Vk = val; woke.push(w.name + '.Vk'); changed.push('st:' + w.name + ':Vk', 'st:' + w.name + ':Qk'); }
+          });
+          if (regQ[x.dst] === tag) { regQ[x.dst] = ''; rf = 'register ' + x.dst + ' (Qi = ' + tag + ' matches: the value lands, Qi cleared)'; changed.push('rq:' + x.dst); }
+          else rf = 'register ' + x.dst + ' REFUSES it (Qi = ' + regQ[x.dst] + ': a younger writer owns the name)';
+        }
+        un.forEach(function (u) { if (u.ins === x.i) { u.ins = -1; u.writing = x.i; changed.push('un:' + u.name); } });
+        s.busy = false; s.time = ''; s.phase = 'write';
+        changed.push('st:' + tag + ':busy', 'st:' + tag + ':time');
+        events.push({ i: x.i, kind: 'W', text: 'I' + x.i + ' ' + x.txt + ' writes result: ⟨' + tag + ', ' + val + '⟩ on the CDB → ' + (x.dst ? [rf].concat(woke.length ? [woke.join(', ')] : []).join('; ') : 'memory (a store does not use the CDB)') + '. ' + tag + ' and its unit are free from the next cycle' });
+      }
+      slipped.forEach(function (k2) { x = ins[k2]; x.slip++; hz(x, 'Structural (CDB)'); waits.push({ i: k2, kind: 'STR', text: 'I' + k2 + ' is ready to write but the single CDB is taken by the older I' + writer + ' this cycle: it slips to the next cycle' }); });
+      /* apply · starts */
+      starts.forEach(function (o) {
+        x = ins[o.i]; s = st[x.rsIdx];
+        x.S = c; x.unit = un[o.u].name; un[o.u].ins = x.i; s.time = x.lat - 1; s.phase = 'exec';
+        changed.push('is:' + x.i + ':S', 'un:' + un[o.u].name, 'st:' + s.name + ':time');
+        events.push({ i: x.i, kind: 'S', text: 'I' + x.i + ' ' + x.txt + ' starts execution in ' + un[o.u].name + ' (' + [s.Vj, s.Vk].filter(Boolean).join(', ') + (s.A ? ', A = ' + s.A : '') + '): ' + x.lat + ' cycle' + (x.lat > 1 ? 's' : '') + ', result on the CDB at ' + (c + x.lat) });
+      });
+      /* execution in progress: the Time counters go down */
+      st.forEach(function (w) {
+        if (w.busy && w.phase === 'exec' && ins[w.ins].S < c && ins[w.ins].W === 0) {
+          var x2 = ins[w.ins], left = x2.S + x2.lat - 1 - c;
+          w.time = left >= 0 ? left : 0; changed.push('st:' + w.name + ':time');
+          if (left === 0) events.push({ i: w.ins, kind: 'E', text: 'I' + w.ins + ' ' + x2.txt + ' finishes its last execution cycle in ' + x2.unit + '; it writes in the next cycle' });
+        }
+      });
+      var snap = snapshot(c, events, waits); snap.changed = changed; cycles.push(snap);
+      if (ins.every(function (y) { return y.W > 0; })) break;
+    }
+    return { cycles: cycles, ins: ins.map(cp), total: cycles[cycles.length - 1].c, regs: regs, cdb: cdbLog };
+  }
+  /* The notes' program (page 163) on the notes' machine, with one load unit (the tables) or two (Hennessy & Patterson) */
+  function l13Programs() {
+    function prog() {
+      return [
+        { txt: 'LD F6, 34(R2)', op: 'LD', cls: 'load', dst: 'F6', j: 'R2', imm: 34 },
+        { txt: 'LD F2, 45(R3)', op: 'LD', cls: 'load', dst: 'F2', j: 'R3', imm: 45 },
+        { txt: 'FMUL F0, F2, F4', op: 'FMUL', cls: 'mul', dst: 'F0', j: 'F2', k: 'F4' },
+        { txt: 'FSUB F8, F6, F2', op: 'FSUB', cls: 'add', dst: 'F8', j: 'F6', k: 'F2' },
+        { txt: 'FDIV F10, F0, F6', op: 'FDIV', cls: 'mul', dst: 'F10', j: 'F0', k: 'F6' },
+        { txt: 'FADD F6, F8, F2', op: 'FADD', cls: 'add', dst: 'F6', j: 'F8', k: 'F2' }];
+    }
+    function stations() { return [{ name: 'Load1', cls: 'load' }, { name: 'Load2', cls: 'load' }, { name: 'ADD1', cls: 'add' }, { name: 'ADD2', cls: 'add' }, { name: 'MUL1', cls: 'mul' }, { name: 'MUL2', cls: 'mul' }]; }
+    var lat = { LD: 2, FADD: 2, FSUB: 2, FMUL: 10, FDIV: 40 }, regs = ['F0', 'F2', 'F4', 'F6', 'F8', 'F10'];
+    return {
+      one: { regs: regs, instrs: prog(), stations: stations(), units: [{ name: 'Load unit', cls: 'load' }, { name: 'Adder', cls: 'add' }, { name: 'Mult/Div', cls: 'mul' }], lat: lat },
+      two: { regs: regs, instrs: prog(), stations: stations(), units: [{ name: 'Load unit 1', cls: 'load' }, { name: 'Load unit 2', cls: 'load' }, { name: 'Adder', cls: 'add' }, { name: 'Mult/Div', cls: 'mul' }], lat: lat }
+    };
+  }
+  </script>
+  <script>
+  Course.widget('l13-w-stepper', function (root, ui) {
+    var P = l13Programs(), runs = { '1': l13Simulate(P.one), '2': l13Simulate(P.two) }, el = Course.el;
+    var model = ui.select('load units', [
+      { value: '1', label: 'one load unit, held through its write cycle — the notes’ tables (59 cycles)' },
+      { value: '2', label: 'two independent load units — the classic CS252 table (57 cycles)' }], null, '1');
+    var hi = ui.toggle('highlight the cells that changed in this cycle', true);
+    var caps = ['Before cycle 1: every station is empty'], c;
+    for (c = 1; c <= 59; c++) caps.push('Cycle ' + c);
+    var st = ui.stepper({ steps: caps, play: 700, start: 1 });
+    var roCycle = ui.readout('cycle', { digits: 0 }), roCdb = ui.readout('on the CDB'), roDone = ui.readout('results written', { digits: 0 }), roWait = ui.readout('waiting in a station', { digits: 0 });
+    var note = ui.note('');
+    var box = el('div', { 'class': 'l13-sb' }); ui.stage.appendChild(box);
+    var key = el('p', { 'class': 'l13-key', html: '<span><i class="l13-sw l13-chg"></i>changed in this cycle</span><span><i class="l13-sw l13-cdb"></i>broadcasting on the CDB in this cycle</span>' });
+    function td(text, keys, cls, chg) {
+      var empty = text === '' || text == null, cell = el('td', { 'class': cls || '', text: empty ? '—' : String(text) });
+      if (empty) cell.classList.add('l13-dim');
+      if (keys && keys.some(function (k) { return chg[k]; })) cell.classList.add('l13-chg');
+      return cell;
+    }
+    function hazText(x) {
+      var parts = x.hz.slice();
+      if (x.I && x.nameDeps) parts.push(x.nameDeps + ' solved by renaming');
+      return x.I ? (parts.length ? parts.join('; ') : 'None') : '';
+    }
+    function render() {
+      var run = runs[model.value], cyc = Math.min(st.index, run.total), snap = run.cycles[cyc], chg = {}, i, u;
+      if (hi.value) snap.changed.forEach(function (k) { chg[k] = true; });
+      box.textContent = '';
+      /* instruction status — the paper's columns */
+      var t1 = el('table', { 'class': 'tbl tbl--center' }), tb1 = el('tbody');
+      t1.appendChild(el('thead', null, el('tr', null, [el('th', { 'class': 'l13-left', text: 'INSTRUCTION' }), el('th', { text: 'ISSUE' }), el('th', { text: 'START EXEC' }), el('th', { text: 'WRITE RESULT' }), el('th', { 'class': 'l13-left', text: 'Hazards Type' }), el('th', { text: 'RSi' }), el('th', { text: 'UNIT' })])));
+      snap.ins.forEach(function (x) {
+        tb1.appendChild(el('tr', null, [el('td', { 'class': 'l13-left l13-mono', text: 'I' + x.i + '  ' + x.txt }),
+          td(x.I || '', ['is:' + x.i + ':I'], '', chg), td(x.S || '', ['is:' + x.i + ':S'], '', chg), td(x.W || '', ['is:' + x.i + ':W'], '', chg),
+          td(hazText(x), [], 'l13-haz', chg), td(x.rs, [], 'l13-mono', chg), td(x.unit, [], '', chg)]));
+      });
+      t1.appendChild(tb1);
+      box.appendChild(el('div', null, [el('h4', { text: 'Instruction status (the paper’s table)' }), el('div', { 'class': 'scroll-x' }, t1)]));
+      /* reservation stations */
+      var t2 = el('table', { 'class': 'tbl tbl--center' }), tb2 = el('tbody');
+      t2.appendChild(el('thead', null, el('tr', null, ['Name', 'Busy', 'Op', 'Vj', 'Vk', 'Qj', 'Qk', 'A', 'Time'].map(function (h, j) { return el('th', { 'class': j === 0 ? 'l13-left' : '', text: h }); }))));
+      snap.st.forEach(function (s) {
+        var n = s.name, writing = s.phase === 'write', tr = el('tr', { 'class': writing ? 'l13-cdb' : '' }, [el('td', { 'class': 'l13-left l13-mono', text: n }),
+          td(s.busy || writing ? 'Yes' : 'No', ['st:' + n + ':busy'], '', chg), td(s.op, ['st:' + n + ':op'], 'l13-mono', chg),
+          td(s.Vj, ['st:' + n + ':Vj'], 'l13-mono', chg), td(s.Vk, ['st:' + n + ':Vk'], 'l13-mono', chg),
+          td(s.Qj, ['st:' + n + ':Qj'], 'l13-mono', chg), td(s.Qk, ['st:' + n + ':Qk'], 'l13-mono', chg),
+          td(s.A, ['st:' + n + ':A'], 'l13-mono', chg), td(writing ? 'CDB' : (s.time === '' ? '' : s.time), ['st:' + n + ':time'], '', chg)]);
+        tb2.appendChild(tr);
+      });
+      t2.appendChild(tb2);
+      box.appendChild(el('div', null, [el('h4', { text: 'Reservation stations (Time = execution cycles still to run after this one)' }), el('div', { 'class': 'scroll-x' }, t2)]));
+      /* units and the register-status row, side by side in two small tables */
+      var t3 = el('table', { 'class': 'tbl tbl--center' }), tb3 = el('tbody');
+      t3.appendChild(el('thead', null, el('tr', null, [el('th', { 'class': 'l13-left', text: 'Unit' }), el('th', { text: 'executing' })])));
+      snap.un.forEach(function (un) {
+        var txt = '';
+        if (un.ins >= 0) { var sx = snap.st.filter(function (s) { return s.ins === un.ins; })[0]; txt = 'I' + un.ins + (sx && sx.time !== '' ? ' (' + sx.time + ' left)' : ''); }
+        else if (un.writing >= 0) txt = 'I' + un.writing + ' → CDB';
+        tb3.appendChild(el('tr', null, [el('td', { 'class': 'l13-left', text: un.name }), td(txt, ['un:' + un.name], 'l13-mono', chg)]));
+      });
+      t3.appendChild(tb3);
+      var t4 = el('table', { 'class': 'tbl tbl--center' });
+      t4.appendChild(el('thead', null, el('tr', null, [el('th', { 'class': 'l13-left', text: 'Register' })].concat(run.regs.map(function (r) { return el('th', { text: r }); })))));
+      t4.appendChild(el('tbody', null, el('tr', null, [el('td', { 'class': 'l13-left', text: 'Qi' })].concat(run.regs.map(function (r) { return td(snap.regQ[r], ['rq:' + r], 'l13-mono', chg); })))));
+      box.appendChild(el('div', null, [el('h4', { text: 'Units' }), el('div', { 'class': 'scroll-x' }, t3)]));
+      box.appendChild(el('div', null, [el('h4', { text: 'Register status (which station will write the register)' }), el('div', { 'class': 'scroll-x' }, t4)]));
+      box.appendChild(key);
+      /* the log */
+      var html = '';
+      if (cyc === 0) html = 'Nothing has issued yet. Press <b>Next</b> for cycle 1.';
+      else {
+        html = '<b>Cycle ' + cyc + '</b>' + (st.index > run.total ? ' — the run ended at ' + run.total + '; every result is written' : '') + '<ul class="l13-log">';
+        snap.events.forEach(function (e) { html += '<li>' + e.text + '.</li>'; });
+        snap.waits.forEach(function (w) { html += '<li class="l13-wait"><b>' + (w.kind === 'RAW' ? 'RAW wait:' : 'Structural wait:') + '</b> ' + w.text + '.</li>'; });
+        if (!snap.events.length && !snap.waits.length) html += '<li>Only execution in progress: the Time counters go down.</li>';
+        html += '</ul>';
+      }
+      note.set(html);
+      var done = 0, waiting = 0, cdb = 'idle';
+      for (i = 0; i < snap.ins.length; i++) if (snap.ins[i].W) done++;
+      for (i = 0; i < snap.waits.length; i++) if (snap.waits[i].kind === 'RAW') waiting++;
+      for (u = 0; u < snap.events.length; u++) if (snap.events[u].kind === 'W') { var w = snap.ins[snap.events[u].i]; cdb = '⟨' + w.rs + ', v(' + w.dst + ')⟩'; }
+      roCycle.set(cyc); roCdb.set(cdb, cdb === 'idle' ? undefined : 'key'); roDone.set(done + ' of ' + snap.ins.length, done === snap.ins.length ? 'good' : undefined); roWait.set(waiting);
+    }
+    ui.onChange(render);
+  });
+  </script>
+
+  <aside class="redpen" data-page="166">
+    <p class="claim">"LD F2 (Instr. 2) starts execution: Address calculated (R3 + 45); Memory load begins."</p>
+    <p class="fix">In the notes' own machine LD F2 starts execution at cycle 5, not 3: the single load unit is busy with LD F6 through its write cycle 4.</p>
+    <p class="because">The sentence contradicts the table under it, which leaves START EXEC blank for LD F2 at cycle 3 and shows the EXLoad row still holding Load1; page 170 then starts LD F2 at cycle 5, and every later number (FMUL 8, FDIV 19, the finish at 59) follows from 5. The sentence is true of a machine with two load units, where the run ends at 57. One or the other — never both in one table. The exam removes the ambiguity by stating the number of units; copy that habit when a text does not.</p>
+  </aside>
+
+  <aside class="redpen" data-page="168">
+    <p class="claim">"Reservation Station = SUB1" … "F8.Qi = SUB1"</p>
+    <p class="fix">The station is ADD1, and F8.Qi = ADD1, as the tables of pages 169 to 178 say. There is no SUB1 (nor the DIV1 of page 170, nor the LB1/SUB1/DIV1 of the renaming table on page 160): FSUB uses an ADD-class station and FDIV a MUL-class station.</p>
+    <p class="because">Page 162 explains it itself: FADD and FSUB share one adder and its two stations, FMUL and FDIV one multiplier-divider and its two stations. The name in the RSi column of the paper must be a station the text defines (RS1 … RS6); a name invented from the opcode is a wrong answer, and inside the notes it makes the Qj = ADD1 of cycle 6 unreadable.</p>
+  </aside>
+
+  <aside class="redpen" data-page="168">
+    <p class="claim">"But the RS Load listens to the CDB for the Load1 tag. It sees the result of the CDB broadcast and overwrites its state"</p>
+    <p class="fix">The station that listens for the tag Load1 is ADD1, the one holding FSUB — a consumer. A load buffer produces tags; it never waits for one here.</p>
+    <p class="because">A broadcast is matched against the Qj and Qk fields of every station: at cycle 4 only ADD1 has Qj = Load1 (and the register file has Qi[F6] = Load1). The same confusion returns on page 171, "it already read F6's value from the Reservation Station of the Load1", and on page 179, "from Load 1": FDIV took v(F6) from the register file at issue in cycle 5, where Load1's broadcast had put it in cycle 4. Stations receive values from the register file at issue or from the bus; one station never reads another.</p>
+  </aside>
+
+  <aside class="redpen" data-page="173">
+    <p class="claim">"ADDD F6, F8, F2 still waiting. Needs F0, but still waiting on F8, tag = ADD1 (result of SUBD)."</p>
+    <p class="fix">FADD does not read F0. At cycle 7 it waits for one operand only: F8, tag ADD1.</p>
+    <p class="because">Its sources are F8 and F2, and F2 arrived in this very cycle; the "Needs F0" is copied from the DIVD line above it. Trace every wait back to a source register of the instruction: on the paper, a RAW written against the wrong register is a wrong hazard.</p>
+  </aside>
+
+  <aside class="redpen" data-page="180">
+    <p class="claim">"Executed in MUL1 from cycle 8 to 18 (10 cycles total latency)"</p>
+    <p class="fix">Execution occupies the ten cycles 8 to 17; cycle 18 is the write-result cycle, in which the result travels on the CDB. Write = start + latency: 8 + 10 = 18.</p>
+    <p class="because">"8 to 18" inclusive would be eleven cycles, and page 176 had said "will finish around cycle 17" — which is the last execution cycle. The exam's pre-filled row settles the convention: LD with latency 4 issues at 1, starts at 2, writes at 6. If you count the write cycle as execution, every consumer in your table starts one cycle late.</p>
+  </aside>
+
+  <div class="pitfall" data-label="WAW is not WAR">
+    <p>"WAW hazard on F6 is avoided: … DIVD, which uses F6, was issued in cycle 5: it read the value of F6 at that time" (page 179). That is the WAR story — a reader protected by its own copy. The WAW story is different: Qi[F6] always names the <em>youngest</em> writer, ADD2 from cycle 6 on, so a late broadcast from Load1 would bounce off the register file. In this run Load1 wrote at 4, before FADD even issued, so time alone kept the two writes to F6 in order and the mechanism was never tested. Keep the two answers apart: WAR — readers hold values or tags, never the name; WAW — the register file honours only the youngest tag.</p>
+  </div>
+
+  <aside class="redpen" data-page="182">
+    <p class="claim">"No hazards occured, and Tomasulo's algorithm correctly handled: RAW (by waiting with tags)."</p>
+    <p class="fix">Data hazards did occur, and they cost cycles: FMUL waited in MUL1 from cycle 3 to 7 for F2, FDIV in MUL2 from 5 to 18 for F0, FADD in ADD2 from 6 to 10 for F8. What did not occur: a stall at issue, a wait caused by a name (WAR or WAW), a wrong result.</p>
+    <p class="because">The notes' own sentence says it — "handled RAW by waiting". Tomasulo turns a RAW hazard into a wait inside a station; it does not remove the wait, and it cannot: the value does not exist yet. A quiz option saying "Tomasulo eliminates all data hazards" is false; "eliminates WAR and WAW hazards" is true.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">In-order issue, out-of-order execution and completion: issue 1 to 6; start 2, 5, 8, 8, 19, 11; write 4, 7, 18, 10, 59, 13.</mark></p>
+</section>
+
+<section id="l13-assume">
+  <h2>Change one assumption, and every number on its chain moves</h2>
+
+  <p>The notes' number for <code>LD F2</code> is 5. The classic Berkeley CS252 table of the same example — Hennessy and Patterson's model; the slides are in the resources — says 3. Both are right, for different machines. The notes keep the load unit busy through the write cycle of its instruction and have only one of them; the textbook model lets a second load buffer proceed on its own, as if loads were pipelined through memory. Then <code>LD F2</code> starts at 3 and writes at 5, and the two cycles travel unchanged down everything that waited for F2:</p>
+
+  <figure class="tbl-fig" id="l13-tbl-two">
+    <figcaption>The same program with two independent load units (the classic CS252 table, Hennessy and Patterson's model): every number on the chain of F2 is two cycles earlier.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>INSTRUCTION</th><th>ISSUE</th><th>START EXEC</th><th>WRITE RESULT</th><th>one load unit (the notes)</th></tr></thead>
+        <tbody>
+          <tr><td><code>I0: LD F6, 34(R2)</code></td><td class="num">1</td><td class="num">2</td><td class="num">4</td><td>1 · 2 · 4</td></tr>
+          <tr class="is-key"><td><code>I1: LD F2, 45(R3)</code></td><td class="num">2</td><td class="num">3</td><td class="num">5</td><td>2 · 5 · 7</td></tr>
+          <tr><td><code>I2: FMUL F0, F2, F4</code></td><td class="num">3</td><td class="num">6</td><td class="num">16</td><td>3 · 8 · 18</td></tr>
+          <tr><td><code>I3: FSUB F8, F6, F2</code></td><td class="num">4</td><td class="num">6</td><td class="num">8</td><td>4 · 8 · 10</td></tr>
+          <tr><td><code>I4: FDIV F10, F0, F6</code></td><td class="num">5</td><td class="num">17</td><td class="num">57</td><td>5 · 19 · 59</td></tr>
+          <tr><td><code>I5: FADD F6, F8, F2</code></td><td class="num">6</td><td class="num">9</td><td class="num">11</td><td>6 · 11 · 13</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Page 181 guesses a divide latency of "up to 20 cycles" and a finish at "38+". The next page uses 40 — the latency of the scoreboard run too (page 138). A latency is a given of the exercise, never a guess.</aside>
+  <p>The finish moves from 59 to 57, and the CPI from 9.83 to 9.5. Nothing else changed: same code, same latencies, one sentence about the hardware. That is the lesson for the paper. The hardware sentence of Exercise 1 — "2 RESERVATION STATIONS with 2 LOAD/STORE units", "1 FP unit" — is not decoration; it decides numbers, and the June 2025 text even pre-fills a second load at 2 / 3 / 7 to make the two-unit convention explicit. When a text leaves an assumption open, write down the one you use next to the table.</p>
+
+  <h3>From the notes' tables to the paper's table</h3>
+
+  <p>The papers' Exercise 1 differs from the notes' tables in three ways. The hardware: two stations per class, LOAD/STORE units of latency 4, FP units of 3, an INT_ALU/BR unit of 2, named RS1 to RS6 and LDU1, FPU1, ALU1. The columns: <mark class="key">Hazards Type</mark>, <mark class="key">RSi</mark> and <mark class="key">UNIT</mark> after the three cycle numbers, and "Calculate the CPI" below. The code: a loop body with a store, an <code>ADDUI</code> and a <code>BNE</code>, none of which the notes' example has. (One more difference is spelling only: the 2024 and 2025 texts prefix every register with a dollar sign, <code>$F2</code>; the 2026 text drops it, and so does this notebook.) Three rules cover the newcomers. A store issues to a LOAD/STORE station, starts when its base register and its data are available, and its WRITE RESULT is the end of the memory write — it never uses the CDB, so it never collides with anybody on it. <code>ADDUI</code> and <code>BNE</code> use the integer station and unit. When no station of the class is free, issue waits — and everything behind it waits too — and the paper's word for the hazard is "Structural". The June 2026 exercise filled in is lesson 12. Here is the notes' program on the papers' kind of machine, with latencies chosen so that every rule fires once:</p>
+
+  <figure class="tbl-fig" id="l13-tbl-exam">
+    <figcaption>The six instructions on an exam-style machine: 2 RS (RS1, RS2) with 2 LOAD/STORE units (LDU1, LDU2), latency 4; 2 RS (RS3, RS4) with one FP add/sub unit (FPU1), latency 3; 2 RS (RS5, RS6) with one FP mul/div unit (FPU2), latency 6 for FMUL and 12 for FDIV; a single CDB; all cache hits.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>INSTRUCTION</th><th>ISSUE</th><th>START EXEC</th><th>WRITE RESULT</th><th>Hazards Type</th><th>RSi</th><th>UNIT</th></tr></thead>
+        <tbody>
+          <tr><td><code>I0: LD F6, 34(R2)</code></td><td class="num">1</td><td class="num">2</td><td class="num">6</td><td>None</td><td>RS1</td><td>LDU1</td></tr>
+          <tr><td><code>I1: LD F2, 45(R3)</code></td><td class="num">2</td><td class="num">3</td><td class="num">7</td><td>None</td><td>RS2</td><td>LDU2</td></tr>
+          <tr><td><code>I2: FMUL F0, F2, F4</code></td><td class="num">3</td><td class="num">8</td><td class="num">14</td><td>RAW with I1 for F2</td><td>RS5</td><td>FPU2</td></tr>
+          <tr><td><code>I3: FSUB F8, F6, F2</code></td><td class="num">4</td><td class="num">8</td><td class="num">11</td><td>RAW with I0 for F6; RAW with I1 for F2</td><td>RS3</td><td>FPU1</td></tr>
+          <tr><td><code>I4: FDIV F10, F0, F6</code></td><td class="num">5</td><td class="num">15</td><td class="num">27</td><td>RAW with I2 for F0; RAW with I0 for F6</td><td>RS6</td><td>FPU2</td></tr>
+          <tr><td><code>I5: FADD F6, F8, F2</code></td><td class="num">6</td><td class="num">12</td><td class="num">15</td><td>RAW with I3 for F8; RAW with I1 for F2; WAR with I3, I4 and WAW with I0 for F6 solved by renaming</td><td>RS4</td><td>FPU1</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Check the rows the way an examiner does. <code>I2</code> starts at 8 = <code>I1</code>'s write + 1. <code>I4</code> starts at 15 = <code>I2</code>'s write + 1, and FPU2 is free: <code>I2</code> executed in 8 to 13 and wrote at 14. <code>I5</code> starts at 12 = <code>I3</code>'s write + 1, with FPU1 free since <code>I3</code>'s write at 11. Note that <code>I4</code> now has a second RAW, with <code>I0</code> for F6: with a load latency of 4, F6 is still pending when <code>I4</code> issues at 5, so it captures the tag RS1 instead of the value — the hazards column depends on the latencies too. The CDB is used at 6, 7, 11, 14, 15 and 27, all distinct. CPI = 27 / 6 = 4.5. Had <code>I2</code> and <code>I3</code> wanted the bus in the same cycle, the older <code>I2</code> would have written first and <code>I3</code> would have slipped by one, together with everything waiting for F8 — <a href="l14.html">lesson 14</a> is made of such collisions.</p>
+
+  <div class="tip">
+    <p>On the paper, fill each row with four questions in order. <em>Is a station of my class free?</em> — if not, ISSUE waits, write "Structural". <em>Which of my sources is still pending, and when does its producer write?</em> — START EXEC is the latest of those writes + 1, or ISSUE + 1 if none, or the first cycle my unit is free if that is later; write "RAW with I# for F#". <em>Add the latency</em> — WRITE RESULT. <em>Does anybody older write in that same cycle?</em> — if so, slip by one, "Structural on the CDB". Then CPI = last WRITE RESULT / N, and the WAR and WAW of the code go into the hazards column with the words "solved by renaming".</p>
+  </div>
+</section>
+
+<section id="l13-vs">
+  <h2>Before and after: the scoreboard on the same six instructions</h2>
+
+  <p>Lesson 10 ran this program on the scoreboard — one Integer unit for the loads, one adder, two multipliers and a divider, the same latencies — and the notes print the final table on page 139: <code>LD F6</code> 1-2-3-4, <code>LD F2</code> 5-6-7-8, <code>FMUL</code> 6-9-19-20, <code>FSUB</code> 7-9-11-12, <code>FDIV</code> 8-21-61-62, <code>FADD</code> 13-14-16-22 (issue, read operands, execution complete, write result). Put the two runs on one time axis and every row of the notes' Table 19 becomes a visible difference.</p>
+
+  <div class="widget" id="l13-w-gantt">
+    <h3 class="widget-title">Scoreboard against Tomasulo: the same six instructions on one time axis</h3>
+    <p class="widget-intro">Above, the scoreboard run of lesson 10; below, the Tomasulo run of this lesson. In each row: the issue cell (I), the scoreboard's read-operands cell (R), dashed bars for waiting with the hazard named when there is room, a solid bar for execution, and a tick for the write of the result — on the Tomasulo side, a CDB broadcast. Bars cut at the right edge continue beyond the window.</p>
+    <ol class="tasks">
+      <li>Before you look: in which cycle does the scoreboard issue its last instruction, and in which does Tomasulo? Then find the two issue stalls of the scoreboard and name what caused each.
+        <details class="answer"><summary>What you should see</summary>
+          <p>13 against 6. The scoreboard holds <code>LD F2</code> at issue in cycles 2 to 4 because its single Integer unit is busy through <code>LD F6</code>'s write, and <code>FADD</code> in cycles 9 to 12 because the adder is busy with <code>FSUB</code>; every instruction behind a stalled one waits with it. Tomasulo has a second load buffer and a second add station: the wait happens inside the station, out of everybody's way.</p></details>
+      </li>
+      <li>Look at <code>FMUL</code> in both runs. Count the cycles between the write of <code>LD F2</code> and the first execution cycle of <code>FMUL</code> in each machine.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Scoreboard: write at 8, read operands at 9, execution from 10 — two cycles. Tomasulo: write at 7, execution from 8 — one cycle, because the value came down the bus into MUL1 during the write. That one cycle is forwarding, and it is saved after every producer on the chain. The insight to take from this widget: the CDB removes the read-operands cycle after every producer, and renaming removes every wait at write result.</p></details>
+      </li>
+      <li><code>FADD</code>: predict the cycle in which its result is written in each machine, and say what the dashed bar after its execution in the scoreboard means.
+        <details class="answer"><summary>What you should see</summary>
+          <p>22 against 13. The scoreboard's <code>FADD</code> finished executing at 16 and waited five cycles for <code>FDIV</code> to read F6 at 21 — the WAR check at write result of <a href="l09.html#l09-rules">lesson 9</a>. In Tomasulo, <code>FDIV</code> copied v(F6) into MUL2 at cycle 5, so the write at 13 answers to nobody.</p></details>
+      </li>
+      <li>Switch the Tomasulo machine to two load units. Which rows move, and why does the scoreboard row of <code>LD F2</code> stay where it is?
+        <details class="answer"><summary>What you should see</summary>
+          <p><code>LD F2</code> and the four instructions downstream of F2 move up by two cycles; the last result lands at 57. The scoreboard side has one Integer unit and no second buffer, so its <code>LD F2</code> still waits at issue until cycle 5. Different machines, different numbers — and the scoreboard's 62 is a fair comparison only with the one-load-unit 59.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l13-w-gantt', function (root, ui) {
+    var P = l13Programs(), runs = { '1': l13Simulate(P.one), '2': l13Simulate(P.two) }, svg = Course.svg;
+    /* the scoreboard run of the notes (page 138), with the waits named in lesson 10: issue, read, execution, write */
+    var SB = [
+      { name: 'I0 LD F6', I: 1, R: 2, ex: [3, 3], W: 4, waits: [] },
+      { name: 'I1 LD F2', I: 5, R: 6, ex: [7, 7], W: 8, waits: [{ a: 2, b: 4, l: 'STR Integer' }] },
+      { name: 'I2 FMUL', I: 6, R: 9, ex: [10, 19], W: 20, waits: [{ a: 7, b: 8, l: 'RAW F2' }] },
+      { name: 'I3 FSUB', I: 7, R: 9, ex: [10, 11], W: 12, waits: [{ a: 8, b: 8, l: 'RAW F2' }] },
+      { name: 'I4 FDIV', I: 8, R: 21, ex: [22, 61], W: 62, waits: [{ a: 9, b: 20, l: 'RAW F0' }] },
+      { name: 'I5 FADD', I: 13, R: 14, ex: [15, 16], W: 22, waits: [{ a: 9, b: 12, l: 'STR Add' }, { a: 17, b: 21, l: 'WAR F6' }] }];
+    var model = ui.select('Tomasulo machine', [
+      { value: '1', label: 'one load unit, held through its write cycle (the notes: 59)' },
+      { value: '2', label: 'two independent load units (the classic CS252 table: 57)' }], null, '1');
+    var win = ui.select('cycles shown', [{ value: '24', label: '1–24: where everything is decided' }, { value: '62', label: '1–62: the whole run' }], null, '24');
+    var guides = ui.toggle('guide lines at every CDB broadcast', true);
+    var roIssue = ui.readout('all six issued by'), roHop = ui.readout('LD F2 → FMUL'), roAdd = ui.readout('FADD writes at'), roLast = ui.readout('last result at');
+    var Wd = 760, L = 96, ROW = 26, Y1 = 56, Y2 = 250, H = 440;
+    var s = ui.svg(Wd, H, { label: 'Two timelines of the same six instructions: the scoreboard run above, the Tomasulo run below, with issue cells, waiting bars, execution bars and write ticks' });
+    ui.legend([{ label: 'execution', color: 's1', mark: 'area' }, { label: 'waiting (the hazard)', color: 's2', mark: 'dash' }, { label: 'write result — on the Tomasulo side a CDB broadcast', color: 's1', mark: 'square' }, { label: 'I = issue, R = read operands (scoreboard only)', color: 'muted', mark: 'line' }]);
+    function tomRows(run) {
+      return run.ins.map(function (x, i) {
+        var prodW = 0, reg = '', p, q;
+        [x.j, x.k].forEach(function (src) {
+          if (!src) return;
+          for (p = i - 1; p >= 0; p--) if (run.ins[p].dst === src) break;
+          if (p >= 0) { q = run.ins[p].W; if (q >= x.I + 1 && q > prodW) { prodW = q; reg = src; } }
+        });
+        var waits = [];
+        if (prodW) waits.push({ a: x.I + 1, b: prodW, l: 'RAW ' + reg });
+        var after = prodW ? prodW + 1 : x.I + 1;
+        if (x.S > after) waits.push({ a: after, b: x.S - 1, l: 'STR unit' });
+        return { name: 'I' + i + ' ' + x.op, I: x.I, R: 0, ex: [x.S, x.S + x.lat - 1], W: x.W, waits: waits };
+      });
+    }
+    function draw() {
+      while (s.firstChild) s.removeChild(s.firstChild);
+      var run = runs[model.value], n = +win.value, cw = (Wd - L - 8) / n, rows2 = tomRows(run), c, i;
+      function X(cy) { return L + (cy - 1) * cw; }
+      var every = n > 30 ? 5 : 1;
+      for (c = 1; c <= n + 1; c++) if ((c - 1) % every === 0 || c === n + 1) svg('line', { x1: X(c), y1: 30, x2: X(c), y2: H - 14, 'class': 'st-grid' }, s);
+      for (c = 1; c <= n; c++) if (c === 1 || c % every === 0) svg('text', { x: X(c) + cw / 2, y: 22, 'class': 'tx-mid tx-sm tx-muted', text: String(c) }, s);
+      svg('text', { x: 4, y: Y1 - 8, 'class': 'tx-sm tx-bold', text: 'Before: the scoreboard (lesson 10)' }, s);
+      svg('text', { x: 4, y: Y2 - 8, 'class': 'tx-sm tx-bold', text: 'After: Tomasulo (this lesson)' }, s);
+      function cell(cy, y, letter) {
+        if (cy < 1 || cy > n) return;
+        svg('rect', { x: X(cy) + 1, y: y + 1, width: cw - 2, height: 18, 'class': 'fi-paper' }, s);
+        if (cw >= 22 && letter) svg('text', { x: X(cy) + cw / 2, y: y + 14, 'class': 'tx-mid tx-mono tx-sm', text: letter }, s);
+      }
+      function bar(a, b, y, cls, label) {
+        if (a > n || b < a) return;
+        var bb = Math.min(b, n), w = (bb - a + 1) * cw - 2;
+        svg('rect', { x: X(a) + 1, y: y + 1, width: w, height: 18, 'class': cls }, s);
+        if (label && w >= label.length * 11 + 8) svg('text', { x: X(a) + 1 + w / 2, y: y + 14, 'class': 'tx-mid tx-sm halo', text: label }, s);
+      }
+      function tick(cy, y) { if (cy >= 1 && cy <= n) svg('rect', { x: X(cy) + cw / 2 - 3, y: y + 1, width: 6, height: 18, 'class': 'fi-s1' }, s); }
+      function rows(data, y0, withR) {
+        data.forEach(function (r, k) {
+          var y = y0 + k * ROW;
+          svg('text', { x: L - 6, y: y + 14, 'class': 'tx-end tx-mono tx-sm', text: r.name }, s);
+          r.waits.forEach(function (w) { bar(w.a, w.b, y, 'fw-s2 st-s2 dash', w.l); });
+          cell(r.I, y, 'I');
+          if (withR && r.R) cell(r.R, y, 'R');
+          bar(r.ex[0], r.ex[1], y, 'fw-s1 st-s1', '');
+          tick(r.W, y);
+        });
+      }
+      rows(SB, Y1, true);
+      rows(rows2, Y2, false);
+      var yc = Y2 + 6 * ROW + 6;
+      svg('text', { x: L - 6, y: yc + 14, 'class': 'tx-end tx-sm', text: 'CDB' }, s);
+      for (i = 0; i < run.cdb.length; i++) {
+        c = run.cdb[i].c;
+        if (c > n) continue;
+        tick(c, yc);
+        if (guides.value) svg('line', { x1: X(c) + cw / 2, y1: Y2 - 2, x2: X(c) + cw / 2, y2: yc, 'class': 'st-s1 sw-1 dash' }, s);
+      }
+      var T = run.ins, two = model.value === '2';
+      roIssue.set('scoreboard 13 · Tomasulo 6');
+      roHop.set('scoreboard: write 8, read 9, execute 10 · Tomasulo: write ' + T[1].W + ', execute ' + T[2].S);
+      roAdd.set('scoreboard 22 · Tomasulo ' + T[5].W);
+      roLast.set('scoreboard 62 · Tomasulo ' + T[4].W + (two ? ' (two load units)' : ''));
+    }
+    ui.onChange(draw);
+  });
+  </script>
+
+  <figure class="tbl-fig" id="l13-tbl-19">
+    <figcaption>The notes' Table 19 (page 184), row by row, with the place in the two runs where each row shows. One cell of the notes is corrected in the red-pen callout below this table; the sentence about exceptions on page 185 gets its own in the next section.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Row</th><th>Scoreboard</th><th>Tomasulo</th><th>Where you see it</th></tr></thead>
+        <tbody>
+          <tr><td>Operand tracking</td><td>register availability (Rj, Rk flags)</td><td>tags: Qj, Qk in the station, Qi in the register file</td><td>MUL1 holds "Load2", not "F2 not ready"</td></tr>
+          <tr><td>Register renaming</td><td>none</td><td>implicit, through the station tags</td><td>F6.Qi = Load1 at cycle 1, ADD2 at cycle 6</td></tr>
+          <tr><td>WAR / WAW hazards</td><td>must be stalled explicitly</td><td>eliminated by renaming</td><td>FADD writes at 22 on the scoreboard, at 13 here</td></tr>
+          <tr><td>Operand read timing</td><td>in the Read Operands stage, after issue (the notes write "at execution start")</td><td>at issue (value) or when the tag is broadcast (bus)</td><td>FMUL reads at 9 there; MUL1 fills at 3 and 7 here</td></tr>
+          <tr><td>Operand forwarding</td><td>none: wait for the register write, then read</td><td>yes, on the common data bus</td><td>FMUL executes from 10 there, from 8 here</td></tr>
+          <tr><td>Control model</td><td>one centralized scoreboard</td><td>decentralized: logic at each station and unit</td><td>a stalled load blocks issue there, waits in its buffer here</td></tr>
+          <tr><td>Functional units</td><td>ask the scoreboard whether they may start</td><td>the station checks its tags and starts</td><td>FMUL and FSUB both start at 8 on their own</td></tr>
+          <tr><td>Instruction readiness</td><td>RAW only, no renaming</td><td>RAW plus renamed operands: data-driven</td><td>FDIV fires the cycle after MUL1's broadcast</td></tr>
+          <tr><td>Common bus</td><td>no shared result forwarding</td><td>one broadcast serves every listener</td><td>cycle 7: three stations and a register</td></tr>
+          <tr><td>Complexity</td><td>simpler: one table, no tags, no bus (the notes write "simpler renaming logic")</td><td>more complex, higher performance</td><td>62 against 59 cycles, 13 against 6 to issue</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The numbers behind the words, three of them. <strong>Forwarding.</strong> A scoreboard consumer waits for the register-file write and then spends a cycle of its own reading — results go only to the register file, and no bus carries a tag that a waiting unit could match: <code>LD F2</code> writes at 8, <code>FMUL</code> reads at 9 and executes from 10. Tomasulo's <code>FMUL</code> executes from 8, the cycle after the write at 7, because the value came down the bus into MUL1. One cycle saved per producer-consumer hop. <strong>Renaming.</strong> The scoreboard's <code>FADD</code> completed execution at 16 and waited until 21 for <code>FDIV</code> to read F6 — the WAR test at write result. In Tomasulo <code>FDIV</code> copied v(F6) into MUL2 at cycle 5, so <code>FADD</code>'s write at 13 answers to nobody: 22 becomes 13. The course schedule's name for this is <mark class="key">implicit register renaming</mark>: no extra registers, the station tags are the new names. <strong>Distributed control.</strong> The scoreboard issues only when a unit is free, so <code>LD F2</code> waits at issue for the Integer unit in cycles 2 to 4 and <code>FADD</code> for the adder in 9 to 12, with everything behind them. Tomasulo issues into a station and lets the wait happen there: 13 cycles to issue become 6.</p>
+
+  <p>Now the puzzle of the hook. All of that, and the run is only three cycles shorter. The sum that explains it:</p>
+
+  <ol class="steps" id="l13-steps-chain">
+    <li>
+      <p>Every path through the program ends in <code>FDIV</code>, which needs F0 from <code>FMUL</code>, which needs F2 from <code>LD F2</code>. The chain <code>LD F2</code> → <code>FMUL</code> → <code>FDIV</code> carries \(2 + 10 + 40 = 52\) cycles of pure latency. No scheduler, static or dynamic, can shorten it: the values do not exist earlier.</p>
+    </li>
+    <li>
+      <p>Tomasulo, one load unit: <code>LD F2</code> starts at 5 (the unit is busy with <code>LD F6</code> through cycle 4) and writes at 5 + 2 = 7. Then each link costs its latency plus one CDB hop:</p>
+      \[ 59 = (5 + 2) + (1 + 10) + (1 + 40) . \]
+    </li>
+    <li>
+      <p>Scoreboard: <code>LD F2</code> issues at 5 (the Integer unit is busy through cycle 4), reads at 6, executes at 7, writes at 8; <code>FMUL</code> reads at 9, executes 10 to 19, writes at 20; <code>FDIV</code> reads at 21, executes 22 to 61, writes at 62. Each link costs a read cycle <em>and</em> a write cycle around its latency:</p>
+      \[ \begin{aligned} 62 &amp;= (5 + 1 + 1 + 1) \\ &amp;+ (1 + 10 + 1) + (1 + 40 + 1) . \end{aligned} \]
+    </li>
+    <li>
+      <p>\(62 - 59 = 3\): one read-operands cycle saved on each of the three links of the chain, nothing more. The seven cycles of issue stalls and the five cycles of WAR waiting that Tomasulo removed all happened in the shadow of the divide and never touched the finish line. With two load units the chain starts two cycles earlier and the finish is 57 — again the chain, not the scheduler.</p>
+    </li>
+  </ol>
+
+  <p>So the answer to the hook: the savings went to the instructions off the critical path — <code>FSUB</code> and <code>FADD</code> finish at 10 and 13 instead of 12 and 22 — and to the issue stage, which was free for new work from cycle 7. A program that was one long dependence chain would show the same three cycles and nothing else; a loop whose iterations are independent of each other shows all of it, which is why the next lessons run loops. Dynamic scheduling removes waiting caused by <em>names</em> and by <em>structure</em>; waiting caused by <em>values</em> stays.</p>
+
+  <aside class="redpen" data-page="184">
+    <p class="claim">"Simpler renaming logic" (Table 19, row Complexity, column Scoreboarding)</p>
+    <p class="fix">A scoreboard has no renaming logic at all. It is simpler because its control is a single centralized table: no tags, no tag comparators in the units, no broadcast bus.</p>
+    <p class="because">The same table says so two rows up: "Register Renaming — None". If a quiz asks which of the two renames registers, the answer is Tomasulo only; the scoreboard's answer to a WAR or WAW is a stall, which is exactly what the FADD row of lesson 10 shows (write held from 16 to 22).</p>
+  </aside>
+
+  <p>What the scoreboard keeps, in the notes' words (page 183): it is simpler to implement, historically foundational, and more hardware-economical for small-scale or embedded designs. Fair: one table and no bus is cheap, and every out-of-order machine since inherits its idea of issuing into a controller and letting the controller decide. But the verdict the notes give and the exam expects is the same — "for high-performance out-of-order execution, Tomasulo's model is the clear winner".</p>
+
+  <p class="memo"><mark class="key">Forwarding saves the read-operands cycle after every producer; renaming removes every wait at write result; the dependence chain stays exactly as long as its latencies.</mark></p>
+</section>
+
+<section id="l13-draw">
+  <h2>What Tomasulo breaks, and what fixed it</h2>
+
+  <p>The notes close with four drawbacks (pages 184 and 185). Each one is a sentence of the open question — "main concepts and benefits" has a cost side too — and each one points at a later lesson.</p>
+
+  <p><strong>1. Complex hardware.</strong> Stations with operand-tracking logic, a tag field for every register, a bus that broadcasts to every station, and comparators in every station to match the tag: area, control complexity, power. "Scaling the CDB becomes harder with many Functional Units and many RSs" (page 185) — every new listener is one more comparator on the bus.</p>
+
+  <p><strong>2. The CDB bottleneck.</strong> One result per cycle. In this run the six writes never collided, so the bus cost nothing; the two past papers of lesson 14 are built so that they do, and every collision slips the younger instruction and everything waiting for it. The mitigations the notes name — several CDBs, local bypass networks, a reorder buffer with a central commit stage — are what the next lessons and modern cores use.</p>
+
+  <p><strong>3. No precise exceptions.</strong> The notes' footnote 6 gives the definition to memorise: in precise exception handling, all instructions before the faulting one must complete, and none after it should affect the architectural state. Tomasulo breaks it twice over, as Fig. 3 shows: completion is out of order, and the register file is written <em>in place</em> at write result. Suppose <code>FDIV</code>, executing from 19 to 58, faults at cycle 30. <code>FADD</code>, which comes <em>after</em> it in the program, wrote F6 at cycle 13; F10 holds nothing new. The state is one no sequential machine could ever have had, and there is nothing to undo it with — "once a value is written to the register file via CDB, it's hard to 'undo' it".</p>
+
+  <figure class="fig fig--plain" id="l13-fig-imprecise">
+    <svg class="dia" viewBox="0 0 560 200" role="img" aria-label="Timeline: FDIV executes from cycle 19 to 58 and writes at 59; FADD, younger, wrote F6 at cycle 13; a fault in FDIV at cycle 30 finds F6 already overwritten by the younger instruction and F10 still old">
+      <text x="98" y="22" class="tx-mid tx-sm tx-muted">1</text>
+      <text x="165" y="22" class="tx-mid tx-sm tx-muted">10</text>
+      <text x="240" y="22" class="tx-mid tx-sm tx-muted">20</text>
+      <text x="315" y="22" class="tx-mid tx-sm tx-muted">30</text>
+      <text x="390" y="22" class="tx-mid tx-sm tx-muted">40</text>
+      <text x="465" y="22" class="tx-mid tx-sm tx-muted">50</text>
+      <text x="532" y="22" class="tx-mid tx-sm tx-muted">59</text>
+      <text x="84" y="54" class="tx-end tx-mono tx-sm">I4 FDIV</text>
+      <text x="84" y="84" class="tx-end tx-mono tx-sm">I5 FADD</text>
+      <rect x="135" y="40" width="98" height="20" class="fw-s2 st-s2 dash"/>
+      <text x="184" y="54" class="tx-mid tx-sm halo">RAW F0</text>
+      <rect x="233" y="40" width="300" height="20" class="fw-s1 st-s1"/>
+      <rect x="534" y="41" width="6" height="18" class="fi-s1"/>
+      <rect x="143" y="70" width="30" height="20" class="fw-s2 st-s2 dash"/>
+      <rect x="173" y="70" width="15" height="20" class="fw-s1 st-s1"/>
+      <rect x="189" y="71" width="6" height="18" class="fi-s1"/>
+      <line x1="319" y1="34" x2="319" y2="104" class="st-bad sw-2 dash"/>
+      <line x1="312" y1="43" x2="326" y2="57" class="st-bad sw-3"/>
+      <line x1="326" y1="43" x2="312" y2="57" class="st-bad sw-3"/>
+      <text x="319" y="124" class="tx-mid tx-hand">fault here</text>
+      <text x="300" y="152" class="tx-mid">F6 already holds the younger result</text>
+      <text x="300" y="180" class="tx-mid">F10 still old: the older FDIV is not done</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> Why the register file cannot be trusted at an exception. <code>FADD</code>, younger than <code>FDIV</code>, wrote F6 at 13; <code>FDIV</code> is still executing at 30. A fault there leaves a state no sequential run produces, and in-place writes cannot be taken back. The scoreboard, which also writes in place and out of order, has the same problem.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="185">
+    <p class="claim">"Scoreboarding can handle precise exceptions more gracefully."</p>
+    <p class="fix">It cannot. The scoreboard also completes out of order and writes the register file in place: on the same code it writes F8 at 12 and F6 at 22 while the older FDIV runs until 62. Neither machine gives precise exceptions; the fix for both is an in-order commit point — the reorder buffer.</p>
+    <p class="because">Lesson 9 listed "no register renaming … exceptions are imprecise" among the scoreboard's own assumptions (notes, pages 103–104), and Hennessy and Patterson name the CDC 6600 and the IBM 360/91 together as the textbook cases of imprecise interrupts. If a quiz option says the scoreboard is better at exceptions, it is the distractor.</p>
+  </aside>
+
+  <p><strong>4. Limited scalability.</strong> The original design issues one instruction per cycle and has one bus; a superscalar must issue and retire several per cycle, so the CDB and the tag matching must widen with it, and the stations grow with every extra unit. Modern cores keep the idea and change the parts: a <mark class="key">register alias table</mark> for the renaming, a <mark class="key">physical register file</mark> for the values, and <mark class="key">reorder-buffer commit</mark> for the order — "these ideas evolved from Tomasulo" (page 185). Lesson 17 adds the reorder buffer to a Tomasulo machine and shows how a result like <code>FADD</code>'s write at 13 is made to wait its turn before it reaches the register file.</p>
+
+  <div class="story" data-year="1967">
+    <p>Robert Tomasulo's algorithm ran in the floating-point unit of the IBM System/360 Model 91, of which only about fifteen were built; the first went to NASA's Goddard Space Flight Center in October 1967 and was then the most powerful computer in user operation. His 1967 paper describes the hardware as "looking ahead" about eight instructions; the Model 91 had imprecise exceptions and out-of-order memory stores, the two problems the reorder buffer later fixed. Intel's Golden Cove core of 2021 keeps 512 instructions in flight in its reorder buffer — the same algorithm with a 64-times larger window. Tomasulo received the Eckert–Mauchly Award in 1997 "for the ingenious Tomasulo algorithm, which enabled out-of-order execution processors to be implemented".</p>
+  </div>
+
+  <p class="memo"><mark class="key">Tomasulo's costs: comparators everywhere, one result per cycle on the bus, no precise exceptions, no easy way to go wide — and the reorder buffer is the answer to the third.</mark></p>
+</section>
+
+<section id="l13-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="3" id="l13-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used by modern superscalar processors (Tomasulo-style): 4. Reservation stations; 5. Dynamic register renaming; 6. Out-of-order execution.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>Reservation stations.</b> Buffers in front of each functional unit. An issued instruction waits there with its opcode, its operand values (Vj, Vk) if they were available at issue, otherwise the tags (Qj, Qk) of the stations that will produce them; the station is itself the tag under which the result will be broadcast. Benefits: the instruction leaves the in-order front end at once (no issue stall on a RAW hazard), waits locally and fires as soon as both operands arrive, results reach every waiting station and the register file in one cycle through the common data bus (forwarding), and hazard detection is distributed instead of centralized in a scoreboard.</p>
+        <p><b>Dynamic register renaming.</b> At issue the destination register's status field Qi is set to the station's tag, so the register names its youngest producer; consumers take a value or a tag at issue and never consult the register name again. Benefits: WAR hazards disappear (a reader owns its copy or its producer's tag), WAW hazards disappear (only the broadcast whose tag matches Qi is written; an older writer's result is dropped), so the false dependences created by register reuse no longer serialize execution; more instructions in flight; loop iterations overlap without unrolling.</p>
+        <p><b>Out-of-order execution.</b> An instruction executes as soon as its operands and a unit are available, whatever older instructions are doing: issue stays in order, execution and completion do not. Benefits: a long-latency instruction (a cache miss, a 40-cycle divide) no longer blocks independent work behind it — in the classic example FADD, issued after FDIV, writes its result at cycle 13 while FDIV finishes at 59 — giving higher unit utilization and IPC. Cost: results written out of order make exceptions imprecise and speculation hard to undo; the reorder buffer restores in-order commit.</p>
+      </div>
+      <div class="exam-note">
+        <p>Five lines per item on the paper. The examiner looks for the mechanism (fields, tags, the broadcast, Qi = youngest writer) and for the benefit stated as a hazard class removed or a stall avoided — not for the word "faster". A concrete number from the example ("FADD writes at 13, before the older FDIV") shows you have run it.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l13-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the following assembly code to be executed on a CPU with dynamic scheduling based on the TOMASULO algorithm with all cache HITS, a single Common Data Bus and: 2 RESERVATION STATIONS (RS1, RS2) with 2 LOAD/STORE units (LDU1, LDU2) with latency 4; 2 RESERVATION STATIONS (RS3, RS4) with 1 FP ADD/SUB unit (FPU1) with latency 3; 2 RESERVATION STATIONS (RS5, RS6) with 1 FP MUL/DIV unit (FPU2) with latency 6 for FMUL and 12 for FDIV. Complete the table (row I0 is given: 1, 2, 6, None, RS1, LDU1) and calculate the CPI.</p>
+<pre><code>I0: LD   F6, 34(R2)
+I1: LD   F2, 45(R3)
+I2: FMUL F0, F2, F4
+I3: FSUB F8, F6, F2
+I4: FDIV F10, F0, F6
+I5: FADD F6, F8, F2</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>INSTRUCTION</th><th>ISSUE</th><th>START EXEC</th><th>WRITE RESULT</th><th>Hazards Type</th><th>RSi</th><th>UNIT</th></tr></thead>
+            <tbody>
+              <tr><td>I0: LD F6, 34(R2)</td><td class="num">1</td><td class="num">2</td><td class="num">6</td><td>None</td><td>RS1</td><td>LDU1</td></tr>
+              <tr><td>I1: LD F2, 45(R3)</td><td class="num">2</td><td class="num">3</td><td class="num">7</td><td>None</td><td>RS2</td><td>LDU2</td></tr>
+              <tr><td>I2: FMUL F0, F2, F4</td><td class="num">3</td><td class="num">8</td><td class="num">14</td><td>RAW with I1 for F2</td><td>RS5</td><td>FPU2</td></tr>
+              <tr><td>I3: FSUB F8, F6, F2</td><td class="num">4</td><td class="num">8</td><td class="num">11</td><td>RAW with I0 for F6, with I1 for F2</td><td>RS3</td><td>FPU1</td></tr>
+              <tr><td>I4: FDIV F10, F0, F6</td><td class="num">5</td><td class="num">15</td><td class="num">27</td><td>RAW with I2 for F0, with I0 for F6</td><td>RS6</td><td>FPU2</td></tr>
+              <tr><td>I5: FADD F6, F8, F2</td><td class="num">6</td><td class="num">12</td><td class="num">15</td><td>RAW with I3 for F8, with I1 for F2; WAR with I3, I4 and WAW with I0 for F6 solved by renaming</td><td>RS4</td><td>FPU1</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Checks: I2 starts at 8 = write of I1 + 1; I3 at 8 = max(6 + 1, 7 + 1); I4 at 15 = write of I2 + 1, FPU2 free (I2 executed 8–13); I5 at 12 = write of I3 + 1, FPU1 free since 11. CDB at 6, 7, 11, 14, 15, 27: no collision. <b>CPI = 27 / 6 = 4.5.</b></p>
+      </div>
+      <div class="exam-note">
+        <p>Marks go to the three numbers of every row, to the hazard written with its instruction and register, and to the CPI as "last WRITE RESULT / instructions". The row most often wrong is I4: its F6 is still pending at issue with a load latency of 4, so it has two RAW hazards, and it must wait for FPU2 as well as for F0 — here both conditions give 15.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="57" data-tol="0.1" id="l13-exam-num">
+    <div class="exam-q" lang="en">
+      <p>The same six instructions run with latencies load 2, add/sub 2, mult 10, div 40, one adder, one multiplier-divider and two independent load units (the second load starts the cycle after its issue). In which cycle does FDIV write its result?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>LD F2: issue 2, start 3, write 5. FMUL: start 6, write 16. FDIV: start 17 (F0 written at 16, the multiplier free), write 17 + 40 = <b>57</b>. With one load unit held through its write cycle the chain starts two cycles later and the answer is 59.</p>
+      </div>
+      <div class="exam-note"><p>The examiner checks that you propagated the two cycles along the chain and did not touch anything off it: FADD moves from 13 to 11 too, but it is not asked.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l13-exam-mcq1">
+    <div class="exam-q" lang="en">
+      <p>In Tomasulo's algorithm a result is broadcast on the CDB with the tag RS3. The register file writes it into F6 if and only if:</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>F6 is the destination of the broadcasting instruction <span class="fb">Not enough: if a younger instruction has renamed F6 since, the write must be skipped.</span></li>
+      <li data-correct>Qi[F6] = RS3 <span class="fb">The register file compares the tag with its Qi field: a match means RS3 is still the youngest writer of F6. This is how WAW is handled.</span></li>
+      <li>no reservation station is reading F6 <span class="fb">Readers never block a write in Tomasulo: they hold a value or a tag of their own.</span></li>
+      <li>RS3 is the oldest busy station <span class="fb">Age decides who gets the bus when two results are ready, not whether the register accepts the value.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 2. If Qi[F6] = RS4, a younger writer owns the name and the broadcast is dropped by the register file (the stations waiting for RS3 still take it).</p></div>
+      <div class="exam-note"><p>A quiz in the style of the 2026 block: single answer, one point.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l13-exam-mcq2">
+    <div class="exam-q" lang="en">
+      <p>Which hazards make a scoreboard stall but are eliminated by Tomasulo's algorithm?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>RAW only <span class="fb">RAW waits remain in both machines: a value that does not exist yet cannot be forwarded.</span></li>
+      <li data-correct>WAR and WAW <span class="fb">Renaming through station tags: readers keep their copy or their producer's tag, the register file honours only the youngest tag.</span></li>
+      <li>structural hazards on the functional units <span class="fb">Both machines wait for a busy unit; Tomasulo even adds a structural resource, the single CDB.</span></li>
+      <li>all data hazards <span class="fb">Only the two name hazards; FMUL still waited four cycles in MUL1 for F2.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 2. In the example the scoreboard held FADD's write from 16 to 22 for a WAR with FDIV; Tomasulo wrote it at 13.</p></div>
+      <div class="exam-note"><p>The distractor "all data hazards" is the one students pick after reading "no hazards occurred" on page 182.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l13-exam-mcq3">
+    <div class="exam-q" lang="en">
+      <p>Which statements about the Common Data Bus are correct? (multiple answers)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>It carries a value together with the tag of the producing reservation station <span class="fb">The pair ⟨tag, value⟩ is what every listener matches against its own tags.</span></li>
+      <li>Every register of the register file is overwritten by each broadcast <span class="fb">Only the register whose Qi equals the tag; the others ignore it.</span></li>
+      <li data-correct>At most one result can be broadcast per cycle on a single CDB <span class="fb">The structural limit of the bus: the older instruction goes first, the younger slips.</span></li>
+      <li data-correct>A reservation station whose Qj equals the broadcast tag copies the value and clears Qj <span class="fb">That is the capture: Vj takes the value, Qj becomes 0.</span></li>
+      <li>Stores write their data on the CDB <span class="fb">A store writes memory; it never uses the bus, which is why it cannot collide with anybody on it.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 3 and 4.</p></div>
+      <div class="exam-note"><p>The "multiple answer" form of the 2026 quizzes: tick every true statement, and nothing is said about penalties, so reason about each option on its own.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="2" id="l13-exam-why">
+    <div class="exam-q" lang="en">
+      <p>Why can the original Tomasulo algorithm not provide precise exceptions, and what is added to fix it?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Results are written into the register file at write result, in completion order, which is not program order: in the classic example FADD writes F6 at cycle 13 while the older FDIV finishes at 59. If FDIV raised an exception, F6 would already hold a value produced by a younger instruction and no earlier instruction could be guaranteed complete — the architectural state is inconsistent and in-place writes cannot be undone. The fix is a reorder buffer: results go to the ROB at write result and are committed to the register file in program order, so at an exception everything older has committed and everything younger is discarded. The scoreboard has the same problem, since it too writes registers in place and out of order.</p>
+      </div>
+      <div class="exam-note"><p>Three things earn the marks: "out of order" plus "in place", the definition of precise (all before complete, none after visible), and the ROB as an in-order commit point.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l13-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">End of cycle 6 of the notes' run. In cycle 7 the bus carries ⟨Load2, v(F2)⟩. Which cells change?</p>
+    <ul class="options">
+      <li data-correct>The Qi field of F2 in the register file <span class="fb">Qi[F2] = Load2 matches: the value lands and the tag is cleared.</span></li>
+      <li data-correct>MUL1.Vj <span class="fb">MUL1 held Qj = Load2 for the F2 of FMUL.</span></li>
+      <li data-correct>ADD1.Vk <span class="fb">ADD1 held Qk = Load2 for the F2 of FSUB.</span></li>
+      <li data-correct>ADD2.Vk <span class="fb">ADD2 held Qk = Load2 for the F2 of FADD — three stations from one broadcast.</span></li>
+      <li>MUL2.Vk <span class="fb">MUL2 holds v(F6), copied from the register file at issue; it is not listening for anything but MUL1.</span></li>
+      <li>The Qi field of F6 <span class="fb">Qi[F6] = ADD2 since cycle 6; the tag Load2 does not match, so the field is untouched.</span></li>
+    </ul>
+    <p class="q-fb">One call, four listeners — and every other cell exactly as it was.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">FSUB is issued at cycle 4 and has v(F6) in its station from that cycle. Why does it start executing at 8 and not at 5?</p>
+    <ul class="options">
+      <li>The adder is busy <span class="fb">The adder is idle until cycle 8; nothing else uses it before.</span></li>
+      <li data-correct>It waits for F2, which Load2 broadcasts at cycle 7 <span class="fb">Qk = Load2 until the broadcast; start = 7 + 1 = 8.</span></li>
+      <li>The CDB is busy in cycles 5 to 7 <span class="fb">The bus is a limit on writes, not on starts; and it is idle in 5 and 6.</span></li>
+      <li>FMUL, which is older, must start first <span class="fb">Tomasulo starts instructions out of order; the two happen to start together at 8 because they wait for the same tag.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Same machine as the notes (one load unit, held through its write cycle), but the load latency is 4 instead of 2. In which cycle does LD F2 start executing?</p>
+    <ul class="options">
+      <li>3 <span class="fb">That is the two-load-unit answer; with one unit it is busy.</span></li>
+      <li>5 <span class="fb">The notes' number with latency 2: LD F6 wrote at 4. With latency 4 it writes at 6.</span></li>
+      <li>6 <span class="fb">The unit is still busy in the write cycle 6.</span></li>
+      <li data-correct>7 <span class="fb">LD F6: issue 1, start 2, write 2 + 4 = 6; the unit is free from 7, so LD F2 starts at 7 and writes at 11.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">FADD wrote F6 at cycle 13, yet FDIV — older, and a reader of F6 — only started at 19. Why is FDIV's result still correct?</p>
+    <ul class="options">
+      <li>FDIV reads F6 from the register file at 19 <span class="fb">That would give it FADD's value — the WAR hazard exactly. A station never reads the register file after issue.</span></li>
+      <li data-correct>FDIV copied v(F6) into MUL2.Vk at issue, in cycle 5 <span class="fb">The value was in the register file since Load1's broadcast at 4; the copy belongs to FDIV and nothing can change it.</span></li>
+      <li>The CDB delays FADD's write until FDIV has read F6 <span class="fb">That is the scoreboard's answer (write held until 22). Tomasulo has no such check.</span></li>
+      <li>F6 was renamed to ADD2, so FDIV reads ADD2's value <span class="fb">ADD2 produces the new F6, which FDIV must not see; the rename protects the old value, it does not redirect the reader.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Page 182 says "no hazards occurred". Which statement is right?</p>
+    <ul class="options">
+      <li>Tomasulo removed every RAW, WAR and WAW wait of the program <span class="fb">FMUL waited from 3 to 7, FDIV from 5 to 18, FADD from 6 to 10 — all RAW.</span></li>
+      <li data-correct>RAW waits remained; what disappeared were the waits caused by names (WAR, WAW) and the stalls at issue <span class="fb">Tomasulo turns a RAW into a wait inside a station and makes WAR and WAW non-hazards; it cannot create a value early.</span></li>
+      <li>Only structural hazards remained <span class="fb">One structural wait (LD F2 for the load unit) and three RAW waits.</span></li>
+      <li>The hazards occurred but cost no cycles <span class="fb">They cost exactly the latencies on the chain: 59 cycles instead of 6.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">FDIV raises an exception at cycle 30. In which of the two machines does the register file hold the state a sequential machine would have?</p>
+    <ul class="options">
+      <li>Tomasulo <span class="fb">F6 was overwritten by the younger FADD at 13.</span></li>
+      <li>The scoreboard <span class="fb">It wrote F8 at 12 and F6 at 22 while FDIV was still running: also younger results in place.</span></li>
+      <li data-correct>Neither: both write registers in place and out of order; a reorder buffer is needed <span class="fb">Precise exceptions need an in-order commit point, which neither algorithm has.</span></li>
+      <li>Both, because both issue in order <span class="fb">In-order issue says nothing about the order of writes, and the writes are what the state is made of.</span></li>
+    </ul>
+    <p class="q-fb">This is the sentence of page 185 that the red pen corrected: the scoreboard is not more graceful here.</p>
+  </div>
+</section>
+
+<section class="recap" id="l13-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Three numbers per row, three rules: start = max(issue + 1, producer's write + 1, unit free); write = start + latency; one CDB write per cycle, oldest first. CPI = last write / N.</li>
+    <li>The notes' run on one load unit: 1-2-4, 2-5-7, 3-8-18, 4-8-10, 5-19-59, 6-11-13 — issue in order, start and write out of order, the bus never used twice in a cycle.</li>
+    <li>One broadcast serves every listener: at cycle 7 ⟨Load2, v(F2)⟩ fills MUL1, ADD1, ADD2 and the register F2 in the same cycle; MUL2 and F6, which are not listening, are untouched.</li>
+    <li>Assumptions decide numbers: two independent load units move LD F2 from 5 to 3 and the finish from 59 to 57; the exam states its units, and you write down the one you use when a text does not.</li>
+    <li>Against the scoreboard on the same code: 13 cycles to issue become 6 (stations instead of stalls), FADD's write 22 becomes 13 (renaming), each producer-consumer hop loses a read-operands cycle (the CDB) — and the finish moves only from 62 to 59, because the chain LD F2 → FMUL → FDIV is 52 cycles of latency that no scheduler can shorten.</li>
+    <li>The price: tag comparators everywhere, one result per cycle on the bus, imprecise exceptions (the register file is written in place, out of order — true of the scoreboard too), poor scaling to several issues per cycle. The reorder buffer answers the exception problem; register alias tables and physical register files answer the scaling.</li>
+  </ul>
+
+  <aside class="cheat" id="l13-cheat">
+    <dl>
+      <dt>Start of execution</dt><dd>\(S = \max(I + 1,\ W_{\text{prod}} + 1,\ U)\) — \(I\) issue, \(W_{\text{prod}}\) write of each pending producer, \(U\) first cycle the unit is free (busy through the write cycle of its instruction)</dd>
+      <dt>Write result</dt><dd>\(W = S + L\), \(L\) the latency; execution occupies \(S \dots S + L - 1\)</dd>
+      <dt>Single CDB</dt><dd>one write per cycle; two ready → the older writes, the younger slips by one ("Structural on the CDB")</dd>
+      <dt>Register-file rule</dt><dd>a broadcast ⟨tag, value⟩ is written into F only if Qi[F] = tag; a station copies it into Vj / Vk if Qj / Qk = tag</dd>
+      <dt>Issue rule</dt><dd>in order, one per cycle, only into a free station; a station is busy from issue through write result; no station free → "Structural", everything behind waits</dd>
+      <dt>Stores</dt><dd>issue to a LOAD/STORE station; write result = end of the memory write; never on the CDB</dd>
+      <dt>CPI</dt><dd>\(\text{CPI} = W_{\text{last}} / N\) (last WRITE RESULT over the instructions of one iteration)</dd>
+      <dt>The classic run</dt><dd>load 2, add 2, mult 10, div 40: one load unit 1-2-4 · 2-5-7 · 3-8-18 · 4-8-10 · 5-19-59 · 6-11-13 (CPI 59/6); two load units: LD F2 2-3-5, finish 57; scoreboard: 62 cycles, all issued at 13, FADD written at 22</dd>
+      <dt>What vanishes, what stays</dt><dd>WAR / WAW → "solved by renaming"; issue stalls on busy units → waits in stations; RAW → still waits (producer's write + 1); the critical chain → unchanged</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l13-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=deFR2cx9pew" target="_blank" rel="noopener">Tomasulo Timing Quiz Part 2 — Georgia Tech HPCA</a>
+      <span class="res-by">Milos Prvulovic, Udacity</span>
+      <p class="res-why">A ready-made drill in the exact shape of Exercise 1: pause, fill issue / execute / write for each instruction with one CDB and fixed latencies, then watch the solution clip linked from it. Check Prvulovic's conventions against the four rules above before trusting a number.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://aca-iiith.vlabs.ac.in/exp/dynamic-scheduling-tomasulo/simulation/index.html" target="_blank" rel="noopener">Dynamic Scheduling with Tomasulo Algorithm — simulator</a>
+      <span class="res-by">Virtual Labs, IIIT Hyderabad</span>
+      <p class="res-why">Set the latencies to 2 / 2 / 10 / 40, enter the six instructions and step: the stations, the register alias table and the CDB activity in a second implementation. Then enter an exam loop body with a store and read the cycles off the timeline.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://people.eecs.berkeley.edu/~kubitron/courses/cs252-S12/lectures/lec07-dynasched2.pdf" target="_blank" rel="noopener">CS252 Lecture 7: Scoreboard, Tomasulo, Register Renaming</a>
+      <span class="res-by">John Kubiatowicz, UC Berkeley</span><span class="res-dur">25 pages</span>
+      <p class="res-why">The same six instructions, the same three-table layout and the same mnemonics as the notes, with the two-load-unit timing (57): the right second source whenever a table of the notes looks wrong.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.virginia.edu/evans/greatworks/tomasulo.pdf" target="_blank" rel="noopener">An Efficient Algorithm for Exploiting Multiple Arithmetic Units</a>
+      <span class="res-by">R. M. Tomasulo, IBM Journal, 1967</span><span class="res-dur">9 pages</span>
+      <p class="res-why">The abstract alone is the lesson: "a simple common data busing and register tagging scheme which permits simultaneous execution of independent instructions while preserving the essential precedences". Recognise Vj, Vk, Qj, Qk in his sink and source tags.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=AhtIrJNSQws" target="_blank" rel="noopener">Digital Design and Computer Architecture, Lecture 15: Out-of-Order Execution</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span>
+      <p class="res-why">Tomasulo as "restricted dataflow" — a tag is a promise of a value, the station a waiting room, the bus a loudspeaker — and why in-order issue and in-order retirement are kept around out-of-order execution: the bridge to the reorder buffer.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>This run was kind to the hardware: the single CDB never had two customers, every station was free when its instruction arrived, and every unit was free when the operands were. Next, two past papers built so that none of that holds — two stations per class, one FP unit, one bus — where every lost cycle is structural.</p>
+</aside>
+
+</main>
+</body>
+</html>

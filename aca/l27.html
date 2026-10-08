@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Virtual memory in one lesson, and VIPT: start the cache before the TLB answers · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l27">
+
+<header class="lesson-head">
+  <h1>Virtual memory in one lesson, and VIPT: start the cache before the TLB answers</h1>
+  <p class="lede">After this lesson you will translate a virtual address into a physical one by hand, tell a TLB miss from a page fault, and decide with one inequality, cache size / associativity ≤ page size, whether an L1 cache can start its lookup before the TLB answers without synonym problems.</p>
+</header>
+
+<div class="hook" data-label="Two facts and a puzzle">
+  <p>Print the address of a variable in a running program and you get something like <span class="num">0x7FFE_1234</span>, the notes' Example 19 (p. 358). That is not where the byte sits in RAM: it is a <em>virtual</em> address, a name the operating system made up for your process. Yet its last three hex digits, 234, are true: they are also the last three digits of the RAM location that holds the byte.</p>
+  <p>Second fact. For about a decade Intel's L1 data cache was 32 KB with 8 ways. When it finally grew, in 2019, it became 48 KB with 12 ways. Divide: 32 / 8 = 48 / 12 = 4 KB, exactly the size of a page.</p>
+  <p>Why should a cache, a block of hardware, take its shape from a page, a notion of the operating system? Make a guess and keep it. By the end of the lesson you will derive the answer in one line, from the first fact.</p>
+</div>
+
+<section id="l27-pages">
+  <h2>Pages, frames and the page table</h2>
+
+  <aside class="margin-note">Virtual memory is an "OPTIONAL TOPIC" on the week-10 course page, but it is on the professor's exam-topic list. The notes treat it only as a refresher before VIPT (pp. 357–359).</aside>
+
+  <p>Every program believes it owns one large, continuous address space of \(2^{32}\) or \(2^{64}\) bytes; real RAM is finite and fragmented (p. 357). <mark class="key">Paging</mark> reconciles the two: the operating system and the hardware cut both spaces into blocks of one fixed size and keep, for every program, a map from its blocks to real ones.</p>
+
+  <p>The notes picture a city of identical hotel buildings, each with rooms 0 to 4095 (p. 358). Your booking names a building and a room; reception may move you to another building, but it never changes the room number. Room 0x234 stays room 0x234.</p>
+
+  <div class="def">
+    <p><dfn>Virtual page</dfn> — a block of the virtual address space, the program's view. All pages have one size, commonly 4 KB (2 MB and 1 GB exist too); each process has its own set, which isolates it from the others (p. 357).</p>
+    <p><dfn>Physical page, or frame</dfn> — a block of RAM of the same size. Several virtual pages, of different processes or of one, may map to the same frame: shared memory.</p>
+    <p><dfn>Page table</dfn> — the map of one process, kept in memory. It is indexed by the virtual page number (VPN); each entry holds the physical frame number (PFN) and some flags.</p>
+  </div>
+
+  <p>An address therefore has two fields: the low bits are the <mark class="key">page offset</mark>, the byte inside the page (12 bits for pages of 4 KB = \(2^{12}\) bytes), and the bits above it are the page number. Translation replaces the page number and copies the offset:</p>
+
+  <div class="formula">
+    \[ \text{VA} = \text{VPN} \mid \text{page offset} \]
+    \[ \text{PA} = \text{PFN} \mid \text{page offset} \]
+    \[ \text{PA} = \text{PFN} \times P + \text{page offset} \]
+    <dl class="legend">
+      <dt>VPN</dt><dd>virtual page number, the high bits of the virtual address: 20 bits for 32-bit addresses and 4 KB pages</dd>
+      <dt>PFN</dt><dd>physical frame number, read from the page table; the notes also write PPN, physical page number (pp. 360–362)</dd>
+      <dt>\(P\)</dt><dd>page size; the page offset has \(\log_2 P\) bits and is the same in both addresses</dd>
+    </dl>
+  </div>
+
+  <aside class="margin-note">A hex digit is four bits, so a 12-bit offset is exactly the last three hex digits.</aside>
+
+  <p>Example 19 (p. 358), step by step. In the 32-bit virtual address <span class="num">0x7FFE_1234</span> (the underscore only groups the hex digits by four), the last three digits are the offset, <span class="num">0x234</span>, and the five before them the VPN, <span class="num">0x7FFE1</span>. The page table maps VPN 0x7FFE1 to PFN <span class="num">0x01AB0</span>. Put the frame number in front of the unchanged offset: PA = 0x01AB0 | 0x234 = <span class="num">0x01AB_0234</span> = 0x01AB0 × 4096 + 0x234 (Fig. 1).</p>
+
+  <figure class="fig fig--plain" id="l27-fig-translate">
+    <svg class="dia" viewBox="0 0 560 256" role="img" aria-label="Example 19: the virtual address 0x7FFE1234 is split into the page number 0x7FFE1 and the offset 0x234; the page table turns 0x7FFE1 into the frame number 0x01AB0, while the offset 0x234 goes straight down unchanged into the physical address 0x01AB0234">
+      <text x="255" y="28" class="tx-mid tx-sm">VPN · 20 bits</text>
+      <text x="455" y="28" class="tx-mid tx-sm">offset · 12 bits</text>
+      <rect x="130" y="38" width="250" height="30" class="fw-s3 st-s3"/>
+      <rect x="380" y="38" width="150" height="30" class="fi-soft"/>
+      <text x="255" y="58" class="tx-mid tx-mono">0x7FFE1</text>
+      <text x="455" y="58" class="tx-mid tx-mono">0x234</text>
+      <text x="112" y="59" class="tx-end tx-bold">VA</text>
+      <line x1="255" y1="68" x2="255" y2="102" marker-end="url(#arr)"/>
+      <rect x="170" y="106" width="170" height="52" rx="4" class="fi-paper sw-2"/>
+      <text x="255" y="126" class="tx-mid tx-sm">page table</text>
+      <text x="255" y="148" class="tx-mid tx-mono">7FFE1 → 01AB0</text>
+      <line x1="255" y1="158" x2="255" y2="190" class="st-s5 sw-2" marker-end="url(#arr-s5)"/>
+      <line x1="380" y1="72" x2="380" y2="190" class="st-muted dash"/>
+      <line x1="530" y1="72" x2="530" y2="190" class="st-muted dash"/>
+      <text x="455" y="124" class="tx-mid tx-sm">copied</text>
+      <text x="455" y="146" class="tx-mid tx-sm">unchanged</text>
+      <text x="12" y="116" class="tx-hand">new building,</text>
+      <text x="22" y="150" class="tx-hand">same room</text>
+      <rect x="130" y="194" width="250" height="30" class="fw-s5 st-s5"/>
+      <rect x="380" y="194" width="150" height="30" class="fi-soft"/>
+      <text x="255" y="214" class="tx-mid tx-mono">0x01AB0</text>
+      <text x="455" y="214" class="tx-mid tx-mono">0x234</text>
+      <text x="112" y="215" class="tx-end tx-bold">PA</text>
+      <text x="255" y="248" class="tx-mid tx-sm">PFN · 20 bits</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> Example 19 (p. 358). Translation replaces the 20-bit page number 0x7FFE1 with the frame number 0x01AB0 read from the page table; the 12-bit page offset 0x234 drops straight down into the physical address. The violet field is translated, the grey one is never touched.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="357">
+    <p class="claim">"Virtual Page Number (VPN) = Physical Frame Number (PFN) + flags"</p>
+    <p class="fix">A page-table entry is <em>indexed by</em> the VPN and <em>contains</em> the PFN and the flags: PT[VPN] = (PFN, flags).</p>
+    <p class="because">In Example 19 the VPN is 0x7FFE1 and the PFN 0x01AB0: no flags make them equal. Like a cache index (<a href="l23.html">lesson 23</a>), the VPN selects the entry; it is not a value stored in it.</p>
+  </aside>
+
+  <p>Why bother? Hennessy &amp; Patterson (Appendix B.4; not in the notes) list four gains: <em>capacity</em>, since RAM becomes a cache for the disk and a program may exceed it; <em>protection</em>, since a process reaches only the frames its table maps, with permissions checked on every access; <em>relocation</em>, since a program runs wherever its frames are; and <em>sharing</em>: two page tables may point to one frame — keep that one for section 4.</p>
+
+  <p>Virtual memory is one more level of the hierarchy, so the four questions of <a href="l23.html">lesson 23</a> apply, with pages for blocks and frames for lines. Every answer follows from one number: a miss at this level, a <em>page fault</em>, goes to the disk and costs millions of cycles.</p>
+
+  <figure class="tbl-fig" id="l27-tbl-four">
+    <figcaption>The four questions of lesson 23, answered for pages (Hennessy &amp; Patterson, Appendix B.4; not in the notes).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Question</th><th>Answer</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Placement</td><td>in any frame: fully associative</td><td>a page fault costs millions of cycles, so the miss rate must be as low as possible</td></tr>
+          <tr><td>Identification</td><td>the page table, indexed by the VPN; the TLB keeps recent entries</td><td>no search: the VPN is an index, so no tags are compared</td></tr>
+          <tr><td>Replacement</td><td>approximately LRU: a use (reference) bit per page, set on access and cleared now and then by the OS</td><td>a wrong victim costs a disk access; exact LRU over millions of pages is too costly</td></tr>
+          <tr><td>Write policy</td><td>always write-back, with a dirty bit per page</td><td>writing through to the disk on every store is out of the question</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <details class="why">
+    <summary>Why not one flat page table?</summary>
+    <p>A flat table for 32-bit addresses and 4 KB pages has \(2^{20}\) entries, 4 MB per process at 4 bytes each, mostly for pages never touched. Real systems build a tree of small tables indexed by fields of the VPN (x86-64: four levels of 9 bits, \(4 \times 9 + 12 = 48\) bits), and a TLB miss walks several dependent reads (Hennessy &amp; Patterson; not in the notes).</p>
+  </details>
+
+  <p class="memo"><mark class="key">Translation replaces the page number and copies the page offset: with 4 KB pages the last 12 bits, three hex digits, are the same in the virtual and in the physical address.</mark></p>
+</section>
+
+<section id="l27-tlb">
+  <h2>The TLB: a cache for translations</h2>
+
+  <p>The page table lives in memory, so reading it first would add a memory access to every load, store and instruction fetch (p. 359). The cure is the idea of this whole chapter: keep the recent entries in a small, fast memory.</p>
+
+  <div class="def">
+    <p><dfn>Translation lookaside buffer (TLB)</dfn> — "a small, fast cache that stores the most recent virtual-to-physical address translations" (p. 359). Its tag is the VPN; its data are the PFN and the flags of the page-table entry.</p>
+  </div>
+
+  <p>On every access the CPU generates a virtual address and checks the TLB (p. 359). A <mark class="key">TLB hit</mark> gives the physical address at once; a <mark class="key">TLB miss</mark> walks the page table in memory, slowly, and inserts the result into the TLB. In the notes' hotel, the TLB is a post-it note with your current room key, so you need not queue at reception every time.</p>
+
+  <p>The textbook picture, not in the notes: a TLB has tens of entries, fully or highly associative, often split into instruction and data TLBs behind a larger second-level TLB, and answers in about a cycle; its entries carry the protection bits, checked on every access. The memory it covers, its <em>reach</em>, is entries × page size: 64 entries × 4 KB = 256 KB. A miss is refilled by a hardware page walker (x86, ARM) or a software handler (MIPS), in tens of cycles.</p>
+
+  <p>Keep two events apart. A TLB miss means only that the translation is not in the small cache: usually the page is in RAM, and the walk finds a valid entry. A <mark class="key">page fault</mark> means the entry is invalid: the page is not in RAM at all. The hardware raises an exception; the operating system reads the page from the disk into a free frame, sets the valid bit and restarts the instruction — millions of cycles, and a restart that needs precise exceptions (<a href="l17.html">lesson 17</a>).</p>
+
+  <div class="widget" id="l27-w-translate">
+    <h3 class="widget-title">One process, seven accesses: TLB, page table, page fault</h3>
+    <p class="widget-intro">A process with 32-bit virtual addresses and 4 KB pages. On top, the virtual address of the current access, split into VPN and offset; at the bottom, the physical address it reaches. In the middle, a TLB of four entries (fully associative, empty at the start) and the part of the page table that matters, in memory: V is the valid bit, "disk" a page that is not in RAM. The entries used by the current access sit on the highlighter. Press "Next" one access at a time. The insight: translation replaces only the page number; the offset is always true.</p>
+    <ol class="tasks">
+      <li>Access 1 is Example 19, <span class="num">0x7FFE_1234</span>, with the TLB empty. Before pressing "Next", predict whether the TLB hits and write the physical address.
+        <details class="answer"><summary>What you should see</summary>
+          <p>A TLB miss, since the TLB is empty. The walk reads the entry of VPN 0x7FFE1: valid, PFN 0x01AB0, which goes into the TLB. The physical address is 0x01AB_0234: the last three hex digits come straight down from the virtual address.</p></details>
+      </li>
+      <li>Accesses 2 and 3 are <span class="num">0x7FFE_1238</span> and <span class="num">0x7FFE_0FFC</span>, both within 0x240 bytes of access 1. Predict which of them hits in the TLB.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Access 2 hits: same VPN, 0x7FFE1, so PFN 0x01AB0 comes out at once and the PA is 0x01AB_0238. Access 3 misses: 0x7FFE_0FFC lies 4 bytes below the start of the page, so its VPN is 0x7FFE0, another page. Its frame, 0x00C17, is nowhere near 0x01AB0: pages that are neighbours in the virtual space need not be neighbours in RAM.</p></details>
+      </li>
+      <li>Accesses 4 and 5 both miss in the TLB. Predict which of them needs the disk, and what each costs.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Access 4 is an ordinary TLB miss: the entry of VPN 0x00403 is valid, the walk refills the TLB with PFN 0x001F2 in tens of cycles, PA 0x001F_2A2C. Access 5 finds V = 0 for VPN 0x00404: a page fault. The operating system loads the page from the disk into frame 0x0A3F7, sets V = 1 and restarts the access: millions of cycles. Access 6, in the same page, then hits.</p></details>
+      </li>
+      <li>Access 7 returns to the page of Example 19, at <span class="num">0x7FFE_1FF8</span>. Write the physical address before you look.
+        <details class="answer"><summary>What you should see</summary>
+          <p>0x01AB_0FF8, a TLB hit: four entries are enough for the four pages used so far. Translation swapped 0x7FFE1 for 0x01AB0; the offset 0xFF8 went through untouched.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-translate', function (root, ui) {
+    var S = Course.svg, PAGE = 4096, CAP = 4;
+    var PT0 = [
+      { vpn: 0x00403, v: 1, pfn: 0x001F2, frame: 0x001F2 },
+      { vpn: 0x00404, v: 0, pfn: 0, frame: 0x0A3F7 },
+      { vpn: 0x7FFE0, v: 1, pfn: 0x00C17, frame: 0x00C17 },
+      { vpn: 0x7FFE1, v: 1, pfn: 0x01AB0, frame: 0x01AB0 }
+    ];
+    var TRACE = [0x7FFE1234, 0x7FFE1238, 0x7FFE0FFC, 0x00403A2C, 0x00404008, 0x00404010, 0x7FFE1FF8];
+    function h(x, n) { var s = x.toString(16).toUpperCase(); while (s.length < n) s = '0' + s; return s; }
+    function a8(x) { var s = h(x, 8); return '0x' + s.slice(0, 4) + '_' + s.slice(4); }
+    var caps = ['Before the first access: the TLB is empty; the page table is in memory.'];
+    TRACE.forEach(function (va, k) { caps.push('Access ' + (k + 1) + ': the byte at virtual address ' + a8(va) + (k === 0 ? ', Example 19.' : '.')); });
+    var st = ui.stepper({ steps: caps });
+    var roVA = ui.readout('VPN | offset'), roPath = ui.readout('translation'), roPA = ui.readout('physical address'),
+        roCnt = ui.readout('so far: TLB hits · misses · page faults');
+    var note = ui.note('');
+    var svg = ui.svg(560, 384, { label: 'The virtual address split into VPN and offset, a four-entry TLB, part of the page table in memory, and the physical address made of the frame number and the unchanged offset' });
+    ui.legend([
+      { label: 'VPN (translated)', color: 's3', mark: 'area' },
+      { label: 'PFN', color: 's5', mark: 'area' },
+      { label: 'page walk', color: 's2', mark: 'dash' },
+      { label: 'entry used by this access', color: 'ink', mark: 'hl' }
+    ]);
+
+    function replay(n) {
+      var pt = PT0.map(function (e) { return { vpn: e.vpn, v: e.v, pfn: e.pfn, frame: e.frame }; });
+      var tlb = [], hits = 0, misses = 0, faults = 0, cur = null;
+      for (var k = 0; k < n; k++) {
+        var va = TRACE[k], vpn = Math.floor(va / PAGE), off = va % PAGE, out, row = -1, ptRow = -1, pfn = 0, t;
+        for (t = 0; t < tlb.length; t++) if (tlb[t].vpn === vpn) row = t;
+        for (t = 0; t < pt.length; t++) if (pt[t].vpn === vpn) ptRow = t;
+        if (row >= 0) { out = 'hit'; hits++; pfn = tlb[row].pfn; tlb[row].used = k; }
+        else {
+          misses++;
+          var e = ptRow >= 0 ? pt[ptRow] : null;
+          if (!e) { out = 'fault'; faults++; pfn = 0; }
+          else if (!e.v) { out = 'fault'; faults++; e.v = 1; e.pfn = e.frame; pfn = e.pfn; }
+          else { out = 'miss'; pfn = e.pfn; }
+          if (tlb.length < CAP) { tlb.push({ vpn: vpn, pfn: pfn, used: k }); row = tlb.length - 1; }
+          else {
+            var lru = 0;
+            for (t = 1; t < tlb.length; t++) if (tlb[t].used < tlb[lru].used) lru = t;
+            tlb[lru] = { vpn: vpn, pfn: pfn, used: k }; row = lru;
+          }
+        }
+        cur = { va: va, vpn: vpn, off: off, out: out, row: row, ptRow: ptRow, pfn: pfn, pa: pfn * PAGE + off };
+      }
+      return { pt: pt, tlb: tlb, hits: hits, misses: misses, faults: faults, cur: cur };
+    }
+
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }, svg); }
+    function R(x, y, w, hh, cls) { return S('rect', { x: x, y: y, width: w, height: hh, 'class': cls || '' }, svg); }
+    function Ln(x1, y1, x2, y2, cls, mk) {
+      var a = { x1: x1, y1: y1, x2: x2, y2: y2, 'class': cls || '' };
+      if (mk) a['marker-end'] = 'url(#' + mk + ')';
+      return S('line', a, svg);
+    }
+
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var c = s.cur, r, y;
+      T(255, 30, 'VPN · 20 bits', 'tx-mid tx-sm');
+      T(455, 30, 'offset · 12 bits', 'tx-mid tx-sm');
+      R(130, 40, 250, 30, 'fw-s3 st-s3');
+      R(380, 40, 150, 30, 'fi-soft');
+      T(112, 61, 'VA', 'tx-end tx-bold');
+      T(255, 60, c ? '0x' + h(c.vpn, 5) : '—', 'tx-mid tx-mono');
+      T(455, 60, c ? '0x' + h(c.off, 3) : '—', 'tx-mid tx-mono');
+      Ln(380, 74, 380, 316, 'st-muted dash');
+      Ln(530, 74, 530, 316, 'st-muted dash');
+      T(455, 186, 'copied', 'tx-mid tx-sm');
+      T(455, 206, 'unchanged', 'tx-mid tx-sm');
+
+      T(20, 108, 'TLB', 'tx-sm tx-bold');
+      if (c && c.row >= 0) R(14, 134 + c.row * 24, 162, 32, 'hl');
+      R(20, 116, 150, 22, 'fw-s3 st-s3');
+      T(57, 131, 'VPN', 'tx-mid tx-mono tx-sm');
+      T(132, 131, 'PFN', 'tx-mid tx-mono tx-sm');
+      for (r = 0; r < CAP; r++) {
+        y = 138 + r * 24;
+        var e = s.tlb[r];
+        R(20, y, 75, 24, 'fi-paper');
+        R(95, y, 75, 24, 'fi-paper');
+        T(57, y + 17, e ? h(e.vpn, 5) : '—', 'tx-mid tx-mono tx-sm' + (e ? '' : ' tx-muted'));
+        T(132, y + 17, e ? h(e.pfn, 5) : '—', 'tx-mid tx-mono tx-sm' + (e ? '' : ' tx-muted'));
+      }
+
+      var walked = !!(c && c.out !== 'hit');
+      T(190, 108, 'page table', 'tx-sm tx-bold');
+      if (walked && c.ptRow >= 0) R(184, 134 + c.ptRow * 24, 182, 32, 'hl');
+      R(190, 116, 170, 22, 'fw-s3 st-s3');
+      T(226, 131, 'VPN', 'tx-mid tx-mono tx-sm');
+      T(276, 131, 'V', 'tx-mid tx-mono tx-sm');
+      T(325, 131, 'PFN', 'tx-mid tx-mono tx-sm');
+      for (r = 0; r < s.pt.length; r++) {
+        y = 138 + r * 24;
+        var p = s.pt[r];
+        R(190, y, 72, 24, 'fi-paper');
+        R(262, y, 28, 24, 'fi-paper');
+        R(290, y, 70, 24, 'fi-paper');
+        if (c && c.out === 'fault' && r === c.ptRow) R(190, y, 170, 24, 'fw-s2 st-s2 sw-2');
+        T(226, y + 17, h(p.vpn, 5), 'tx-mid tx-mono tx-sm');
+        T(276, y + 17, String(p.v), 'tx-mid tx-mono tx-sm');
+        T(325, y + 17, p.v ? h(p.pfn, 5) : 'disk', 'tx-mid tx-mono tx-sm' + (p.v ? '' : ' tx-muted'));
+      }
+
+      Ln(150, 72, 150, 112, '', 'arr');
+      if (walked) {
+        Ln(300, 72, 300, 112, 'st-s2 dash sw-2', 'arr-s2');
+        T(308, 98, 'walk', 'tx-sm');
+      }
+      T(20, 258, !c ? 'TLB empty' : (c.out === 'hit' ? 'TLB hit' : 'TLB miss'), 'tx-sm tx-bold');
+      if (c && c.out === 'miss') T(190, 258, 'walk: valid entry', 'tx-sm');
+      if (c && c.out === 'fault') T(190, 258, 'page fault', 'tx-sm tx-bold');
+      if (c) { Ln(132, 238, 228, 314, '', 'arr'); T(214, 290, 'PFN', 'tx-sm halo'); }
+
+      R(130, 320, 250, 30, 'fw-s5 st-s5');
+      R(380, 320, 150, 30, 'fi-soft');
+      T(112, 341, 'PA', 'tx-end tx-bold');
+      T(255, 340, c ? '0x' + h(c.pfn, 5) : '—', 'tx-mid tx-mono');
+      T(455, 340, c ? '0x' + h(c.off, 3) : '—', 'tx-mid tx-mono');
+      T(255, 372, 'PFN · 20 bits', 'tx-mid tx-sm');
+      T(455, 372, 'offset · 12 bits', 'tx-mid tx-sm');
+    }
+
+    var NOTES = {
+      hit: 'TLB hit: the translation of this page is already in the TLB, so the PFN comes out in about one cycle, with no memory access for the translation.',
+      miss: 'TLB miss: the page-table entry is read from memory (a page walk, tens of cycles). It is valid, so its PFN goes into the TLB and the access completes. With a hardware page walker no operating system is involved, and the disk never is.',
+      fault: 'TLB miss, and the walk finds V = 0: the page is not in RAM. Page fault: an exception hands control to the operating system, which reads the page from the disk into a free frame (0x0A3F7), writes the entry with V = 1 and restarts the instruction. The retried access walks again and fills the TLB. Millions of cycles.'
+    };
+    ui.onChange(function () {
+      var s = replay(st.index), c = s.cur;
+      if (!c) {
+        roVA.set('—'); roPath.set('—'); roPA.set('—');
+        roCnt.set('0 · 0 · 0');
+        note.set('The page table holds the translations of four pages; one of them, VPN 0x00404, is still on the disk. Press "Next" for the first access.');
+      } else {
+        roVA.set('0x' + h(c.vpn, 5) + ' | 0x' + h(c.off, 3));
+        roPath.set(c.out === 'hit' ? 'TLB hit · about 1 cycle' : c.out === 'miss' ? 'TLB miss · page walk, tens of cycles' : 'page fault · OS and disk, millions of cycles');
+        roPA.set(a8(c.pa));
+        roCnt.set(s.hits + ' · ' + s.misses + ' · ' + s.faults);
+        note.set(NOTES[c.out] + ' Physical address: PFN 0x' + h(c.pfn, 5) + ' followed by the unchanged offset 0x' + h(c.off, 3) + '.');
+      }
+      draw(s);
+    });
+  });
+  </script>
+
+  <div class="story" data-year="1962">
+    <p>Virtual memory was invented in Manchester for the Atlas, inaugurated in December 1962: a core of 16K words and a drum of 96K words were made to look like one "one-level store" of 512-word pages. A page missing from the core raised a page-fault interrupt for the supervisor, and 32 associative page address registers translated in hardware.</p>
+  </div>
+
+  <p class="memo"><mark class="key">A TLB miss costs a page walk of tens of cycles and never touches the disk; a page fault costs a trip to the disk through the operating system, millions of cycles.</mark></p>
+</section>
+
+<section id="l27-vipt">
+  <h2>Start the cache before the TLB answers</h2>
+
+  <p>Now put the TLB in front of the L1. A physically addressed cache (<a href="l23.html">lesson 23</a>) needs the physical index to select a set, so it waits for the TLB: cache hit alone 1 cycle, TLB lookup 1 cycle, in sequence 2 cycles — "this doubles the critical latency" (p. 360). More than 90 % of accesses are hits, and the hit time is the term of AMAT that every access pays.</p>
+
+  <p>Look at what the cache needs, and when: the index first, to select a set and read its tags; the tag only at the end, for the comparison. And the index of a small cache sits in the low bits, inside the page offset, which translation does not change. In the hotel city, a porter who knows only your room number can already walk to the right floor — every building has the same layout — and check the building name on the door when reception phones it through.</p>
+
+  <div class="def">
+    <p><dfn>Virtually indexed, physically tagged (VIPT) cache</dfn> — a cache where "the index (which set to look at) is taken from the virtual address" and "the tag (to confirm if it's the right block) comes from the physical address after TLB translation" (p. 360).</p>
+  </div>
+
+  <p>The notes' five steps (p. 360), drawn in Fig. 2: the CPU issues a virtual address; its index bits select a set at once; meanwhile the TLB translates the VPN into the PFN; the PFN, which is the physical tag, is compared with the tags of the selected set; a match is a hit.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-vipt">
+    <svg class="dia" viewBox="0 0 560 262" role="img" aria-label="A VIPT lookup: the VPN of the virtual address goes to the TLB while the index, which lies inside the page offset, selects a set of the cache at the same time; the PFN from the TLB is compared with the tags read from the set, and a match is a hit">
+      <text x="430" y="18" class="tx-mid tx-sm">page offset</text>
+      <path d="M340 34V28H520V34" class="st-muted"/>
+      <rect x="60" y="40" width="280" height="30" class="fw-s3 st-s3"/>
+      <rect x="340" y="40" width="90" height="30" class="fi-paper"/>
+      <rect x="430" y="40" width="90" height="30" class="fi-soft"/>
+      <text x="200" y="60" class="tx-mid tx-mono tx-sm">VPN · 20 bits</text>
+      <text x="385" y="60" class="tx-mid tx-mono tx-sm">index</text>
+      <text x="475" y="60" class="tx-mid tx-mono tx-sm">offset</text>
+      <text x="48" y="61" class="tx-end tx-bold">VA</text>
+      <line x1="150" y1="70" x2="150" y2="116" marker-end="url(#arr)"/>
+      <line x1="385" y1="70" x2="385" y2="116" marker-end="url(#arr)"/>
+      <text x="268" y="102" class="tx-mid tx-hand">in parallel</text>
+      <rect x="60" y="120" width="180" height="56" rx="4" class="fi-paper sw-2"/>
+      <text x="150" y="143" class="tx-mid tx-bold">TLB</text>
+      <text x="150" y="165" class="tx-mid tx-sm">VPN → PFN</text>
+      <rect x="300" y="120" width="220" height="56" rx="4" class="fi-paper sw-2"/>
+      <text x="410" y="143" class="tx-mid tx-bold">cache</text>
+      <text x="410" y="165" class="tx-mid tx-sm">read the set</text>
+      <polyline points="150,176 150,232 361,232" class="sw-2" marker-end="url(#arr)"/>
+      <text x="255" y="222" class="tx-mid tx-sm halo">PFN = physical tag</text>
+      <line x1="385" y1="176" x2="385" y2="208" class="sw-2" marker-end="url(#arr)"/>
+      <text x="397" y="198" class="tx-sm">tags</text>
+      <circle cx="385" cy="232" r="20" class="fi-paper sw-2"/>
+      <text x="385" y="238" class="tx-mid tx-lg">=</text>
+      <line x1="405" y1="232" x2="454" y2="232" marker-end="url(#arr)"/>
+      <text x="462" y="237" class="tx-bold">hit?</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> A VIPT lookup. Index and block offset lie inside the page offset, so the cache selects its set from the virtual address while the TLB translates the VPN. The comparison at the bottom (one comparator per way) needs both: the tags read from the set and the PFN from the TLB.</figcaption>
+  </figure>
+
+  <p>The set read and the translation now overlap. With \(T_{\text{TLB}}\) for the TLB lookup, \(T_{\text{read}}\) for indexing the cache and reading the set, and \(T_{\text{cmp}}\) for comparing the tags and selecting the way:</p>
+
+  <div class="formula">
+    \[ T_{\text{serial}} = T_{\text{TLB}} + T_{\text{read}} + T_{\text{cmp}} \]
+    \[ T_{\text{VIPT}} = \max(T_{\text{TLB}},\, T_{\text{read}}) + T_{\text{cmp}} \]
+  </div>
+
+  <p>If the TLB answers before the set has been read, a VIPT hit costs what the cache alone costs. The widget puts both designs on one clock.</p>
+
+  <div class="widget" id="l27-w-timeline">
+    <h3 class="widget-title">One hit, two designs, one clock</h3>
+    <p class="widget-intro">On top, a physically indexed L1: the cache waits for the physical address from the TLB. Below, a VIPT L1: it reads its set while the TLB translates, and only the comparison waits for the PFN. The sliders set how long each step takes, in fractions of a clock cycle; a hit takes as many whole cycles as its critical path needs, and the dashed lines are the clock edges. A miss costs 20 cycles more in both designs. The insight: VIPT removes the TLB from the hit path without removing the TLB.</p>
+    <ol class="tasks">
+      <li>At the start (TLB 0.75, set read 0.75, compare 0.25 cycles, miss rate 5 %), predict the hit time of each design in whole clock cycles, then the AMAT of each.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Serial: path 1.75, so 2 cycles. VIPT: max(0.75, 0.75) + 0.25 = 1.00, so 1 cycle: the notes' 2 against 1 (p. 360). AMAT = 2 + 0.05 × 20 = 3.00 against 1 + 0.05 × 20 = 2.00 cycles.</p></details>
+      </li>
+      <li>Raise the TLB lookup to 1.5 cycles. Does VIPT still hide it?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Not completely. The set is read at 0.75, the PFN arrives at 1.5, and the comparison waits: path 1.75, 2 cycles. The serial design gets worse too: 2.5, so 3 cycles. VIPT hides the TLB only up to the time of the set read, which is one reason a TLB is kept tiny.</p></details>
+      </li>
+      <li>Back to the start. Move the miss rate from 0 to 20 %. Predict what happens to the AMAT gap between the two designs.
+        <details class="answer"><summary>What you should see</summary>
+          <p>It stays 1 cycle: 2 against 1 at 0 %, 6 against 5 at 20 %. Only the hit time differs; the miss term, miss rate × miss penalty, is the same in both. VIPT is a hit-time technique, not a miss-penalty one.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-timeline', function (root, ui) {
+    var S = Course.svg, MP = 20, X0 = 110, U = 84;
+    var sT = ui.slider({ label: 'TLB lookup (clock cycles)', min: 0.25, max: 2, step: 0.25, value: 0.75 });
+    var sR = ui.slider({ label: 'index the cache and read the set (clock cycles)', min: 0.25, max: 2, step: 0.25, value: 0.75 });
+    var sC = ui.slider({ label: 'compare the tags and select (clock cycles)', min: 0.25, max: 1, step: 0.25, value: 0.25 });
+    var sM = ui.slider({ label: 'miss rate', min: 0, max: 0.2, step: 0.01, value: 0.05, format: function (v) { return Math.round(v * 100) + ' %'; } });
+    var roPath = ui.readout('critical path of a hit: serial · VIPT'),
+        roHit = ui.readout('hit time in whole clock cycles: serial · VIPT'),
+        roAmat = ui.readout('AMAT = hit time + miss rate × 20 cycles: serial · VIPT');
+    var note = ui.note('');
+    var svg = ui.svg(560, 300, { label: 'Two timelines of one cache hit on a clock-cycle axis: on top the TLB lookup, then the set read and the tag comparison; below, the TLB lookup and the set read side by side, then the comparison' });
+    ui.legend([
+      { label: 'TLB lookup', color: 's3', mark: 'area' },
+      { label: 'index and read the set', color: 's1', mark: 'area' },
+      { label: 'compare tags, select the way', color: 'ink', mark: 'area' },
+      { label: 'waiting', color: 's2', mark: 'area' }
+    ]);
+    function f(v) { return Course.fmt(v, 2); }
+    function model() {
+      var t = sT.value, r = sR.value, c = sC.value, mr = sM.value;
+      var ser = t + r + c, par = Math.max(t, r) + c;
+      var hs = Math.max(1, Math.ceil(ser - 1e-9)), hp = Math.max(1, Math.ceil(par - 1e-9));
+      return { t: t, r: r, c: c, mr: mr, ser: ser, par: par, hs: hs, hp: hp, as: hs + mr * MP, ap: hp + mr * MP };
+    }
+    function X(tt) { return X0 + tt * U; }
+    function bar(t0, t1, y, cls) {
+      if (t1 - t0 < 1e-9) return;
+      S('rect', { x: X(t0), y: y, width: (t1 - t0) * U, height: 22, 'class': cls }, svg);
+    }
+    function lane(m, serial, y0) {
+      S('text', { x: 20, y: y0 + 48, 'class': 'tx-sm tx-bold halo', text: serial ? 'TLB, then cache' : 'VIPT: TLB and cache in parallel' }, svg);
+      S('text', { x: 100, y: y0 + 75, 'class': 'tx-end tx-sm', text: 'TLB' }, svg);
+      S('text', { x: 100, y: y0 + 107, 'class': 'tx-end tx-sm', text: 'cache' }, svg);
+      bar(0, m.t, y0 + 60, 'fw-s3 st-s3');
+      var end;
+      if (serial) {
+        bar(0, m.t, y0 + 92, 'fw-s2 st-s2 dash');
+        bar(m.t, m.t + m.r, y0 + 92, 'fw-s1 st-s1');
+        bar(m.t + m.r, m.ser, y0 + 92, 'fw-ink');
+        end = m.ser;
+      } else {
+        bar(0, m.r, y0 + 92, 'fw-s1 st-s1');
+        if (m.t > m.r) bar(m.r, m.t, y0 + 92, 'fw-s2 st-s2 dash');
+        bar(Math.max(m.t, m.r), m.par, y0 + 92, 'fw-ink');
+        end = m.par;
+      }
+      var hc = serial ? m.hs : m.hp, yb = y0 + 126;
+      S('line', { x1: X(end), y1: y0 + 56, x2: X(end), y2: yb, 'class': 'st-ink sw-2' }, svg);
+      S('line', { x1: X(0), y1: yb, x2: X(hc), y2: yb, 'class': 'sw-2' }, svg);
+      S('line', { x1: X(0), y1: yb - 5, x2: X(0), y2: yb + 5, 'class': 'sw-2' }, svg);
+      S('line', { x1: X(hc), y1: yb - 5, x2: X(hc), y2: yb + 5, 'class': 'sw-2' }, svg);
+      S('text', { x: X(0), y: y0 + 146, 'class': 'tx-sm halo', text: 'hit: ' + hc + (hc === 1 ? ' clock cycle' : ' clock cycles') + ' (path ' + f(end) + ')' }, svg);
+    }
+    function draw(m) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      for (var k = 0; k <= 5; k++) {
+        S('line', { x1: X(k), y1: 30, x2: X(k), y2: 268, 'class': 'st-muted dash sw-1' }, svg);
+        S('text', { x: X(k), y: 22, 'class': 'tx-mid tx-sm tx-muted', text: String(k) }, svg);
+      }
+      lane(m, true, 0);
+      lane(m, false, 128);
+      S('text', { x: 530, y: 294, 'class': 'tx-end tx-sm tx-muted', text: 'time in clock cycles' }, svg);
+    }
+    ui.onChange(function () {
+      var m = model();
+      roPath.set(f(m.ser) + ' · ' + f(m.par) + ' cycles');
+      roHit.set(m.hs + ' · ' + m.hp);
+      roAmat.set(f(m.as) + ' · ' + f(m.ap) + ' cycles');
+      var msg = m.t <= m.r
+        ? 'The TLB answers (' + f(m.t) + ') no later than the set has been read (' + f(m.r) + '): VIPT hides the translation completely, and a hit costs what the cache alone costs, ' + f(m.r + m.c) + ' cycles of path.'
+        : 'The TLB answers (' + f(m.t) + ') after the set has been read (' + f(m.r) + '): the comparison waits ' + f(m.t - m.r) + ' cycles for the physical tag. VIPT still shortens the path by ' + f(m.ser - m.par) + ' cycles, but no longer hides the whole TLB.';
+      msg += ' The AMAT gap, ' + f(m.as - m.ap) + ' cycles, is the hit-time gap: the miss term, ' + f(m.mr) + ' × 20 = ' + f(m.mr * MP) + ' cycles, is the same in both designs.';
+      note.set(msg);
+      draw(m);
+    });
+  });
+  </script>
+
+  <div class="pitfall"><p>"A VIPT cache skips the TLB on a hit." No: the TLB is read on every access. Its PFN is the tag that decides the hit, and its permission bits are checked. VIPT takes the TLB off the critical path; it does not take it away.</p></div>
+
+  <p>Index and tag can each come from either address, which gives three designs worth knowing:</p>
+
+  <figure class="tbl-fig" id="l27-tbl-designs">
+    <figcaption>Where the index and the tag come from. The problems of VIVT are the subject of section 4, the price of VIPT the subject of section 5.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Design</th><th>Index from</th><th>Tag from</th><th>TLB on a hit</th><th>Price</th></tr></thead>
+        <tbody>
+          <tr><td>PIPT: physically indexed, physically tagged</td><td>physical address</td><td>physical address</td><td>in series</td><td>the TLB time on every hit; used for L2 and L3, which start after the translation is done (p. 364)</td></tr>
+          <tr><td>VIVT: virtually indexed, virtually tagged</td><td>virtual address</td><td>virtual address</td><td>not needed</td><td>synonyms (p. 360); homonyms and cache flushes (not in the notes)</td></tr>
+          <tr class="is-key"><td>VIPT: virtually indexed, physically tagged</td><td>page-offset bits of the virtual address</td><td>physical address</td><td>in parallel</td><td>one way may not be larger than one page</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The textbook name of VIPT is "avoiding address translation during indexing of the cache", a hit-time technique. The January 2026 quiz transcribed in the notes (pp. 503–504) offers it as a miss-penalty one, and the notes' solution accepts it (<a href="l24.html">lesson 24</a> and <a href="l26.html">lesson 26</a> settle that quiz). A miss still pays its full penalty; VIPT shortens every hit.</p>
+
+  <p class="memo"><mark class="key">VIPT reads the set with page-offset bits while the TLB translates, then compares the physical tag: the TLB leaves the critical path of a hit, not the machine.</mark></p>
+</section>
+
+<section id="l27-synonyms">
+  <h2>Two names for one byte: synonyms</h2>
+
+  <p>Why not tag the cache with virtual addresses too? A virtually indexed, virtually tagged (VIVT) cache would need the TLB only on a miss. The obstacle is the <mark class="key">synonym</mark>, or alias: two virtual addresses that map to the same physical address — normal with memory shared between processes, memory-mapped files, a page mapped twice (p. 361).</p>
+
+  <p>The notes' Example 20 (p. 362) takes two aliases, <span class="num">VA1 = 0x4000_1234</span> and <span class="num">VA2 = 0x8000_1234</span>, both mapped to <span class="num">PA = 0x1000_1234</span>. With 4 KB pages, 64 B blocks and a 4 KB direct-mapped cache of 64 sets, the 12-bit page offset splits into a 6-bit index and a 6-bit block offset. Do the arithmetic before reading the notes' story:</p>
+
+  <figure class="tbl-fig" id="l27-tbl-ex20">
+    <figcaption>Example 20 (p. 362) recomputed. The three addresses differ only above bit 11.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Field (bits)</th><th>VA1</th><th>VA2</th><th>PA</th></tr></thead>
+        <tbody>
+          <tr><td>address</td><td class="num">0x4000_<wbr>1234</td><td class="num">0x8000_<wbr>1234</td><td class="num">0x1000_<wbr>1234</td></tr>
+          <tr><td>page number [31:12]</td><td class="num">0x40001</td><td class="num">0x80001</td><td class="num">0x10001</td></tr>
+          <tr><td>page offset [11:0]</td><td class="num">0x234</td><td class="num">0x234</td><td class="num">0x234</td></tr>
+          <tr class="is-key"><td>index [11:6]</td><td class="num">001000 = 8</td><td class="num">001000 = 8</td><td class="num">001000 = 8</td></tr>
+          <tr><td>block offset [5:0]</td><td class="num">110100 = 52</td><td class="num">110100 = 52</td><td class="num">110100 = 52</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>All three share the page offset 0x234 = 0010 0011 0100, so they share the index: set 8. The notes put VA1 in "Set 10" and VA2 in "Set 42" of a VIVT cache and tag the VIPT line "0x1000"; neither survives the arithmetic.</p>
+
+  <aside class="redpen" data-page="362">
+    <p class="claim">"VA1 index = bits [11 : 6] of 0x4000_1234 → suppose = Set 10." … "VA2 index = bits [11 : 6] of 0x8000_1234 → suppose = Set 42."</p>
+    <p class="fix">Bits [11:6] of both addresses are 001000: both aliases select set 8, in VIVT as in VIPT. This 4 KB direct-mapped VIVT cache cannot hold two copies: the aliases conflict in set 8 (virtual tags 0x40001 and 0x80001) and evict each other; the values stay correct, at the cost of a miss at every switch.</p>
+    <p class="because">The index lies inside the page offset, 0x234 = 564 = 8 × 64 + 52, and all aliases share the page offset. Two copies need two places: a second way (the tables below) or an index that reaches into the VPN (section 5). The exam exercise on synonyms runs the notes' own cache to the end.</p>
+  </aside>
+
+  <aside class="redpen" data-page="362">
+    <p class="claim">"Tag check uses Physical Page Number (0x1000) from TLB."</p>
+    <p class="fix">The physical page number of 0x1000_1234 is its upper 20 bits, 0x10001, and that is the tag of the line.</p>
+    <p class="because">The underscore groups the hex digits four by four; with 4 KB pages the page boundary falls after the fifth digit: 0x10001 | 0x234. Example 19 splits correctly on p. 358: 0x7FFE_1234 gives 0x7FFE1 | 0x234.</p>
+  </aside>
+
+  <p>Duplication needs room for both names. Give the cache a second way: 8 KB, 2-way, still 4 KB per way, so still 64 sets and index [11:6]. Run four accesses, write-back with write-allocate and 0 in memory at the start: write 7 through VA1, read through VA2, write 9 through VA2, read through VA1.</p>
+
+  <div class="tabs" id="l27-tabs-alias">
+    <div data-tab="Virtual tags (VIVT)">
+      <figure class="tbl-fig" id="l27-tbl-vivt">
+        <figcaption>VIVT. Every access goes to set 8, and no block is evicted (Write in memory: No). The cache sees two different blocks: set 8 ends with two copies of one physical block, and both reads return stale data.</figcaption>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Type of<br>memory access</th><th>Hit/ Miss<br>Type</th><th>Value<br>returned</th><th>Cache<br>Tag</th><th>Cache<br>Address</th><th>Dirty<br>bit</th></tr></thead>
+            <tbody>
+              <tr><td>Write 7 via VA1</td><td>Cold-start Miss</td><td>—</td><td class="num">0x40001</td><td>way 0</td><td class="num">1</td></tr>
+              <tr class="is-key"><td>Read via VA2</td><td>Cold-start Miss</td><td>0: stale, should be 7</td><td class="num">0x80001</td><td>way 1</td><td class="num">0</td></tr>
+              <tr><td>Write 9 via VA2</td><td>Hit</td><td>—</td><td class="num">0x80001</td><td>way 1</td><td class="num">1</td></tr>
+              <tr class="is-key"><td>Read via VA1</td><td>Hit</td><td>7: stale, should be 9</td><td class="num">0x40001</td><td>way 0</td><td class="num">1</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </figure>
+    </div>
+    <div data-tab="Physical tags (VIPT)">
+      <figure class="tbl-fig" id="l27-tbl-vipt2">
+        <figcaption>VIPT. Set 8 again, no write-back. Both names match the physical tag 0x10001: one line, one miss, every value right.</figcaption>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Type of<br>memory access</th><th>Hit/ Miss<br>Type</th><th>Value<br>returned</th><th>Cache<br>Tag</th><th>Cache<br>Address</th><th>Dirty<br>bit</th></tr></thead>
+            <tbody>
+              <tr><td>Write 7 via VA1</td><td>Cold-start Miss</td><td>—</td><td class="num">0x10001</td><td>way 0</td><td class="num">1</td></tr>
+              <tr><td>Read via VA2</td><td>Hit</td><td>7</td><td class="num">0x10001</td><td>way 0</td><td class="num">1</td></tr>
+              <tr><td>Write 9 via VA2</td><td>Hit</td><td>—</td><td class="num">0x10001</td><td>way 0</td><td class="num">1</td></tr>
+              <tr><td>Read via VA1</td><td>Hit</td><td>9</td><td class="num">0x10001</td><td>way 0</td><td class="num">1</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </figure>
+    </div>
+  </div>
+
+  <figure class="fig fig--pair fig--plain" id="l27-fig-synonyms">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Before: set 8 of a 2-way VIVT cache after a write of 7 through VA1 and a read through VA2. Way 0 holds tag 40001 with 7, dirty; way 1 holds tag 80001 with the stale 0, so the read returns 0">
+        <text x="150" y="16" class="tx-mid tx-sm tx-muted">set 8 after step 2</text>
+        <rect x="40" y="26" width="230" height="22" class="fw-s3 st-s3"/>
+        <text x="60" y="41" class="tx-mid tx-mono tx-sm">way</text>
+        <text x="91" y="41" class="tx-mid tx-mono tx-sm">V</text>
+        <text x="113" y="41" class="tx-mid tx-mono tx-sm">D</text>
+        <text x="160" y="41" class="tx-mid tx-mono tx-sm">Tag</text>
+        <text x="233" y="41" class="tx-mid tx-mono tx-sm">Data</text>
+        <rect x="40" y="48" width="40" height="24" class="fi-paper"/><rect x="80" y="48" width="22" height="24" class="fi-paper"/><rect x="102" y="48" width="22" height="24" class="fi-paper"/><rect x="124" y="48" width="72" height="24" class="fi-paper"/><rect x="196" y="48" width="74" height="24" class="fi-paper"/>
+        <rect x="40" y="72" width="40" height="24" class="fi-paper"/><rect x="80" y="72" width="22" height="24" class="fi-paper"/><rect x="102" y="72" width="22" height="24" class="fi-paper"/><rect x="124" y="72" width="72" height="24" class="fi-paper"/><rect x="196" y="72" width="74" height="24" class="fi-paper"/>
+        <text x="60" y="65" class="tx-mid tx-mono tx-sm">0</text>
+        <text x="91" y="65" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="113" y="65" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="160" y="65" class="tx-mid tx-mono tx-sm">40001</text>
+        <text x="233" y="65" class="tx-mid tx-mono tx-sm">7</text>
+        <text x="60" y="89" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="91" y="89" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="113" y="89" class="tx-mid tx-mono tx-sm">0</text>
+        <text x="160" y="89" class="tx-mid tx-mono tx-sm">80001</text>
+        <text x="233" y="89" class="tx-mid tx-mono tx-sm">0</text>
+        <circle cx="233" cy="85" r="10" class="st-bad sw-2"/>
+        <text x="150" y="126" class="tx-mid tx-hand">two copies</text>
+        <rect x="40" y="148" width="104" height="26" rx="4" class="fi-paper"/>
+        <text x="92" y="165" class="tx-mid tx-sm">VA1: write 7</text>
+        <rect x="166" y="148" width="104" height="26" rx="4" class="fi-paper"/>
+        <text x="218" y="165" class="tx-mid tx-sm">VA2: read</text>
+        <polyline points="40,161 20,161 20,60 34,60" marker-end="url(#arr)"/>
+        <line x1="218" y1="148" x2="218" y2="102" marker-end="url(#arr)"/>
+        <text x="218" y="196" class="tx-mid tx-sm tx-bad">returns 0, not 7</text>
+      </svg>
+      <p class="fig-label">Before: virtual tags (VIVT)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="After: set 8 of a 2-way VIPT cache after the same two accesses. Way 0 holds the physical tag 10001 with 7, dirty; way 1 is empty; both VA1 and VA2 point to way 0 and the read returns 7">
+        <text x="150" y="16" class="tx-mid tx-sm tx-muted">set 8 after step 2</text>
+        <rect x="40" y="26" width="230" height="22" class="fw-s3 st-s3"/>
+        <text x="60" y="41" class="tx-mid tx-mono tx-sm">way</text>
+        <text x="91" y="41" class="tx-mid tx-mono tx-sm">V</text>
+        <text x="113" y="41" class="tx-mid tx-mono tx-sm">D</text>
+        <text x="160" y="41" class="tx-mid tx-mono tx-sm">Tag</text>
+        <text x="233" y="41" class="tx-mid tx-mono tx-sm">Data</text>
+        <rect x="40" y="48" width="40" height="24" class="fi-paper"/><rect x="80" y="48" width="22" height="24" class="fi-paper"/><rect x="102" y="48" width="22" height="24" class="fi-paper"/><rect x="124" y="48" width="72" height="24" class="fi-paper"/><rect x="196" y="48" width="74" height="24" class="fi-paper"/>
+        <rect x="40" y="72" width="40" height="24" class="fi-paper"/><rect x="80" y="72" width="22" height="24" class="fi-paper"/><rect x="102" y="72" width="22" height="24" class="fi-paper"/><rect x="124" y="72" width="72" height="24" class="fi-paper"/><rect x="196" y="72" width="74" height="24" class="fi-paper"/>
+        <text x="60" y="65" class="tx-mid tx-mono tx-sm">0</text>
+        <text x="91" y="65" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="113" y="65" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="160" y="65" class="tx-mid tx-mono tx-sm">10001</text>
+        <text x="233" y="65" class="tx-mid tx-mono tx-sm">7</text>
+        <text x="60" y="89" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="91" y="89" class="tx-mid tx-mono tx-sm tx-muted">0</text>
+        <text x="113" y="89" class="tx-mid tx-mono tx-sm tx-muted">0</text>
+        <text x="160" y="89" class="tx-mid tx-mono tx-sm tx-muted">—</text>
+        <text x="233" y="89" class="tx-mid tx-mono tx-sm tx-muted">—</text>
+        <text x="150" y="126" class="tx-mid tx-hand">one copy</text>
+        <rect x="40" y="148" width="104" height="26" rx="4" class="fi-paper"/>
+        <text x="92" y="165" class="tx-mid tx-sm">VA1: write 7</text>
+        <rect x="166" y="148" width="104" height="26" rx="4" class="fi-paper"/>
+        <text x="218" y="165" class="tx-mid tx-sm">VA2: read</text>
+        <polyline points="40,161 20,161 20,60 34,60" marker-end="url(#arr)"/>
+        <polyline points="270,161 288,161 288,60 276,60" marker-end="url(#arr)"/>
+        <text x="218" y="196" class="tx-mid tx-sm tx-good">returns 7</text>
+      </svg>
+      <p class="fig-label">After: physical tags (VIPT)</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Set 8 of the 8 KB 2-way cache after step 2 of the tables above. Before: with virtual tags VA2 is a new block to the cache; it misses and fetches the 0 still in memory, while the 7 sits dirty in way 0. After: with physical tags both names match the line tagged 0x10001, and the read returns 7.</figcaption>
+  </figure>
+
+  <p>VIPT avoids this with two facts at once (p. 361). The index comes from page-offset bits, identical in every alias, so all aliases select the same set; the tag is the physical page number, identical too, so all of them match the same line. One copy, no stale data. The notes call it the <mark class="key">page offset trick</mark>: bits that translation never changes can index the cache before translation ends.</p>
+
+  <p>Virtual tags have a second problem, not in the notes: <em>homonyms</em>, one virtual address naming different frames in different processes. A VIVT cache must be flushed at every context switch or extend its tags with an address-space identifier; physical tags never meet it.</p>
+
+  <p class="memo"><mark class="key">Aliases share their page offset and their physical page: VIPT sends them to one set and matches them against one tag, so the block has a single copy.</mark></p>
+</section>
+
+<section id="l27-size">
+  <h2>The size law: cache size / associativity ≤ page size</h2>
+
+  <p>"Ok, now we can sleep peacefully knowing that the Synonym Problem has been solved." "Not at all!" (p. 363): the trick needs every index bit inside the page offset, and a larger cache needs more index bits. Example 21 (p. 364): 4 KB pages give 12 offset bits, 64-byte blocks take 6, so 6 index bits are left, 64 sets at most. A 32 KB 4-way cache has 8 KB per way, 128 sets, 7 index bits; the seventh, bit 12, belongs to the VPN.</p>
+
+  <p>Why that hurts: bit 12 is a page-number bit, and aliases need not agree on it. If <span class="num">VA1 = 0x4000_1234</span> and a third name, <span class="num">VA3 = 0x8000_0234</span>, map to the same frame, the index [12:6] puts VA1 in set 72 and VA3 in set 8 (bit 12 is 1 in VA1, 0 in VA3). Two sets, two copies: the synonym problem is back, physical tags or not (p. 363).</p>
+
+  <ol class="steps" id="l27-steps-law">
+    <li><p>Count the sets: the cache holds \(C / B\) blocks, \(A\) per set.</p> \[ S = \frac{C}{A \times B} \]</li>
+    <li><p>Count the bits: index \(i = \log_2 S\), block offset \(o = \log_2 B\), page offset \(p = \log_2 P\). VIPT needs index and block offset inside the page offset:</p> \[ i + o \le p \]</li>
+    <li><p>A sum of logarithms is the logarithm of a product:</p> \[ \log_2 S + \log_2 B \le \log_2 P \] \[ S \times B \le P \]</li>
+    <li><p>Sets times block size is the size of one way, the cache divided by its ways:</p> \[ S \times B = \frac{C}{A} \quad\Rightarrow\quad \frac{C}{A} \le P \]</li>
+    <li><p>Example 21 fails by one bit; one more factor of two in \(A\) fixes it:</p> \[ \frac{32\ \text{KB}}{4} = 8\ \text{KB} \gt 4\ \text{KB} \] \[ k = i + o - p = 7 + 6 - 12 = 1 \] <p>With 8 ways, 32 KB / 8 = 4 KB: equality. With 4 ways the maximum is 4 × 4 KB = 16 KB (p. 364).</p></li>
+    <li><p>Rearranged: the largest VIPT cache with \(A\) ways and the fewest ways for a cache of size \(C\). A law that fails by \(k\) bits lets an alias sit in any of \(2^k\) sets.</p> \[ C_{\max} = A \times P \qquad A_{\min} = \frac{C}{P} \]</li>
+  </ol>
+
+  <aside class="margin-note">On p. 363 the notes justify eq. (80) with one garbled sentence; the steps above are the argument.</aside>
+
+  <div class="formula" data-label="(80)">
+    \[ \frac{\text{cache size}}{\text{associativity}} \le \text{page size} \]
+    <dl class="legend">
+      <dt>cache size / associativity</dt><dd>one way, \(S \times B\) bytes: what index and block offset can reach</dd>
+      <dt>page size</dt><dd>what the page offset can reach: the only bits known before the TLB answers</dd>
+    </dl>
+  </div>
+
+  <div class="widget" id="l27-w-slicer">
+    <h3 class="widget-title">Address bit-slicer: does the index fit in the page offset?</h3>
+    <p class="widget-intro">The same 32-bit virtual address drawn twice, bit by bit, bit 31 on the left. On top as the page table splits it, VPN | page offset; below as the cache splits it, tag | index | block offset, with the bit ranges above each field. The dashed line is the page boundary: bits to its right are equal in the virtual and the physical address. Index bits to its left are VPN bits and turn red. The insight: the law cache size / associativity ≤ page size says where one bit field must end.</p>
+    <ol class="tasks">
+      <li>The widget opens on Example 21: 32 KB, 4-way, 64 B blocks, 4 KB pages. Before reading the readouts, say how many index bits there are and which one leaks. Then predict the smallest associativity that fixes it, and set it.
+        <details class="answer"><summary>What you should see</summary>
+          <p>128 sets, 7 index bits [12:6]; bit 12 is red, so k = 1 and an alias may sit in 2 sets. At 8 ways: 64 sets, index [11:6], 32 KB / 8 = 4 KB = the page. This is the 32 KB 8-way L1 of the hook.</p></details>
+      </li>
+      <li>Back to 4 ways. Would larger blocks help? Predict, then move the block size to 128 B.
+        <details class="answer"><summary>What you should see</summary>
+          <p>No. The block offset gains a bit and the index loses one: index [12:7], and bit 12 is still red. Index plus block offset stays 13 bits, because the law C / A ≤ P has no block size in it.</p></details>
+      </li>
+      <li>Pick the AMD Opteron preset, 64 KB 2-way. How many sets could hold an alias? Find two fixes, each with a single slider.
+        <details class="answer"><summary>What you should see</summary>
+          <p>32 KB per way: 9 index bits [14:6], three of them from the VPN, so an alias may sit in any of 2³ = 8 sets (the Opteron checked them in hardware, according to Hennessy &amp; Patterson). Fixes: 16 ways (64 KB / 16 = 4 KB per way), or pages of 32 KB (15 offset bits).</p></details>
+      </li>
+      <li>With 16 KB pages, what is the largest VIPT cache with 8 ways? Predict, then check with the last preset.
+        <details class="answer"><summary>What you should see</summary>
+          <p>8 × 16 KB = 128 KB: 256 sets, index [13:6], and the page offset now ends at bit 13. A larger page is the other way to grow a VIPT L1.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-slicer', function (root, ui) {
+    var S = Course.svg, X0 = 40, U = 15, H = 28, MONO = 10.6;
+    var PRE = { ex20: [12, 0, 6, 12], ex21: [15, 2, 6, 12], intel: [15, 3, 6, 12], opteron: [16, 1, 6, 12], big: [17, 3, 6, 14] };
+    function size(e) { return e >= 20 ? Math.pow(2, e - 20) + ' MB' : e >= 10 ? Math.pow(2, e - 10) + ' KB' : Math.pow(2, e) + ' B'; }
+    var sC, sA, sB, sP;
+    var pre = ui.select('preset', [
+      { value: 'custom', label: 'your own (move a slider)' },
+      { value: 'ex20', label: 'Example 20: 4 KB direct-mapped' },
+      { value: 'ex21', label: 'Example 21: 32 KB 4-way' },
+      { value: 'intel', label: '32 KB 8-way (Intel L1, for a decade)' },
+      { value: 'opteron', label: '64 KB 2-way (AMD Opteron L1)' },
+      { value: 'big', label: '128 KB 8-way with 16 KB pages' }
+    ], function (v) { apply(v); }, 'ex21');
+    function custom() { pre.value = 'custom'; }
+    sC = ui.slider({ label: 'cache size C', min: 12, max: 18, step: 1, value: 15, format: size, onInput: custom });
+    sA = ui.slider({ label: 'associativity A', min: 0, max: 5, step: 1, value: 2, onInput: custom, format: function (v) { return v === 0 ? '1 (direct-mapped)' : Math.pow(2, v) + '-way'; } });
+    sB = ui.slider({ label: 'block size B', min: 4, max: 7, step: 1, value: 6, format: size, onInput: custom });
+    sP = ui.slider({ label: 'page size P', min: 12, max: 16, step: 1, value: 12, format: size, onInput: custom });
+    function apply(v) {
+      var p = PRE[v];
+      if (!p) return;
+      sC.set(p[0], true); sA.set(p[1], true); sB.set(p[2], true); sP.set(p[3], true);
+    }
+    var roSets = ui.readout('sets S = C / (A × B)'), roBits = ui.readout('index + block offset vs page offset'),
+        roLaw = ui.readout('one way, C / A, vs the page P'), roK = ui.readout('index bits taken from the VPN');
+    var note = ui.note('');
+    var svg = ui.svg(560, 244, { label: 'A 32-bit virtual address drawn twice: split into VPN and page offset, and split into tag, index and block offset, with the page boundary as a dashed line and the index bits that fall on the VPN side in red' });
+    ui.legend([
+      { label: 'VPN, tag', color: 's3', mark: 'area' },
+      { label: 'index bit taken from the VPN', color: 'bad', mark: 'area' },
+      { label: 'page boundary', color: 'ink', mark: 'dash' }
+    ]);
+
+    function model() {
+      var c = Math.round(sC.value), a = Math.round(sA.value), b = Math.round(sB.value), p = Math.round(sP.value);
+      var i = Math.max(0, c - a - b);
+      return { c: c, a: a, b: b, p: p, i: i, k: Math.max(0, i + b - p) };
+    }
+    function xb(bit) { return X0 + (31 - bit) * U; }
+    function rng(hi, lo) { return hi === lo ? '[' + hi + ']' : '[' + hi + ':' + lo + ']'; }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }, svg); }
+    function spread(items, lo, hi, gap) {
+      var i;
+      items.sort(function (a, b) { return a.cx - b.cx; });
+      for (i = 0; i < items.length; i++) {
+        var minC = i ? items[i - 1].cx + items[i - 1].w / 2 + gap + items[i].w / 2 : lo + items[i].w / 2;
+        if (items[i].cx < minC) items[i].cx = minC;
+      }
+      for (i = items.length - 1; i >= 0; i--) {
+        var maxC = i < items.length - 1 ? items[i + 1].cx - items[i + 1].w / 2 - gap - items[i].w / 2 : hi - items[i].w / 2;
+        if (items[i].cx > maxC) items[i].cx = maxC;
+      }
+    }
+    function rects(fields, y) {
+      fields.forEach(function (f) {
+        f.x = xb(f.hi); f.w = (f.hi - f.lo + 1) * U;
+        S('rect', { x: f.x, y: y, width: f.w, height: H, 'class': f.cls }, svg);
+      });
+    }
+    function labels(fields, y) {
+      var above = [], below = [];
+      fields.forEach(function (f) {
+        var lab = rng(f.hi, f.lo), cx = f.x + f.w / 2, nw = f.name.length * MONO;
+        above.push({ cx: cx, w: lab.length * MONO, t: lab, fx: cx });
+        if (f.w >= nw + 12) T(cx, y + 19, f.name, 'tx-mid tx-mono tx-sm halo');
+        else below.push({ cx: cx, w: nw, t: f.name, fx: cx });
+      });
+      spread(above, 4, 556, 12);
+      above.forEach(function (it) {
+        T(it.cx, y - 9, it.t, 'tx-mid tx-mono tx-sm halo');
+        if (Math.abs(it.cx - it.fx) > 4) S('line', { x1: it.fx, y1: y, x2: it.cx, y2: y - 6, 'class': 'st-muted' }, svg);
+      });
+      spread(below, 4, 556, 12);
+      below.forEach(function (it) {
+        T(it.cx, y + H + 24, it.t, 'tx-mid tx-mono tx-sm');
+        S('line', { x1: it.fx, y1: y + H, x2: it.cx, y2: y + H + 6, 'class': 'st-muted' }, svg);
+      });
+    }
+    function draw(m) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var Y1 = 54, Y2 = 158;
+      var r1 = [{ hi: 31, lo: m.p, name: 'VPN', cls: 'fw-s3 st-s3' }, { hi: m.p - 1, lo: 0, name: 'page offset', cls: 'fi-soft' }];
+      var r2 = [{ hi: 31, lo: m.i + m.b, name: 'tag', cls: 'fw-s3 st-s3' }];
+      if (m.i > 0) r2.push({ hi: m.i + m.b - 1, lo: m.b, name: 'index', cls: 'fi-paper' });
+      r2.push({ hi: m.b - 1, lo: 0, name: 'block offset', cls: 'fi-soft' });
+      T(20, 20, 'virtual address, as the page table splits it', 'tx-sm tx-muted halo');
+      T(20, 126, 'the same address, as the cache splits it', 'tx-sm tx-muted halo');
+      rects(r1, Y1);
+      rects(r2, Y2);
+      if (m.k > 0) {
+        var hiL = m.i + m.b - 1, wL = (hiL - m.p + 1) * U;
+        S('rect', { x: xb(hiL), y: Y1, width: wL, height: H, 'class': 'fw-bad st-bad sw-2' }, svg);
+        S('rect', { x: xb(hiL), y: Y2, width: wL, height: H, 'class': 'fw-bad st-bad sw-2' }, svg);
+      }
+      var xp = X0 + (32 - m.p) * U;
+      S('line', { x1: xp, y1: 34, x2: xp, y2: 198, 'class': 'st-ink sw-2 dash' }, svg);
+      labels(r1, Y1);
+      labels(r2, Y2);
+      T(Course.clamp(xp, 72, 488), 236, 'page boundary', 'tx-mid tx-sm');
+    }
+    ui.onChange(function () {
+      var m = model(), ok = m.k === 0, way = m.c - m.a;
+      roSets.set(String(Math.pow(2, m.i)));
+      roBits.set(m.i + ' + ' + m.b + ' = ' + (m.i + m.b) + (ok ? ' ≤ ' : ' > ') + m.p + ' bits', ok ? 'good' : 'bad');
+      roLaw.set(size(way) + (ok ? ' ≤ ' : ' > ') + size(m.p), ok ? 'good' : 'bad');
+      roK.set(ok ? '0: VIPT-safe' : 'k = ' + m.k + ': an alias may sit in ' + Math.pow(2, m.k) + ' sets', ok ? 'good' : 'bad');
+      if (ok) {
+        note.set('Every index bit lies inside the page offset, so the set can be read before the TLB answers. With ' + Math.pow(2, m.a) + (m.a === 0 ? ' way' : ' ways') + ' and ' + size(m.p) + ' pages the largest VIPT cache is A × P = ' + size(m.a + m.p) + '.');
+      } else {
+        note.set((m.k === 1 ? 'Index bit ' + rng(m.p, m.p) + ' belongs' : 'Index bits ' + rng(m.i + m.b - 1, m.p) + ' belong') + ' to the VPN and may change in translation: two aliases can select ' + Math.pow(2, m.k) + ' different sets. Fixes: at least ' + Math.pow(2, m.c - m.p) + ' ways (C / P), or pages of ' + size(way) + ' (one way), or page colouring of ' + m.k + (m.k === 1 ? ' bit' : ' bits') + ' by the OS, or hardware that checks the ' + Math.pow(2, m.k) + ' candidate sets on a miss.');
+      }
+      draw(m);
+    });
+  });
+  </script>
+
+  <div class="pitfall"><p>"VIPT caps the L1 at the size of a page." No: it caps <em>one way</em> at a page. Twelve ways of 4 KB make 48 KB, all VIPT-safe.</p></div>
+
+  <h3>Back to the hook</h3>
+
+  <p>32 KB / 8 ways = 4 KB, one page: that L1 used every index bit the page offset allows (p. 364 gives the same example), and to grow it added ways: 48 KB / 12 = 4 KB again. The first fact of the hook is the reason: only the page offset, the last three hex digits, is known before the TLB answers, so one way can cover at most one page. With 16 KB pages, as on Apple silicon, 8 ways would allow 8 × 16 KB = 128 KB.</p>
+
+  <p>The lower levels escape the law: "Higher-level caches (L2, L3) are usually physically indexed, physically tagged (PIPT), so they don't suffer this limitation" (p. 364). They are accessed only after an L1 miss, when the TLB has long answered, so there is nothing left to hide.</p>
+
+  <p>Adding ways is not free: each adds a tag comparison, widens the multiplexer and costs energy on every access. So VIPT pushes L1 associativity up while a short hit time, the theme of <a href="l28.html">lesson 28</a>, pushes it down. Way prediction (<a href="l25.html">lesson 25</a>) eases the conflict by reading the predicted way first; many processors also accept a pipelined L1 hit of two or more cycles. Other escapes (Hennessy &amp; Patterson; not in the notes): OS page colouring, so that all aliases of a frame agree on the leaking index bits; hardware that checks the \(2^k\) candidate sets on a miss, as in the 64 KB 2-way L1 of the AMD Opteron; larger pages.</p>
+
+  <p class="memo"><mark class="key">A VIPT L1 keeps every alias in one set only while cache size / associativity ≤ page size: to grow, it adds ways or uses larger pages.</mark></p>
+</section>
+
+<section id="l27-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <p>The three official papers have no question on virtual memory, so these questions follow the forms the papers use for the cache (the July 2024 address quiz and cache table, the formula-sheet AMAT) and the June 2026 open question. The model answers are computed here; there are no official solutions.</p>
+
+  <div class="exam" data-kind="open" data-points="8" id="l27-exam-theory">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used in the memory hierarchy of modern processors: 1. Paged virtual memory; 2. Per-process page tables; 3. Translation lookaside buffer (TLB); 4. Handling of TLB misses and page faults; 5. Virtually indexed, physically tagged (VIPT) L1 caches; 6. Indexing the cache with page-offset bits only; 7. Higher associativity in a VIPT L1 cache; 8. Physically indexed, physically tagged (PIPT) L2 and L3 caches.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> The virtual and the physical address spaces are divided into pages of one fixed size (for example 4 KB). Each process sees a large, private, contiguous virtual space; the OS maps its pages onto physical frames anywhere in RAM. A virtual address is VPN | page offset; translation replaces the VPN with the PFN and leaves the offset unchanged. Benefits: programs larger than RAM (main memory acts as a cache for the disk), protection and isolation between processes, relocation, sharing of frames; fixed-size pages avoid external fragmentation. Cost: a translation on every access.</p>
+        <p><b>2.</b> Each process has a page table in memory, indexed by the VPN; each entry holds the PFN, a valid bit, a dirty bit, a use bit and protection bits. The same virtual address in two processes maps to different frames (isolation), two VPNs may point to one frame (sharing), and the hardware enforces the permissions. Because a page fault costs millions of cycles, placement is fully associative (any frame), replacement approximates LRU with the use bit, and the write policy is always write-back with the dirty bit. Cost: memory for the tables, hence multi-level tables.</p>
+        <p><b>3.</b> A small, fast, fully or highly associative cache of recent translations: tag = VPN, data = PFN and the flags. It is looked up on every access; on a hit the physical address is available in about one cycle, with the protection check. Benefit: without it every access would need an extra memory access to read the page table. Cost: it must stay tiny (tens of entries) to answer within the cycle.</p>
+        <p><b>4.</b> On a TLB miss the page table is walked in memory, by a hardware walker or a software handler, in tens of cycles; if the entry is valid it is inserted into the TLB and the access completes, with no OS involvement for a hardware walker. If the entry is invalid, the page is not in RAM: a page-fault exception transfers control to the OS, which chooses a frame (writing back a dirty victim), reads the page from the disk, updates the entry and restarts the faulting instruction; this costs millions of cycles and requires precise exceptions. A TLB miss is not a page fault.</p>
+        <p><b>5.</b> The cache index is taken from the virtual address and the tag from the physical address. The set is read while the TLB translates the VPN; the PFN is then compared with the tags of the set. Benefit: the TLB latency leaves the hit time, max(TLB, set read) + compare instead of TLB + cache, for example 1 cycle instead of 2 (notes, p. 360); since most accesses are hits, the AMAT drops. The TLB is still read on every access, for the tag and the permissions. Cost: the size restriction of point 7.</p>
+        <p><b>6.</b> Translation never changes the page offset, so index and block-offset bits taken from it are the same in the virtual and the physical address and can be used before the TLB answers (the page offset trick). It also solves synonyms, two virtual addresses mapped to one physical address (shared memory, mapped files): all aliases select the same set and, with physical tags, match the same line, so only one copy exists and no stale value can be read. A VIVT cache could keep two copies with different virtual tags.</p>
+        <p><b>7.</b> All index bits must lie in the page offset: index bits + block-offset bits ≤ page-offset bits, that is cache size / associativity ≤ page size. With 4 KB pages and 64-byte blocks a 32 KB 4-way cache (8 KB per way, 7 index bits) takes one index bit from the VPN; 8 ways make it safe (4 KB per way), and 48 KB needs 12 ways. A larger VIPT L1 therefore needs more ways. Cost: more comparators, a wider way multiplexer, more energy and a longer hit time, which way prediction mitigates. Alternatives: page colouring, hardware alias detection, larger pages.</p>
+        <p><b>8.</b> L2 and L3 use the physical address for both index and tag. They are accessed only after an L1 miss, when the TLB has already translated the address, so translation adds nothing to their access and they have no synonym problem and no page-size limit: they can be large (MBs) and highly associative. Their longer hit time is acceptable because it is paid only on L1 misses.</p>
+      </div>
+      <div class="exam-note"><p>The form is the June 2026 question: eight sub-points, about five lines each. For each technique the examiner looks for the mechanism, what it buys and what it costs. Sub-points 4 and 7 carry the usual traps: a TLB miss is not a page fault, and the law limits one way, not the whole cache.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l27-exam-size">
+    <div class="exam-q" lang="en">
+      <p>A processor has 32-bit virtual addresses, 4 KB pages and an L1 data cache with 32-byte blocks. 1. The L1 is 8 KB, 2-way set-associative: give the structure of the address as seen by the cache (tag | index | offset, with bit positions) and say whether the cache can be virtually indexed and physically tagged without synonym problems. 2. The designers want 64 KB, keeping 2 ways: how many index bits come from the virtual page number, and in how many sets could an alias of a block be found? 3. What is the minimum associativity of a 64 KB VIPT L1? 4. Give two other ways to make the 64 KB 2-way cache safe.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Page offset = log₂ 4096 = 12 bits, [11:0]. Block offset = log₂ 32 = 5 bits, [4:0].</p>
+        <p>1. Sets = 8 KB / (32 B × 2) = 128, so the index has 7 bits, [11:5], and the tag 32 − 7 − 5 = 20 bits, [31:12]: |20-bit tag | 7-bit index | 5-bit offset|. Index + offset = 7 + 5 = 12 bits = the page offset; equivalently 8 KB / 2 = 4 KB ≤ 4 KB. The cache can be VIPT, and its tag is exactly the PFN.</p>
+        <p>2. Sets = 64 KB / (32 B × 2) = 1024, so the index has 10 bits, [14:5]. Bits 14, 13 and 12 lie above the page offset: k = 10 + 5 − 12 = 3 bits come from the VPN, and an alias may be in any of 2³ = 8 sets.</p>
+        <p>3. Minimum associativity = 64 KB / 4 KB = 16 ways: 128 sets, index [11:5] again.</p>
+        <p>4. Pages of 32 KB (15 offset bits contain index [14:5]); page colouring by the OS, so that all aliases of a frame agree on virtual-address bits 14 to 12; hardware that checks the 8 candidate sets on a miss and removes a duplicate (as the AMD Opteron did).</p>
+      </div>
+      <div class="exam-note"><p>Part 1 is the address-structure quiz of July 2024 (lesson 23) with one more question: do index and offset fit in the page offset? The examiner checks the count k = i + o − p and the \(2^k\) candidate sets, and that the fixes act on C / A or on P, never on the block size.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l27-exam-alias">
+    <div class="exam-q" lang="en">
+      <p>Pages are 4 KB. The L1 data cache is 4 KB, direct-mapped, with 64-byte blocks, write-back and write-allocate. The operating system maps the virtual addresses VA1 = 0x4000_1234 and VA2 = 0x8000_1234 to the same physical address PA = 0x1000_1234, where memory holds 0. The CPU performs: (1) write 7 via VA1; (2) read via VA2; (3) write 9 via VA2; (4) read via VA1. Give the set that all four accesses use, then complete the table Type of memory access | Hit/ Miss Type | Cache Tag | Dirty bit | Write in memory | Value returned, first for a virtually indexed, virtually tagged cache, then for a virtually indexed, physically tagged one. Does either design return a wrong value?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>64 sets: index = bits [11:6] of the page offset 0x234 = 001000 = set 8 for all three addresses. Virtual tags: 0x40001 (VA1) and 0x80001 (VA2); physical tag: 0x10001.</p>
+        <p>VIVT:</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Type of<br>memory access</th><th>Hit/ Miss<br>Type</th><th>Cache<br>Tag</th><th>Dirty<br>bit</th><th>Write in<br>memory</th><th>Value<br>returned</th></tr></thead>
+            <tbody>
+              <tr><td>Write 7 via VA1</td><td>Cold-start Miss</td><td class="num">0x40001</td><td class="num">1</td><td>No</td><td>—</td></tr>
+              <tr><td>Read via VA2</td><td>Cold-start Miss</td><td class="num">0x80001</td><td class="num">0</td><td>Yes (7)</td><td class="num">7</td></tr>
+              <tr><td>Write 9 via VA2</td><td>Hit</td><td class="num">0x80001</td><td class="num">1</td><td>No</td><td>—</td></tr>
+              <tr><td>Read via VA1</td><td>Conflict Miss</td><td class="num">0x40001</td><td class="num">0</td><td>Yes (9)</td><td class="num">9</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>VIPT:</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Type of<br>memory access</th><th>Hit/ Miss<br>Type</th><th>Cache<br>Tag</th><th>Dirty<br>bit</th><th>Write in<br>memory</th><th>Value<br>returned</th></tr></thead>
+            <tbody>
+              <tr><td>Write 7 via VA1</td><td>Cold-start Miss</td><td class="num">0x10001</td><td class="num">1</td><td>No</td><td>—</td></tr>
+              <tr><td>Read via VA2</td><td>Hit</td><td class="num">0x10001</td><td class="num">1</td><td>No</td><td class="num">7</td></tr>
+              <tr><td>Write 9 via VA2</td><td>Hit</td><td class="num">0x10001</td><td class="num">1</td><td>No</td><td>—</td></tr>
+              <tr><td>Read via VA1</td><td>Hit</td><td class="num">0x10001</td><td class="num">1</td><td>No</td><td class="num">9</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>In the VIVT table, "Yes (7)" means that the dirty line of VA1, holding 7, is written back to PA 0x1000_1234 before VA2's block is fetched; that fetch then reads the 7.</p>
+        <p>Neither design returns a wrong value. The aliases share set 8, and a direct-mapped set holds one block: the VIVT cache never has two copies, it pays 3 misses out of 4 and 2 write-backs instead (ping-pong). The VIPT cache has 1 miss and 3 hits. With a second way (8 KB 2-way) the VIVT cache would keep both copies and both reads would return stale values.</p>
+      </div>
+      <div class="exam-note"><p>This is the notes' own Example 20 configuration, run to the end: it is the counterexample to their "Set 10 / Set 42" story (red pen in section 4). The examiner checks the set from the page offset, the tags as page numbers (0x40001, not 0x4000), and the write-backs. A VIVT cache must also translate the victim's address to write it back to PA 0x1000_1234; the table assumes it does.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="1.5" data-tol="0.01" id="l27-exam-amat">
+    <div class="exam-q" lang="en">
+      <p>A physically indexed L1 cache waits for the TLB: TLB lookup 1 clock cycle, then the cache hit 1 clock cycle. A VIPT version overlaps the TLB lookup completely with the indexing, so its hit takes 1 clock cycle. In both designs the miss rate is 5 % and the miss penalty 20 clock cycles. How much is the speed-up of the average memory access time of the VIPT design over the serial one?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ \text{AMAT}_{\text{serial}} = 2 + 0.05 \times 20 = 3 \]
+        \[ \text{AMAT}_{\text{VIPT}} = 1 + 0.05 \times 20 = 2 \]
+        <p>Speed-up = 3 / 2 = 1.5.</p>
+      </div>
+      <div class="exam-note"><p>The miss term is the same 1 cycle in both designs: only the hit time changes. The widget of section 3 shows that the gap stays one cycle at any miss rate.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l27-exam-amin">
+    <div class="exam-q" lang="en">
+      <p>(SINGLE ANSWER) An L1 data cache of 64 KB with 64-byte blocks must be virtually indexed and physically tagged on a machine with 4 KB pages. What is the minimum associativity such that no index bit comes from the virtual page number?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Answer 1: 4-way <span class="fb">16 KB per way: 8 index bits [13:6], two of them from the VPN.</span></li>
+      <li>Answer 2: 8-way <span class="fb">8 KB per way: 7 index bits [12:6], bit 12 still from the VPN.</span></li>
+      <li data-correct>Answer 3: 16-way <span class="fb">64 KB / 16 = 4 KB per way = one page: 64 sets, index [11:6].</span></li>
+      <li>Answer 4: 32-way <span class="fb">Safe, with 2 KB per way, but not the minimum: 16 ways already fit.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 3. Minimum associativity = cache size / page size = 64 KB / 4 KB = 16. The block size does not enter: it moves bits between index and block offset, not out of the page offset.</p></div>
+      <div class="exam-note"><p>The quick route is the law, C / A ≤ P; the slow route counts sets and bits. Both give 16. Answer 2 is the near miss: 8 ways halve the overflow, but bit 12 is still a VPN bit.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l27-exam-tag">
+    <div class="exam-q" lang="en">
+      <p>(SINGLE ANSWER) In a virtually indexed, physically tagged cache, the tag stored with each block is:</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Answer 1: the virtual page number of the address that brought the block into the cache <span class="fb">That is a virtually tagged (VIVT) cache, the design with synonyms.</span></li>
+      <li data-correct>Answer 2: bits of the physical address, from the physical page number supplied by the TLB <span class="fb">The tag is physical: every alias of the block matches it.</span></li>
+      <li>Answer 3: the page offset of the address <span class="fb">The page offset supplies the index and the block offset; it is never compared.</span></li>
+      <li>Answer 4: no tag, because the index identifies the block <span class="fb">Many blocks share an index; without a tag a hit could not be recognised.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 2. The index comes from the page-offset bits of the virtual address, the tag from the physical address: the PFN delivered by the TLB is compared with the tags of the selected set.</p></div>
+      <div class="exam-note"><p>Read the name backwards: physically <em>tagged</em>. The distractors are the other two designs and the index.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l27-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>(True/False) A TLB miss means that the page is not in main memory, so the operating system must load it from the disk.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">That describes a page fault. After a TLB miss the page is usually in memory, and the walk only refills the TLB.</span></li>
+      <li data-correct>False <span class="fb">A TLB miss is a miss in the cache of translations: the page table is walked in tens of cycles. Only an invalid entry, a page fault, involves the disk.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. On a TLB miss the page table in memory is walked and the translation inserted into the TLB, in tens of cycles. Only if the page-table entry is invalid does a page fault occur, and the OS loads the page from the disk, in millions of cycles.</p></div>
+      <div class="exam-note"><p>The distinction between the two misses is the whole point. If asked to motivate, give the cost of each.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l27-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Pages are 4 KB. A process accesses the virtual address 0x0040_3A2C, and its page table maps VPN 0x00403 to PFN 0x001F2. Which physical address does the access reach?</p>
+    <ul class="options">
+      <li data-correct>0x001F_2A2C <span class="fb">PFN 0x001F2 in front of the unchanged offset 0xA2C, the last three hex digits.</span></li>
+      <li>0x0040_3A2C <span class="fb">That is the virtual address: no translation happened.</span></li>
+      <li>0x001F_2000 <span class="fb">The frame is right, but the offset 0xA2C was dropped. Translation never touches the offset.</span></li>
+      <li>0x01F2_0A2C <span class="fb">The PFN was shifted by 16 bits instead of 12. A 12-bit offset is three hex digits, so the PFN starts at the fourth digit from the right.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">The TLB holds the translation of VPN 0x7FFE1, with 4 KB pages. Which of these accesses hit in the TLB? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>0x7FFE_1000 <span class="fb">The first byte of the same page: VPN 0x7FFE1.</span></li>
+      <li data-correct>0x7FFE_1FFF <span class="fb">The last byte of the same page: VPN 0x7FFE1.</span></li>
+      <li>0x7FFE_2000 <span class="fb">One byte past the end of the page: VPN 0x7FFE2, another page.</span></li>
+      <li>0x7FFE_0234 <span class="fb">Same offset as Example 19, but VPN 0x7FFE0. The offset plays no part in the TLB lookup.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An access misses in the TLB, and the page walk finds a valid entry for its VPN. What happens next?</p>
+    <ul class="options">
+      <li data-correct>The translation is inserted into the TLB and the access completes, in tens of cycles, without a page fault <span class="fb">A TLB miss with a valid entry is a refill, not a fault: the disk is never touched.</span></li>
+      <li>A page fault: the OS reads the page from the disk <span class="fb">Only an invalid entry, a page that is not in RAM, raises a page fault.</span></li>
+      <li>The data cache is flushed, since its contents may be stale <span class="fb">A TLB miss says nothing about the contents of the data cache.</span></li>
+      <li>The program is stopped with a protection error <span class="fb">Only a violation of the permission bits does that; nothing here says the access is forbidden.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can a VIPT cache select its set before the TLB has answered?</p>
+    <ul class="options">
+      <li data-correct>Its index bits lie inside the page offset, which translation does not change <span class="fb">The bits it needs first are already the physical ones.</span></li>
+      <li>Because the TLB is faster than the cache <span class="fb">Speed is not the argument: a cache that needed translated index bits would wait for any TLB. The index needs no translation at all.</span></li>
+      <li>Because it compares virtual tags <span class="fb">Its tags are physical: the comparison does wait for the PFN of the TLB.</span></li>
+      <li>Because the OS keeps virtual and physical addresses equal <span class="fb">Only the page offset is equal; the page numbers differ.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Intel's L1 data cache of 2019 is 48 KB, 12-way, with 64-byte blocks, and pages are 4 KB. Can it be VIPT without synonym problems?</p>
+    <ul class="options">
+      <li data-correct>Yes: one way is exactly one page <span class="fb">48 KB / 12 = 4 KB per way: 64 sets, so index + block offset = 6 + 6 = 12 bits, the whole page offset.</span></li>
+      <li>No: 48 KB is not a power of two, so the index cannot be a bit field <span class="fb">The number of sets must be a power of two, and it is: 48 KB / (12 × 64 B) = 64.</span></li>
+      <li>No: it would need 16 ways <span class="fb">16 ways are needed for 64 KB; for 48 KB, 12 ways give 4 KB per way.</span></li>
+      <li>Only with 16 KB pages <span class="fb">4 KB per way already fits a 4 KB page.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A 64 KB 4-way L1 on a machine with 4 KB pages is not VIPT-safe. Which changes, each on its own, would make it safe? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>16 ways <span class="fb">64 KB / 16 = 4 KB per way.</span></li>
+      <li data-correct>16 KB pages <span class="fb">64 KB / 4 = 16 KB per way = one page: the 14 offset bits hold index and block offset.</span></li>
+      <li data-correct>Page colouring by the operating system <span class="fb">All aliases of a frame get virtual addresses that agree on the two leaking index bits, so they select the same set.</span></li>
+      <li>Blocks of 128 B instead of 64 B <span class="fb">One bit moves from the index to the block offset; their sum, the log of the size of a way, stays 14 bits.</span></li>
+      <li>Making it direct-mapped <span class="fb">64 KB in one way: four leaking bits instead of two.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The notes' Example 20 cache, 4 KB, direct-mapped, 64-byte blocks, 4 KB pages, with virtual tags. A program alternates reads through VA1 = 0x4000_1234 and VA2 = 0x8000_1234, aliases of one physical address. What happens?</p>
+    <ul class="options">
+      <li data-correct>Both select set 8 with different virtual tags: they evict each other at every switch, and every value read is correct <span class="fb">The ping-pong of the exam exercise above: misses, not stale data.</span></li>
+      <li>VA1 goes to set 10 and VA2 to set 42: two copies and stale data <span class="fb">That is the notes' story; bits [11:6] of both addresses are 001000, set 8.</span></li>
+      <li>Both hit the same line, as in a VIPT cache <span class="fb">Their virtual tags differ, 0x40001 and 0x80001. Only physical tags would match.</span></li>
+      <li>The second access raises a page fault <span class="fb">Both pages are mapped; an alias is legal and common.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l27-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Paging cuts virtual and physical memory into pages of one size; a virtual address is VPN | page offset, and translation replaces the VPN with the PFN read from the per-process page table, leaving the offset untouched.</li>
+    <li>The TLB is a small cache of translations: a hit gives the PFN in about a cycle, a miss walks the page table in tens of cycles, and only an invalid entry is a page fault, handled by the OS in millions of cycles.</li>
+    <li>A physically indexed L1 waits for the TLB on every hit. A VIPT L1 selects its set with page-offset bits while the TLB translates, then compares the physical tag: the TLB leaves the hit path but is still used on every access.</li>
+    <li>Synonyms are two virtual addresses for one physical address. Virtual tags allow two copies and stale data; page-offset index plus physical tag give every alias the same set and the same line.</li>
+    <li>VIPT keeps synonyms in one set only if cache size / associativity ≤ page size, which follows from S × B = C / A. A larger VIPT L1 needs more ways (32 KB 8-way, 48 KB 12-way with 4 KB pages) or larger pages, unless the OS or extra hardware handles the aliases; L2 and L3 are PIPT.</li>
+    <li>At the exam, "avoiding address translation during indexing of the cache" is a hit-time technique, not a miss-penalty one.</li>
+  </ul>
+
+  <aside class="cheat" id="l27-cheat">
+    <dl>
+      <dt>Symbols</dt><dd>P page size, C cache size, A associativity (ways), B block size, S number of sets; VPN virtual page number, PFN physical frame number</dd>
+      <dt>Virtual address</dt><dd>VA = VPN | page offset; page offset = \(\log_2 P\) bits (12 for 4 KB), VPN = the rest</dd>
+      <dt>Physical address</dt><dd>PA = PFN | page offset, i.e. \(\text{PFN} \times P + \text{offset}\); PT[VPN] = (PFN, valid, dirty, use, protection)</dd>
+      <dt>TLB hit / miss / page fault</dt><dd>hit: PFN in about 1 cycle; miss: page walk, tens of cycles, TLB refilled; invalid entry: page fault, the OS loads the page from the disk, millions of cycles</dd>
+      <dt>TLB reach</dt><dd>entries × page size (64 × 4 KB = 256 KB)</dd>
+      <dt>Hit time, physically indexed</dt><dd>\(T_{\text{TLB}} + T_{\text{read}} + T_{\text{cmp}}\): TLB lookup, then index and read the set, then compare the tags</dd>
+      <dt>Hit time, VIPT</dt><dd>\(\max(T_{\text{TLB}}, T_{\text{read}}) + T_{\text{cmp}}\): TLB and set read in parallel</dd>
+      <dt>AMAT</dt><dd>AMAT = Hit Time + Miss Rate × Miss Penalty: VIPT lowers the hit time only</dd>
+      <dt>Sets</dt><dd>\(S = C / (A \times B)\); index \(i = \log_2 S\), block offset \(o = \log_2 B\)</dd>
+      <dt>VIPT size law (80)</dt><dd>\(C / A \le P\), equivalently \(i + o \le \log_2 P\)</dd>
+      <dt>Bits taken from the VPN</dt><dd>\(k = i + o - \log_2 P\); an alias may sit in \(2^k\) sets</dd>
+      <dt>Largest cache, fewest ways</dt><dd>\(C_{\max} = A \times P\), \(A_{\min} = C / P\)</dd>
+      <dt>PIPT · VIVT · VIPT</dt><dd>index and tag from PA (L2, L3) · both from VA (synonyms, homonyms) · index from VA page offset, tag from PA (L1)</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l27-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/playlist?list=PLiwt1iVUib9s2Uo5BeYmwkDFUh70fJPxX" target="_blank" rel="noopener">Virtual Memory (playlist)</a>
+      <span class="res-by">David Black-Schaffer, Uppsala University</span><span class="res-dur">14 short videos</span>
+      <p class="res-why">Address translation, page tables, the TLB and page faults drawn by hand in small steps: the first few videos before section 1 give you the picture this lesson builds on.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Tg6ID2uWjuY" target="_blank" rel="noopener">Aliasing in Virtually Accessed Caches</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech HPCA (Udacity)</span><span class="res-dur">a few minutes</span>
+      <p class="res-why">With section 4: why two virtual names for one physical block break a virtually tagged cache.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Jt1P_qisNCc" target="_blank" rel="noopener">Real VIPT Caches</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech HPCA (Udacity)</span><span class="res-dur">a few minutes</span>
+      <p class="res-why">With the bit-slicer of section 5: why index and offset bits must fit inside the page offset, and what that does to the size of real L1 caches.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://pages.cs.wisc.edu/~remzi/OSTEP/Homework/homework.html" target="_blank" rel="noopener">OSTEP homework simulators</a>
+      <span class="res-by">Arpaci-Dusseau, Operating Systems: Three Easy Pieces</span>
+      <p class="res-why">paging-linear-translate.py generates random virtual addresses and page tables in Python: translate them by hand as in Example 19, then check yourself with -c.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf" target="_blank" rel="noopener">Paging: Faster Translations (TLBs)</a>
+      <span class="res-by">Arpaci-Dusseau, OSTEP chapter 19</span><span class="res-dur">16 pages</span>
+      <p class="res-why">The TLB material the notes leave out: hit and miss flow, hardware against software miss handling, and what a context switch does to the TLB.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>VIPT is one of the notes' four hit-time techniques. The others shorten the access itself: a small, simple L1, pipelined writes and small sub-blocks. Why does a 32 KB L1 beat a larger one, and where does each of the chapter's nineteen techniques land on the AMAT scorecard?</p>
+</aside>
+
+</main>
+</body>
+</html>

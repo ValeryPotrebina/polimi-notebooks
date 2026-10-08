@@ -1,0 +1,960 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The assembly line in silicon · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l01">
+
+<header class="lesson-head">
+  <h1>The assembly line in silicon</h1>
+  <p class="lede">After this lesson you will push five instructions through the five stages of the RISC-V pipeline cycle by cycle, say what each pipeline register carries, and compute how long any program takes on an ideal pipeline — and why it is never the 5× the notes promise.</p>
+</header>
+
+<div class="hook" data-label="A puzzle with one division">
+  <p>Take five instructions and a processor whose five stages take 2 ns each. One instruction after another: 5 × 10 ns = 50 ns. Overlapped on the pipeline: 18 ns. Next to that 18 ns the notes print "a speedup of 5×". Divide 50 by 18 and you get 2.78.</p>
+  <p>Where did the other half of the promised speedup go, and when, if ever, do you get it back? The answer is one subtraction — and it is the same subtraction that puts the "+4" into the cycle-count formula on the A4 sheet you are allowed to bring to the exam.</p>
+  <p>One more number before you start. In March 2026 the first self-assessment test of this course — on the basics of pipelining, hazards and caches — was taken by 124 students; the average score was 5.3 out of 10 (WeBeep, week 2). The basics are examined, and they are missed.</p>
+</div>
+
+<section id="l01-stages">
+  <h2>Five stops for every instruction</h2>
+
+  <p>Here is the loop this whole lesson runs on. It is written the way the exam papers write assembly: capital mnemonics, <code>F</code> registers for floating-point values, <code>R</code> registers for integers, and the memory address as an offset in front of a base register in brackets. The papers of 2024 and 2025 wrote the registers as <code>$F2</code> and <code>$R1</code>; the 2026 paper dropped the dollar sign, and so does this notebook.</p>
+
+<pre><code>LOOP:  LD    F2, 0(R1)
+       FADD  F4, F2, F0
+       SD    F4, 0(R1)
+       ADDUI R1, R1, 8
+       BNE   R1, R2, LOOP</code></pre>
+
+  <p>Read it once in words: load the number at address <code>R1</code> into <code>F2</code>; add <code>F0</code> to it and put the sum in <code>F4</code>; store <code>F4</code> back to the same address; move the pointer <code>R1</code> on by 8 bytes; go back to <code>LOOP</code> unless <code>R1</code> has reached <code>R2</code>. The instructions are numbered <code>I0</code> to <code>I4</code> as the papers number them. The machine of this lesson is the one of the notes: five stages, one clock cycle each, and every instruction — the <code>FADD</code> included — spends exactly one cycle in the execute stage. Real floating-point adders take several cycles; that pipeline arrives in <a href="l07.html">lesson 7</a>.</p>
+
+  <h3>The RISC-V subset of the notes, in three spellings</h3>
+
+  <p>The notes (pp. 8–9) introduce the instruction set in three families, with the effect of each instruction written as a register transfer: <mark class="key">ALU instructions</mark> (<code>add rd, rs1, rs2</code> does <code>rd ← rs1 + rs2</code>; <code>addi</code> adds a constant), <mark class="key">load and store instructions</mark> (<code>ld rd, offset(rs1)</code> does <code>rd ← M[rs1 + offset]</code>; <code>sd rs2, offset(rs1)</code> does the reverse) and <mark class="key">branches and jumps</mark> (<code>beq</code>, <code>bne</code>, <code>j</code>, <code>jr</code>). These are the only kinds of instruction the pipeline ever sees. The same instructions appear in three spellings during the course, and you must read all three fluently, because the exam is written in the third.</p>
+
+  <figure class="tbl-fig" id="l01-tbl-spellings">
+    <figcaption>Same instruction, three spellings. The notes switch between the first two; the exam papers use the third.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>What it does</th><th>RISC-V, notes pp. 8–12</th><th>MIPS style, notes pp. 16–17</th><th>Exam papers</th></tr></thead>
+        <tbody>
+          <tr><td>load from memory into a register</td><td><code>ld x10, 40(x1)</code></td><td><code>lw $x, offset($y)</code></td><td><code>LD F2, 0(R1)</code></td></tr>
+          <tr><td>store a register to memory</td><td><code>sd x5, 8(x1)</code></td><td><code>sw $x, offset($y)</code></td><td><code>SD F4, 0(R1)</code></td></tr>
+          <tr><td>register + register</td><td><code>add x3, x1, x2</code></td><td><code>op $x, $y, $z</code></td><td><code>FADD F4, F2, F0</code></td></tr>
+          <tr><td>register + constant</td><td><code>addi x1, x1, 8</code></td><td>—</td><td><code>ADDUI R1, R1, 8</code></td></tr>
+          <tr><td>conditional branch (not equal / equal)</td><td><code>bne x1, x2, L1</code>, <code>beq x1, x2, L1</code></td><td><code>beq $x, $y, offset</code> (the notes' only MIPS-style example)</td><td><code>BNE R1, R2, LOOP</code></td></tr>
+          <tr><td>register names</td><td><code>x0</code> … <code>x31</code></td><td><code>$x</code>, <code>$y</code>, <code>$z</code></td><td><code>R1</code>, <code>R2</code> … and <code>F0</code>, <code>F2</code> … (2024–25: <code>$R1</code>, <code>$F2</code>)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">A slip on p. 9: the notes write the condition of beq as rs1 = rs1. Read rs1 = rs2 — the sentence above it says so.</aside>
+
+  <p>Two small things to know about the first spelling. The notes use <code>ld</code> and <code>sd</code>, the 64-bit load and store of RV64, and on p. 10 call the registers 32-bit wide; in RV64 they are 64 bits (the width is called XLEN). And the notes' <code>j</code> and <code>jr</code> are pseudo-instructions. None of this matters for the exam; the mnemonics of the papers do.</p>
+
+  <h3>What happens at each stop</h3>
+
+  <p>Every instruction visits the same five stages in the same order. Walk <code>LD F2, 0(R1)</code> through them — it is the notes' Example 1 (p. 12), <code>ld x10, 40(x1)</code>, in the papers' spelling:</p>
+
+  <ol>
+    <li><b>IF, instruction fetch.</b> The program counter (PC) addresses the instruction memory; the instruction word comes out, and a separate adder computes PC + 4, the address of the next instruction. (Separate, so that IF never needs the ALU while EX is using it for another instruction.)</li>
+    <li><b>ID, instruction decode.</b> The opcode is decoded, the register file is read — here <code>R1</code> — and the immediate 0 is extracted and sign-extended.</li>
+    <li><b>EX, execute.</b> The ALU adds <code>R1 + 0</code>: the memory address.</li>
+    <li><b>MEM, memory access.</b> The data memory is read at that address.</li>
+    <li><b>WB, write-back.</b> The word that came out of memory is written into <code>F2</code>.</li>
+  </ol>
+
+  <p>Now look at the hardware those five steps use, and you will see why there are exactly five of them and not four or six. Each step uses a <em>different</em> resource, and uses it once: the instruction memory, the two read ports of the register file, the ALU, the data memory, the one write port of the register file. The notes list these components on pp. 10–11; the register file has <mark class="key">two read ports and one write port</mark> because every RISC-V instruction reads at most two registers and writes at most one. That one-resource-per-stop property is the precondition for everything that follows: five instructions can occupy the five stops at the same time without fighting over hardware.</p>
+
+  <figure class="fig fig--plain" id="l01-fig-datapath">
+    <svg class="dia" viewBox="0 0 560 190" role="img" aria-label="The datapath as five resources in a row: the PC feeds the instruction memory, then the register file read ports, the ALU, the data memory and the register file write port; the result returns to the register file">
+      <text x="300" y="20" class="tx-mid tx-hand">five resources, each used once</text>
+      <text x="100" y="44" class="tx-mid tx-bold">IF</text>
+      <text x="202" y="44" class="tx-mid tx-bold">ID</text>
+      <text x="304" y="44" class="tx-mid tx-bold">EX</text>
+      <text x="406" y="44" class="tx-mid tx-bold">MEM</text>
+      <text x="508" y="44" class="tx-mid tx-bold">WB</text>
+      <rect x="10" y="73" width="36" height="24" class="fi-paper"/>
+      <text x="28" y="90" class="tx-mid tx-mono">PC</text>
+      <line x1="46" y1="85" x2="56" y2="85" marker-end="url(#arr)"/>
+      <rect x="58" y="60" width="84" height="52" class="fi-paper sw-2"/>
+      <text x="100" y="82" class="tx-mid tx-sm">Instr.</text>
+      <text x="100" y="99" class="tx-mid tx-sm">memory</text>
+      <line x1="142" y1="85" x2="158" y2="85" marker-end="url(#arr)"/>
+      <rect x="160" y="60" width="84" height="52" class="fi-paper sw-2"/>
+      <text x="202" y="82" class="tx-mid tx-sm">Reg. file</text>
+      <text x="202" y="99" class="tx-mid tx-sm">read ×2</text>
+      <line x1="244" y1="85" x2="260" y2="85" marker-end="url(#arr)"/>
+      <rect x="262" y="60" width="84" height="52" class="fi-paper sw-2"/>
+      <text x="304" y="91" class="tx-mid">ALU</text>
+      <line x1="346" y1="85" x2="362" y2="85" marker-end="url(#arr)"/>
+      <rect x="364" y="60" width="84" height="52" class="fi-paper sw-2"/>
+      <text x="406" y="82" class="tx-mid tx-sm">Data</text>
+      <text x="406" y="99" class="tx-mid tx-sm">memory</text>
+      <line x1="448" y1="85" x2="464" y2="85" marker-end="url(#arr)"/>
+      <rect x="466" y="60" width="84" height="52" class="fi-paper sw-2"/>
+      <text x="508" y="82" class="tx-mid tx-sm">Reg. file</text>
+      <text x="508" y="99" class="tx-mid tx-sm">write ×1</text>
+      <path d="M508 112 V150 H202 V118" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="355" y="176" class="tx-mid tx-hand">the result returns to the registers</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> The datapath of the notes' Fig. 1 (p. 10) redrawn as five stops. The blue path is the one loop in the flow of data: a result written into the register file in WB, where a later instruction reads it in ID. (The other backward path, a branch target into the PC, is the subject of <a href="l04.html">lesson 4</a>.)</figcaption>
+  </figure>
+
+  <div class="pitfall">
+    <p>"RISC-V adopts a Harvard architecture, so there are no structural hazards." The notes come close to this on p. 10 ("RISC-V adopts a Harvard Architecture style … This prevents structural hazards"). Separate instruction and data memories are a choice of the <em>implementation</em> — in a real chip two level-1 caches in front of one memory — made so that the fetch of one instruction and the memory access of another never compete. It is not a property of the RISC-V instruction set, and a RISC-V processor with a single memory port, or with a multi-cycle divider, has structural hazards all the same. Keep the reasoning, drop the "RISC-V adopts".</p>
+  </div>
+
+  <p class="memo"><mark class="key">Five stages because five resources: instruction memory, register read ports, ALU, data memory, register write port — each used once per instruction.</mark></p>
+</section>
+
+<section id="l01-overlap">
+  <h2>Overlap, not speed: the assembly line</h2>
+
+  <p>In a car factory nobody waits for one car to be finished before the next body enters the line. Each station does its one job and passes the car on; a new car rolls off the end at the pace of the slowest station, not at the pace of a whole car. The notes (p. 13) use the same picture, and it is exact: the five stops of Fig. 1 are the five stations, and the instructions are the cars.</p>
+
+  <div class="story" data-year="1961">
+    <p>Pipelining was born as a disappointment. IBM's 7030 "Stretch" was promised to be 100 times faster than the IBM 704; it came out about 30 times faster, IBM cut its price from 13.5 to 7.78 million dollars and sold nine. But its "lookahead" unit, which overlapped the fetching and decoding of instructions with the execution of earlier ones, is the ancestor of every pipeline in this course.</p>
+  </div>
+
+  <p>Take the notes' numbers: 2 ns per stage, so 10 ns per instruction. Without overlap, five instructions take 50 ns — each one must leave the last stop before the next enters the first. With overlap, the second instruction enters IF while the first moves to ID, and so on. The first instruction still needs the full 10 ns; after that one instruction <em>completes</em> every 2 ns.</p>
+
+  <figure class="fig fig--pair" id="l01-fig-seqpipe">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Sequential execution: instruction I0 occupies the five stages one after another for 10 ns, and only then I1 starts; five instructions take 50 ns">
+        <text x="30" y="56" class="tx-end tx-mono tx-sm">I0</text>
+        <rect x="36" y="40" width="24" height="22" class="fw-s4 st-s4"/><text x="48" y="55" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="60" y="40" width="24" height="22" class="fw-s4 st-s4"/><text x="72" y="55" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="84" y="40" width="24" height="22" class="fw-s4 st-s4"/><text x="96" y="55" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="108" y="40" width="24" height="22" class="fw-s4 st-s4"/><text x="120" y="55" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="132" y="40" width="24" height="22" class="fw-s4 st-s4"/><text x="144" y="55" class="tx-mid tx-mono tx-sm">WB</text>
+        <text x="30" y="88" class="tx-end tx-mono tx-sm">I1</text>
+        <rect x="156" y="72" width="24" height="22" class="fw-s4 st-s4"/><text x="168" y="87" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="180" y="72" width="24" height="22" class="fw-s4 st-s4"/><text x="192" y="87" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="204" y="72" width="24" height="22" class="fw-s4 st-s4"/><text x="216" y="87" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="228" y="72" width="24" height="22" class="fw-s4 st-s4"/><text x="240" y="87" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="252" y="72" width="24" height="22" class="fw-s4 st-s4"/><text x="264" y="87" class="tx-mid tx-mono tx-sm">WB</text>
+        <text x="30" y="118" class="tx-end tx-mono tx-sm">I2</text>
+        <rect x="276" y="102" width="18" height="22" class="fw-s4 st-s4 dash"/>
+        <line x1="36" y1="140" x2="286" y2="140" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="36" y1="135" x2="36" y2="145" class="st-muted"/>
+        <line x1="156" y1="135" x2="156" y2="145" class="st-muted"/>
+        <line x1="276" y1="135" x2="276" y2="145" class="st-muted"/>
+        <text x="36" y="160" class="tx-mid tx-sm tx-muted">0</text>
+        <text x="156" y="160" class="tx-mid tx-sm tx-muted">10 ns</text>
+        <text x="276" y="160" class="tx-mid tx-sm tx-muted">20 ns</text>
+        <text x="150" y="190" class="tx-mid tx-hand">10 ns each, 50 ns for five</text>
+      </svg>
+      <p class="fig-label">Before: one instruction after another</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Pipelined execution: each instruction starts one stage time after the previous one; in the fifth cycle all five stages are busy; five instructions finish after 18 ns">
+        <rect x="139" y="27" width="28" height="122" class="st-ink dash sw-2" rx="6"/>
+        <text x="30" y="45" class="tx-end tx-mono tx-sm">I0</text>
+        <rect x="36" y="30" width="26" height="22" class="fw-s5 st-s5"/><text x="49" y="45" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="62" y="30" width="26" height="22" class="fw-s5 st-s5"/><text x="75" y="45" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="88" y="30" width="26" height="22" class="fw-s5 st-s5"/><text x="101" y="45" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="114" y="30" width="26" height="22" class="fw-s5 st-s5"/><text x="127" y="45" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="140" y="30" width="26" height="22" class="fw-s5 st-s5"/><text x="153" y="45" class="tx-mid tx-mono tx-sm">WB</text>
+        <text x="30" y="69" class="tx-end tx-mono tx-sm">I1</text>
+        <rect x="62" y="54" width="26" height="22" class="fw-s5 st-s5"/><text x="75" y="69" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="88" y="54" width="26" height="22" class="fw-s5 st-s5"/><text x="101" y="69" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="114" y="54" width="26" height="22" class="fw-s5 st-s5"/><text x="127" y="69" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="140" y="54" width="26" height="22" class="fw-s5 st-s5"/><text x="153" y="69" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="166" y="54" width="26" height="22" class="fw-s5 st-s5"/><text x="179" y="69" class="tx-mid tx-mono tx-sm">WB</text>
+        <text x="30" y="93" class="tx-end tx-mono tx-sm">I2</text>
+        <rect x="88" y="78" width="26" height="22" class="fw-s5 st-s5"/><text x="101" y="93" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="114" y="78" width="26" height="22" class="fw-s5 st-s5"/><text x="127" y="93" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="140" y="78" width="26" height="22" class="fw-s5 st-s5"/><text x="153" y="93" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="166" y="78" width="26" height="22" class="fw-s5 st-s5"/><text x="179" y="93" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="192" y="78" width="26" height="22" class="fw-s5 st-s5"/><text x="205" y="93" class="tx-mid tx-mono tx-sm">WB</text>
+        <text x="30" y="117" class="tx-end tx-mono tx-sm">I3</text>
+        <rect x="114" y="102" width="26" height="22" class="fw-s5 st-s5"/><text x="127" y="117" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="140" y="102" width="26" height="22" class="fw-s5 st-s5"/><text x="153" y="117" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="166" y="102" width="26" height="22" class="fw-s5 st-s5"/><text x="179" y="117" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="192" y="102" width="26" height="22" class="fw-s5 st-s5"/><text x="205" y="117" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="218" y="102" width="26" height="22" class="fw-s5 st-s5"/><text x="231" y="117" class="tx-mid tx-mono tx-sm">WB</text>
+        <text x="30" y="141" class="tx-end tx-mono tx-sm">I4</text>
+        <rect x="140" y="126" width="26" height="22" class="fw-s5 st-s5"/><text x="153" y="141" class="tx-mid tx-mono tx-sm">IF</text>
+        <rect x="166" y="126" width="26" height="22" class="fw-s5 st-s5"/><text x="179" y="141" class="tx-mid tx-mono tx-sm">ID</text>
+        <rect x="192" y="126" width="26" height="22" class="fw-s5 st-s5"/><text x="205" y="141" class="tx-mid tx-mono tx-sm">EX</text>
+        <rect x="218" y="126" width="26" height="22" class="fw-s5 st-s5"/><text x="231" y="141" class="tx-mid tx-mono tx-sm">ME</text>
+        <rect x="244" y="126" width="26" height="22" class="fw-s5 st-s5"/><text x="257" y="141" class="tx-mid tx-mono tx-sm">WB</text>
+        <line x1="36" y1="160" x2="286" y2="160" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="36" y1="155" x2="36" y2="165" class="st-muted"/>
+        <line x1="140" y1="155" x2="140" y2="165" class="st-muted"/>
+        <line x1="270" y1="155" x2="270" y2="165" class="st-muted"/>
+        <text x="36" y="180" class="tx-mid tx-sm tx-muted">0</text>
+        <text x="140" y="180" class="tx-mid tx-sm tx-muted">8 ns</text>
+        <text x="270" y="180" class="tx-mid tx-sm tx-muted">18 ns</text>
+        <text x="200" y="197" class="tx-mid tx-hand">all five stops busy</text>
+      </svg>
+      <p class="fig-label">After: overlapped on the pipeline</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> The notes' Fig. 3 (p. 13) as a before/after pair, 2 ns per stage. Left: 50 ns for five instructions. Right: 18 ns. The dashed column is the fifth cycle, in which every stop holds a different instruction — a vertical slice of the diagram is "what is each resource doing now", a row is "the life of one instruction".</figcaption>
+  </figure>
+
+  <h3>Latency and throughput</h3>
+
+  <p>Pipelining changes nothing about one instruction. <mark class="key">Latency</mark>, the time from the fetch of an instruction to its write-back, is still five stages, 10 ns (p. 14: "does not change"). What changes is the <mark class="key">throughput</mark>: the number of instructions completed per unit of time. One per 10 ns becomes one per 2 ns once the line is full. The notes call pipelining a <em>technique</em> (p. 8), and that is the right word: it is a property of the implementation, not of the instruction set — the program cannot tell whether it runs on a pipeline, it only finishes sooner.</p>
+
+  <p>The table is the exam's way of writing Fig. 2: rows are instructions, columns are clock cycles C1, C2 …, and each cell names the stage. (The notes' Table 1 on p. 15 is the transpose, rows for cycles and columns for stages; same diagonal.)</p>
+
+  <figure class="tbl-fig" id="l01-tbl-ideal">
+    <figcaption>The five instructions of the loop on the ideal pipeline, 2 ns per cycle. I0 finishes in C5, after 10 ns; the last instruction finishes in C9, after 18 ns.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th></th><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th><th>C6</th><th>C7</th><th>C8</th><th>C9</th></tr></thead>
+        <tbody>
+          <tr><th><span class="nw"><code>I0 LD F2, 0(R1)</code></span></th><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td><td></td><td></td><td></td></tr>
+          <tr><th><span class="nw"><code>I1 FADD F4, F2, F0</code></span></th><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td><td></td><td></td></tr>
+          <tr><th><span class="nw"><code>I2 SD F4, 0(R1)</code></span></th><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td><td></td></tr>
+          <tr><th><span class="nw"><code>I3 ADDUI R1, R1, 8</code></span></th><td></td><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td></tr>
+          <tr class="is-key"><th><span class="nw"><code>I4 BNE R1, R2, LOOP</code></span></th><td></td><td></td><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>One honesty note. This table assumes what the notes assume for the ideal case: that no instruction needs a value a previous one has not yet produced, and that the branch does not disturb the fetching. Our loop breaks both — <code>FADD</code> needs the <code>F2</code> that <code>LD</code> produces, and <code>BNE</code> jumps. <a href="l02.html">Lesson 2</a> and <a href="l04.html">lesson 4</a> charge for that. Today the pipeline is ideal.</p>
+
+  <h3>The formula behind the 18 ns</h3>
+
+  <p>Count cycles in the table. The first instruction needs five; every later one finishes one cycle after its predecessor. Write \(k\) for the number of stages, \(n\) for the number of instructions and \(T\) for the stage time (which is the clock period):</p>
+
+  <ol class="steps" id="l01-steps-speedup">
+    <li>
+      <p>Without a pipeline every instruction takes all \(k\) stage times, one after another:</p>
+      \[ T_{\text{seq}} = n \, k \, T . \]
+    </li>
+    <li>
+      <p>On the pipeline the first instruction finishes in cycle \(k\). Instruction number \(i\) (counting from 1) enters one cycle later than its predecessor and therefore finishes one cycle later: in cycle \(k + (i - 1)\).</p>
+    </li>
+    <li>
+      <p>The last instruction has \(i = n\), so the whole program ends in cycle \(k + n - 1\):</p>
+      \[ T_{\text{pipe}} = (k + n - 1) \, T . \]
+      <p>With \(k = 5\), \(n = 5\), \(T = 2\) ns: \(9 \times 2 = 18\) ns, the number of the hook. The \(k - 1 = 4\) extra cycles are the <mark class="key">fill</mark>: the cycles before the first instruction comes out, during which the stops behind it are still filling up.</p>
+    </li>
+    <li>
+      <p>The speedup is the ratio; the stage time cancels:</p>
+      \[ S(n) = \frac{n \, k \, T}{(k + n - 1) \, T} = \frac{n \, k}{k + n - 1} . \]
+    </li>
+    <li>
+      <p>Divide numerator and denominator by \(n\). As \(n\) grows, \((k - 1) / n\) vanishes and the speedup climbs towards \(k\) — never reaching it:</p>
+      \[ S(n) = \frac{k}{1 + (k - 1)/n} \;\longrightarrow\; k . \]
+      <p>For five instructions: \(25 / 9 = 2.78\). For a hundred: \(500 / 104 = 4.81\).</p>
+    </li>
+  </ol>
+
+  <figure class="tbl-fig" id="l01-tbl-speedup">
+    <figcaption>Ideal five-stage pipeline, 2 ns per stage: time and speedup for \(n\) instructions, recomputed from \((k + n - 1)\,T\).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>\(n\)</th><th>sequential \(10n\) ns</th><th>pipelined \((n + 4) \times 2\) ns</th><th>speedup</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td class="num">10</td><td class="num">10</td><td class="num">1.00</td></tr>
+          <tr class="is-key"><td class="num">5</td><td class="num">50</td><td class="num">18</td><td class="num">2.78</td></tr>
+          <tr><td class="num">10</td><td class="num">100</td><td class="num">28</td><td class="num">3.57</td></tr>
+          <tr><td class="num">20</td><td class="num">200</td><td class="num">48</td><td class="num">4.17</td></tr>
+          <tr><td class="num">100</td><td class="num">1000</td><td class="num">208</td><td class="num">4.81</td></tr>
+          <tr><td class="num">1000</td><td class="num">10 000</td><td class="num">2008</td><td class="num">4.98</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="13">
+    <p class="claim">"In an ideal scenario, a 5-stage pipeline should provide a speedup of 5× reducing execution time to: (5 + 4) × 2 ns = 18 ns"</p>
+    <p class="fix">50 ns to 18 ns is a speedup of 2.78×. The 5× is the ratio of the throughputs once the line is full (one instruction per 2 ns against one per 10 ns), which is the limit of \(nk / (k + n - 1)\) for \(n \to \infty\); the execution time of a finite program never shrinks by 5×.</p>
+    <p class="because">Compute it: \(50 / 18 = 2.78\). The notes' explanation of the 9 cycles ("5 steps of the first instruction, 5 of the last, minus 1") works only because here \(n = k\): with six instructions it would still give 9, but the pipeline needs 10. The clean statement is \(k + n - 1\): the first instruction takes \(k\) cycles, each of the other \(n - 1\) adds one. A quiz that asks for the time of 100 instructions wants 208 ns and 4.81×, not 200 ns and 5×.</p>
+  </aside>
+
+  <div class="widget" id="l01-w-gantt">
+    <h3 class="widget-title">Sequential against pipelined: where the 5× hides</h3>
+    <p class="widget-intro">The upper chart is Fig. 2 drawn to scale for your own \(n\) and \(k\): every instruction's stages against time. The lower chart is the speedup \(S(n)\) with the ceiling \(k\). The work of one instruction is fixed at 10 ns and split evenly over the \(k\) stages; the overhead slider adds a pipeline-register delay to every stage.</p>
+    <ol class="tasks">
+      <li>Before touching anything, predict: with the notes' values (five instructions, five stages, no overhead) the sequential run takes 50 ns. What will the total time and the speedup read when you switch on "pipelined execution"?
+        <details class="answer"><summary>What you should see</summary>
+          <p>18 ns and 2.78×. The orange band at the left is the fill, four cycles in which the stops behind the first instruction are still empty; those 8 ns are the gap between 2.78 and 5.</p></details>
+      </li>
+      <li>Keep the pipeline on and raise \(n\) to 20. Predict the speedup before you look, then check the point on the lower chart.
+        <details class="answer"><summary>What you should see</summary>
+          <p>4.17×: \(200 / 48\). The fill is still four cycles, but now it is spread over twenty instructions. The curve creeps towards the dashed ceiling \(k = 5\) and never touches it.</p></details>
+      </li>
+      <li>Set the register overhead to 0.5 ns per stage with \(k = 5\). The ceiling readout changes. Why to exactly 4?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The clock period is now 2 + 0.5 = 2.5 ns, so a full pipeline completes one instruction per 2.5 ns against one per 10 ns sequentially: 10 / 2.5 = 4. The overhead lowers the ceiling for every \(n\); the magenta curve sits below the teal one.</p></details>
+      </li>
+      <li>Keep 0.5 ns of overhead and go to \(k = 10\). Is a ten-stage pipeline twice as good as a five-stage one?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No: the ceiling is 10 / (1 + 0.5) = 6.67, not 10. At 1 ns of overhead per stage it falls to 5, the same as a five-stage pipeline with no overhead at all. The one insight to take away: <b>the clock period is the slowest stage plus the register overhead, so deeper pipelines pay a growing tax</b>.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l01-w-gantt', function (root, ui) {
+    var TI = 10;                                         // ns of work in one instruction: five stages of 2 ns in the notes
+    var NAMES5 = ['IF', 'ID', 'EX', 'ME', 'WB'];
+    var pipe = ui.toggle('pipelined execution (off: one instruction after another)', false);
+    var n = ui.slider({ label: 'instructions n', min: 1, max: 20, step: 1, value: 5 });
+    var k = ui.slider({ label: 'stages k', min: 1, max: 10, step: 1, value: 5 });
+    var treg = ui.slider({ label: 'register overhead per stage (ns)', min: 0, max: 1, step: 0.1, value: 0 });
+    ui.button('The notes’ case', function () { n.set(5, true); k.set(5, true); treg.set(0, true); }, { kind: 'ghost', icon: 'refresh' });
+    var roT = ui.readout('stage time T'), roClk = ui.readout('clock period'), roTot = ui.readout('total time'),
+        roS = ui.readout('speedup over sequential'), roLim = ui.readout('ceiling for n → ∞');
+
+    function speedup(N, K, tr) { return N * TI / ((K + N - 1) * (TI / K + tr)); }
+    function model() {
+      var N = n.value, K = k.value, T = TI / K, clk = T + treg.value;
+      var seq = N * TI, pp = (K + N - 1) * clk;
+      return { N: N, K: K, T: T, clk: clk, seq: seq, pipe: pp, S: seq / pp, lim: TI / clk, fill: (K - 1) * clk };
+    }
+
+    var gantt = ui.plot({ x: [0, 50], y: [0, 5], xLabel: 'time (ns)', yLabel: 'instructions', aspect: 2.3, grid: false, yTicks: [],
+      label: 'Gantt chart of the stages of every instruction against time, sequential or pipelined' });
+    gantt.draw(function (g) {
+      var m = model(), on = pipe.value, color = on ? 's5' : 's4', names = m.K === 5 ? NAMES5 : null, i, s;
+      if (on && m.K > 1) {
+        g.rect(0, 0, m.fill, m.N, { color: 's2', alpha: 0.14, stroke: false });
+        g.text(m.fill / 2, m.N, 'fill', { align: 'center', baseline: 'top', color: 'soft', size: 11, dy: 3 });
+      }
+      for (i = 0; i < m.N; i++) {
+        var y1 = m.N - i - 1, y2 = m.N - i, start = on ? i * m.clk : i * TI, w = on ? m.clk : m.T;
+        for (s = 0; s < m.K; s++) {
+          var x1 = start + s * w, x2 = x1 + w;
+          g.rect(x1, y1 + 0.08, x2, y2 - 0.08, { color: color, alpha: 0.28, stroke: color, width: 1 });
+          var pw = g.px(x2) - g.px(x1), ph = g.py(y1) - g.py(y2), lab = names ? names[s] : String(s + 1);
+          if (pw >= (names ? 24 : 14) && ph >= 13) g.text((x1 + x2) / 2, (y1 + y2) / 2, lab, { align: 'center', baseline: 'middle', font: 'mono', size: 11, halo: false });
+        }
+      }
+      var tot = on ? m.pipe : m.seq;
+      g.vline(tot, { color: 'ink', dash: true });
+      g.text(tot, m.N, Course.fmt(tot, 1) + ' ns', { align: 'right', baseline: 'top', dx: -6, dy: 6, color: 'soft', size: 11.5, weight: 600 });
+    });
+
+    var sp = ui.plot({ x: [0, 60], y: [0, 10.5], xLabel: 'instructions n', yLabel: 'speedup', aspect: 2.0, xTicks: [0, 10, 20, 30, 40, 50, 60],
+      label: 'Speedup of the pipeline over sequential execution as a function of the number of instructions, with the ceiling k' });
+    sp.draw(function (g) {
+      var m = model(), tr = treg.value;
+      g.hline(m.K, { color: 's6', dash: true, width: 2.5, label: 'k = ' + m.K });
+      if (tr > 0) g.hline(m.lim, { color: 's6', dash: true, width: 2.5, label: 'ceiling with overhead: ' + Course.fmt(m.lim, 2) });
+      g.line(function (x) { return speedup(x, m.K, 0); }, { color: 's4', width: 2.2, domain: [1, 60] });
+      if (tr > 0) g.line(function (x) { return speedup(x, m.K, tr); }, { color: 's5', width: 2.6, domain: [1, 60] });
+      g.circle(m.N, m.S, 11, { color: 'key', alpha: 0.65, stroke: false, px: true });
+      g.points([[m.N, m.S]], { color: 'ink', r: 4.5 });
+      g.text(m.N, m.S, 'n = ' + m.N + ': ' + Course.fmt(m.S, 2) + '×', { dx: 12, dy: -13, weight: 600 });
+    });
+
+    ui.legend([
+      { label: 'a stage, sequential run', color: 's4', mark: 'square' },
+      { label: 'a stage, pipelined run', color: 's5', mark: 'square' },
+      { label: 'fill: k − 1 cycles, paid once', color: 's2', mark: 'area' },
+      { label: 'speedup S(n), no overhead', color: 's4', mark: 'line' },
+      { label: 'speedup with register overhead', color: 's5', mark: 'line' },
+      { label: 'ceiling k', color: 's6', mark: 'dash' },
+      { label: 'your n', color: 'ink', mark: 'dot' }
+    ]);
+
+    ui.onChange(function () {
+      var m = model(), on = pipe.value, tot = on ? m.pipe : m.seq;
+      gantt.setView({ x: [0, Math.max(m.seq, m.pipe) * 1.04], y: [0, m.N] });
+      roT.set(Course.fmt(m.T, 2) + ' ns');
+      roClk.set(Course.fmt(m.clk, 2) + ' ns');
+      roTot.set(Course.fmt(tot, 1) + ' ns = ' + (on ? '(' + m.K + ' + ' + m.N + ' − 1) × ' + Course.fmt(m.clk, 2) : m.N + ' × 10'));
+      roS.set(on ? Course.fmt(m.S, 2) + '×' : '1.00× — nothing overlaps');
+      roLim.set(Course.fmt(m.lim, 2) + '×' + (treg.value > 0 ? ' (k = ' + m.K + ' without overhead)' : ' = k'));
+    });
+  });
+  </script>
+
+  <details class="why">
+    <summary>Why not ten stages of 1 ns, then twenty of 0.5 ns?</summary>
+    <p>Because the clock period is not "the work divided by \(k\)". Every stage ends in a pipeline register (next section), and that register costs time on every cycle: setup, delay, the uncertainty of the clock edge. The clock period must be at least the delay of the <em>slowest</em> stage plus this overhead, \(T_{\text{clk}} \ge \max_i d_i + t_{\text{reg}}\). Split 10 ns into 10 stages with 0.5 ns of overhead each and the clock is 1.5 ns, not 1 ns; the ceiling is 6.67, not 10. Stages are never perfectly balanced either, so the slowest sets the pace for all, and a deeper pipeline has more instructions in flight, so every hazard of the next lessons costs more cycles. This argument is Hennessy and Patterson's, not the notes': it is the standard answer to "why deeper is not always faster".</p>
+  </details>
+
+  <p class="memo"><mark class="key">Pipelining raises throughput, not speed: one instruction still takes \(k\) cycles, but once the line is full one completes every cycle, and \(n\) instructions take \(k + n - 1\) cycles.</mark></p>
+</section>
+
+<section id="l01-born">
+  <h2>What each instruction does at each stop</h2>
+
+  <p>All five instructions march through the same five stages, but they do different things there — and in some stages nothing at all. The notes give one small table per instruction class (pp. 16–17); here they are side by side, in the loop's own instructions. The cell marked "born" is where the instruction's result first exists; the cell marked "idle" is a stage the instruction passes through without doing anything.</p>
+
+  <figure class="tbl-fig" id="l01-tbl-stages">
+    <figcaption>Stage by stage, for the four kinds of instruction in the loop. A value is "born" at the end of the cycle shown.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Instruction</th><th>IF</th><th>ID</th><th>EX</th><th>MEM</th><th>WB</th></tr></thead>
+        <tbody>
+          <tr><th><span class="nw"><code>LD F2, 0(R1)</code></span><br>load</th><td>fetch; PC + 4</td><td>read <code>R1</code>; extract 0</td><td>address <code>R1 + 0</code></td><td>read memory — <b><code>F2</code> born</b></td><td>write <code>F2</code></td></tr>
+          <tr><th><span class="nw"><code>FADD F4, F2, F0</code></span><br>ALU</th><td>fetch; PC + 4</td><td>read <code>F2</code>, <code>F0</code></td><td><code>F2 + F0</code> — <b><code>F4</code> born</b></td><td><em>idle: passes through</em></td><td>write <code>F4</code></td></tr>
+          <tr><th><span class="nw"><code>SD F4, 0(R1)</code></span><br>store</th><td>fetch; PC + 4</td><td>read <code>R1</code> and <code>F4</code></td><td>address <code>R1 + 0</code></td><td>write <code>F4</code> to memory</td><td><em>idle: nothing to write</em></td></tr>
+          <tr><th><span class="nw"><code>ADDUI R1, R1, 8</code></span><br>ALU, immediate</th><td>fetch; PC + 4</td><td>read <code>R1</code>; extract 8</td><td><code>R1 + 8</code> — <b><code>R1</code> born</b></td><td><em>idle: passes through</em></td><td>write <code>R1</code></td></tr>
+          <tr><th><span class="nw"><code>BNE R1, R2, LOOP</code></span><br>branch</th><td>fetch; PC + 4</td><td>read <code>R1</code>, <code>R2</code></td><td>compare <code>R1</code> with <code>R2</code>; target = PC + offset</td><td>load the PC if taken</td><td><em>idle: no register to write</em></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Three facts in this table are worth more than the rest, because the next lessons are built on them. A load's value is born at the end of MEM, one stage later than an ALU result, because the load needs the ALU for the address <em>and then</em> the memory: this is why a load's consumer will cost a stall that no wire can remove. A store reads <em>two</em> registers in ID — the base and the data — although the data is needed only in MEM: ID is the only stage with read ports, so the value is read early and carried along. And a branch compares in EX and loads the PC in MEM; the instructions fetched meanwhile were fetched blind. That is the <mark class="key">control hazard</mark> the notes name on p. 17 and <a href="l04.html">lesson 4</a> is about.</p>
+
+  <figure class="fig fig--plain" id="l01-fig-born">
+    <svg class="dia" viewBox="0 0 560 210" role="img" aria-label="A grid of the five instructions against the five stages: the cell where each result is born is highlighted, the idle cells are greyed out, and no cell is missing">
+      <text x="198" y="28" class="tx-mid tx-sm tx-muted">IF</text>
+      <text x="234" y="28" class="tx-mid tx-sm tx-muted">ID</text>
+      <text x="270" y="28" class="tx-mid tx-sm tx-muted">EX</text>
+      <text x="306" y="28" class="tx-mid tx-sm tx-muted">ME</text>
+      <text x="342" y="28" class="tx-mid tx-sm tx-muted">WB</text>
+      <rect x="288" y="40" width="36" height="26" class="hl"/>
+      <rect x="252" y="70" width="36" height="26" class="hl"/>
+      <rect x="252" y="130" width="36" height="26" class="hl"/>
+      <text x="172" y="58" class="tx-end tx-mono tx-sm">LD F2, 0(R1)</text>
+      <rect x="180" y="40" width="36" height="26" class="fi-paper"/><text x="198" y="57" class="tx-mid tx-mono tx-sm">IF</text>
+      <rect x="216" y="40" width="36" height="26" class="fi-paper"/><text x="234" y="57" class="tx-mid tx-mono tx-sm">ID</text>
+      <rect x="252" y="40" width="36" height="26" class="fi-paper"/><text x="270" y="57" class="tx-mid tx-mono tx-sm">EX</text>
+      <rect x="288" y="40" width="36" height="26" class="fi-paper"/><text x="306" y="57" class="tx-mid tx-mono tx-sm tx-bold">ME</text>
+      <rect x="324" y="40" width="36" height="26" class="fi-paper"/><text x="342" y="57" class="tx-mid tx-mono tx-sm">WB</text>
+      <text x="172" y="88" class="tx-end tx-mono tx-sm">FADD F4, F2, F0</text>
+      <rect x="180" y="70" width="36" height="26" class="fi-paper"/><text x="198" y="87" class="tx-mid tx-mono tx-sm">IF</text>
+      <rect x="216" y="70" width="36" height="26" class="fi-paper"/><text x="234" y="87" class="tx-mid tx-mono tx-sm">ID</text>
+      <rect x="252" y="70" width="36" height="26" class="fi-paper"/><text x="270" y="87" class="tx-mid tx-mono tx-sm tx-bold">EX</text>
+      <rect x="288" y="70" width="36" height="26" class="fi-soft st-muted"/><text x="306" y="87" class="tx-mid tx-mono tx-sm tx-muted">ME</text>
+      <rect x="324" y="70" width="36" height="26" class="fi-paper"/><text x="342" y="87" class="tx-mid tx-mono tx-sm">WB</text>
+      <text x="172" y="118" class="tx-end tx-mono tx-sm">SD F4, 0(R1)</text>
+      <rect x="180" y="100" width="36" height="26" class="fi-paper"/><text x="198" y="117" class="tx-mid tx-mono tx-sm">IF</text>
+      <rect x="216" y="100" width="36" height="26" class="fi-paper"/><text x="234" y="117" class="tx-mid tx-mono tx-sm">ID</text>
+      <rect x="252" y="100" width="36" height="26" class="fi-paper"/><text x="270" y="117" class="tx-mid tx-mono tx-sm">EX</text>
+      <rect x="288" y="100" width="36" height="26" class="fi-paper"/><text x="306" y="117" class="tx-mid tx-mono tx-sm">ME</text>
+      <rect x="324" y="100" width="36" height="26" class="fi-soft st-muted"/><text x="342" y="117" class="tx-mid tx-mono tx-sm tx-muted">WB</text>
+      <text x="172" y="148" class="tx-end tx-mono tx-sm">ADDUI R1, R1, 8</text>
+      <rect x="180" y="130" width="36" height="26" class="fi-paper"/><text x="198" y="147" class="tx-mid tx-mono tx-sm">IF</text>
+      <rect x="216" y="130" width="36" height="26" class="fi-paper"/><text x="234" y="147" class="tx-mid tx-mono tx-sm">ID</text>
+      <rect x="252" y="130" width="36" height="26" class="fi-paper"/><text x="270" y="147" class="tx-mid tx-mono tx-sm tx-bold">EX</text>
+      <rect x="288" y="130" width="36" height="26" class="fi-soft st-muted"/><text x="306" y="147" class="tx-mid tx-mono tx-sm tx-muted">ME</text>
+      <rect x="324" y="130" width="36" height="26" class="fi-paper"/><text x="342" y="147" class="tx-mid tx-mono tx-sm">WB</text>
+      <text x="172" y="178" class="tx-end tx-mono tx-sm">BNE R1, R2, LOOP</text>
+      <rect x="180" y="160" width="36" height="26" class="fi-paper"/><text x="198" y="177" class="tx-mid tx-mono tx-sm">IF</text>
+      <rect x="216" y="160" width="36" height="26" class="fi-paper"/><text x="234" y="177" class="tx-mid tx-mono tx-sm">ID</text>
+      <rect x="252" y="160" width="36" height="26" class="fi-paper"/><text x="270" y="177" class="tx-mid tx-mono tx-sm">EX</text>
+      <rect x="288" y="160" width="36" height="26" class="fi-paper"/><text x="306" y="177" class="tx-mid tx-mono tx-sm">ME</text>
+      <rect x="324" y="160" width="36" height="26" class="fi-soft st-muted"/><text x="342" y="177" class="tx-mid tx-mono tx-sm tx-muted">WB</text>
+      <line x1="400" y1="53" x2="368" y2="53" class="st-ink" marker-end="url(#arr)"/>
+      <text x="408" y="58" class="tx-hand">F2 born in ME</text>
+      <line x1="400" y1="113" x2="368" y2="113" class="st-muted" marker-end="url(#arr-muted)"/>
+      <text x="408" y="118" class="tx-hand">idle, not skipped</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> The yellow cells are where a result is born: EX for an ALU instruction, MEM for a load. The grey cells are stages the instruction does nothing in. Every row still has five cells: an idle stage is traversed, never skipped.</figcaption>
+  </figure>
+
+  <h3>Why an idle stage is not a skipped stage</h3>
+
+  <p>Look at the grey cells and ask the obvious question: the <code>FADD</code> has its result at the end of EX, so why not write it in the very next cycle and let the instruction leave the pipeline early? Because of the fifth column of Fig. 1. The register file has one write port, and in any cycle the instruction one step ahead may be using it. If <code>FADD</code> jumped from EX to WB, it would reach WB in cycle 5, the same cycle as the <code>LD</code> in front of it — two writes, one port. Worse, an ALU instruction that follows a load would then write its register <em>before</em> the load writes its own, and results would land in the register file out of program order. Keeping every instruction in the pipe for exactly five cycles guarantees that at most one instruction is in WB per cycle and that writes happen in order. The idle stage is the price of that guarantee, and the price is zero: the stage was going to exist anyway.</p>
+
+  <aside class="redpen" data-page="16">
+    <p class="claim">"Since there is no memory operation, the instruction bypasses the ME stage." — and, in the stage tables: "ME: No memory access (skipped)", "WB: No write-back stage (skipped)"</p>
+    <p class="fix">No instruction skips a stage in the five-stage pipeline. An ALU instruction spends its fourth cycle in MEM doing nothing, a store spends its fifth cycle in WB doing nothing; every instruction has a latency of exactly five cycles.</p>
+    <p class="because">Fixed latency keeps the pipeline in order with one instruction per stage: if ALU instructions moved from EX straight to WB, an ALU instruction behind a load would collide with it on the single register write port, and later results could be written before earlier ones (a WAW hazard). Pipelines with <em>variable</em> latency — the multi-cycle FP units of <a href="l07.html">lesson 7</a> — create exactly these two problems and need extra hardware for them. The same wording returns on p. 17 ("stores do not have WB, ALU instructions skip ME"): read "idle" wherever the notes say "skipped".</p>
+  </aside>
+
+  <aside class="redpen" data-page="17">
+    <p class="claim">"WB: Update PC if branch is taken" (in the stage table of the conditional branch, under "ME: No memory access (skipped)")</p>
+    <p class="fix">Wrong stage. In the basic five-stage pipeline the comparison and the target address are computed in EX and the PC is loaded in MEM; nothing branch-related happens in WB, and a branch writes no register.</p>
+    <p class="because">The notes themselves say so where branches are treated properly (p. 31: "ME Stage: Based on the comparison, update the PC to either PC + 4 (if not taken) or PC + offset (if taken)"), and so does Hennessy and Patterson's basic pipeline. Optimised pipelines move the decision into ID — the exam's VLIW exercises say "branch solved in ID stage" — earlier still, never later. The stage that updates the PC sets the branch penalty of <a href="l04.html">lesson 4</a>: with the PC loaded at the end of MEM the correct fetch starts in the branch's fifth cycle and three fetches are lost; put it in WB and the penalty comes out as four, one cycle too large.</p>
+  </aside>
+
+  <p>One last look at the table before moving on. <code>F2</code> is born at the end of cycle 4, in the <code>LD</code>'s MEM stage — but <code>FADD</code> reads <code>F2</code> in its ID stage, which is cycle 3. The ideal table of the previous section quietly reads a value that does not exist yet. That is the <mark class="key">data hazard</mark>, and what the hardware does about it is the whole of <a href="l02.html">lesson 2</a>.</p>
+
+  <p class="memo"><mark class="key">An ALU result is born at the end of EX, a loaded value at the end of MEM; an instruction with nothing to do in a stage still spends the cycle there.</mark></p>
+</section>
+
+<section id="l01-registers">
+  <h2>What travels between the stops: the pipeline registers</h2>
+
+  <p>Between any two stations of a car factory there is a short stretch of conveyor that holds the car — and its work order — while the next station is busy. The pipeline has the same thing between any two stages: a <mark class="key">pipeline register</mark>, a bank of flip-flops that is written at the end of every clock cycle and read in the next. There are four of them, named after the stages they separate: <code>IF/ID</code>, <code>ID/EX</code>, <code>EX/MEM</code> and <code>MEM/WB</code> (notes, p. 19 and Fig. 4 on p. 18). All four are clocked together, so on every clock edge the whole pipeline advances by one stop.</p>
+
+  <aside class="margin-note">The notes' Fig. 4 adds the branch offset to \(\text{PC} + 4\): that is MIPS. RISC-V adds it to the PC of the branch itself — same wire, a different constant, and the exam never asks which.</aside>
+
+  <p>What must a register hold? Everything the instruction inside it still needs for the stages ahead — because the instruction word itself stays behind in <code>IF/ID</code> and is overwritten by the next fetch one cycle later. The notes list the contents in one line each; here is the full list, with the control-signal names of Patterson and Hennessy, which the notes do not spell out:</p>
+
+  <ul>
+    <li><b><code>IF/ID</code></b>: the instruction word (32 bits) and PC + 4.</li>
+    <li><b><code>ID/EX</code></b>: PC + 4; the two values read from the register file; the sign-extended immediate; the number of the destination register <code>rd</code>; and the control signals decoded from the opcode for the three stages ahead — for EX (<code>ALUOp</code>, <code>ALUSrc</code>: register or immediate as the second operand), for MEM (<code>MemRead</code>, <code>MemWrite</code>, <code>Branch</code>) and for WB (<code>RegWrite</code>, <code>MemtoReg</code>: write the ALU result or the loaded word).</li>
+    <li><b><code>EX/MEM</code></b>: the ALU result, which for a load or store is the address; the value to be stored; for a branch the target address and the outcome of the comparison; <code>rd</code>; the control signals for MEM and WB.</li>
+    <li><b><code>MEM/WB</code></b>: the word read from memory, or the ALU result passed through; <code>rd</code>; the control signals for WB.</li>
+  </ul>
+
+  <p>Two things travel in every register and are easy to forget at the exam: the <em>destination register number</em> and the <em>control bits</em>. Decoding happens once, in ID; from then on the instruction carries its own work order, and each stage consumes the part addressed to it, so the control word gets shorter from register to register. The write-back stage, three cycles after decode, learns which register to write from the <code>rd</code> field of <code>MEM/WB</code>, not from the instruction word, which by then belongs to an instruction three places behind.</p>
+
+  <figure class="fig fig--plain" id="l01-fig-control">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="The four pipeline registers drawn as columns of fields: the destination register number rd and the control bits appear in every register after decode, and the control word loses one stage's worth of bits at each register">
+      <text x="70" y="34" class="tx-mid tx-sm tx-bold">IF/ID</text>
+      <rect x="8" y="44" width="124" height="18" class="fi-paper"/><text x="70" y="57" class="tx-mid tx-sm">instruction</text>
+      <rect x="8" y="62" width="124" height="18" class="fi-paper"/><text x="70" y="75" class="tx-mid tx-sm">PC + 4</text>
+      <text x="210" y="34" class="tx-mid tx-sm tx-bold">ID/EX</text>
+      <rect x="148" y="44" width="124" height="18" class="fi-paper"/><text x="210" y="57" class="tx-mid tx-sm">PC + 4</text>
+      <rect x="148" y="62" width="124" height="18" class="fi-paper"/><text x="210" y="75" class="tx-mid tx-sm">rs1 value</text>
+      <rect x="148" y="80" width="124" height="18" class="fi-paper"/><text x="210" y="93" class="tx-mid tx-sm">rs2 value</text>
+      <rect x="148" y="98" width="124" height="18" class="fi-paper"/><text x="210" y="111" class="tx-mid tx-sm">immediate</text>
+      <rect x="148" y="116" width="124" height="18" class="fw-s3 st-s3"/><text x="210" y="129" class="tx-mid tx-sm tx-bold">rd</text>
+      <rect x="148" y="134" width="124" height="18" class="fw-s3 st-s3"/><text x="210" y="147" class="tx-mid tx-sm">EX control</text>
+      <rect x="148" y="152" width="124" height="18" class="fw-s3 st-s3"/><text x="210" y="165" class="tx-mid tx-sm">MEM control</text>
+      <rect x="148" y="170" width="124" height="18" class="fw-s3 st-s3"/><text x="210" y="183" class="tx-mid tx-sm">WB control</text>
+      <text x="350" y="34" class="tx-mid tx-sm tx-bold">EX/MEM</text>
+      <rect x="288" y="44" width="124" height="18" class="fi-paper"/><text x="350" y="57" class="tx-mid tx-sm">ALU result</text>
+      <rect x="288" y="62" width="124" height="18" class="fi-paper"/><text x="350" y="75" class="tx-mid tx-sm">store data</text>
+      <rect x="288" y="80" width="124" height="18" class="fi-paper"/><text x="350" y="93" class="tx-mid tx-sm">target, zero</text>
+      <rect x="288" y="98" width="124" height="18" class="fw-s3 st-s3"/><text x="350" y="111" class="tx-mid tx-sm tx-bold">rd</text>
+      <rect x="288" y="116" width="124" height="18" class="fw-s3 st-s3"/><text x="350" y="129" class="tx-mid tx-sm">MEM control</text>
+      <rect x="288" y="134" width="124" height="18" class="fw-s3 st-s3"/><text x="350" y="147" class="tx-mid tx-sm">WB control</text>
+      <text x="490" y="34" class="tx-mid tx-sm tx-bold">MEM/WB</text>
+      <rect x="428" y="44" width="124" height="18" class="fi-paper"/><text x="490" y="57" class="tx-mid tx-sm">memory data</text>
+      <rect x="428" y="62" width="124" height="18" class="fi-paper"/><text x="490" y="75" class="tx-mid tx-sm">ALU result</text>
+      <rect x="428" y="80" width="124" height="18" class="fw-s3 st-s3"/><text x="490" y="93" class="tx-mid tx-sm tx-bold">rd</text>
+      <rect x="428" y="98" width="124" height="18" class="fw-s3 st-s3"/><text x="490" y="111" class="tx-mid tx-sm">WB control</text>
+      <line x1="273" y1="125" x2="287" y2="108" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="413" y1="107" x2="427" y2="90" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <text x="10" y="212" class="tx-hand">rd travels with the instruction</text>
+      <text x="550" y="236" class="tx-end tx-hand">control bits are used up stage by stage</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The four pipeline registers as columns of fields. The violet fields are bookkeeping: the destination number <code>rd</code> and the control signals, decoded once in ID and carried along. <code>ID/EX</code> holds control for three stages, <code>EX/MEM</code> for two, <code>MEM/WB</code> for one.</figcaption>
+  </figure>
+
+  <p>Why have the registers at all? Not for the reason the notes give on p. 19 ("they eliminate the need for re-fetching or re-decoding instructions at each cycle" — re-fetching was never on the table). The real reason is the clock. Without a register between two stages, their logic would form one long combinational path, and the clock period would have to cover both; the register cuts the path, so that the period only has to cover <em>one</em> stage. That is what lets the clock run at the pace of a stage instead of the pace of an instruction, which is the entire point of the technique. The registers are also where the forwarding hardware of the next lesson reads its values from: a result that sits in <code>EX/MEM</code> can be handed to the ALU without waiting for WB.</p>
+
+  <aside class="redpen" data-page="10">
+    <p class="claim">"Figure 2: Specific implementation of the RISC-V Data Path." — and on p. 18, "Figure 4: Structure of RISC-V pipeline."</p>
+    <p class="fix">Both figures show Patterson and Hennessy's <em>MIPS</em> datapath, not a RISC-V one. The five stages and the four pipeline registers are the same, so the pictures still teach the right structure — but do not quote their bit positions as RISC-V.</p>
+    <p class="because">Check the labels on the page: the register fields come from instruction bits [25–21], [20–16], [15–11], the immediate from [15–0], the sign extension is "16 bit → 32 bit", and the branch offset goes through a "2-bit left shifter". Those are MIPS encodings. RISC-V keeps <code>rs1</code> in bits [19:15], <code>rs2</code> in [24:20], <code>rd</code> in [11:7], its immediates are 12 bits, and its branch offset has the zero bit built in, so no shifter. The exam does not ask for bit positions: learn the structure, ignore the numbers.</p>
+  </aside>
+
+  <div class="widget" id="l01-w-walker">
+    <h3 class="widget-title">Datapath walker: five instructions, nine cycles, four registers</h3>
+    <p class="widget-intro">The upper row is the datapath of Fig. 1 with the four pipeline registers between the stops; the lower part is the exam-style table. Move the cycle slider, or step with the buttons. Click a pipeline register (or choose it in the list) and the note under the controls tells you what it holds in this cycle — for the instruction that is reading it. Greyed stops are idle.</p>
+    <ol class="tasks">
+      <li>Before you move anything: in cycle 4, which instruction is in MEM and what does it do there? Then set the slider to C4 and check.
+        <details class="answer"><summary>What you should see</summary>
+          <p><code>I0 LD</code> reads the data memory at <code>R1 + 0</code>; the value of <code>F2</code> is born at the end of this cycle. Go to C5 and inspect <code>MEM/WB</code>: there it is, travelling with <code>rd = F2</code> and <code>RegWrite = 1</code>, so that WB knows what to write and where.</p></details>
+      </li>
+      <li>Set C5, the cycle in which all five stops are occupied. Predict which stop is greyed, then look.
+        <details class="answer"><summary>What you should see</summary>
+          <p>MEM: it holds <code>I1 FADD</code>, which has no memory access. Choose <code>EX/MEM</code> in the list and the note explains why it does not jump ahead to WB — <code>I0</code> is writing <code>F2</code> there in this very cycle, through the single write port.</p></details>
+      </li>
+      <li>Inspect <code>ID/EX</code> in C3, then <code>EX/MEM</code> in C4, then <code>MEM/WB</code> in C5. Which field is in all three?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The destination <code>rd = F2</code> of the load, and its WB control bits. The instruction word that named <code>F2</code> was in <code>IF/ID</code> only during C2; from then on the number travels with the instruction. This is the one insight of the widget: <b><code>rd</code> and the control signals move through the pipeline registers with the instruction they belong to.</b></p></details>
+      </li>
+      <li>Go to C9, the last cycle. How many stops are busy, and what happened to the other four?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only WB, with <code>I4 BNE</code> — which has nothing to write there. The four empty stops are the mirror image of the fill: C1 to C4 fill the line, C6 to C9 drain it. Both ends cost the same four cycles, and a program pays them once.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l01-w-walker', function (root, ui) {
+    var S = Course.svg;
+    var STAGES = ['IF', 'ID', 'EX', 'MEM', 'WB'], SHORT = ['IF', 'ID', 'EX', 'ME', 'WB'];
+    var HW = ['I-mem', 'RF read', 'ALU', 'D-mem', 'RF write'];
+    var REGS = ['IF/ID', 'ID/EX', 'EX/MEM', 'MEM/WB'];
+    var INS = [
+      { tag: 'I0', mn: 'LD F2, 0(R1)', idle: {}, at: [
+        ['instruction word: LD F2, 0(R1)', 'PC + 4 (the address of I1)'],
+        ['PC + 4', 'rs1 value: R1, the base', 'rs2 value: not used', 'immediate: 0', 'rd: F2', 'EX control: ALUSrc = immediate, ALUOp = add', 'MEM control: MemRead = 1, MemWrite = 0, Branch = 0', 'WB control: RegWrite = 1, MemtoReg = memory'],
+        ['ALU result: R1 + 0, the address', 'store data: none', 'rd: F2', 'MEM control: MemRead = 1, MemWrite = 0, Branch = 0', 'WB control: RegWrite = 1, MemtoReg = memory'],
+        ['memory data: M[R1 + 0] — the value of F2, born at the end of MEM', 'ALU result: R1 + 0 (not needed now)', 'rd: F2', 'WB control: RegWrite = 1, MemtoReg = memory'] ] },
+      { tag: 'I1', mn: 'FADD F4, F2, F0', idle: { 3: 'FADD has no memory access; its result passes through MEM untouched. It cannot jump to WB: I0 is writing F2 there through the single write port, and results must stay in order.' }, at: [
+        ['instruction word: FADD F4, F2, F0', 'PC + 4 (the address of I2)'],
+        ['PC + 4', 'rs1 value: F2, read in ID', 'rs2 value: F0, read in ID', 'immediate: not used', 'rd: F4', 'EX control: ALUSrc = register, ALUOp = add', 'MEM control: MemRead = 0, MemWrite = 0, Branch = 0', 'WB control: RegWrite = 1, MemtoReg = ALU'],
+        ['ALU result: F2 + F0 — the value of F4, born at the end of EX', 'store data: F0 (carried, unused)', 'rd: F4', 'MEM control: all 0 — the next stage will do nothing', 'WB control: RegWrite = 1, MemtoReg = ALU'],
+        ['memory data: none', 'ALU result: F2 + F0, passed through MEM untouched', 'rd: F4', 'WB control: RegWrite = 1, MemtoReg = ALU'] ] },
+      { tag: 'I2', mn: 'SD F4, 0(R1)', idle: { 4: 'SD wrote its data into memory in MEM; there is no register to write, so RegWrite = 0 and the cycle passes.' }, at: [
+        ['instruction word: SD F4, 0(R1)', 'PC + 4 (the address of I3)'],
+        ['PC + 4', 'rs1 value: R1, the base', 'rs2 value: F4, the data to store, read in ID', 'immediate: 0', 'rd: none — a store writes no register', 'EX control: ALUSrc = immediate, ALUOp = add', 'MEM control: MemRead = 0, MemWrite = 1, Branch = 0', 'WB control: RegWrite = 0'],
+        ['ALU result: R1 + 0, the address', 'store data: F4', 'rd: none', 'MEM control: MemWrite = 1', 'WB control: RegWrite = 0'],
+        ['memory data: none', 'ALU result: R1 + 0 (unused)', 'rd: none', 'WB control: RegWrite = 0 — nothing will be written'] ] },
+      { tag: 'I3', mn: 'ADDUI R1, R1, 8', idle: { 3: 'ADDUI has no memory access; R1 + 8 passes through MEM untouched and waits its turn at the write port.' }, at: [
+        ['instruction word: ADDUI R1, R1, 8', 'PC + 4 (the address of I4)'],
+        ['PC + 4', 'rs1 value: R1', 'rs2 value: not used', 'immediate: 8', 'rd: R1', 'EX control: ALUSrc = immediate, ALUOp = add', 'MEM control: all 0', 'WB control: RegWrite = 1, MemtoReg = ALU'],
+        ['ALU result: R1 + 8 — the new R1, born at the end of EX', 'store data: none', 'rd: R1', 'MEM control: all 0', 'WB control: RegWrite = 1, MemtoReg = ALU'],
+        ['memory data: none', 'ALU result: R1 + 8, passed through', 'rd: R1', 'WB control: RegWrite = 1, MemtoReg = ALU'] ] },
+      { tag: 'I4', mn: 'BNE R1, R2, LOOP', idle: { 4: 'BNE writes no register. Its decision was taken in EX and the PC was loaded in MEM (basic pipeline).' }, at: [
+        ['instruction word: BNE R1, R2, LOOP', 'PC + 4 (the address after the loop)'],
+        ['PC + 4, carried for the branch adder', 'rs1 value: R1', 'rs2 value: R2', 'immediate: the offset to LOOP', 'rd: none', 'EX control: ALUOp = subtract (compare)', 'MEM control: Branch = 1, MemRead = 0, MemWrite = 0', 'WB control: RegWrite = 0'],
+        ['zero flag: 1 if R1 − R2 = 0 (then BNE is not taken)', 'branch target: PC + offset, the address of LOOP', 'rd: none', 'MEM control: Branch = 1', 'WB control: RegWrite = 0'],
+        ['nothing to write back: RegWrite = 0', 'the PC was loaded in MEM if the branch was taken'] ] }
+    ];
+    var N = INS.length, K = STAGES.length, LAST = K + N - 1;
+    var picked = 1;
+
+    var cyc = ui.slider({ label: 'clock cycle', min: 1, max: LAST, step: 1, value: 1, format: function (v) { return 'C' + v; } });
+    ui.button('− 1 cycle', function () { cyc.set(Math.max(1, cyc.value - 1), true); }, { kind: 'ghost', icon: 'back' });
+    ui.button('+ 1 cycle', function () { cyc.set(Math.min(LAST, cyc.value + 1), true); }, { kind: 'ghost', icon: 'next' });
+    var sel = ui.select('pipeline register to inspect', REGS, function (v, i) { picked = i; }, REGS[picked]);
+    var roFlight = ui.readout('instructions in flight', { digits: 0 }), roIdle = ui.readout('idle stop in this cycle');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'stop busy with an instruction', color: 's1', mark: 'square' },
+      { label: 'idle stop: the instruction does nothing here', color: 'muted', mark: 'square' },
+      { label: 'the register you inspect', color: 'ink', mark: 'hl' }
+    ]);
+
+    var svg = ui.svg(560, 320, { label: 'The five-stage datapath with its four pipeline registers above an instruction-by-cycle table; the current cycle is highlighted and idle stages are greyed' });
+    var BX = [28, 134, 240, 346, 452], BW = 80, BY = 36, BH = 52, RX = [114, 220, 326, 432], RW = 14;
+    var block = [], bName = [], bTag = [], regHl = [], regRect = [];
+    STAGES.forEach(function (st, s) {
+      S('text', { x: BX[s] + BW / 2, y: 24, 'class': 'tx-mid tx-bold', text: st }, svg);
+      if (s < K - 1) S('line', { x1: BX[s] + BW, y1: 62, x2: BX[s + 1], y2: 62, 'class': 'st-muted' }, svg);
+    });
+    RX.forEach(function (x, r) {
+      regHl[r] = S('rect', { x: x, y: 18, width: RW, height: 96, 'class': 'hl', rx: 3 }, svg);
+      var g = S('g', { tabindex: '0', role: 'button', 'aria-label': 'inspect the pipeline register ' + REGS[r], style: 'cursor:pointer' }, svg);
+      regRect[r] = S('rect', { x: x, y: 18, width: RW, height: 96, 'class': 'fi-paper sw-2', rx: 3 }, g);
+      S('text', { x: x + RW / 2, y: 132, 'class': 'tx-mid tx-sm', text: REGS[r] }, g);
+      function choose() { picked = r; sel.value = REGS[r]; ui.changed(); }
+      g.addEventListener('click', choose);
+      g.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); choose(); } });
+    });
+    STAGES.forEach(function (st, s) {
+      block[s] = S('rect', { x: BX[s], y: BY, width: BW, height: BH, 'class': 'fi-paper sw-2', rx: 4 }, svg);
+      bName[s] = S('text', { x: BX[s] + BW / 2, y: 56, 'class': 'tx-mid tx-sm', text: HW[s] }, svg);
+      bTag[s] = S('text', { x: BX[s] + BW / 2, y: 78, 'class': 'tx-mid tx-mono', text: '' }, svg);
+    });
+    /* the exam-style table: rows = instructions, columns = cycles */
+    var TX = 212, TY = 170, CW = 36, CH = 26, RH = 28, colHl, cell = [];
+    for (var c = 1; c <= LAST; c++) S('text', { x: TX + (c - 1) * CW + CW / 2, y: 160, 'class': 'tx-mid tx-sm tx-muted', text: 'C' + c }, svg);
+    colHl = S('rect', { x: TX, y: TY, width: CW, height: N * RH - 2, 'class': 'hl', rx: 3 }, svg);
+    INS.forEach(function (ins, i) {
+      S('text', { x: TX - 6, y: TY + i * RH + 17, 'class': 'tx-end tx-mono tx-sm', text: ins.tag + ' ' + ins.mn }, svg);
+      cell[i] = [];
+      for (var s = 0; s < K; s++) {
+        var col = i + s, x = TX + col * CW, y = TY + i * RH, idle = !!ins.idle[s];
+        var r = S('rect', { x: x, y: y, width: CW, height: CH, 'class': idle ? 'fi-soft st-muted' : 'fi-paper' }, svg);
+        var t = S('text', { x: x + CW / 2, y: y + 17, 'class': 'tx-mid tx-mono tx-sm' + (idle ? ' tx-muted' : ''), text: SHORT[s] }, svg);
+        cell[i][s] = { r: r, t: t, idle: idle };
+      }
+    });
+
+    function update() {
+      var c = cyc.value, inFlight = 0, idleList = [], s, i;
+      for (s = 0; s < K; s++) {
+        i = c - 1 - s;
+        var ins = i >= 0 && i < N ? INS[i] : null, idle = ins && ins.idle[s];
+        if (ins) inFlight++;
+        block[s].setAttribute('class', !ins ? 'fi-paper st-muted' : idle ? 'fi-soft st-muted sw-2' : 'fw-s1 st-s1 sw-2');
+        bName[s].setAttribute('class', 'tx-mid tx-sm' + (ins && !idle ? '' : ' tx-muted'));
+        bTag[s].textContent = ins ? (idle ? ins.tag + ' idle' : ins.tag) : '';
+        bTag[s].setAttribute('class', 'tx-mid tx-mono' + (idle ? ' tx-muted' : ''));
+        if (idle) idleList.push(STAGES[s] + ': ' + ins.tag + ' ' + ins.mn.split(' ')[0]);
+      }
+      for (i = 0; i < N; i++) for (s = 0; s < K; s++) {
+        var k = cell[i][s], now = i + s === c - 1;
+        k.r.setAttribute('class', k.idle ? 'fi-soft st-muted' : now ? 'fw-s1 st-s1' : 'fi-paper');
+      }
+      colHl.setAttribute('x', TX + (c - 1) * CW);
+      for (var r = 0; r < RX.length; r++) regHl[r].setAttribute('visibility', r === picked ? 'visible' : 'hidden');
+      roFlight.set(inFlight);
+      roIdle.set(idleList.length ? idleList.join('; ') : 'none');
+      var j = c - 2 - picked, name = '<b>' + REGS[picked] + '</b> at C' + c;
+      if (j >= 0 && j < N) {
+        var fields = INS[j].at[picked], idleTxt = INS[j].idle[picked + 1];
+        note.set(name + ' holds <code>' + INS[j].tag + ' ' + INS[j].mn + '</code>, now in ' + STAGES[picked + 1] + ' — ' + fields.join(' · ') + '.' + (idleTxt ? ' <b>Why not skip?</b> ' + idleTxt : ''));
+      } else {
+        note.set(name + ' is empty: ' + (j < 0 ? 'no instruction has reached it yet.' : 'the last instruction has already gone past it.'));
+      }
+    }
+    ui.onChange(update);
+  });
+  </script>
+
+  <p class="memo"><mark class="key">The instruction word stays in IF/ID for one cycle; everything the later stages need — operands, immediate, destination number, control bits — travels with the instruction through ID/EX, EX/MEM and MEM/WB.</mark></p>
+</section>
+
+<section id="l01-answer">
+  <h2>The puzzle, solved — and what spoils the ideal line</h2>
+
+  <p>Back to the hook. Five instructions, 50 ns sequential, 18 ns pipelined, and the notes' "5×". You now have the subtraction: the pipeline needs \(k + n - 1 = 9\) cycles, not \(n = 5\), because the first instruction must travel the whole line before anything comes out — four fill cycles, \(k - 1\). The speedup is \(nk / (k + n - 1) = 25/9 = 2.78\). You get the rest back only by amortising the fill: 100 instructions give 4.81, 1000 give 4.98, and the 5 is a ceiling, approached and never reached. Add the register overhead and the ceiling itself drops below 5.</p>
+
+  <p>The same four cycles appear on the example A4 formula sheet the course page shows as "Clock Cycles = IC + Stall Cycles + 4". The "+4" is this fill, counted once per program; the "stall cycles" are the price of what this lesson assumed away. <a href="l03.html">Lesson 3</a> turns these into CPI and MIPS.</p>
+
+  <p>Three things spoil the ideal line, and the notes name them on pp. 10, 17 and 20–21. A <mark class="key">structural hazard</mark>: two instructions need the same resource in the same cycle — with one memory for instructions and data, the IF of one instruction and the MEM of another would collide, which is why the datapath has two. A <mark class="key">data hazard</mark>: an instruction needs a value an earlier one has not produced yet — our <code>FADD</code> and its <code>F2</code>. A <mark class="key">control hazard</mark>: the next PC is not known when the next fetch should start — our <code>BNE</code>. Each of them costs cycles, each has a fix, and each fix is a lesson: data hazards and forwarding next, branches in lesson 4, the hazards that return with multi-cycle units in lesson 7.</p>
+
+  <p>One rule to carry with you until lesson 7, where exceptions are treated: whatever overlapping the pipeline does, an exception must look as if the faulting instruction had executed alone — everything before it completed, nothing after it started. Overlap is allowed to change timing, never meaning.</p>
+</section>
+
+<section id="l01-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l01-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used by a pipelined RISC-V processor:</p>
+      <ol>
+        <li>Pipelining of the instruction execution</li>
+        <li>The five-stage organisation IF / ID / EX / MEM / WB</li>
+        <li>The pipeline registers</li>
+        <li>Separate instruction and data memories</li>
+      </ol>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> Pipelining is an implementation technique that overlaps the execution of consecutive instructions: the execution is divided into stages and each stage works on a different instruction in the same clock cycle. The latency of one instruction does not change (k cycles), but once the pipeline is full one instruction completes per cycle, so the throughput grows by up to k times; n instructions take k + n − 1 cycles instead of nk, and the clock period becomes the time of one stage instead of a whole instruction. Costs: a fill of k − 1 cycles, pipeline-register overhead, and hazards (structural, data, control) that insert stalls.</p>
+        <p><b>2.</b> The five stages correspond to five resources used once by every instruction: IF fetches from the instruction memory and computes PC + 4; ID decodes and reads the two source registers (two read ports); EX uses the ALU for the operation, the address or the branch comparison; MEM accesses the data memory (loads and stores only); WB writes the destination register (one write port). Because each stage uses a different resource, five instructions can be in flight without conflicts; every instruction traverses all five stages (idle stages are not skipped), so completion is in order and at most one instruction writes per cycle.</p>
+        <p><b>3.</b> The pipeline registers IF/ID, ID/EX, EX/MEM and MEM/WB sit between the stages and are written on every clock edge. They hold everything an in-flight instruction still needs: the instruction and PC + 4 (IF/ID); the operand values, the immediate, the destination register number and the control signals for EX, MEM and WB (ID/EX); the ALU result or address, the store data, the branch target, rd and the MEM/WB control (EX/MEM); the loaded data or ALU result, rd and the WB control (MEM/WB). Benefits: they isolate the stages so that the clock period equals one stage; the control is decoded once and carried along; and they are the source of the values used by forwarding.</p>
+        <p><b>4.</b> With a single memory, the instruction fetch of one instruction and the data access of another (IF and MEM of two different instructions in the same cycle) would compete for the memory port: a structural hazard with a stall every time. Separate instruction and data memories (in practice separate L1 caches) give the two stages their own port, so the hazard is designed away. It is a property of the implementation, not of the instruction set.</p>
+      </div>
+      <div class="exam-note">
+        <p>The 2026 paper asks its 8-point question in exactly this form: "Explain the main concepts and benefits of each one of the following techniques", with a few lines per sub-point. Fill them with the key words — overlap, throughput versus latency, k + n − 1, one resource per stage, the four register names with their contents, "structural hazard" for the memory — and with a cost next to each benefit. A sub-point that only says what the thing is called says nothing.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l01-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Consider the five-stage RISC-V pipeline (IF, ID, EX, MEM, WB) with one clock cycle per stage and no hazards (ideal case). Complete the pipeline diagram for one iteration of the following loop, then give the total number of clock cycles and the execution time with a 2 ns clock. How many cycles would the same five instructions take on a non-pipelined machine that executes the five stages one after another?</p>
+<pre><code>LOOP:  LD    F2, 0(R1)
+       FADD  F4, F2, F0
+       SD    F4, 0(R1)
+       ADDUI R1, R1, 8
+       BNE   R1, R2, LOOP</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th></th><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th><th>C6</th><th>C7</th><th>C8</th><th>C9</th></tr></thead>
+            <tbody>
+              <tr><th><span class="nw"><code>I0 LD F2, 0(R1)</code></span></th><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td><td></td><td></td><td></td></tr>
+              <tr><th><span class="nw"><code>I1 FADD F4, F2, F0</code></span></th><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td><td></td><td></td></tr>
+              <tr><th><span class="nw"><code>I2 SD F4, 0(R1)</code></span></th><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td><td></td></tr>
+              <tr><th><span class="nw"><code>I3 ADDUI R1, R1, 8</code></span></th><td></td><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td><td></td></tr>
+              <tr><th><span class="nw"><code>I4 BNE R1, R2, LOOP</code></span></th><td></td><td></td><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>MEM</td><td>WB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Total clock cycles = k + n − 1 = 5 + 5 − 1 = 9 (equivalently IC + 4 = 5 + 4 with no stalls); execution time = 9 × 2 ns = 18 ns. Non-pipelined: 5 × 5 = 25 cycles = 50 ns. Speedup of the pipeline = 50 / 18 = 2.78.</p>
+      </div>
+      <div class="exam-note">
+        <p>Every row has all five stages, the idle ones included — a row that stops at EX for the FADD or at MEM for the SD is wrong. The diagonal must shift by exactly one column per instruction, and the cycle count must be read from the last WB (C9), not guessed as "5 instructions, 5 cycles".</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="208" data-tol="0.5" data-unit="ns" id="l01-exam-time">
+    <div class="exam-q" lang="en">
+      <p>An ideal five-stage pipeline with a 2 ns clock executes 100 independent instructions. How many nanoseconds does the execution take?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ T_{\text{pipe}} = (k + n - 1)\,T \]
+        \[ = (5 + 100 - 1) \times 2 = 208 \text{ ns} \]
+        <p>Against 1000 ns without the pipeline: a speedup of 1000 / 208 = 4.81.</p>
+      </div>
+      <div class="exam-note">
+        <p>The tempting wrong answer is 200 ns (one instruction per cycle, no fill). The four extra cycles are the fill of the five-stage pipeline, the "+4" of the course's cycle formula.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="6.67" data-tol="0.02" id="l01-exam-ceiling">
+    <div class="exam-q" lang="en">
+      <p>A non-pipelined processor executes one instruction in 10 ns. A designer splits that work evenly into 10 pipeline stages, but every stage adds 0.5 ns of pipeline-register overhead to the clock period. What is the maximum speedup over the non-pipelined processor, for a very long program of independent instructions? Give two decimals.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Stage time = 10 / 10 = 1 ns; clock period = 1 + 0.5 = 1.5 ns. For n → ∞ the pipeline completes one instruction per clock period, so the speedup tends to 10 / 1.5 = 6.67 — not 10.</p>
+      </div>
+      <div class="exam-note">
+        <p>This is the "why deeper is not always faster" question. The expected reasoning is: ceiling = time of one instruction / clock period, and the clock period = slowest stage + register overhead. A five-stage pipeline with the same overhead has a ceiling of 10 / 2.5 = 4, so the deeper pipeline is still better here — but by 1.67×, not 2×.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l01-exam-mcq1">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about an ideal five-stage pipeline is correct? (Single answer)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Each instruction completes in one clock cycle. <span class="fb">Each instruction still takes five cycles from fetch to write-back; only the rate of completion changes.</span></li>
+      <li data-correct>Once the pipeline is full, one instruction completes per cycle, but each instruction still takes five cycles. <span class="fb">Throughput of one per cycle, latency of five cycles.</span></li>
+      <li>The latency of each instruction is reduced to one fifth. <span class="fb">The latency is unchanged (slightly larger with the register overhead). Pipelining improves throughput, not latency.</span></li>
+      <li>Five instructions always take exactly five cycles. <span class="fb">They take 5 + 5 − 1 = 9 cycles; the first instruction must traverse the whole pipeline before anything completes.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 2. The pipeline overlaps instructions: the time of one instruction is still k cycles, but a new one completes every cycle once the pipeline is full, so n instructions take k + n − 1 cycles.</p></div>
+      <div class="exam-note"><p>The quiz tests the latency/throughput distinction — the first bullet of the notes' p. 14. Options 1 and 3 are the same misconception in two forms.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l01-exam-mcq2">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true for the basic five-stage RISC-V pipeline? (Multiple answers)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>An ALU instruction passes through the MEM stage without using it. <span class="fb">The stage is traversed idle, so that every instruction keeps a five-cycle latency.</span></li>
+      <li>A store skips the WB stage and completes one cycle earlier than a load. <span class="fb">A store has nothing to write in WB but still spends the cycle there; no stage is skipped.</span></li>
+      <li data-correct>The destination register number travels in the pipeline registers together with the instruction. <span class="fb"><code>rd</code> is copied from ID/EX to EX/MEM to MEM/WB, because the instruction word is no longer available when WB happens.</span></li>
+      <li>The branch updates the PC in the WB stage. <span class="fb">The comparison is in EX and the PC is loaded in MEM (basic pipeline); optimised pipelines decide in ID.</span></li>
+      <li data-correct>The value loaded by a load instruction is available only at the end of its MEM stage. <span class="fb">EX computes the address, MEM reads the memory; the value does not exist before the end of MEM.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 3 and 5.</p></div>
+      <div class="exam-note"><p>Options 2 and 4 are the two claims of the notes corrected in this lesson (pp. 16–17). The 2026 paper uses "Multiple Choice – Multiple answer" quizzes of exactly this shape.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l01-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text"><code>LD F2, 0(R1)</code> is fetched in cycle 1. At the end of which cycle does the value of <code>F2</code> exist for the first time anywhere in the processor?</p>
+    <ul class="options">
+      <li>Cycle 3 <span class="fb">In cycle 3 the load is in EX, which only computes the address R1 + 0.</span></li>
+      <li data-correct>Cycle 4 <span class="fb">Cycle 4 is the load's MEM stage: the data memory answers, and the word sits in MEM/WB at the end of the cycle.</span></li>
+      <li>Cycle 5 <span class="fb">Cycle 5 is when the value is written into the register file — but it already existed one cycle earlier, in the MEM/WB register. That one cycle is what forwarding exploits in lesson 2.</span></li>
+      <li>Cycle 2 <span class="fb">In cycle 2 the instruction is being decoded; nothing has been read from memory.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A processor executes an instruction in 10 ns. It is pipelined into five stages of 2 ns. The time one instruction spends from its fetch to its write-back becomes…</p>
+    <ul class="options">
+      <li>2 ns <span class="fb">2 ns is the interval between two completions once the pipeline is full — the throughput, not the latency.</span></li>
+      <li data-correct>10 ns, or a little more <span class="fb">The instruction still goes through all the logic; only the overlap with other instructions is new. The register overhead makes it slightly longer, never shorter.</span></li>
+      <li>50 ns <span class="fb">50 ns is five instructions one after another.</span></li>
+      <li>18 ns <span class="fb">18 ns is the time of five pipelined instructions, not of one.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text"><code>SD F4, 0(R1)</code> has just finished its ID stage. Which of these are in the <code>ID/EX</code> register at that moment?</p>
+    <ul class="options">
+      <li data-correct>The value of <code>R1</code> <span class="fb">The base register, read in ID, needed by the ALU in EX.</span></li>
+      <li data-correct>The value of <code>F4</code> <span class="fb">The data to store is read in ID too, although it is needed only in MEM — ID is the only stage with read ports, so it is carried along.</span></li>
+      <li data-correct>The immediate 0 <span class="fb">Sign-extended, it is the second ALU operand.</span></li>
+      <li>The address <code>R1 + 0</code> <span class="fb">The address is computed in EX and appears in EX/MEM, one cycle later.</span></li>
+      <li>A destination register number that WB will write <span class="fb">A store writes no register; its RegWrite control bit is 0.</span></li>
+    </ul>
+    <p class="q-fb">A picture to keep: ID/EX holds the <em>inputs</em> of EX — two values, an immediate, the destination and the work order — never the result of EX.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does <code>FADD</code> not jump from EX straight to WB, skipping the MEM stage in which it has nothing to do?</p>
+    <ul class="options">
+      <li data-correct>Because the register file has one write port that the instruction ahead may be using in that cycle, and results must be written in program order <span class="fb">With a load one place ahead, the two would reach WB in the same cycle. Fixed five-cycle latency keeps one instruction per stage and in-order completion.</span></li>
+      <li>Because the MEM stage stores the result in memory temporarily <span class="fb">An ALU result never touches the data memory; it passes through MEM in the EX/MEM and MEM/WB registers.</span></li>
+      <li>Because FADD actually reads its operands from memory <span class="fb">Its operands are registers, read in ID.</span></li>
+      <li>It does skip MEM — the notes are right <span class="fb">The notes' "skipped" is corrected in this lesson; every instruction traverses all five stages.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A balanced seven-stage pipeline with no overhead and no hazards executes 50 instructions. How many clock cycles does it need?</p>
+    <ul class="options">
+      <li>50 <span class="fb">That forgets the fill: the first instruction needs seven cycles before anything completes.</span></li>
+      <li data-correct>56 <span class="fb">k + n − 1 = 7 + 50 − 1 = 56: the fill is k − 1 = 6 cycles, paid once.</span></li>
+      <li>57 <span class="fb">The fill is k − 1, not k: the first instruction's own seven cycles already include one completion.</span></li>
+      <li>350 <span class="fb">350 is the non-pipelined count, 50 × 7.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">On an ideal five-stage pipeline you double the program from 100 to 200 instructions. The speedup over sequential execution…</p>
+    <ul class="options">
+      <li>doubles <span class="fb">The speedup is nk / (k + n − 1), which grows ever more slowly: 4.81 becomes 4.90.</span></li>
+      <li>stays at 4.81 <span class="fb">It does grow — the fixed fill of four cycles is now spread over twice as many instructions.</span></li>
+      <li data-correct>rises slightly, towards 5, without reaching it <span class="fb">4.81 → 4.90: the fill becomes a smaller share of the total, and k = 5 is the limit for n → ∞.</span></li>
+      <li>reaches exactly 5 <span class="fb">5 would require zero fill, i.e. no first instruction. It is a ceiling, not a value.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The exam paper writes <code>ADDUI R1, R1, 8</code>. Which instruction of the notes' RISC-V subset does the same thing?</p>
+    <ul class="options">
+      <li><code>add x1, x1, x8</code> <span class="fb">That adds two registers; the 8 of the paper is a constant, not a register.</span></li>
+      <li data-correct><code>addi x1, x1, 8</code> <span class="fb">Register plus immediate constant: the pointer moves on by 8 bytes.</span></li>
+      <li><code>ld x1, 8(x1)</code> <span class="fb">That loads from memory at x1 + 8; ADDUI touches no memory.</span></li>
+      <li><code>sd x1, 8(x1)</code> <span class="fb">That stores to memory; ADDUI only updates a register.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l01-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Pipelining is an implementation technique that overlaps the five stages of consecutive instructions; it multiplies throughput by up to \(k\) and leaves the latency of one instruction unchanged.</li>
+    <li>There are five stages because there are five resources, each used once per instruction: instruction memory, register read ports, ALU, data memory, register write port.</li>
+    <li>\(n\) instructions take \(k + n - 1\) cycles: the \(k - 1 = 4\) fill cycles are paid once and are the "+4" of the course's cycle formula, Clock Cycles = IC + Stall Cycles + 4; the speedup \(nk/(k + n - 1)\) approaches \(k\) and never reaches it.</li>
+    <li>The clock period is the slowest stage plus the pipeline-register overhead, so a deeper pipeline raises the ceiling by less than its depth.</li>
+    <li>An ALU result is born at the end of EX, a loaded value at the end of MEM; a store reads its data in ID and writes memory in MEM; a branch compares in EX and loads the PC in MEM. No instruction skips a stage: idle stages are traversed, which keeps completion in order and one write per cycle.</li>
+    <li>The pipeline registers IF/ID, ID/EX, EX/MEM, MEM/WB carry everything an in-flight instruction still needs — operands, immediate, destination number, control bits — and let the clock run at the pace of one stage.</li>
+    <li>Three things break the ideal line: structural, data and control hazards. They are the next lessons.</li>
+  </ul>
+
+  <aside class="cheat" id="l01-cheat">
+    <dl>
+      <dt>Sequential time</dt><dd>\(T_{\text{seq}} = n\,k\,T\) — \(n\) instructions, \(k\) stages, \(T\) = stage time</dd>
+      <dt>Pipelined time</dt><dd>\(T_{\text{pipe}} = (k + n - 1)\,T\); cycles = IC + (k − 1) = IC + 4 for five stages (no stalls)</dd>
+      <dt>Speedup</dt><dd>\(S(n) = \dfrac{n\,k}{k + n - 1} \to k\) for \(n \to \infty\)</dd>
+      <dt>Clock period</dt><dd>\(T_{\text{clk}} \ge \max_i d_i + t_{\text{reg}}\) — slowest stage delay \(d_i\) plus register overhead; ceiling = \(T_{\text{instr}} / T_{\text{clk}}\)</dd>
+      <dt>Stages and resources</dt><dd>IF: I-memory, PC + 4 · ID: register read (2 ports) · EX: ALU · MEM: D-memory · WB: register write (1 port)</dd>
+      <dt>Where a value is born</dt><dd>ALU result: end of EX · loaded word: end of MEM · PC of a taken branch: MEM (basic pipeline)</dd>
+      <dt>Pipeline registers</dt><dd>IF/ID: instruction, PC + 4 · ID/EX: PC + 4, rs1, rs2, imm, rd, control EX/MEM/WB · EX/MEM: ALU result or address, store data, target, rd, control MEM/WB · MEM/WB: memory data or ALU result, rd, control WB</dd>
+      <dt>Rule</dt><dd>no stage is skipped: idle stages are traversed, latency is always 5 cycles</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l01-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=BVNx3wtJ9vs" target="_blank" rel="noopener">CPU Pipeline</a>
+      <span class="res-by">Computerphile, Matt Godbolt</span><span class="res-dur">≈ 22 min</span>
+      <p class="res-why">The production-line picture told with pen and paper and no formulas: the best twenty minutes before reading anything about stages and cycles.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://mostlykiguess.github.io/RISC-V-Processor-Implementation/" target="_blank" rel="noopener">Interactive RISC-V CPU Visualizer: sequential vs pipelined</a>
+      <span class="res-by">student project, GitHub Pages</span>
+      <p class="res-why">One page, two modes — a single-cycle CPU and a five-stage pipelined one. Run the same program in both and compare the cycle counts: Fig. 2 of this lesson, live.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://ripes.dk/" target="_blank" rel="noopener">Ripes, a visual RISC-V pipeline simulator (browser build)</a>
+      <span class="res-by">Morten Borup Petersen</span>
+      <p class="res-why">Type the five instructions of the loop, step cycle by cycle and watch the real datapath: which multiplexer selects what, which pipeline register holds which value. Keep it open for lesson 2, where its forwarding switch becomes the point.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://courses.grainger.illinois.edu/cs433/fa2019/slides/appendixC.pdf" target="_blank" rel="noopener">Hennessy &amp; Patterson, Appendix C condensed to 74 slides</a>
+      <span class="res-by">UIUC CS433</span><span class="res-dur">74 slides</span>
+      <p class="res-why">The textbook chapter the course page points to — Appendix A in the 4th edition is Appendix C in the 5th and 6th. Slide 2 is the speedup identity of this lesson; sections C.1 and C.2 are its scope.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://mark.people.clemson.edu/464/pipelining.html" target="_blank" rel="noopener">Pipelining review</a>
+      <span class="res-by">Mark Smotherman, Clemson</span>
+      <p class="res-why">Five real pipelines side by side — the MIPS R2000 with 5 stages, the R4000 with 8, the Intel i486 with 5 — to see that the exam's five-stage machine was a real product, not a toy.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Every table in this lesson pretended that the five instructions were strangers. They are not: the FADD wants the F2 that the LD has not yet delivered, and the ideal table reads a value that does not exist. Next: what the hardware does when the line jams — hazards, stalls and the wires that forward a value before it is written.</p>
+</aside>
+
+</main>
+</body>
+</html>

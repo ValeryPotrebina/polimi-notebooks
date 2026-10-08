@@ -1,0 +1,1336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>One machine, many brains: multiprocessors, buses and topologies · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l33">
+
+<header class="lesson-head">
+  <h1>One machine, many brains: multiprocessors, buses and topologies</h1>
+  <p class="lede">After this lesson you will say what makes a machine a multiprocessor and why it is built, explain why a single bus stops scaling at a few tens of processors, and compute the total and bisection bandwidth, the diameter and the degree of the classic networks by counting their links and cutting them in half.</p>
+</header>
+
+<div class="hook" data-label="Two puzzles">
+  <p>The notes report that commercial single-bus multiprocessors "maxed out at ≈36 processors before the bus saturated" (p. 420). Take such a machine, 36 processors on one bus, and plug in a 37th. The machine barely gets faster. Worse, every memory access of the other 36 now waits a little longer: the 37th processor has made the bus slower for everyone.</p>
+  <p>Architects answered with networks of many links. A 64-node ring has 64 links where a bus has one. Yet when half of the machine sends data to the other half, the ring is "only 2× bus" — the notes' own verdict (p. 423). Sixty-four times the wires, twice the speed.</p>
+  <p>Both puzzles have the same answer. It is a single number, and by the end of the lesson you will compute it for any network.</p>
+</div>
+
+<section id="l33-what">
+  <h2>What makes a machine a multiprocessor</h2>
+
+  <p>Open the task manager of a laptop under load: several cores are busy at once, each running its own program or thread. One operating system schedules them all, and each core can load any address of the one memory. That chip is a multiprocessor. A rack of a hundred web servers is not: a hundred operating systems, a hundred separate memories, messages over a network — a cluster (<a href="l34.html">lesson 34</a>).</p>
+
+  <div class="def">
+    <p><dfn>Multiprocessor</dfn> — "a computer system with tightly coupled processors, coordinated by a single operating system, and typically offering a shared memory abstraction (shared address space)" (p. 417): processors that "remain part of one coherent machine, not a loose cluster".</p>
+  </div>
+
+  <p>Its execution paradigm is <mark class="key">MIMD</mark> (multiple instruction, multiple data): every processor runs its own instruction stream on its own data (Flynn's taxonomy, <a href="l30.html">lesson 30</a>). What it harvests is <mark class="key">thread-level parallelism</mark> (TLP), many independent streams at once — where instruction-level parallelism overlaps the instructions of one stream (lessons 7–21) and data-level parallelism applies one instruction to many elements (lessons 30–32). Multithreading (<a href="l29.html">lesson 29</a>) shares one core among threads; a multiprocessor gives each thread a core of its own.</p>
+
+  <p>Why build one? The notes give four goals (p. 417). <b>Performance</b>: very high throughput from TLP. <b>Scalability</b>: performance that grows, ideally linearly, as processors are added. <b>Reliability</b>: redundancy lets the machine tolerate some faults. <b>Versatility</b>: the same idea from embedded systems to high-end servers. Behind all four is history: "the shift from single-core → multicore → manycore reflects the industry response to ILP and frequency walls" — the walls of <a href="l08.html#l08-limits">lesson 8</a>.</p>
+
+  <p>The notes sort multiprocessors by integration and scale; from left to right the machines grow and the memory spreads out.</p>
+
+  <figure class="tbl-fig" id="l33-tbl-scales">
+    <figcaption>The notes' taxonomy by integration and scale (p. 417), with the memory and the coherence style of each.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Multicore</th><th>SMP</th><th>Large-scale multiprocessor</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">what</th><td>several cores on the same chip; a <em>manycore</em> beyond 32 cores</td><td>symmetric multiprocessor: all processors share one centralized memory</td><td>distributed shared memory (DSM): the memory is physically spread over the nodes</td></tr>
+          <tr><th scope="row">size, examples</th><td>Intel i7, AMD Ryzen, ARM big.LITTLE</td><td>typically ≤ 32 processors</td><td>beyond 32 processors</td></tr>
+          <tr><th scope="row">memory access</th><td>uniform: one chip is a small SMP</td><td>uniform: UMA, Uniform Memory Access</td><td>non-uniform: NUMA, local fast and remote slow</td></tr>
+          <tr><th scope="row">coherence</th><td>snooping on small chips (p. 432)</td><td>snooping protocols</td><td>directory-based protocols</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Two typos of the chapter, so that they do not puzzle you: "bit.LITTLE" (p. 417) is ARM's big.LITTLE, and "DMS" (p. 445) is DSM.</aside>
+
+  <p>In one sentence of the notes: "centralized memory works up to a point, beyond which distribution is necessary" (p. 417). SMP or NUMA is a scalability decision, and the coherence protocol comes with it — snooping, every cache listening to one shared medium, for small machines; directories, a table next to each memory recording who holds a copy, for large ones (lessons 35–38).</p>
+
+  <aside class="margin-note">"Most existing multicore chips today are SMPs" (p. 417) holds per chip: two such chips in a two-socket server already make a NUMA machine (lesson 34).</aside>
+
+  <div class="pitfall"><p>"A multicore is a SIMD machine." No: every core has its own program counter and fetches its own instructions — MIMD. SIMD lives inside a core, in its vector or packed units (lessons 30–32).</p></div>
+
+  <p class="memo"><mark class="key">Multiprocessors are not just "more cores": they are about how processors, memory and communication are organised and coordinated (p. 417).</mark></p>
+</section>
+
+<section id="l33-questions">
+  <h2>Ten questions every multiprocessor answers</h2>
+
+  <p>Every machine with more than one processor answers ten questions, whether its designers meant to or not. The notes list them (pp. 418–419) under one frame: architects balance <em>scalability</em> — network, memory placement, coherence protocol — against <em>programmability</em> — shared memory or message passing — and design hardware and software together "to extract parallelism and hide communication latency".</p>
+
+  <figure class="tbl-fig" id="l33-tbl-questions">
+    <figcaption>The ten design questions of the notes (pp. 418–419), the options they list, and where this notebook answers each.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>#</th><th>Question</th><th>The options</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>How many processors?</td><td>small: 2–8 cores (single bus, snooping, UMA); medium: 8–32; large: hundreds to thousands (NUMA, DSM or message passing) — chosen by the workload: servers, embedded, HPC</td><td>this lesson</td></tr>
+          <tr><td class="num">2</td><td>How powerful are they?</td><td>a few complex out-of-order cores or many simple in-order ones, as in IBM Blue Gene: single-thread speed against throughput; performance per watt rules at large scale</td><td><a href="l08.html">lesson 8</a></td></tr>
+          <tr><td class="num">3</td><td>How are they connected?</td><td>a bus: cheap, simple, saturates at ≈ 36 processors; or an interconnection network: rings, meshes, crossbars, hypercubes — it sets bandwidth, latency and scalability</td><td>sections 3–5</td></tr>
+          <tr><td class="num">4</td><td>How do they share data?</td><td>shared memory: implicit, through loads and stores, coherence needed; message passing: explicit send and receive, simpler hardware, harder programming</td><td>below; <a href="l34.html">lesson 34</a></td></tr>
+          <tr><td class="num">5</td><td>Where is the physical memory?</td><td>centralized (UMA): uniform access, easy, a bottleneck; distributed (NUMA): scalable, non-uniform latency</td><td><a href="l34.html">lesson 34</a></td></tr>
+          <tr><td class="num">6</td><td>How do they coordinate?</td><td>locks, barriers, atomic operations; their cost can limit scalability</td><td><a href="l34.html">lesson 34</a></td></tr>
+          <tr><td class="num">7</td><td>How are they programmed?</td><td>multiprogramming (independent jobs), threads on shared memory, MPI processes, data-parallel / SPMD in bulk-synchronous phases</td><td><a href="l34.html">lesson 34</a></td></tr>
+          <tr><td class="num">8</td><td>How do the caches stay coherent?</td><td>snooping protocols on small SMPs, directory protocols on large NUMA machines</td><td><a href="l35.html">lessons 35–38</a></td></tr>
+          <tr><td class="num">9</td><td>In which order do writes become visible?</td><td>memory consistency: sequential consistency (simple, slow) or relaxed models (complex, efficient)</td><td><a href="l35.html">lesson 35</a></td></tr>
+          <tr><td class="num">10</td><td>How is performance evaluated?</td><td>speedup against the number of processors (Amdahl, Gustafson), local against remote latency, network and memory bandwidth, performance per watt and per cost</td><td>section 6</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">The notes file NUMA under "Medium-scale: 8-32 cores" (p. 418); a single chip of that size normally still has one memory system — NUMA arrives with several sockets (lesson 34).</aside>
+
+  <h3>Shared memory or message passing: same power, different price</h3>
+
+  <p>Question 4 hides a surprise. With shared memory a processor communicates by storing to an address that another one later loads from; nobody sends anything. With message passing it calls <code>send</code> and the other calls <code>receive</code>. Different worlds — yet each can be built out of the other:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Messages built on shared memory">
+      <p>The sender writes the message into a buffer in shared memory, then sets a flag. The receiver waits until the flag is set and reads the buffer. A send is a few stores, a receive a few loads.</p>
+    </div>
+    <div class="compare-col" data-label="Shared memory built on messages">
+      <p>One process owns the data. A load becomes a request message to the owner, who replies with the value; a store becomes a message carrying the new value. A load is one send and one receive.</p>
+    </div>
+  </div>
+
+  <p>So neither model is more powerful than the other: both are <mark class="key">Turing complete</mark> (footnote 11, p. 418) — each can compute anything a Turing machine (an endless tape, a read/write head and a table of rules) can compute. "Choosing shared memory vs. message passing does not limit what can be computed, only how" (p. 419). The difference is practicality: performance, programmability, ease of reasoning. Shared memory is natural to program but needs coherence hardware; message passing needs simpler hardware but makes the programmer move every byte (lesson 34).</p>
+</section>
+
+<section id="l33-bus">
+  <h2>One bus for everyone — until it is full</h2>
+
+  <p>Start with the simplest wiring, the one the notes draw first (Fig. 31, p. 422): every processor, with its cache, hangs on a single bus, and so do the main memory and the I/O system. Every cache miss of every processor becomes a transaction on it, and it carries one transaction at a time.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-bus">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="Four processors P0 to P3, each with its cache, hang on one bus together with the main memory and the I/O system; memory sends data to cache C1 over the bus while the requests of C0, C2 and C3 wait">
+        <line x1="42" y1="48" x2="42" y2="58"/>
+        <line x1="114" y1="48" x2="114" y2="58"/>
+        <line x1="186" y1="48" x2="186" y2="58"/>
+        <line x1="258" y1="48" x2="258" y2="58"/>
+        <line x1="8" y1="118" x2="292" y2="118" class="st-ink sw-4"/>
+        <line x1="42" y1="84" x2="42" y2="111" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="186" y1="84" x2="186" y2="111" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="258" y1="84" x2="258" y2="111" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="114" y1="115" x2="114" y2="85" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="100" y1="150" x2="100" y2="123" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="226" y1="150" x2="226" y2="120"/>
+        <rect x="12" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="84" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="156" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="228" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="20" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="92" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="164" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="236" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="64" y="150" width="72" height="30" class="fi-paper sw-2"/>
+        <rect x="196" y="150" width="60" height="30" class="fi-paper sw-2"/>
+        <text x="42" y="37" class="tx-mid tx-mono">P0</text>
+        <text x="114" y="37" class="tx-mid tx-mono">P1</text>
+        <text x="186" y="37" class="tx-mid tx-mono">P2</text>
+        <text x="258" y="37" class="tx-mid tx-mono">P3</text>
+        <text x="42" y="74" class="tx-mid tx-mono tx-sm">C0</text>
+        <text x="114" y="74" class="tx-mid tx-mono tx-sm">C1</text>
+        <text x="186" y="74" class="tx-mid tx-mono tx-sm">C2</text>
+        <text x="258" y="74" class="tx-mid tx-mono tx-sm">C3</text>
+        <text x="100" y="170" class="tx-mid">memory</text>
+        <text x="226" y="170" class="tx-mid">I/O</text>
+        <text x="292" y="108" class="tx-end tx-sm">bus</text>
+        <text x="150" y="216" class="tx-mid tx-hand">one at a time</text>
+      </svg>
+      <p class="fig-label">Before: one bus, one transfer at a time</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="The same four processors and caches reach one memory split into four banks through an interconnection network; bank 2 sends data to C0 and bank 1 sends data to C3 at the same time">
+        <line x1="42" y1="48" x2="42" y2="58"/>
+        <line x1="114" y1="48" x2="114" y2="58"/>
+        <line x1="186" y1="48" x2="186" y2="58"/>
+        <line x1="258" y1="48" x2="258" y2="58"/>
+        <rect x="8" y="100" width="284" height="34" rx="6" class="fi-soft"/>
+        <line x1="42" y1="80" x2="42" y2="100"/>
+        <line x1="114" y1="80" x2="114" y2="100"/>
+        <line x1="186" y1="80" x2="186" y2="100"/>
+        <line x1="258" y1="80" x2="258" y2="100"/>
+        <line x1="42" y1="134" x2="42" y2="156"/>
+        <line x1="114" y1="134" x2="114" y2="156"/>
+        <line x1="186" y1="134" x2="186" y2="156"/>
+        <line x1="258" y1="134" x2="258" y2="156"/>
+        <line x1="186" y1="156" x2="52" y2="86" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="114" y1="156" x2="248" y2="86" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="12" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="84" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="156" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="228" y="16" width="60" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="20" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="92" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="164" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="236" y="58" width="44" height="22" class="fi-paper"/>
+        <rect x="20" y="156" width="44" height="24" class="fi-paper sw-2"/>
+        <rect x="92" y="156" width="44" height="24" class="fi-paper sw-2"/>
+        <rect x="164" y="156" width="44" height="24" class="fi-paper sw-2"/>
+        <rect x="236" y="156" width="44" height="24" class="fi-paper sw-2"/>
+        <text x="42" y="37" class="tx-mid tx-mono">P0</text>
+        <text x="114" y="37" class="tx-mid tx-mono">P1</text>
+        <text x="186" y="37" class="tx-mid tx-mono">P2</text>
+        <text x="258" y="37" class="tx-mid tx-mono">P3</text>
+        <text x="42" y="74" class="tx-mid tx-mono tx-sm">C0</text>
+        <text x="114" y="74" class="tx-mid tx-mono tx-sm">C1</text>
+        <text x="186" y="74" class="tx-mid tx-mono tx-sm">C2</text>
+        <text x="258" y="74" class="tx-mid tx-mono tx-sm">C3</text>
+        <text x="16" y="121" class="tx-sm">network</text>
+        <text x="42" y="172" class="tx-mid tx-sm">bank 0</text>
+        <text x="114" y="172" class="tx-mid tx-sm">bank 1</text>
+        <text x="186" y="172" class="tx-mid tx-sm">bank 2</text>
+        <text x="258" y="172" class="tx-mid tx-sm">bank 3</text>
+        <text x="150" y="206" class="tx-mid tx-sm">one memory in four banks</text>
+      </svg>
+      <p class="fig-label">After: a network, several transfers at once</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Left: the notes' Figure 31 (p. 422) redrawn — every cache miss of every processor is a transaction on the one bus, so while memory answers C1 the requests of C0, C2 and C3 wait. Right: the same processors and the same central memory, split into four banks behind an interconnection network; two misses travel at once on different paths. Only the wiring changed: the memory did not move.</figcaption>
+  </figure>
+
+  <p>Count what that means. Suppose a processor running alone keeps the bus busy a fraction \(d\) of the time — say one miss every 100 ns, each holding the bus for 2.8 ns, so \(d = 2.8\%\), a value picked here to land on the notes' number. Two such processors keep it busy 5.6% of the time, ten 28%. A bus cannot be busier than 100%, so it carries the traffic of at most</p>
+  \[ P_{\max} \approx \frac{1}{d} = \frac{1}{0.028} \approx 36 \]
+  <p>processors. That is how a bus ends at the notes' "≈36 processors" (p. 420): not a law of nature, but the capacity of the bus divided by the demand of one processor.</p>
+
+  <p>Below the ceiling most requests find the bus free, so throughput grows almost linearly. Near it requests queue; past it each new processor brings a customer and no capacity, so throughput flattens and every access waits longer. The hardware adds a second reason (background, not in the notes): every device loads the wires electrically, so a bus built for more slots runs a slower clock.</p>
+
+  <div class="widget" id="l33-w-bus">
+    <h3 class="widget-title">The bus that stops helping</h3>
+    <p class="widget-intro">Throughput is counted in processors' worth: 10 means as much work as ten processors running alone. The bus curve comes from a standard queueing model (mean-value analysis) of processors that compute, miss in their cache and wait for a bus that serves one miss at a time. The network is modelled as one whose capacity grows with the machine; its only price is that every miss crosses switches and takes three bus-transfer times. \(d\) is the share of the bus one processor would use if it ran alone.</p>
+    <ol class="tasks">
+      <li>Leave \(d\) at 2.8% and predict, before touching P: where does the bus curve go flat? Then drag P to 64.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Near \(1/d = 35.7\) processors' worth. At P = 64 the bus delivers 35.7 — as much as 36 processors working alone — while each processor runs at 56% of its solo speed. The bus is 100% busy, and every access takes 29 times its idle-bus time.</p></details>
+      </li>
+      <li>Set P = 36 and read the access time. Now add the 37th processor: what does it buy, and what does it cost?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Throughput goes from 32.0 to 32.6 processors' worth — the note says the newcomer added 0.53 of a processor — while every bus access goes from 5.4 to 5.9 times the idle-bus time, for all 37 processors. That is the 37th processor making the bus slower for everyone.</p></details>
+      </li>
+      <li>Find the P at which the bus becomes 80% busy. What is happening to each processor there?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At P = 31. At 32 processors the bus is 83% busy, every access already takes 4 times as long as on an idle bus, and each processor runs at 92% of its solo speed; from there every newcomer buys less than the one before. This is the size where the notes' SMPs stop: "typically ≤ 32 processors".</p></details>
+      </li>
+      <li>Halve the demand to 1.4% — what bigger private caches would do. Where is the ceiling now, and where do the two curves cross?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The ceiling doubles to 71.4: at P = 64 the bus still delivers 60.6 and is 85% busy. Bigger caches are what let bus-based machines grow from a handful of processors to a few tens. The crossing with the network moves from about P = 28 to about P = 52; below it the bus wins, because every network access crosses switches.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-bus', function (root, ui) {
+    var L = 3, PMAX = 64;                       /* a network access costs L bus-transfer times */
+    var pS = ui.slider({ label: 'processors P', min: 1, max: PMAX, step: 1, value: 36 });
+    var dS = ui.slider({ label: 'bus share one processor needs alone, d', min: 1, max: 10, step: 0.1, value: 2.8,
+      format: function (v) { return v.toFixed(1) + '%'; } });
+    var roCeil = ui.readout('bus ceiling 1/d'), roUtil = ui.readout('bus busy'), roAcc = ui.readout('one bus access takes'),
+        roBus = ui.readout('throughput with the bus'), roNet = ui.readout('throughput with a network');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0, 64], y: [0, 66], xLabel: 'processors P', yLabel: 'throughput (× one processor)', aspect: 1.55,
+      label: 'Throughput against the number of processors for a single bus and for a network, with the ideal line and the bus ceiling' });
+    ui.legend([
+      { label: 'single bus', color: 's4', mark: 'line' },
+      { label: 'network', color: 's5', mark: 'line' },
+      { label: 'ideal: P processors', color: 's6', mark: 'dash' },
+      { label: 'bus ceiling 1/d', color: 'soft', mark: 'dash' }
+    ]);
+
+    /* exact mean-value analysis of a closed queue: P processors, one bus (time unit = one solo access interval) */
+    function curves() {
+      var d = dS.value / 100, S = d, Z = 1 - d, Q = 0, bus = [[0, 0]], net = [[0, 0]], rows = [null];
+      for (var n = 1; n <= PMAX; n++) {
+        var R = S * (1 + Q), X = n / (Z + R);
+        Q = X * R;
+        rows.push({ X: X, slow: R / S, util: X * S });
+        bus.push([n, X]);
+        net.push([n, n / (Z + L * S)]);
+      }
+      return { d: d, bus: bus, net: net, rows: rows };
+    }
+    var C = curves();
+    function curP() { return Math.max(1, Math.min(PMAX, Math.round(pS.value))); }
+
+    plot.draw(function (g) {
+      var P = curP(), ceil = 1 / C.d;
+      g.line([[0, 0], [64, 64]], { color: 's6', dash: true });
+      if (ceil <= 64) g.hline(ceil, { color: 'soft', dash: true, label: '1/d = ' + ceil.toFixed(1) });
+      g.line(C.net, { color: 's5', width: 2.5 });
+      g.line(C.bus, { color: 's4', width: 2.5 });
+      g.vline(P, { color: 'muted', dash: true });
+      g.points([[P, C.bus[P][1]]], { color: 's4', r: 6 });
+      g.points([[P, C.net[P][1]]], { color: 's5', r: 6, shape: 'square' });
+    });
+
+    ui.onChange(function () {
+      C = curves();
+      var P = curP(), r = C.rows[P], prev = P > 1 ? C.rows[P - 1] : null, gain = prev ? r.X - prev.X : r.X;
+      roCeil.set((1 / C.d).toFixed(1) + ' processors');
+      roUtil.set(Math.round(100 * r.util) + '%');
+      roAcc.set('× ' + r.slow.toFixed(1) + ' the idle-bus time');
+      roBus.set(r.X.toFixed(1) + ' (each processor at ' + Math.round(100 * r.X / P) + '%)');
+      roNet.set(C.net[P][1].toFixed(1));
+      if (!prev) note.set('One processor alone: it uses the bus ' + (100 * C.d).toFixed(1) + '% of the time and never waits.');
+      else if (r.util < 0.5) note.set('The bus is mostly idle: processor ' + P + ' added ' + gain.toFixed(2) + ' of a processor’s throughput.');
+      else if (r.util < 0.8) note.set('Requests start to queue: processor ' + P + ' added ' + gain.toFixed(2) + ' of a processor, and every access waits a little longer.');
+      else note.set('Past the knee: processor ' + P + ' added only ' + gain.toFixed(2) + ' of a processor and made every bus access slower, from × ' + prev.slow.toFixed(1) + ' to × ' + r.slow.toFixed(1) + ' the idle-bus time.');
+    });
+  });
+  </script>
+
+  <aside class="margin-note">Four numbers, one story: a bus is comfortable up to about 8 processors (p. 418), its sweet spot is 8–16 (p. 420), classic SMPs stop near 32 (p. 417), and it is saturated by 36 (p. 420).</aside>
+
+  <p>The notes' cost/performance trade-off (p. 420) puts prices on the picture. Past its sweet spot the bus "plateaus regardless of added CPUs"; a network is "initially costlier (switches, links)" but keeps the performance per processor roughly constant, so it will "always win once the bus reaches its plateau". Hence small SMPs of 4–16 cores ruled desktops and servers, while large HPC systems adopted meshes, tori and fat trees.</p>
+
+  <div class="story" data-year="1972"><p>Revisiting his SISD / SIMD / MIMD classification, Michael Flynn already warned that MIMD "multiprocessors are subjected to a saturation syndrome based on general communications lockout": past some size, processors wait for the shared path instead of computing.</p></div>
+
+  <p>The bus is not dead, though. Its weakness is also its strength: because everyone shares it, everyone hears every transaction — exactly what a snooping coherence protocol needs (<a href="l35.html">lesson 35</a>).</p>
+
+  <h3>Network-connected multiprocessors</h3>
+
+  <p>The alternative is an <mark class="key">interconnection network</mark>: many point-to-point links joined by switches, so that transfers on different links proceed at once (Fig. 1, right). It takes the bus off the critical path and "can scale to many more processors" (p. 420). The notes' description of it needs a correction:</p>
+
+  <aside class="redpen" data-page="420">
+    <p class="claim">"In Network-Connected Multiprocessors, each processor has its onw local memory. The interconnection network is used <em>only</em> for inter-processor communication, not for every single load/store."</p>
+    <p class="fix">How the nodes are wired (bus or network) and where the memory sits (centralized or distributed) are separate choices. A network that joins the processors to one central memory carries every cache miss; one that joins nodes each holding part of the memory carries every remote load and store. Only in a message-passing machine does it carry nothing but messages between processors.</p>
+    <p class="because">The notes' own Figure 34 (p. 427) shows a UMA machine whose processors reach one central main memory through an "Interconnection Network": every cache miss crosses it, as on the right of Fig. 1. And in the distributed version, "if P0 accesses data in MM3 (remote memory), it must cross the interconnect" (p. 429) — that is a plain load.</p>
+  </aside>
+</section>
+
+<section id="l33-metrics">
+  <h2>Which number tells the truth: total and bisection bandwidth</h2>
+
+  <p>To compare networks you need numbers. Take the notes' 8-node ring (p. 423) with \(b = 1\) GB/s per link. If every node talks to a neighbour, all 8 links work at once: 8 GB/s. Now run a fire drill: the four nodes on the left each send to a partner on the right, at the same moment. Whatever routes they take, all that traffic must squeeze through the links that join the two halves — 2 of them. The network moves 2 GB/s.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-ring">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 228" role="img" aria-label="An 8-node ring with all eight links highlighted: total bandwidth 8 links times b, 8 GB/s">
+        <line x1="178" y1="42" x2="217" y2="80" class="hl"/>
+        <line x1="217" y1="80" x2="217" y2="136" class="hl"/>
+        <line x1="217" y1="136" x2="178" y2="174" class="hl"/>
+        <line x1="178" y1="174" x2="122" y2="174" class="hl"/>
+        <line x1="122" y1="174" x2="83" y2="136" class="hl"/>
+        <line x1="83" y1="136" x2="83" y2="80" class="hl"/>
+        <line x1="83" y1="80" x2="122" y2="42" class="hl"/>
+        <line x1="122" y1="42" x2="178" y2="42" class="hl"/>
+        <line x1="178" y1="42" x2="217" y2="80" class="sw-2"/>
+        <line x1="217" y1="80" x2="217" y2="136" class="sw-2"/>
+        <line x1="217" y1="136" x2="178" y2="174" class="sw-2"/>
+        <line x1="178" y1="174" x2="122" y2="174" class="sw-2"/>
+        <line x1="122" y1="174" x2="83" y2="136" class="sw-2"/>
+        <line x1="83" y1="136" x2="83" y2="80" class="sw-2"/>
+        <line x1="83" y1="80" x2="122" y2="42" class="sw-2"/>
+        <line x1="122" y1="42" x2="178" y2="42" class="sw-2"/>
+        <circle cx="178" cy="42" r="13" class="fi-paper sw-2"/>
+        <circle cx="217" cy="80" r="13" class="fi-paper sw-2"/>
+        <circle cx="217" cy="136" r="13" class="fi-paper sw-2"/>
+        <circle cx="178" cy="174" r="13" class="fi-paper sw-2"/>
+        <circle cx="122" cy="174" r="13" class="fi-paper sw-2"/>
+        <circle cx="83" cy="136" r="13" class="fi-paper sw-2"/>
+        <circle cx="83" cy="80" r="13" class="fi-paper sw-2"/>
+        <circle cx="122" cy="42" r="13" class="fi-paper sw-2"/>
+        <text x="178" y="46" class="tx-mid tx-mono tx-sm">0</text>
+        <text x="217" y="84" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="217" y="140" class="tx-mid tx-mono tx-sm">2</text>
+        <text x="178" y="178" class="tx-mid tx-mono tx-sm">3</text>
+        <text x="122" y="178" class="tx-mid tx-mono tx-sm">4</text>
+        <text x="83" y="140" class="tx-mid tx-mono tx-sm">5</text>
+        <text x="83" y="84" class="tx-mid tx-mono tx-sm">6</text>
+        <text x="122" y="46" class="tx-mid tx-mono tx-sm">7</text>
+        <text x="150" y="102" class="tx-mid">8 links × b</text>
+        <text x="150" y="124" class="tx-mid tx-bold">= 8 GB/s</text>
+        <text x="150" y="216" class="tx-mid tx-hand">neighbours talk</text>
+      </svg>
+      <p class="fig-label">Total bandwidth: count every link</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 228" role="img" aria-label="The same ring cut in half by a vertical line: only the two links between nodes 7 and 0 and between nodes 3 and 4 cross the cut, bisection bandwidth 2 GB/s">
+        <line x1="122" y1="42" x2="178" y2="42" class="hl"/>
+        <line x1="178" y1="174" x2="122" y2="174" class="hl"/>
+        <line x1="178" y1="42" x2="217" y2="80" class="sw-2"/>
+        <line x1="217" y1="80" x2="217" y2="136" class="sw-2"/>
+        <line x1="217" y1="136" x2="178" y2="174" class="sw-2"/>
+        <line x1="178" y1="174" x2="122" y2="174" class="sw-2"/>
+        <line x1="122" y1="174" x2="83" y2="136" class="sw-2"/>
+        <line x1="83" y1="136" x2="83" y2="80" class="sw-2"/>
+        <line x1="83" y1="80" x2="122" y2="42" class="sw-2"/>
+        <line x1="122" y1="42" x2="178" y2="42" class="sw-2"/>
+        <line x1="150" y1="12" x2="150" y2="196" class="sw-2 dash"/>
+        <circle cx="178" cy="42" r="13" class="fi-paper sw-2"/>
+        <circle cx="217" cy="80" r="13" class="fi-paper sw-2"/>
+        <circle cx="217" cy="136" r="13" class="fi-paper sw-2"/>
+        <circle cx="178" cy="174" r="13" class="fi-paper sw-2"/>
+        <circle cx="122" cy="174" r="13" class="fi-paper sw-2"/>
+        <circle cx="83" cy="136" r="13" class="fi-paper sw-2"/>
+        <circle cx="83" cy="80" r="13" class="fi-paper sw-2"/>
+        <circle cx="122" cy="42" r="13" class="fi-paper sw-2"/>
+        <text x="178" y="46" class="tx-mid tx-mono tx-sm">0</text>
+        <text x="217" y="84" class="tx-mid tx-mono tx-sm">1</text>
+        <text x="217" y="140" class="tx-mid tx-mono tx-sm">2</text>
+        <text x="178" y="178" class="tx-mid tx-mono tx-sm">3</text>
+        <text x="122" y="178" class="tx-mid tx-mono tx-sm">4</text>
+        <text x="83" y="140" class="tx-mid tx-mono tx-sm">5</text>
+        <text x="83" y="84" class="tx-mid tx-mono tx-sm">6</text>
+        <text x="122" y="46" class="tx-mid tx-mono tx-sm">7</text>
+        <text x="150" y="102" class="tx-mid halo">2 links × b</text>
+        <text x="150" y="124" class="tx-mid tx-bold halo">= 2 GB/s</text>
+        <text x="150" y="218" class="tx-mid tx-hand">half talks to half</text>
+      </svg>
+      <p class="fig-label">Bisection bandwidth: count the links the cut crosses</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> The notes' 8-node ring (p. 423), \(b = 1\) GB/s per link. Left: when every node talks to a neighbour, all 8 links work at once — the total bandwidth, 8 GB/s. Right: when the four nodes on one side talk to the four on the other, everything must cross the two links the dashed cut severs — the bisection bandwidth, 2 GB/s.</figcaption>
+  </figure>
+
+  <p>Those two numbers are the canonical metrics of the notes (p. 421):</p>
+
+  <div class="def">
+    <p><dfn>Total network bandwidth</dfn> (best case) — the sum of the bandwidths of all links: "the maximum aggregate throughput that the network could deliver if all links were used simultaneously and were perfectly balanced".</p>
+    <p><dfn>Bisection bandwidth</dfn> (worst case) — "the minimum total bandwidth of links that must be cut to split the network into two equal halves (each with half the nodes)".</p>
+  </div>
+
+  <div class="formula" data-label="(87), (88)">
+    \[ \text{Total BW} = M \times b \]
+    \[ \text{Bisection BW} = \min_{\text{cuts}} \sum_{\text{crossing links}} b \]
+    <dl class="legend">
+      <dt>\(M\)</dt><dd>number of links in the network</dd>
+      <dt>\(b\)</dt><dd>bandwidth of one link (GB/s)</dd>
+      <dt>cuts</dt><dd>every way of splitting the \(P\) nodes into two halves of \(P/2\)</dd>
+    </dl>
+  </div>
+
+  <p>Why the minimum? Because different splits cross different numbers of links: split the 8-node ring into its odd and its even nodes and all 8 links cross; split it into two arcs and only 2 do. The narrowest passage decides, so "we have to try all possible cuts and select the smallest one" (p. 421) — the notes' "any cut crosses 2 links" means a cut through the ring as drawn. The minimum is a hard limit: if each of the \(P/2\) nodes on one side sends \(m\) bytes across, the transfer takes at least</p>
+  \[ t \ge \frac{(P/2)\, m}{\text{Bisection BW}} , \]
+  <p>however fast the rest of the network is. Apply both definitions to the bus: it is one link, so its total bandwidth is \(b\); a cut through it severs that link, so its bisection is \(b\) as well. On a bus the best case is the worst case.</p>
+
+  <div class="pitfall"><p>"The bisection bandwidth is half the total." No: the 64-node ring has a total of \(64b\) and a bisection of \(2b\).</p></div>
+
+  <aside class="margin-note">The letters of this lesson: \(P\) nodes, \(M\) links, \(b\) per link. The notes reuse \(N\) for three things: the side of a mesh, \(N = \sqrt{P}\); the dimension of a hypercube, \(N = \log_2 P\); and, on p. 420, the number of CPUs.</aside>
+
+  <p>Two more numbers, which the notes use ("logarithmic diameter", p. 424) but never define, complete every comparison of networks (Hennessy &amp; Patterson, Appendix F). The <mark class="key">diameter</mark> is the largest, over all pairs of nodes, of the number of links on the shortest path between them; every link is a hop through a switch, so the diameter measures the worst-case latency. The <mark class="key">degree</mark> is the number of links per node, the ports of its router, so it measures cost. The 8-node ring has diameter 4 and degree 2.</p>
+
+  <p class="memo"><mark class="key">Total bandwidth is the best case, neighbours talking; bisection bandwidth is the worst case, half the machine talking to the other half — and the worst case is the one that bounds global traffic.</mark></p>
+</section>
+
+<section id="l33-topologies">
+  <h2>The classic topologies, by counting and cutting</h2>
+
+  <p>A <mark class="key">topology</mark> is "the way processors and memories are interconnected" (p. 422): it sets how processors communicate (direct neighbours or global links), how far the system scales and what it costs in wires and switches. The notes give five classic ones, studied since the 70s–90s and still behind today's networks-on-chip and HPC interconnects. Their formulas need no memorising: each follows from two moves, count the links and cut the network in half.</p>
+
+  <p>Try both on the notes' Figure 32 (p. 424), a 4 × 4 mesh: four rows of 3 horizontal links and four columns of 3 vertical ones make 24 links, and a cut between the two middle columns crosses one link per row, 4 links — exactly the notes' numbers. The stepper repeats the two moves for every topology.</p>
+
+  <ol class="steps" id="l33-steps-count">
+    <li><p><b>Ring, count.</b> Each of the \(P\) nodes has 2 links and each link has 2 ends, so counting ends counts every link twice:</p>
+      \[ M = \frac{2P}{2} = P \]
+      \[ \text{BW}_{\text{total}} = P\,b \]</li>
+    <li><p><b>Ring, cut.</b> Split the loop into two arcs of \(P/2\) nodes. Walking round a closed loop you pass from one half to the other an even number of times, at least twice — and two arcs need exactly two cuts, wherever they fall:</p>
+      \[ \text{BW}_{\text{bisect}} = 2b \]</li>
+    <li><p><b>Mesh, count.</b> \(N = \sqrt{P}\) rows, each with \(N - 1\) horizontal links, and \(N\) columns, each with \(N - 1\) vertical links:</p>
+      \[ M = 2N(N-1) \]</li>
+    <li><p><b>Mesh, cut.</b> Cut between the two middle columns (\(N\) even): one horizontal link per row crosses, and no balanced cut crosses fewer.</p>
+      \[ \text{BW}_{\text{bisect}} = N\,b = \sqrt{P}\,b \]</li>
+    <li><p><b>Hypercube, count.</b> \(P = 2^N\) nodes, each with \(N\) links, every link counted from both ends:</p>
+      \[ M = \frac{N P}{2} \]</li>
+    <li><p><b>Hypercube, cut.</b> Cut along the top address bit: the two \((N-1)\)-cubes of the doubling (Fig. 3) fall apart, and each node loses exactly one link, the one to its twin. \(P\) nodes, two ends per link:</p>
+      \[ \text{BW}_{\text{bisect}} = \frac{P}{2}\, b = 2^{N-1}\, b \]</li>
+    <li><p><b>Fully connected, count and cut.</b> One link for every pair of nodes; and each of the \(P/2\) nodes of one half has its own link to each of the \(P/2\) nodes of the other:</p>
+      \[ M = \frac{P(P-1)}{2} \]
+      \[ \text{BW}_{\text{bisect}} = \Big(\frac{P}{2}\Big)^2 b \]</li>
+  </ol>
+
+  <figure class="tbl-fig" id="l33-tbl-topo">
+    <figcaption>The five classic topologies of the notes (pp. 422–424, eqs. 89–98, with the hypercube bisection corrected), two extras, and their total / bisection bandwidth in GB/s for \(P = 16\) and \(b = 1\) GB/s. The diameter and port columns are not among the notes' equations.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Topology</th><th>Total BW</th><th>Bisection BW</th><th>Diameter</th><th>Ports per node</th><th>\(P = 16\)</th></tr></thead>
+        <tbody>
+          <tr><td>single bus</td><td>\(b\) (89)</td><td>\(b\) (90)</td><td>1, shared</td><td>1</td><td class="num">1 / 1</td></tr>
+          <tr><td>ring</td><td>\(P\,b\) (91)</td><td>\(2b\) (92)</td><td>\(P/2\)</td><td>2</td><td class="num">16 / 2</td></tr>
+          <tr><td>2-D mesh, \(N = \sqrt{P}\)</td><td>\(2N(N-1)\,b\) (95)</td><td>\(N\,b\) (96)</td><td>\(2(N-1)\)</td><td>2 to 4</td><td class="num">24 / 4</td></tr>
+          <tr class="is-key"><td>hypercube, \(P = 2^N\)</td><td>\((NP/2)\,b\) (97)</td><td>\((P/2)\,b = 2^{N-1} b\) (98, corrected)</td><td>\(N = \log_2 P\)</td><td>\(N\)</td><td class="num">32 / 8</td></tr>
+          <tr><td>fully connected</td><td>\(P(P-1)/2 \cdot b\) (93)</td><td>\((P/2)^2\, b\) (94)</td><td>1</td><td>\(P - 1\)</td><td class="num">120 / 64</td></tr>
+          <tr><td>2-D torus (extra), \(N\) even</td><td>\(2P\,b\)</td><td>\(2N\,b\)</td><td>\(N\)</td><td>4</td><td class="num">32 / 8</td></tr>
+          <tr><td>crossbar switch (extra)</td><td>\(P\,b\)</td><td>\((P/2)\,b\)</td><td>1 switch</td><td>1</td><td class="num">16 / 8</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="tbl-fig" id="l33-tbl-verdict">
+    <figcaption>The notes' verdict on each of the five (pp. 418, 422–424): what it buys and what it costs.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Topology</th><th>Pro</th><th>Con</th></tr></thead>
+        <tbody>
+          <tr><td>single bus</td><td>cheap, simple</td><td>very low scalability; saturates quickly</td></tr>
+          <tr><td>ring</td><td>good best-case parallelism</td><td>worst case only 2× bus</td></tr>
+          <tr><td>2-D mesh</td><td>good scalability; cost-effective</td><td>multiple hops increase latency</td></tr>
+          <tr><td>hypercube</td><td>very good connectivity; logarithmic diameter</td><td>wiring complexity grows</td></tr>
+          <tr><td>fully connected</td><td>non-blocking; high performance</td><td>very high cost, growing as \(P^2\)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The hypercube deserves a picture: its formula is the one the notes get wrong. An \(N\)-dimensional hypercube is built by doubling: take two copies of the \((N-1)\)-cube and join every node to its twin in the other copy — the node whose \(N\)-bit address differs only in the top bit.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-cube">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="Two separate squares of four nodes: a 2-cube with the addresses 000, 001, 010, 011 and its copy with 100, 101, 110, 111">
+        <line x1="40" y1="80" x2="110" y2="80" class="sw-2"/>
+        <line x1="190" y1="80" x2="260" y2="80" class="sw-2"/>
+        <line x1="40" y1="150" x2="110" y2="150" class="sw-2"/>
+        <line x1="190" y1="150" x2="260" y2="150" class="sw-2"/>
+        <line x1="40" y1="80" x2="40" y2="150" class="sw-2"/>
+        <line x1="110" y1="80" x2="110" y2="150" class="sw-2"/>
+        <line x1="190" y1="80" x2="190" y2="150" class="sw-2"/>
+        <line x1="260" y1="80" x2="260" y2="150" class="sw-2"/>
+        <circle cx="40" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="110" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="190" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="260" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="40" cy="150" r="17" class="fi-paper sw-2"/>
+        <circle cx="110" cy="150" r="17" class="fi-paper sw-2"/>
+        <circle cx="190" cy="150" r="17" class="fi-paper sw-2"/>
+        <circle cx="260" cy="150" r="17" class="fi-paper sw-2"/>
+        <text x="40" y="84" class="tx-mid tx-mono tx-sm">010</text>
+        <text x="110" y="84" class="tx-mid tx-mono tx-sm">011</text>
+        <text x="190" y="84" class="tx-mid tx-mono tx-sm">110</text>
+        <text x="260" y="84" class="tx-mid tx-mono tx-sm">111</text>
+        <text x="40" y="154" class="tx-mid tx-mono tx-sm">000</text>
+        <text x="110" y="154" class="tx-mid tx-mono tx-sm">001</text>
+        <text x="190" y="154" class="tx-mid tx-mono tx-sm">100</text>
+        <text x="260" y="154" class="tx-mid tx-mono tx-sm">101</text>
+        <text x="75" y="204" class="tx-mid tx-sm tx-muted">top bit 0</text>
+        <text x="225" y="204" class="tx-mid tx-sm tx-muted">top bit 1</text>
+      </svg>
+      <p class="fig-label">Before: two 2-cubes, 4 + 4 links</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="The two squares joined into a 3-cube: four new links connect each node to its twin with the top bit flipped, and a vertical cut between the squares severs exactly those four links">
+        <path d="M40,80 Q115,8 190,80" class="hl"/>
+        <path d="M110,80 Q185,8 260,80" class="hl"/>
+        <path d="M40,150 Q115,218 190,150" class="hl"/>
+        <path d="M110,150 Q185,218 260,150" class="hl"/>
+        <path d="M40,80 Q115,8 190,80" class="sw-2"/>
+        <path d="M110,80 Q185,8 260,80" class="sw-2"/>
+        <path d="M40,150 Q115,218 190,150" class="sw-2"/>
+        <path d="M110,150 Q185,218 260,150" class="sw-2"/>
+        <line x1="40" y1="80" x2="110" y2="80" class="sw-2"/>
+        <line x1="190" y1="80" x2="260" y2="80" class="sw-2"/>
+        <line x1="40" y1="150" x2="110" y2="150" class="sw-2"/>
+        <line x1="190" y1="150" x2="260" y2="150" class="sw-2"/>
+        <line x1="40" y1="80" x2="40" y2="150" class="sw-2"/>
+        <line x1="110" y1="80" x2="110" y2="150" class="sw-2"/>
+        <line x1="190" y1="80" x2="190" y2="150" class="sw-2"/>
+        <line x1="260" y1="80" x2="260" y2="150" class="sw-2"/>
+        <line x1="150" y1="10" x2="150" y2="196" class="sw-2 dash"/>
+        <circle cx="40" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="110" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="190" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="260" cy="80" r="17" class="fi-paper sw-2"/>
+        <circle cx="40" cy="150" r="17" class="fi-paper sw-2"/>
+        <circle cx="110" cy="150" r="17" class="fi-paper sw-2"/>
+        <circle cx="190" cy="150" r="17" class="fi-paper sw-2"/>
+        <circle cx="260" cy="150" r="17" class="fi-paper sw-2"/>
+        <text x="40" y="84" class="tx-mid tx-mono tx-sm">010</text>
+        <text x="110" y="84" class="tx-mid tx-mono tx-sm">011</text>
+        <text x="190" y="84" class="tx-mid tx-mono tx-sm">110</text>
+        <text x="260" y="84" class="tx-mid tx-mono tx-sm">111</text>
+        <text x="40" y="154" class="tx-mid tx-mono tx-sm">000</text>
+        <text x="110" y="154" class="tx-mid tx-mono tx-sm">001</text>
+        <text x="190" y="154" class="tx-mid tx-mono tx-sm">100</text>
+        <text x="260" y="154" class="tx-mid tx-mono tx-sm">101</text>
+        <text x="150" y="222" class="tx-mid tx-hand">4 links cross</text>
+      </svg>
+      <p class="fig-label">After: join every node to its twin, 4 new links</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Doubling builds the hypercube. Two copies of the 2-cube (left) become a 3-cube when every node is joined to its twin, the address with the top bit flipped (right). The joining links are exactly the links a cut between the two copies severs: \(2^{N-1} = P/2\) of them. Here \(N = 3\): 12 links in all, 4 across the cut.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="424">
+    <p class="claim">"\(\text{BW}_{\text{bisect}} = 2(N-1) \cdot b\)"</p>
+    <p class="fix">\(\text{BW}_{\text{bisect}} = 2^{N-1}\, b = (P/2)\, b\): the 2 is raised to the power \(N - 1\), not multiplied by it.</p>
+    <p class="because">Cut the cube along its top address bit: each pair of twins loses its link, so the cut severs \(P/2\) links. For \(N = 2\) and \(N = 3\) both formulas give 2 and 4 — the two examples printed under eq. (98), which is why the slip hides; for \(N = 4\) (16 nodes) the cut has 8 links where the formula says 6, for \(N = 6\), 32 against 10. A brute-force search over all 6435 balanced cuts of the 16-node cube finds none below 8. The list on p. 421 repeats the formula. Moral: check a formula on three cases, not two.</p>
+  </aside>
+
+  <div class="widget" id="l33-w-topo">
+    <h3 class="widget-title">Cut it in half: a topology explorer</h3>
+    <p class="widget-intro">Pick a topology and a number of nodes; every link carries \(b = 1\) GB/s. The widget draws the network, counts its links, ports and diameter, and — with the cut on — splits the nodes into two halves (filled and hollow) along the cheapest balanced cut and highlights the links it severs. A mesh or a torus needs \(P = N^2\) with \(N\) even and a hypercube \(P = 2^N\): the drawing snaps to the nearest such \(P\).</p>
+    <ol class="tasks">
+      <li>With the ring, predict before you move the slider: when P goes from 8 to 64, what happens to the total bandwidth and to the bisection?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The total grows from 8 to 64 GB/s; the bisection stays at 2 GB/s. In the half-to-half test each of the 32 senders gets 0.06 GB/s, against 0.50 GB/s with 8 nodes. The ring owns 64 links, but global traffic squeezes through 2.</p></details>
+      </li>
+      <li>Switch to the 2-D mesh and compare P = 16 with P = 64. The machine grows 4 times: by how much does the bisection grow?
+        <details class="answer"><summary>What you should see</summary>
+          <p>From 4 to 8 GB/s: twice, \(\sqrt{4}\). The cut is one column of links, and a column is only \(\sqrt{P}\) long. The total grows from 24 to 112 links, so each sender's share in the half-to-half test halves, from 0.50 to 0.25 GB/s.</p></details>
+      </li>
+      <li>Hypercube, P = 16. The notes' eq. (98) gives \(2(N-1)\,b = 6\) GB/s. Count the highlighted links before you read the readout.
+        <details class="answer"><summary>What you should see</summary>
+          <p>8 links: the bisection is \(P/2 \cdot b = 8\) GB/s, and every sender of the half-to-half test gets a full 1 GB/s. At P = 64 the gap is 32 against the formula's 10. At P = 4 and 8 the two agree (2 and 4), which is why the notes' examples look right.</p></details>
+      </li>
+      <li>Compare the fully connected network and the crossbar at P = 64. Which has the larger bisection, and what does each pay for it?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Fully connected: 2016 links, 63 ports on every node, a bisection of 1024 GB/s. Crossbar: 64 links, one port per node, 4096 crosspoints, a bisection of 32 GB/s — the hypercube's number. Yet in the half-to-half test every crossbar sender still gets its full 1 GB/s: the crossbar is non-blocking. Most of the fully connected network's bisection only helps when every node talks to many others at once.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-topo', function (root, ui) {
+    var B = 1;                                            /* GB/s per link, as in the notes' examples */
+    var topo = ui.select('topology', [
+      { value: 'bus', label: 'single bus' },
+      { value: 'ring', label: 'ring' },
+      { value: 'mesh', label: '2-D mesh' },
+      { value: 'cube', label: 'hypercube' },
+      { value: 'full', label: 'fully connected' },
+      { value: 'torus', label: '2-D torus (not in the notes)' },
+      { value: 'xbar', label: 'crossbar switch (not in the notes)' }
+    ], null, 'ring');
+    var pS = ui.slider({ label: 'nodes P', min: 4, max: 64, step: 1, value: 16 });
+    var cutT = ui.toggle('cut the network in half', true);
+    var roP = ui.readout('drawn'), roM = ui.readout('links M'), roDeg = ui.readout('ports per node'),
+        roDiam = ui.readout('diameter'), roTot = ui.readout('total bandwidth'), roBis = ui.readout('bisection bandwidth'),
+        roPer = ui.readout('each of the P/2 senders gets');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0, 160], y: [0, 100], equalAspect: true, axes: false, grid: false, aspect: 1.6, minHeight: 250,
+      label: 'The chosen network drawn node by node; with the cut on, a dashed line splits the nodes into two halves and the links that cross it are highlighted' });
+    ui.legend([
+      { label: 'node of one half', color: 'ink', mark: 'dot' },
+      { label: 'node of the other half', color: 'ink', mark: 'ring' },
+      { label: 'link that crosses the cut', color: 'ink', mark: 'hl' },
+      { label: 'the cut', color: 'soft', mark: 'dash' }
+    ]);
+
+    /* P allowed by each topology: even P; meshes and tori N x N with N even; hypercubes powers of two */
+    function snapP(t, want) {
+      var v = Math.round(want), list, best, i;
+      if (t === 'mesh') list = [4, 16, 36, 64];
+      else if (t === 'torus') list = [16, 36, 64];
+      else if (t === 'cube') list = [4, 8, 16, 32, 64];
+      else { v = Math.max(4, Math.min(64, v)); return v % 2 ? v + (v < 64 ? 1 : -1) : v; }
+      function dist(p) { return t === 'cube' ? Math.abs(Math.log(p) - Math.log(Math.max(1, v))) : Math.abs(p - v); }
+      best = list[0];
+      for (i = 1; i < list.length; i++) if (dist(list[i]) < dist(best)) best = list[i];
+      return best;
+    }
+    function bez(x1, y1, cx, cy, x2, y2) {
+      var pts = [];
+      for (var k = 0; k <= 10; k++) {
+        var t = k / 10, a = (1 - t) * (1 - t), b = 2 * (1 - t) * t, c = t * t;
+        pts.push([a * x1 + b * cx + c * x2, a * y1 + b * cy + c * y2]);
+      }
+      return pts;
+    }
+    /* the network as nodes (x, y, half) and links (a, b, crosses the cut?, drawn path); drawing space 160 x 100, y up */
+    function build(t, want) {
+      var P = snapP(t, want), nodes = [], links = [], i, j, k;
+      var m = { topo: t, P: P, nodes: nodes, links: links };
+      function link(a, b, cross, path) { links.push({ a: a, b: b, cross: !!cross, path: path || null }); }
+      if (t === 'bus') {
+        var hN = P / 2, colsH = Math.ceil(hN / 2), w = 62 / colsH;
+        for (i = 0; i < P; i++) {
+          var h = i < hN ? 0 : 1, q = h ? i - hN : i, c = Math.floor(q / 2);
+          nodes.push({ x: (h ? 87 : 11) + (c + 0.5) * w, y: q % 2 ? 26 : 74, half: h });
+        }
+        m.busY = 50; m.cut = [[80, 4], [80, 96]];
+        m.M = 1; m.cross = 1; m.deg = '1 tap on the bus'; m.diam = '1 hop, shared'; m.layout = 'one bus';
+      } else if (t === 'ring' || t === 'full') {
+        for (i = 0; i < P; i++) {
+          var th = Math.PI / 2 - 2 * Math.PI * (i + 0.5) / P;
+          nodes.push({ x: 80 + 42 * Math.cos(th), y: 50 + 42 * Math.sin(th), half: i < P / 2 ? 1 : 0 });
+        }
+        if (t === 'ring') for (i = 0; i < P; i++) link(i, (i + 1) % P, nodes[i].half !== nodes[(i + 1) % P].half);
+        else for (i = 0; i < P; i++) for (j = i + 1; j < P; j++) link(i, j, nodes[i].half !== nodes[j].half);
+        m.cut = [[80, 2], [80, 98]];
+        m.layout = t === 'ring' ? 'a loop' : 'every pair wired';
+      } else if (t === 'mesh' || t === 'torus') {
+        var N = Math.round(Math.sqrt(P)), s = Math.min(34, 72 / (N - 1)), x0 = 80 - s * (N - 1) / 2, y0 = 50 + s * (N - 1) / 2;
+        for (var r = 0; r < N; r++) for (var cc = 0; cc < N; cc++) nodes.push({ x: x0 + cc * s, y: y0 - r * s, half: cc < N / 2 ? 0 : 1 });
+        for (r = 0; r < N; r++) for (cc = 0; cc < N; cc++) {
+          var id = r * N + cc;
+          if (cc + 1 < N) link(id, id + 1, cc === N / 2 - 1);
+          if (r + 1 < N) link(id, id + N, false);
+          if (t === 'torus') {
+            if (cc === N - 1) link(id, r * N, true, 'wrapx');
+            if (r === N - 1) link(id, cc, false, 'wrapy');
+          }
+        }
+        m.N = N; m.s = s;
+        var xc = x0 + s * (N / 2 - 0.5);
+        m.cut = [[xc, Math.min(99, y0 + 0.8 * s)], [xc, Math.max(1, y0 - s * (N - 1) - 0.8 * s)]];
+        m.layout = N + ' × ' + N + (t === 'torus' ? ' grid with wrap-around links' : ' grid');
+      } else if (t === 'cube') {
+        var n = Math.round(Math.log(P) / Math.LN2), ncol = 1 << Math.ceil(n / 2), nrow = 1 << Math.floor(n / 2);
+        var sc = Math.min(40, 120 / (ncol - 1), 80 / (nrow - 1)), X0 = 80 - sc * (ncol - 1) / 2, Yb = 50 - sc * (nrow - 1) / 2;
+        for (i = 0; i < P; i++) {                         /* even address bits give the column, odd bits the row (row 0 at the bottom) */
+          var col = 0, row = 0;
+          for (k = 0; k < n; k++) { var bit = (i >> k) & 1; if (k % 2 === 0) col += bit << (k / 2); else row += bit << ((k - 1) / 2); }
+          nodes.push({ x: X0 + col * sc, y: Yb + row * sc, half: (i >> (n - 1)) & 1 });
+        }
+        for (i = 0; i < P; i++) for (k = 0; k < n; k++) {
+          j = i ^ (1 << k);
+          if (i > j) continue;
+          var A = nodes[i], Bn = nodes[j], dst = 1 << Math.floor(k / 2), path = null;
+          if (dst > 1) {                                  /* long links as arcs: outwards for N <= 4, alternating by dimension beyond */
+            var away = k % 2 === 0 ? (A.y > 50 ? 1 : -1) : (A.x < 80 ? 1 : -1);
+            var hh = (dst === 2 ? 0.34 : 0.5) * sc * (n <= 4 ? away : (k % 4 < 2 ? 1 : -1));
+            path = k % 2 === 0 ? bez(A.x, A.y, (A.x + Bn.x) / 2, A.y + 2 * hh, Bn.x, Bn.y) : bez(A.x, A.y, A.x - 2 * hh, (A.y + Bn.y) / 2, Bn.x, Bn.y);
+          }
+          link(i, j, k === n - 1, path);
+        }
+        if ((n - 1) % 2 === 0) { var xm = X0 + sc * (ncol / 2 - 0.5); m.cut = [[xm, Math.max(1, Yb - 0.9 * sc)], [xm, Math.min(99, Yb + sc * (nrow - 1) + 0.9 * sc)]]; }
+        else { var ym = Yb + sc * (nrow / 2 - 0.5); m.cut = [[Math.max(1, X0 - 0.9 * sc), ym], [Math.min(159, X0 + sc * (ncol - 1) + 0.9 * sc), ym]]; }
+        m.n = n;
+        m.layout = 'N = ' + n + ' dimensions';
+      } else {
+        var half = P / 2, step = 84 / Math.max(1, half - 1);
+        for (i = 0; i < P; i++) {
+          var left = i < half, idx = left ? i : i - half;
+          nodes.push({ x: left ? 20 : 140, y: 92 - idx * step, half: left ? 0 : 1, port: 70 - 40 * (idx + 0.5) / half });
+        }
+        for (i = 0; i < P; i++) link(i, -1, nodes[i].half === 1);
+        m.sw = [58, 28, 102, 72]; m.cut = [[121, 2], [121, 98]];
+        m.deg = '1, into the switch'; m.diam = '1 switch'; m.layout = 'one ' + P + ' × ' + P + ' switch';
+      }
+      if (m.M === undefined) m.M = links.length;
+      if (m.cross === undefined) m.cross = links.filter(function (l) { return l.cross; }).length;
+      if (m.deg === undefined) {
+        var adj = nodes.map(function () { return []; });
+        links.forEach(function (l) { adj[l.a].push(l.b); adj[l.b].push(l.a); });
+        var dmin = Infinity, dmax = 0, D = 0;
+        adj.forEach(function (a) { dmin = Math.min(dmin, a.length); dmax = Math.max(dmax, a.length); });
+        m.deg = dmin === dmax ? String(dmax) : dmin + ' to ' + dmax;
+        for (var s0 = 0; s0 < P; s0++) {                 /* breadth-first search from every node */
+          var dd = [], qu = [s0], qi = 0;
+          for (var z = 0; z < P; z++) dd.push(-1);
+          dd[s0] = 0;
+          while (qi < qu.length) { var u = qu[qi++]; for (var e = 0; e < adj[u].length; e++) { var v = adj[u][e]; if (dd[v] < 0) { dd[v] = dd[u] + 1; qu.push(v); if (dd[v] > D) D = dd[v]; } } }
+        }
+        m.diam = D + (D === 1 ? ' hop' : ' hops');
+      }
+      return m;
+    }
+
+    function polysOf(m, l) {
+      var A = m.nodes[l.a], s;
+      if (l.b < 0) return [[[A.x, A.y], [A.half ? m.sw[2] : m.sw[0], A.port]]];      /* crossbar: node to switch */
+      var Bn = m.nodes[l.b];
+      if (l.path === 'wrapx') { s = 0.45 * m.s; return [[[A.x, A.y], [A.x + s, A.y]], [[Bn.x, Bn.y], [Bn.x - s, Bn.y]]]; }
+      if (l.path === 'wrapy') { s = 0.45 * m.s; return [[[A.x, A.y], [A.x, A.y - s]], [[Bn.x, Bn.y], [Bn.x, Bn.y + s]]]; }
+      if (l.path) return [l.path];
+      return [[[A.x, A.y], [Bn.x, Bn.y]]];
+    }
+    /* many lines in one path: thousands of links stay fast, and overlapping highlighter strokes do not darken */
+    function strokeAll(g, polys, color, width, alpha) {
+      if (!polys.length) return;
+      var c = g.ctx;
+      c.save(); c.beginPath();
+      polys.forEach(function (P) {
+        c.moveTo(g.px(P[0][0]), g.py(P[0][1]));
+        for (var i = 1; i < P.length; i++) c.lineTo(g.px(P[i][0]), g.py(P[i][1]));
+      });
+      c.strokeStyle = g.colors[color]; c.lineWidth = width; c.globalAlpha = alpha == null ? 1 : alpha;
+      c.lineCap = 'round'; c.lineJoin = 'round'; c.setLineDash([]); c.stroke(); c.restore();
+    }
+    function gb(v) { return (Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(2)) + ' GB/s'; }
+    function explain(m) {
+      var P = m.P, N = m.N, n = m.n;
+      if (m.topo === 'bus') return 'One link that every node taps. The cut severs it, so the total and the bisection are both <b>b = 1 GB/s</b>, whatever P; in the half-to-half test the ' + P / 2 + ' senders take turns on it.';
+      if (m.topo === 'ring') return 'Each node has 2 links and each link 2 ends: M = P = ' + P + '. Split into two arcs, the loop is cut in exactly two places, and no balanced split cuts fewer: bisection <b>2b</b>, for every P.';
+      if (m.topo === 'mesh') return N + ' rows of ' + (N - 1) + ' links and ' + N + ' columns of ' + (N - 1) + ': M = 2N(N − 1) = ' + m.M + '. The cut between the two middle columns crosses one link per row: <b>N = ' + N + '</b>.';
+      if (m.topo === 'torus') return 'The mesh plus a wrap-around link for every row and every column (the stubs at the edges): M = 2P = ' + m.M + '. The cut crosses ' + N + ' links in the middle and the ' + N + ' row wrap-arounds: <b>2N = ' + 2 * N + '</b>.';
+      if (m.topo === 'cube') {
+        var bad = 2 * (n - 1);
+        return 'Every node has N = ' + n + ' links, each counted from both ends: M = NP/2 = ' + m.M + '. Cutting along the top address bit severs exactly the links that joined the two copies: <b>P/2 = ' + P / 2 + '</b>. The notes’ eq. (98), 2(N − 1)·b, gives ' + bad + ' GB/s' + (bad === P / 2 ? ': for N = 2 and N = 3 the two formulas happen to agree.' : ' — count the highlighted links.');
+      }
+      if (m.topo === 'full') return 'A link for every pair: M = P(P − 1)/2 = ' + m.M + '. Each of the ' + P / 2 + ' nodes of one half is wired to each of the ' + P / 2 + ' of the other: <b>(P/2)² = ' + m.cross + '</b>, bought with P − 1 = ' + (P - 1) + ' ports on every node.';
+      return 'One link per node into a ' + P + ' × ' + P + ' switch: ' + P * P + ' crosspoints connect any input to any output. The cut must pass beside the switch, so it severs one link per node of the other half: <b>P/2 = ' + P / 2 + '</b>, as in the hypercube.';
+    }
+
+    var cur = build(topo.value, pS.value);
+
+    plot.draw(function (g) {
+      var m = cur, cut = cutT.value, plain = [], hot = [], dense = m.links.length > 300, i;
+      m.links.forEach(function (l) {
+        var ps = polysOf(m, l), into = cut && l.cross ? hot : plain;
+        for (var k = 0; k < ps.length; k++) into.push(ps[k]);
+      });
+      if (m.topo === 'xbar') {
+        var sw = m.sw, grid = [];
+        for (i = 0; i < m.P; i++) {
+          var yy = sw[1] + (sw[3] - sw[1]) * (i + 0.5) / m.P, xx = sw[0] + (sw[2] - sw[0]) * (i + 0.5) / m.P;
+          grid.push([[sw[0], yy], [sw[2], yy]]);
+          grid.push([[xx, sw[1]], [xx, sw[3]]]);
+        }
+        g.rect(sw[0], sw[1], sw[2], sw[3], { color: 'paper', alpha: 1, stroke: 'ink', width: 2 });
+        strokeAll(g, grid, 'muted', 0.6, 0.8);
+      }
+      if (m.topo === 'bus') m.nodes.forEach(function (nd) { plain.push([[nd.x, nd.y], [nd.x, m.busY]]); });
+      strokeAll(g, plain, dense ? 'muted' : 'ink', dense ? 0.5 : 1.3, dense ? 0.75 : 1);
+      if (m.topo === 'bus') {
+        var bus = [[6, m.busY], [154, m.busY]];
+        if (cut) strokeAll(g, [bus], 'key', 12, 0.6);
+        strokeAll(g, [bus], 'ink', 4);
+      }
+      if (hot.length) {
+        strokeAll(g, hot, 'key', hot.length > 32 ? 5 : 9, 0.55);
+        strokeAll(g, hot, 'ink', hot.length > 32 ? 0.8 : 2);
+      }
+      if (cut) g.line(m.cut, { color: 'soft', dash: true, width: 2 });
+      var rr = m.P <= 8 ? 6 : m.P <= 16 ? 5 : m.P <= 36 ? 4 : 3.2;
+      g.points(m.nodes, { color: 'ink', r: rr, ring: true, hollow: function (p) { return cut && p.half === 1; } });
+      if (m.topo === 'cube' && m.P <= 16) {
+        m.nodes.forEach(function (nd, idx) {
+          var bits = idx.toString(2);
+          while (bits.length < m.n) bits = '0' + bits;
+          g.text(nd.x, nd.y, bits, { font: 'mono', size: 10.5, align: 'center', baseline: 'bottom', dy: -8, color: 'soft' });
+        });
+      }
+    });
+
+    ui.onChange(function () {
+      var m = cur = build(topo.value, pS.value), P = m.P;
+      var tot = (m.topo === 'xbar' ? P : m.M) * B, bis = m.cross * B;
+      roP.set(P + ' nodes · ' + m.layout);
+      roM.set(m.topo === 'bus' ? '1, the bus itself' : m.topo === 'xbar' ? P + ' links + ' + P * P + ' crosspoints' : String(m.M));
+      roDeg.set(m.deg);
+      roDiam.set(m.diam);
+      roTot.set(gb(tot));
+      roBis.set(gb(bis));
+      roPer.set(gb(bis / (P / 2)));
+      note.set(explain(m));
+    });
+  });
+  </script>
+
+  <p>The fully connected network wins every bandwidth contest: diameter 1 and a bisection that grows as \(P^2\). Its price grows as \(P^2\) too — \(P(P-1)/2\) cables and \(P - 1\) ports on every node, "very high cost" (p. 423). The notes file it under another name.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-xbar">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="Four nodes P0 to P3 fully connected: six cables, one for every pair, and three ports on every node">
+        <line x1="90" y1="55" x2="210" y2="55" class="sw-2"/>
+        <line x1="90" y1="165" x2="210" y2="165" class="sw-2"/>
+        <line x1="65" y1="70" x2="65" y2="150" class="sw-2"/>
+        <line x1="235" y1="70" x2="235" y2="150" class="sw-2"/>
+        <line x1="90" y1="70" x2="210" y2="150" class="sw-2"/>
+        <line x1="210" y1="70" x2="90" y2="150" class="sw-2"/>
+        <rect x="40" y="40" width="50" height="30" rx="4" class="fi-paper sw-2"/>
+        <rect x="210" y="40" width="50" height="30" rx="4" class="fi-paper sw-2"/>
+        <rect x="40" y="150" width="50" height="30" rx="4" class="fi-paper sw-2"/>
+        <rect x="210" y="150" width="50" height="30" rx="4" class="fi-paper sw-2"/>
+        <text x="65" y="60" class="tx-mid tx-mono">P0</text>
+        <text x="235" y="60" class="tx-mid tx-mono">P1</text>
+        <text x="65" y="170" class="tx-mid tx-mono">P2</text>
+        <text x="235" y="170" class="tx-mid tx-mono">P3</text>
+        <text x="150" y="214" class="tx-mid tx-sm">6 cables, 3 ports per node</text>
+      </svg>
+      <p class="fig-label">Fully connected: a cable for every pair</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="A 4 by 4 crossbar: four input rows from P0 to P3 cross four output columns to P0 to P3 at sixteen crosspoints; two closed crosspoints connect P0 to P2 and P3 to P1 at the same time">
+        <line x1="44" y1="50" x2="176" y2="50" class="hl"/>
+        <line x1="176" y1="50" x2="176" y2="176" class="hl"/>
+        <line x1="44" y1="155" x2="136" y2="155" class="hl"/>
+        <line x1="136" y1="155" x2="136" y2="176" class="hl"/>
+        <line x1="44" y1="50" x2="246" y2="50"/>
+        <line x1="44" y1="85" x2="246" y2="85"/>
+        <line x1="44" y1="120" x2="246" y2="120"/>
+        <line x1="44" y1="155" x2="246" y2="155"/>
+        <line x1="96" y1="30" x2="96" y2="176"/>
+        <line x1="136" y1="30" x2="136" y2="176"/>
+        <line x1="176" y1="30" x2="176" y2="176"/>
+        <line x1="216" y1="30" x2="216" y2="176"/>
+        <circle cx="96" cy="50" r="5" class="fi-paper"/>
+        <circle cx="136" cy="50" r="5" class="fi-paper"/>
+        <circle cx="176" cy="50" r="5" class="fi-ink"/>
+        <circle cx="216" cy="50" r="5" class="fi-paper"/>
+        <circle cx="96" cy="85" r="5" class="fi-paper"/>
+        <circle cx="136" cy="85" r="5" class="fi-paper"/>
+        <circle cx="176" cy="85" r="5" class="fi-paper"/>
+        <circle cx="216" cy="85" r="5" class="fi-paper"/>
+        <circle cx="96" cy="120" r="5" class="fi-paper"/>
+        <circle cx="136" cy="120" r="5" class="fi-paper"/>
+        <circle cx="176" cy="120" r="5" class="fi-paper"/>
+        <circle cx="216" cy="120" r="5" class="fi-paper"/>
+        <circle cx="96" cy="155" r="5" class="fi-paper"/>
+        <circle cx="136" cy="155" r="5" class="fi-ink"/>
+        <circle cx="176" cy="155" r="5" class="fi-paper"/>
+        <circle cx="216" cy="155" r="5" class="fi-paper"/>
+        <text x="36" y="54" class="tx-end tx-mono tx-sm">P0</text>
+        <text x="36" y="89" class="tx-end tx-mono tx-sm">P1</text>
+        <text x="36" y="124" class="tx-end tx-mono tx-sm">P2</text>
+        <text x="36" y="159" class="tx-end tx-mono tx-sm">P3</text>
+        <text x="36" y="24" class="tx-end tx-sm tx-muted">send</text>
+        <text x="96" y="194" class="tx-mid tx-mono tx-sm">P0</text>
+        <text x="136" y="194" class="tx-mid tx-mono tx-sm">P1</text>
+        <text x="176" y="194" class="tx-mid tx-mono tx-sm">P2</text>
+        <text x="216" y="194" class="tx-mid tx-mono tx-sm">P3</text>
+        <text x="236" y="194" class="tx-sm tx-muted">receive</text>
+        <text x="150" y="222" class="tx-mid tx-sm">16 crosspoints, 1 link per node each way</text>
+      </svg>
+      <p class="fig-label">Crossbar: one switch with \(P^2\) crosspoints</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> Two non-blocking networks for \(P = 4\). Left: fully connected — a cable for every pair, \(P(P-1)/2 = 6\), and \(P - 1 = 3\) ports on every node. Right: a crossbar switch — every node has one link in (its row) and one link out (its column), and closing a crosspoint connects a row to a column; any permutation can be closed at once, here P0 → P2 and P3 → P1. The notes' "crossbar" formulas describe the left picture.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="423">
+    <p class="claim">"Crossbar (Fully Connected Switch Network): Each processor has a dedicated bidirectional link to every other."</p>
+    <p class="fix">A dedicated link between every pair of processors makes a fully connected network, and eqs. (93)–(94) are its formulas: keep them under that name. A crossbar is a switch: every processor has one link into it, and a grid of \(P \times P\) crosspoints connects any input to any output.</p>
+    <p class="because">Count Fig. 4 for \(P = 4\): 6 cables and 3 ports per node against 4 links per direction and 16 crosspoints. Both are non-blocking, and the cost of both grows as \(P^2\) — cables in one, switch points in the other — hence the merged names. But a cut beside a crossbar severs only one link per node of the far half: \((P/2)\, b\), not \((P/2)^2\, b\). If a question pairs the label "crossbar" with eqs. (93)–(94), the formulas are what it means.</p>
+  </aside>
+
+  <h3>Beyond the five</h3>
+
+  <p>Three more shapes complete the map; the notes only name two of them. The <mark class="key">2-D torus</mark> is the mesh plus wrap-around links joining the ends of every row and column: \(2P\) links, a bisection of \(2N\) links — twice the mesh's — and about half its diameter; three-dimensional tori connected the nodes of Cray XT and IBM Blue Gene supercomputers. A <mark class="key">tree</mark> connects \(P\) nodes cheaply, with \(P - 1\) small switches, but has a bisection of one link, at the root; the <mark class="key">fat tree</mark> thickens the links towards the root and recovers \(P/2\), which made it the standard fabric of HPC clusters.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-tree">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 224" role="img" aria-label="A binary tree of switches over eight nodes; the dashed cut between the two halves severs only the link from the root to its right child">
+        <line x1="150" y1="40" x2="224" y2="85" class="hl"/>
+        <line x1="150" y1="40" x2="76" y2="85" class="sw-2"/>
+        <line x1="150" y1="40" x2="224" y2="85" class="sw-2"/>
+        <line x1="76" y1="85" x2="40" y2="130" class="sw-2"/>
+        <line x1="76" y1="85" x2="112" y2="130" class="sw-2"/>
+        <line x1="224" y1="85" x2="188" y2="130" class="sw-2"/>
+        <line x1="224" y1="85" x2="260" y2="130" class="sw-2"/>
+        <line x1="40" y1="130" x2="22" y2="180" class="sw-2"/>
+        <line x1="40" y1="130" x2="58" y2="180" class="sw-2"/>
+        <line x1="112" y1="130" x2="94" y2="180" class="sw-2"/>
+        <line x1="112" y1="130" x2="130" y2="180" class="sw-2"/>
+        <line x1="188" y1="130" x2="170" y2="180" class="sw-2"/>
+        <line x1="188" y1="130" x2="206" y2="180" class="sw-2"/>
+        <line x1="260" y1="130" x2="242" y2="180" class="sw-2"/>
+        <line x1="260" y1="130" x2="278" y2="180" class="sw-2"/>
+        <path d="M150,205 L150,105 L200,25" class="sw-2 dash"/>
+        <circle cx="150" cy="40" r="8" class="fi-paper sw-2"/>
+        <circle cx="76" cy="85" r="8" class="fi-paper sw-2"/>
+        <circle cx="224" cy="85" r="8" class="fi-paper sw-2"/>
+        <circle cx="40" cy="130" r="8" class="fi-paper sw-2"/>
+        <circle cx="112" cy="130" r="8" class="fi-paper sw-2"/>
+        <circle cx="188" cy="130" r="8" class="fi-paper sw-2"/>
+        <circle cx="260" cy="130" r="8" class="fi-paper sw-2"/>
+        <rect x="15" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="51" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="87" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="123" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="163" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="199" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="235" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="271" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <text x="256" y="34" class="tx-mid tx-hand">1 link</text>
+      </svg>
+      <p class="fig-label">Tree: everything crosses at the root</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 224" role="img" aria-label="The same tree with fattened links: one link per node at the bottom, two per switch in the middle and four from the root to each child; the cut now severs four links">
+        <line x1="150" y1="40" x2="224" y2="85" class="hl"/>
+        <line x1="153.5" y1="45.8" x2="79.5" y2="90.8" class="sw-1"/>
+        <line x1="151.2" y1="41.9" x2="77.2" y2="86.9" class="sw-1"/>
+        <line x1="148.8" y1="38.1" x2="74.8" y2="83.1" class="sw-1"/>
+        <line x1="146.5" y1="34.2" x2="72.5" y2="79.2" class="sw-1"/>
+        <line x1="153.5" y1="34.2" x2="227.5" y2="79.2" class="sw-1"/>
+        <line x1="151.2" y1="38.1" x2="225.2" y2="83.1" class="sw-1"/>
+        <line x1="148.8" y1="41.9" x2="222.8" y2="86.9" class="sw-1"/>
+        <line x1="146.5" y1="45.8" x2="220.5" y2="90.8" class="sw-1"/>
+        <line x1="77.8" y1="86.4" x2="41.8" y2="131.4" class="sw-1"/>
+        <line x1="74.2" y1="83.6" x2="38.2" y2="128.6" class="sw-1"/>
+        <line x1="77.8" y1="83.6" x2="113.8" y2="128.6" class="sw-1"/>
+        <line x1="74.2" y1="86.4" x2="110.2" y2="131.4" class="sw-1"/>
+        <line x1="225.8" y1="86.4" x2="189.8" y2="131.4" class="sw-1"/>
+        <line x1="222.2" y1="83.6" x2="186.2" y2="128.6" class="sw-1"/>
+        <line x1="225.8" y1="83.6" x2="261.8" y2="128.6" class="sw-1"/>
+        <line x1="222.2" y1="86.4" x2="258.2" y2="131.4" class="sw-1"/>
+        <line x1="40" y1="130" x2="22" y2="180" class="sw-1"/>
+        <line x1="40" y1="130" x2="58" y2="180" class="sw-1"/>
+        <line x1="112" y1="130" x2="94" y2="180" class="sw-1"/>
+        <line x1="112" y1="130" x2="130" y2="180" class="sw-1"/>
+        <line x1="188" y1="130" x2="170" y2="180" class="sw-1"/>
+        <line x1="188" y1="130" x2="206" y2="180" class="sw-1"/>
+        <line x1="260" y1="130" x2="242" y2="180" class="sw-1"/>
+        <line x1="260" y1="130" x2="278" y2="180" class="sw-1"/>
+        <path d="M150,205 L150,105 L200,25" class="sw-2 dash"/>
+        <circle cx="150" cy="40" r="9" class="fi-paper sw-2"/>
+        <circle cx="76" cy="85" r="9" class="fi-paper sw-2"/>
+        <circle cx="224" cy="85" r="9" class="fi-paper sw-2"/>
+        <circle cx="40" cy="130" r="8" class="fi-paper sw-2"/>
+        <circle cx="112" cy="130" r="8" class="fi-paper sw-2"/>
+        <circle cx="188" cy="130" r="8" class="fi-paper sw-2"/>
+        <circle cx="260" cy="130" r="8" class="fi-paper sw-2"/>
+        <rect x="15" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="51" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="87" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="123" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="163" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="199" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="235" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <rect x="271" y="173" width="14" height="14" class="fi-paper sw-2"/>
+        <text x="256" y="34" class="tx-mid tx-hand">4 links</text>
+      </svg>
+      <p class="fig-label">Fat tree: thicker links towards the root</p>
+    </div>
+    <figcaption><b>Fig. 5.</b> Background, not in the notes, which only name fat trees (pp. 420–421). Left: a binary tree joins 8 nodes with 7 switches, but all traffic between the two halves crosses the one link that the dashed cut severs beside the root: bisection \(b\). Right: a fat tree doubles the links at every level towards the root (1, 2, 4), so the same cut severs \(P/2 = 4\) links.</figcaption>
+  </figure>
+
+  <p>Why, then, do real chips use rings and meshes rather than hypercubes? A chip is flat. A ring or a mesh lies on it with short wires of equal length, and its degree stays 2 or 4 however many cores you add, while a hypercube needs ever longer wires and more router ports. So Intel's client processors link their cores with a ring, and its Xeon Scalable server chips, like Tilera's, with a 2-D mesh.</p>
+</section>
+
+<section id="l33-worth">
+  <h2>What the extra processors are worth — and the two puzzles solved</h2>
+
+  <p>Design question 10 asked how to evaluate a multiprocessor. Two examples from Hennessy &amp; Patterson (§5.1, not in the notes; the numbers vary between editions) show what eats the speedup even with a perfect network: the serial part of the program, and the time to reach remote data.</p>
+
+  <h3>The serial part: Amdahl with \(P\) processors</h3>
+
+  <p>Amdahl's law (<a href="l03.html#l03-amdahl">lesson 3</a>) with the enhancement "run on \(P\) processors" has \(S = P\). Hennessy and Patterson ask: to reach a speedup of 80 with 100 processors, what fraction of the original computation may be sequential?</p>
+
+  <ol class="steps" id="l33-steps-amdahl">
+    <li><p>Amdahl's law with \(S = P\): the fraction \(F\) runs \(P\) times faster, the rest, \(1 - F\), does not.</p>
+      \[ \text{Speedup}(P) = \frac{1}{(1-F) + \dfrac{F}{P}} \]</li>
+    <li><p>Put in the target, 80, and \(P = 100\); then turn both sides upside down:</p>
+      \[ (1-F) + \frac{F}{100} = \frac{1}{80} = 0.0125 \]</li>
+    <li><p>Collect the terms in \(F\), since \(1 - F + 0.01F = 1 - 0.99F\):</p>
+      \[ 1 - 0.99\,F = 0.0125 \]</li>
+    <li><p>Solve, and read the sequential fraction as what is left:</p>
+      \[ F = \frac{0.9875}{0.99} = 0.99747 \]
+      \[ 1 - F = 0.0025 = 0.25\% \]</li>
+  </ol>
+
+  <p>A quarter of a percent: one part in four hundred of the original time may stay serial, and even then the 100 processors deliver only 80. Gustafson's law, which the notes name on p. 419, looks at it the other way round: let the problem grow with the machine, and the scaled speedup is \((1 - F) + F \cdot P\), with \(F\) measured on the parallel machine.</p>
+
+  <h3>The remote access: 0.2% of the instructions, 160% more time</h3>
+
+  <p>The second example is a 32-processor machine with distributed memory, a 4 GHz clock and a base CPI of 0.5 when every reference hits locally. A reference to remote memory takes 100 ns and stalls the processor, and 0.2% of the instructions make one. How much faster would the machine be without remote references? With \(T_{CLK} = 1/f_{CLK} = 0.25\) ns:</p>
+
+  <div class="formula">
+    \[ \frac{t_{\text{remote}}}{T_{CLK}} = \frac{100\ \text{ns}}{0.25\ \text{ns}} = 400 \]
+    \[ CPI = 0.5 + 0.002 \times 400 = 1.3 \]
+    <dl class="legend">
+      <dt>\(t_{\text{remote}}\)</dt><dd>time of one remote access; divided by \(T_{CLK}\) it is the stall in clock cycles</dd>
+      <dt>\(0.5\)</dt><dd>base CPI, every reference local</dd>
+      <dt>\(0.002\)</dt><dd>remote references per instruction (0.2%)</dd>
+    </dl>
+  </div>
+
+  <p>Without them the CPI would be 0.5: the machine would run \(1.3 / 0.5 = 2.6\) times faster. Two remote references in a thousand instructions add 160% to the execution time — where the data lives matters as much as the wiring, the subject of the next lesson.</p>
+
+  <h3>The two puzzles, solved</h3>
+
+  <p><b>The 37th processor.</b> Every miss crosses the bus, and the bus is a single link: its total bandwidth and its bisection are the same \(b\). At 2.8% per processor, 36 processors nearly fill it; in the widget the 37th adds half a processor's throughput and makes every bus access slower for all 37. A faster bus only moves the wall; a network moves the limit to its bisection, which can grow with \(P\).</p>
+
+  <p><b>The ring.</b> Its 64 links give a total of \(64b\), but the cheapest balanced cut crosses only 2 of them: a bisection of \(2b\), twice the bus's — the notes' "only 2× bus". The other 62 links help neighbours, not halves.</p>
+
+  <p class="memo"><mark class="key">When half of a machine talks to the other half, only the links across the narrowest cut count: bisection bandwidth is the honest number, and a bus is simply a network whose bisection is one link.</mark></p>
+</section>
+
+<section id="l33-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l33-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following:</p>
+      <ol>
+        <li>Multiprocessor (tightly coupled, MIMD)</li>
+        <li>Multicore and manycore processors</li>
+        <li>Symmetric multiprocessors (SMP)</li>
+        <li>Large-scale distributed shared-memory multiprocessors</li>
+        <li>Shared-memory and message-passing communication</li>
+        <li>Single-bus interconnection</li>
+        <li>Interconnection networks</li>
+        <li>Bisection bandwidth</li>
+      </ol>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> A multiprocessor is a computer system with tightly coupled processors coordinated by a single operating system, typically offering a shared address space. Each processor runs its own instruction stream on its own data (MIMD), so the machine exploits thread-level parallelism. Benefits: high throughput on many threads or processes, performance that grows with the number of processors, tolerance of some faults through redundancy, one design from embedded systems to servers. Unlike a cluster, it has one OS and one address space.</p>
+        <p><b>2.</b> A multicore puts several cores on the same chip; beyond about 32 cores it is called a manycore. A multicore chip is a small SMP on a chip: private L1/L2 caches, usually a shared last-level cache, uniform access to memory, snooping coherence. Benefit: it turns the transistor budget into throughput through TLP — the industry's answer to the ILP and frequency (power) walls — instead of a wider or faster single core.</p>
+        <p><b>3.</b> In an SMP (centralized shared memory) all processors share one physical memory with the same access time for everyone (UMA), usually through a bus; cache coherence is kept by snooping. Benefits: simple, symmetric view for the programmer and the OS, cheap for a few processors. Limit: the shared bus and memory saturate, so SMPs typically stay at or below about 32 processors.</p>
+        <p><b>4.</b> In a distributed shared-memory (DSM) multiprocessor the memory is physically distributed among the nodes (processor + caches + local memory module) connected by an interconnection network, but forms one shared address space. Access time is non-uniform (NUMA): local is fast, remote is slower. Benefits: it scales beyond about 32 processors because memory bandwidth grows with the nodes and there is no single memory bottleneck, and it is still programmed with loads and stores. Costs: data placement matters, coherence needs directories, the network is complex.</p>
+        <p><b>5.</b> With shared memory, processors communicate implicitly by loads and stores to a common address space: natural to program, but it needs coherence hardware and explicit synchronization (locks, barriers). With message passing, each processor has a private address space and communicates explicitly with send and receive: simpler hardware, explicit control of data movement, harder programming. Both models are Turing complete and each can implement the other, so the choice affects performance, programmability and cost, not what can be computed.</p>
+        <p><b>6.</b> All processors, the memory and the I/O share one bus; every memory access (cache miss) is a bus transaction, one at a time. Benefits: cheap, simple, and a broadcast medium — every cache sees every transaction, which snooping coherence needs. Drawback: saturation. If each processor alone uses a fraction d of the bus, throughput grows linearly and then flattens near 1/d processors (commercial systems maxed out at about 36); beyond that, adding a processor only lengthens the queue and slows every access.</p>
+        <p><b>7.</b> An interconnection network connects the nodes with many point-to-point links and switches (ring, 2-D mesh, torus, hypercube, crossbar, fat tree), so many transfers proceed in parallel and the bandwidth grows with the system. Benefits: it removes the shared bus from the critical path and scales to hundreds or thousands of processors. Costs: switches and links are expensive, and multiple hops add latency. Networks are compared by total and bisection bandwidth, diameter and node degree.</p>
+        <p><b>8.</b> Bisection bandwidth is the minimum, over all cuts that split the network into two halves with equal numbers of nodes, of the total bandwidth of the links crossing the cut. It is the worst case, when half of the nodes communicate with the other half, and it bounds global traffic, while the total bandwidth (M × b, the sum of all links) is the best case for local traffic. Examples: bus b, ring 2b whatever P, 2-D mesh √P·b, hypercube (P/2)·b.</p>
+      </div>
+      <div class="exam-note">
+        <p>The 2026 paper asks its 8-point question in this form, "Explain the main concepts and benefits of each one of the following …", with five lines for each sub-point; multiprocessors and multicores are an item of the course's topic list. What earns the points: the defining words (tightly coupled, single OS, shared address space, MIMD; UMA and NUMA; implicit versus explicit communication; one transaction at a time; best case versus worst case) and a cost next to every benefit. Sub-point 6 is stronger with the 1/d argument than with the bare number 36.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l33-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Consider a multiprocessor with P = 16 nodes whose interconnection links each have a bandwidth b = 1 GB/s. Complete the following table, then explain which topology you would choose if the 16 processors communicate all-to-all, and why.</p>
+      <div class="scroll-x">
+        <table class="tbl tbl--center">
+          <thead><tr><th>Topology</th><th>Links</th><th>Total BW</th><th>Bisection BW</th><th>Diameter</th><th>Ports per node</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Single bus</th><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><th scope="row">Ring</th><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><th scope="row">2-D mesh (4 × 4)</th><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><th scope="row">Hypercube (N = 4)</th><td></td><td></td><td></td><td></td><td></td></tr>
+            <tr><th scope="row">Fully connected</th><td></td><td></td><td></td><td></td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Topology</th><th>Number of links</th><th>Total bandwidth</th><th>Bisection bandwidth</th><th>Diameter</th><th>Ports per node</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Single bus</th><td class="num">1</td><td>b = 1 GB/s</td><td>b = 1 GB/s</td><td class="num">1 (shared)</td><td class="num">1</td></tr>
+              <tr><th scope="row">Ring</th><td class="num">P = 16</td><td>P·b = 16 GB/s</td><td>2b = 2 GB/s</td><td>P/2 = 8</td><td class="num">2</td></tr>
+              <tr><th scope="row">2-D mesh (4 × 4)</th><td>2N(N − 1) = 24</td><td>24 GB/s</td><td>N·b = 4 GB/s</td><td>2(N − 1) = 6</td><td>2 to 4</td></tr>
+              <tr class="is-key"><th scope="row">Hypercube (N = 4)</th><td>NP/2 = 32</td><td>32 GB/s</td><td>(P/2)·b = 8 GB/s</td><td>N = 4</td><td class="num">4</td></tr>
+              <tr><th scope="row">Fully connected</th><td>P(P − 1)/2 = 120</td><td>120 GB/s</td><td>(P/2)²·b = 64 GB/s</td><td class="num">1</td><td class="num">15</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>All-to-all traffic crosses the machine, so it is bounded by the bisection bandwidth, not by the total. The fully connected network has the largest bisection (64 GB/s) and diameter 1, but needs 120 links and 15 ports per node. The hypercube gives 8 GB/s of bisection, so every node can send across the cut at its full link speed (8 GB/s for 8 senders), with only 32 links, 4 ports per node and a diameter of 4: the usual engineering choice at this size. The mesh is cheaper but has half the bisection and diameter 6; the ring and the bus would be throttled to 2 and 1 GB/s.</p>
+      </div>
+      <div class="exam-note">
+        <p>An exercise in the style of the papers' tables. The two traps: the hypercube bisection (8, not the 6 of the notes' eq. 98) and confusing the total with the bisection when the question is about global traffic. Write the formula before the number in each cell — a correct formula with a slip in the arithmetic is still worth most of the cell.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="1.3" data-tol="0.01" id="l33-exam-cpi">
+    <div class="exam-q" lang="en">
+      <p>A 32-processor distributed shared-memory multiprocessor runs at a clock frequency of 4 GHz. Its base CPI, when every memory reference is satisfied locally, is 0.5. A reference to remote memory takes 100 ns and stalls the processor. If 0.2% of the instructions make a remote reference, what is the CPI of the machine?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ T_{CLK} = \frac{1}{4\ \text{GHz}} = 0.25\ \text{ns} \]
+        \[ \text{remote cost} = \frac{100}{0.25} = 400 \text{ cycles} \]
+        \[ CPI = 0.5 + 0.002 \times 400 = 1.3 \]
+        <p>Without remote references the machine would be 1.3 / 0.5 = 2.6 times faster.</p>
+      </div>
+      <div class="exam-note">
+        <p>The example comes from Hennessy &amp; Patterson. The marks are in converting the 100 ns into clock cycles (400, not 100 or 0.4) and in weighting the stall by the fraction of instructions that pay it: 0.2% is 0.002, not 0.2.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="0.2525" data-tol="0.005" data-unit="%" id="l33-exam-amdahl">
+    <div class="exam-q" lang="en">
+      <p>You want a speedup of 80 on a multiprocessor with 100 processors. According to Amdahl's law, what is the largest fraction of the original execution time that may remain sequential? Give the answer in percent.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ 80 = \frac{1}{(1-F) + F/100} \]
+        \[ 1 - 0.99\,F = 0.0125 \]
+        \[ F = 0.99747, \quad 1 - F \approx 0.25\% \]
+      </div>
+      <div class="exam-note">
+        <p>The formula sheet's Amdahl's law with S = P. The answer asked for is the sequential fraction 1 − F, not F: answering 99.75% is the classic lost point. The form F = (1 − 1/Speedup)/(1 − 1/S) from lesson 3 gives the same number in one line: 0.9875 / 0.99.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l33-exam-bis">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about the bisection bandwidth of an interconnection network are true? (Multiple answers)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>It is the sum of the bandwidths of all the links of the network. <span class="fb">That is the total network bandwidth, M × b: the best case, not the worst.</span></li>
+      <li data-correct>It is the minimum bandwidth across any cut that divides the nodes into two equal halves. <span class="fb">This is the definition: the narrowest balanced cut decides.</span></li>
+      <li data-correct>For a ring it is 2b regardless of the number of nodes. <span class="fb">The cheapest balanced cut, into two arcs, crosses the loop exactly twice, whatever P.</span></li>
+      <li data-correct>For a single bus it equals the total network bandwidth. <span class="fb">The bus is one link: total and bisection are both b.</span></li>
+      <li>For a √P × √P mesh it grows linearly with P. <span class="fb">It grows as √P: the cut is one column of N = √P links.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 2, 3 and 4. Answer 1 describes the total bandwidth; the mesh bisection is N·b = √P·b, which grows as the square root of P.</p></div>
+      <div class="exam-note"><p>The family of statements mixes the two metrics on purpose. Check each against the ring and the bus, the two cases you can draw in a second.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l33-exam-cube">
+    <div class="exam-q" lang="en">
+      <p>A hypercube interconnects P = 64 nodes with links of bandwidth b = 1 GB/s. What is its bisection bandwidth? (Single answer)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>10 GB/s <span class="fb">That is 2(N − 1)·b with N = 6, the slip of the notes' eq. (98). The cut severs one link per pair of twins.</span></li>
+      <li>12 GB/s <span class="fb">That is 2N·b, a formula with no derivation behind it. Count instead: the cut along the top address bit severs one link per pair of twins, 32 links.</span></li>
+      <li data-correct>32 GB/s <span class="fb">(P/2)·b = 2^(N−1)·b: cutting along the top address bit severs the 32 links that join the two 5-cubes.</span></li>
+      <li>64 GB/s <span class="fb">That would be one link per node crossing; each crossing link joins two nodes, so it is P/2, not P.</span></li>
+      <li>192 GB/s <span class="fb">That is the total bandwidth, N·P/2·b = 6 · 32.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 3: N = log₂64 = 6, bisection = 2^(N−1)·b = (P/2)·b = 32 GB/s; the total is N·P/2·b = 192 GB/s.</p></div>
+      <div class="exam-note"><p>The distractors are the notes' wrong formula (10), the total (192) and a double count (64). The quickest route is the doubling picture: a 6-cube is two 5-cubes joined by 32 links.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l33-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>In a single-bus multiprocessor, each processor running alone keeps the bus busy 4% of the time. True or false: however many processors are attached, the machine cannot deliver more than the throughput of 25 such processors running alone.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">The bus can be busy at most 100% of the time, so it carries the traffic of at most 1 / 0.04 = 25 processors; past that, extra processors only queue.</span></li>
+      <li>False <span class="fb">Adding processors adds demand, not bus capacity: the throughput flattens at 1/d = 25 processors' worth.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True. Throughput ≤ bus capacity / demand per processor = 1 / 0.04 = 25 processors' worth; near that point the bus is saturated and every further processor only lengthens the queue for the bus.</p></div>
+      <div class="exam-note"><p>The ceiling is capacity divided by demand, the same argument that gives the notes' ≈ 36. Halve the traffic per processor (bigger caches) and the ceiling doubles.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l33-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A 16-node 2-D mesh (4 × 4) is replaced by a 64-node one (8 × 8) with the same links. What happens to the bisection bandwidth?</p>
+    <ul class="options">
+      <li data-correct>It doubles <span class="fb">\(N\,b\) goes from \(4b\) to \(8b\): the cut is one column of links, \(\sqrt{P}\) long.</span></li>
+      <li>It quadruples, like the number of nodes <span class="fb">That is roughly what the total does (24 to 112 links); the bisection grows only as \(\sqrt{P}\).</span></li>
+      <li>It stays the same <span class="fb">That is the ring's behaviour; a mesh's cut grows with its side.</span></li>
+      <li>It halves <span class="fb">Bandwidth never drops when links are added; what halves is each sender's share in the half-to-half test.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these machines are multiprocessors in the sense of the notes?</p>
+    <ul class="options">
+      <li data-correct>An 8-core laptop chip running one operating system over one memory <span class="fb">Tightly coupled cores, one OS, one shared address space: a multicore, an SMP on a chip.</span></li>
+      <li data-correct>A two-socket server running one Linux image, with one address space over the memories of both chips <span class="fb">Still one OS and one shared address space — a NUMA multiprocessor (lesson 34).</span></li>
+      <li>A rack of 16 PCs, each with its own operating system, exchanging MPI messages <span class="fb">Sixteen OS instances and sixteen private address spaces: a cluster, loosely coupled.</span></li>
+      <li>A 4-issue superscalar core running a single thread <span class="fb">One instruction stream: instruction-level parallelism inside one processor, not MIMD.</span></li>
+    </ul>
+    <p class="q-fb">The test is the definition: tightly coupled processors, a single OS, typically one shared address space.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does the bisection bandwidth of a ring stay \(2b\) however many nodes it has?</p>
+    <ul class="options">
+      <li data-correct>Split into two arcs, the loop is cut in exactly two places, and no balanced split cuts fewer <span class="fb">A closed loop is crossed an even number of times, so at least twice, and two arcs reach that minimum for any P. Other splits, odd nodes against even ones for instance, cross more links: that is why the definition takes the minimum.</span></li>
+      <li>Each node can send on only one link at a time <span class="fb">The formula counts links, not how nodes use them; ring nodes may use both links at once.</span></li>
+      <li>Longer rings run their links more slowly <span class="fb">\(b\) is the same for every link; the bisection counts links across the cut.</span></li>
+      <li>A ring's bisection always equals its degree <span class="fb">A coincidence: the 2-D torus has degree 4 and a bisection of \(2\sqrt{P}\) links.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Each processor of a bus-based SMP keeps the bus busy 5% of the time when it runs alone. Larger L2 caches halve its misses. What happens to the number of processors the bus can feed?</p>
+    <ul class="options">
+      <li data-correct>It doubles, from 20 to 40 <span class="fb">The ceiling is \(1/d\): \(1/0.05 = 20\) becomes \(1/0.025 = 40\).</span></li>
+      <li>It stays 20, because the bus did not change <span class="fb">The capacity did not change, but the demand did; the ceiling is their ratio.</span></li>
+      <li>It halves, to 10 <span class="fb">Fewer misses mean less traffic per processor, so more processors fit, not fewer.</span></li>
+      <li>It becomes unlimited <span class="fb">Every processor still uses some bus time, so the ceiling only moves.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">For \(P = 64\) nodes, which network has the larger bisection bandwidth: a crossbar switch or a 6-dimensional hypercube?</p>
+    <ul class="options">
+      <li>The crossbar, \((P/2)^2\,b\), because it has \(P^2\) crosspoints <span class="fb">\((P/2)^2\) is the fully connected network. A crossbar node has one link, so the cut severs \(P/2\) links.</span></li>
+      <li>The hypercube, because it has 192 links against the crossbar's 64 <span class="fb">The total is larger, but only 32 of its links cross the cut.</span></li>
+      <li data-correct>Neither: both have \((P/2)\,b = 32\) GB/s <span class="fb">Crossbar: one link per node of the far half. Hypercube: the 32 links that join the two 5-cubes.</span></li>
+      <li>The crossbar, because it is non-blocking and the hypercube is not <span class="fb">Non-blocking concerns routing permutations without conflicts; the bisection counts links across the cut, and here the counts are equal.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Which statement about shared memory and message passing is right?</p>
+    <ul class="options">
+      <li data-correct>Each can implement the other, so they compute the same things; they differ in programming effort, hardware cost and latency <span class="fb">Both are Turing complete: the choice limits how you compute, never what.</span></li>
+      <li>Message passing cannot express algorithms whose sharing pattern is irregular <span class="fb">It can, at the price of more programming effort: every exchange must be written out.</span></li>
+      <li>Shared memory needs no synchronization, because the data is simply there <span class="fb">The opposite: implicit communication makes races possible, so locks, barriers and atomic operations are needed.</span></li>
+      <li>Shared memory requires one physical memory <span class="fb">"Shared" means one address space; it can be built over distributed memory (DSM, lesson 34).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the remote-access example (4 GHz, base CPI 0.5, 0.2% remote references), a better network cuts the remote access time from 100 ns to 50 ns. What is the CPI now?</p>
+    <ul class="options">
+      <li data-correct>0.9 <span class="fb">50 ns is 200 cycles: \(0.5 + 0.002 \times 200 = 0.9\).</span></li>
+      <li>0.65 <span class="fb">Halving the whole CPI of 1.3 would halve the base part too, and only the remote stall got shorter.</span></li>
+      <li>1.3 <span class="fb">The stall per remote reference halved, so the CPI must drop.</span></li>
+      <li>0.7 <span class="fb">\(0.002 \times 100 = 0.2\) counts the time in nanoseconds; convert it to cycles first: 200 cycles.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l33-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A multiprocessor is a set of tightly coupled processors under a single operating system, usually with one shared address space; it is MIMD and exploits thread-level parallelism for throughput, scalability, reliability and versatility.</li>
+    <li>The three scales are the multicore chip, the SMP (centralized memory, UMA, snooping, up to about 32 processors) and the large-scale DSM (distributed memory, NUMA, directories).</li>
+    <li>Ten design questions shape every multiprocessor; shared memory and message passing are both Turing complete, so choosing between them changes cost, latency and programming effort, not what can be computed.</li>
+    <li>A single bus serves one miss at a time: throughput grows linearly up to about \(1/d\) processors and then flattens, and past the knee each new processor slows every access; networks cost more per node but keep scaling.</li>
+    <li>Total bandwidth (\(M \times b\)) is the best case for local traffic; bisection bandwidth (the narrowest balanced cut) is the worst case and bounds global traffic; diameter measures latency and degree measures cost.</li>
+    <li>Count and cut (total / bisection): bus \(b\) / \(b\), ring \(Pb\) / \(2b\), mesh \(2N(N-1)b\) / \(Nb\), hypercube \((NP/2)\,b\) / \((P/2)\,b\) (not \(2(N-1)b\)), fully connected \(P(P-1)/2 \cdot b\) / \((P/2)^2 b\); a crossbar is a switch with \(P^2\) crosspoints and a bisection of \((P/2)\,b\).</li>
+    <li>Even with a perfect network, a speedup of 80 on 100 processors allows only 0.25% serial work, and 0.2% of instructions going to 100 ns remote memory raise the CPI from 0.5 to 1.3.</li>
+  </ul>
+  <aside class="cheat" id="l33-cheat">
+    <dl>
+      <dt>Total network bandwidth</dt><dd>\(\text{Total BW} = M \times b\), with \(M\) links of bandwidth \(b\) each</dd>
+      <dt>Bisection bandwidth</dt><dd>the minimum, over all cuts into two halves of \(P/2\) nodes, of the bandwidth of the links that cross the cut</dd>
+      <dt>Single bus</dt><dd>total \(b\), bisection \(b\)</dd>
+      <dt>Ring</dt><dd>total \(P\,b\), bisection \(2b\), diameter \(P/2\), degree 2</dd>
+      <dt>2-D mesh, \(N = \sqrt{P}\)</dt><dd>total \(2N(N-1)\,b\), bisection \(N\,b\), diameter \(2(N-1)\)</dd>
+      <dt>Hypercube, \(P = 2^N\)</dt><dd>total \((NP/2)\,b\), bisection \((P/2)\,b = 2^{N-1} b\), diameter and degree \(N\)</dd>
+      <dt>Fully connected</dt><dd>total \(P(P-1)/2 \cdot b\), bisection \((P/2)^2\,b\), degree \(P - 1\)</dd>
+      <dt>2-D torus</dt><dd>total \(2P\,b\), bisection \(2N\,b\)</dd>
+      <dt>Crossbar switch</dt><dd>\(P\) links, \(P^2\) crosspoints, bisection \((P/2)\,b\)</dd>
+      <dt>Bus ceiling</dt><dd>\(P_{\max} \approx 1/d\), \(d\) = share of the bus one processor uses alone</dd>
+      <dt>Amdahl, \(P\) processors</dt><dd>\(\text{Speedup} = 1 / \big((1-F) + F/P\big)\), at most \(1/(1-F)\)</dd>
+      <dt>CPI with remote accesses</dt><dd>\(CPI = CPI_{\text{base}} + r \cdot t_{\text{remote}} / T_{CLK}\), \(r\) = remote references per instruction</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l33-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=PhUo1IMo6UU" target="_blank" rel="noopener">Lecture 27: Multiprocessors (Computer Architecture, Carnegie Mellon, 2015)</a>
+      <span class="res-by">Onur Mutlu</span>
+      <p class="res-why">Why multiprocessors, the MIMD design space, shared memory against message passing, tightly against loosely coupled — the frame of this lesson and the next, drawn on the board.</p>
+    </li>
+    <li class="res" data-kind="book" data-when="after">
+      <a class="res-title" href="https://zoo.cs.yale.edu/classes/cs323/CAAQA6E/Appendix_F_online.pdf" target="_blank" rel="noopener">Appendix F: Interconnection Networks (Computer Architecture: A Quantitative Approach, 6th ed.)</a>
+      <span class="res-by">T. M. Pinkston and J. Duato, in Hennessy &amp; Patterson</span>
+      <p class="res-why">Section F.4, Network Topology: bus, ring, mesh, torus, hypercube and fat tree with degree, diameter and bisection bandwidth — the source of every metric of this lesson, including the two the notes leave out.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Er-EzS0JZSw" target="_blank" rel="noopener">Lecture 22: Interconnects II (ETH Zürich, Fall 2017)</a>
+      <span class="res-by">Onur Mutlu</span>
+      <p class="res-why">Topologies compared on cost, latency and bisection bandwidth, then routing and flow control: what happens inside the links you counted.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://users.cs.utah.edu/~hari/teaching/paralg/Flynn72.pdf" target="_blank" rel="noopener">Some Computer Organizations and Their Effectiveness</a>
+      <span class="res-by">Michael J. Flynn, IEEE Transactions on Computers, 1972</span>
+      <p class="res-why">Flynn's classification (first proposed in 1966) in its refined form, and the source of the "saturation syndrome" quoted in section 3 — the bus problem, seen in 1972.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You now know how processors are wired together. The next question is where the data they share lives: in one memory at the same distance from everyone, or in pieces next to every processor — and why "shared memory" does not have to mean one memory.</p>
+</aside>
+
+</main>
+</body>
+</html>

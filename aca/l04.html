@@ -1,0 +1,1127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Why the pipeline hates branches · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l04">
+
+<header class="lesson-head">
+  <h1>Why the pipeline hates branches: static prediction and the delay slot</h1>
+  <p class="lede">After this lesson you will count what a branch costs in the 5-stage pipeline, pick the static scheme that fits a loop or an if, and fill a delay slot legally — the convention every VLIW exercise of the exam is built on.</p>
+</header>
+
+<div class="hook" data-label="A puzzle from two exam papers">
+  <p>Take the loop of the June 2025 paper, Question 5. The <code>BNE</code> at its bottom runs five times: four jumps back, one fall-through. A predictor with no memory at all — it cannot even remember what happened last time — gets this branch right four times out of five.</p>
+  <p>Point the same predictor at the loop of the 2025 midterm, whose exit test <code>BEQ R1, R2, DONE</code> sits at the top, and it is wrong 100 times out of 101. The only difference between the two branches is the sign of one number inside the instruction.</p>
+  <p>By the end of the lesson you will know which number, why the basic 5-stage pipeline throws away three cycles on every branch, and why every VLIW exercise of the exam says "branch solved in ID stage, 1 cycle delay slot".</p>
+</div>
+
+<section id="l04-late">
+  <h2>A branch answers two questions, and both come late</h2>
+
+  <p>You know from your first architecture course what a conditional branch does: <code>BNE R1, R2, LOOP</code> compares two registers and continues at the label if they differ, at PC + 4 otherwise. The notes write RISC-V <code>beq x1, x3, L1</code>; this notebook writes branches as the exam papers do, without the dollar sign of the older papers (<code>$R1</code>, <code>$F2</code>). Here is the loop of the June 2025 paper in that spelling (the paper prints <code>ADDI.U</code> for <code>ADDUI</code> and <code>ADDI.D</code> for <code>FADD</code>):</p>
+
+<pre><code>INIT: ADDUI R1, R0, 0
+      ADDUI R2, R0, 20
+LOOP: LD    F0, 0(R1)
+      FADD  F2, F0, F0
+      SD    F2, 0(R1)
+      ADDUI R1, R1, 4
+      BNE   R1, R2, LOOP</code></pre>
+
+  <p>What makes a branch special is <em>who</em> is waiting for its answer: the fetch unit needs the next PC every cycle, and a branch delivers it in two parts, both late.</p>
+
+  <div class="def">
+    <p><dfn>Branch outcome</dfn> (BO in the notes) — one bit: <mark class="key">taken</mark> (T, continue at the label) or <mark class="key">not taken</mark> (NT, continue at PC + 4). <dfn>Branch target address</dfn> (<mark class="key">BTA</mark>) — where a taken branch continues: PC + offset, the offset being the sign-extended immediate of the instruction. A scheme that knows "taken" but not "where" still cannot fetch.</p>
+  </div>
+
+  <p>In the basic pipeline of the notes (pp. 30–31) the ALU compares the registers and adds PC + offset in EX, and the PC is written at the end of ME: for three cycles after the branch is fetched, fetch does not know where to go. That gap is the <mark class="key">control hazard</mark>, a "pipeline hazard due to uncertainty in branch outcome during instruction fetch" in the notes' summary box (p. 32), caused by every instruction that modifies the PC, jumps included. Fetch can only <mark class="key">stall</mark> until the PC is known, or <mark class="key">fetch and flush</mark>: guess, keep going, throw the guessed instructions away if the guess was wrong.</p>
+
+  <figure class="fig fig--pair" id="l04-fig-penalty">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 160" role="img" aria-label="Pipeline diagram with the PC written at the end of ME: the next instruction waits in three stall bubbles and is fetched in cycle 5">
+        <text x="50" y="21" class="tx-end tx-sm tx-muted">cycle</text>
+        <text x="68" y="21" class="tx-mid tx-sm tx-muted">1</text><text x="92" y="21" class="tx-mid tx-sm tx-muted">2</text><text x="116" y="21" class="tx-mid tx-sm tx-muted">3</text><text x="140" y="21" class="tx-mid tx-sm tx-muted">4</text><text x="164" y="21" class="tx-mid tx-sm tx-muted">5</text><text x="188" y="21" class="tx-mid tx-sm tx-muted">6</text><text x="212" y="21" class="tx-mid tx-sm tx-muted">7</text><text x="236" y="21" class="tx-mid tx-sm tx-muted">8</text><text x="260" y="21" class="tx-mid tx-sm tx-muted">9</text><text x="284" y="21" class="tx-mid tx-sm tx-muted">10</text>
+        <text x="50" y="45" class="tx-end tx-mono tx-sm">BNE</text>
+        <text x="50" y="73" class="tx-end tx-mono tx-sm">I5</text>
+        <text x="50" y="101" class="tx-end tx-mono tx-sm">I6</text>
+        <rect x="128" y="30" width="24" height="22" class="hl"/>
+        <rect x="56" y="30" width="24" height="22" class="fi-paper"/><rect x="80" y="30" width="24" height="22" class="fi-paper"/><rect x="104" y="30" width="24" height="22" class="fi-paper"/><rect x="128" y="30" width="24" height="22" class="fi-paper"/><rect x="152" y="30" width="24" height="22" class="fi-paper"/>
+        <text x="68" y="45" class="tx-mid tx-mono tx-sm">IF</text><text x="92" y="45" class="tx-mid tx-mono tx-sm">ID</text><text x="116" y="45" class="tx-mid tx-mono tx-sm">EX</text><text x="140" y="45" class="tx-mid tx-mono tx-sm">ME</text><text x="164" y="45" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="80" y="58" width="24" height="22" class="fw-s2 st-s2 dash"/><rect x="104" y="58" width="24" height="22" class="fw-s2 st-s2 dash"/><rect x="128" y="58" width="24" height="22" class="fw-s2 st-s2 dash"/>
+        <rect x="152" y="58" width="24" height="22" class="fi-paper"/><rect x="176" y="58" width="24" height="22" class="fi-paper"/><rect x="200" y="58" width="24" height="22" class="fi-paper"/><rect x="224" y="58" width="24" height="22" class="fi-paper"/><rect x="248" y="58" width="24" height="22" class="fi-paper"/>
+        <text x="164" y="73" class="tx-mid tx-mono tx-sm">IF</text><text x="188" y="73" class="tx-mid tx-mono tx-sm">ID</text><text x="212" y="73" class="tx-mid tx-mono tx-sm">EX</text><text x="236" y="73" class="tx-mid tx-mono tx-sm">ME</text><text x="260" y="73" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="176" y="86" width="24" height="22" class="fi-paper"/><rect x="200" y="86" width="24" height="22" class="fi-paper"/><rect x="224" y="86" width="24" height="22" class="fi-paper"/><rect x="248" y="86" width="24" height="22" class="fi-paper"/><rect x="272" y="86" width="24" height="22" class="fi-paper"/>
+        <text x="188" y="101" class="tx-mid tx-mono tx-sm">IF</text><text x="212" y="101" class="tx-mid tx-mono tx-sm">ID</text><text x="236" y="101" class="tx-mid tx-mono tx-sm">EX</text><text x="260" y="101" class="tx-mid tx-mono tx-sm">ME</text><text x="284" y="101" class="tx-mid tx-mono tx-sm">WB</text>
+        <line x1="140" y1="52" x2="162" y2="58" class="sw-2" marker-end="url(#arr)"/>
+        <text x="150" y="142" class="tx-mid tx-hand">PC written at ME</text>
+      </svg>
+      <p class="fig-label">Before: outcome in EX, PC written in ME — 3 bubbles</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 160" role="img" aria-label="Pipeline diagram with the branch resolved in ID: the next instruction waits in one stall bubble and is fetched in cycle 3">
+        <text x="50" y="21" class="tx-end tx-sm tx-muted">cycle</text>
+        <text x="68" y="21" class="tx-mid tx-sm tx-muted">1</text><text x="92" y="21" class="tx-mid tx-sm tx-muted">2</text><text x="116" y="21" class="tx-mid tx-sm tx-muted">3</text><text x="140" y="21" class="tx-mid tx-sm tx-muted">4</text><text x="164" y="21" class="tx-mid tx-sm tx-muted">5</text><text x="188" y="21" class="tx-mid tx-sm tx-muted">6</text><text x="212" y="21" class="tx-mid tx-sm tx-muted">7</text><text x="236" y="21" class="tx-mid tx-sm tx-muted">8</text><text x="260" y="21" class="tx-mid tx-sm tx-muted">9</text><text x="284" y="21" class="tx-mid tx-sm tx-muted">10</text>
+        <text x="50" y="45" class="tx-end tx-mono tx-sm">BNE</text>
+        <text x="50" y="73" class="tx-end tx-mono tx-sm">I5</text>
+        <text x="50" y="101" class="tx-end tx-mono tx-sm">I6</text>
+        <rect x="80" y="30" width="24" height="22" class="hl"/>
+        <rect x="56" y="30" width="24" height="22" class="fi-paper"/><rect x="80" y="30" width="24" height="22" class="fi-paper"/><rect x="104" y="30" width="24" height="22" class="fi-paper"/><rect x="128" y="30" width="24" height="22" class="fi-paper"/><rect x="152" y="30" width="24" height="22" class="fi-paper"/>
+        <text x="68" y="45" class="tx-mid tx-mono tx-sm">IF</text><text x="92" y="45" class="tx-mid tx-mono tx-sm">ID</text><text x="116" y="45" class="tx-mid tx-mono tx-sm">EX</text><text x="140" y="45" class="tx-mid tx-mono tx-sm">ME</text><text x="164" y="45" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="80" y="58" width="24" height="22" class="fw-s2 st-s2 dash"/>
+        <rect x="104" y="58" width="24" height="22" class="fi-paper"/><rect x="128" y="58" width="24" height="22" class="fi-paper"/><rect x="152" y="58" width="24" height="22" class="fi-paper"/><rect x="176" y="58" width="24" height="22" class="fi-paper"/><rect x="200" y="58" width="24" height="22" class="fi-paper"/>
+        <text x="116" y="73" class="tx-mid tx-mono tx-sm">IF</text><text x="140" y="73" class="tx-mid tx-mono tx-sm">ID</text><text x="164" y="73" class="tx-mid tx-mono tx-sm">EX</text><text x="188" y="73" class="tx-mid tx-mono tx-sm">ME</text><text x="212" y="73" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="128" y="86" width="24" height="22" class="fi-paper"/><rect x="152" y="86" width="24" height="22" class="fi-paper"/><rect x="176" y="86" width="24" height="22" class="fi-paper"/><rect x="200" y="86" width="24" height="22" class="fi-paper"/><rect x="224" y="86" width="24" height="22" class="fi-paper"/>
+        <text x="140" y="101" class="tx-mid tx-mono tx-sm">IF</text><text x="164" y="101" class="tx-mid tx-mono tx-sm">ID</text><text x="188" y="101" class="tx-mid tx-mono tx-sm">EX</text><text x="212" y="101" class="tx-mid tx-mono tx-sm">ME</text><text x="236" y="101" class="tx-mid tx-mono tx-sm">WB</text>
+        <line x1="92" y1="52" x2="114" y2="58" class="sw-2" marker-end="url(#arr)"/>
+        <text x="150" y="142" class="tx-mid tx-hand">two cycles saved</text>
+      </svg>
+      <p class="fig-label">After: outcome and target in ID — 1 bubble</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Fetch stalled until the PC is known (the highlighted cell); I5 is fetched in the cycle after it. Left: the notes' Figure 10 (p. 34). Right: the diagram of p. 36.</figcaption>
+  </figure>
+
+  <p>Read the penalty off the figure: the next PC is known at the end of stage <em>r</em> of the branch (ME is stage 4, ID is 2), so the fetch slots of cycles 2 … <em>r</em> are lost.</p>
+
+  <p class="memo"><mark class="key">Branch penalty = (stage at whose end the PC is written) − 1: three cycles with the PC written in ME, one cycle with the branch solved in ID.</mark></p>
+
+  <p>On the notes' four-instruction sequence (p. 34), counted as the formula sheet counts, cycles = IC + 4 + stalls:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Four instructions, one of them a branch (notes pp. 34, 36, 40).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>PC written at the end of</th><th>Fetch does</th><th>Stalls</th><th>Cycles = IC + 4 + stalls</th></tr></thead>
+        <tbody>
+          <tr><td>ME</td><td>waits</td><td class="num">3</td><td class="num">4 + 4 + 3 = 11</td></tr>
+          <tr><td>ID</td><td>waits</td><td class="num">1</td><td class="num">4 + 4 + 1 = 9</td></tr>
+          <tr class="is-key"><td>ID</td><td>guesses right</td><td class="num">0</td><td class="num">4 + 4 + 0 = 8</td></tr>
+          <tr><td>ID</td><td>guesses wrong, flushes</td><td class="num">1</td><td class="num">4 + 4 + 1 = 9</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Early branch evaluation: move the comparison into ID</h3>
+
+  <p>Nothing forces the comparison to wait for EX: <code>BNE</code> needs an equality test, a cheap tree of XOR gates, and its target is PC-relative, so an adder can produce PC + offset right after decoding. The notes (p. 35) list what the ID stage gains — comparison and addition logic, a multiplexer with control signals to write the PC, wider data paths for the offset and the register values — and both answers are ready at the end of ID: the right panel of Fig. 1.</p>
+
+  <figure class="fig fig--plain" id="l04-fig-datapath">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="Datapath sketch: in the ID stage a comparator produces the branch outcome from the two register values and an adder produces the target address from the PC and the offset; both are fed back to the PC, which no longer waits for EX and ME">
+      <text x="75" y="22" class="tx-mid tx-sm tx-muted">IF</text>
+      <text x="260" y="22" class="tx-mid tx-sm tx-muted">ID</text>
+      <text x="410" y="22" class="tx-mid tx-sm tx-muted">EX</text>
+      <text x="510" y="22" class="tx-mid tx-sm tx-muted">ME</text>
+      <rect x="152" y="30" width="8" height="190" class="fi-soft st-muted"/>
+      <rect x="362" y="30" width="8" height="190" class="fi-soft st-muted"/>
+      <rect x="20" y="96" width="36" height="28" class="fi-paper sw-2"/>
+      <text x="38" y="115" class="tx-mid tx-mono">PC</text>
+      <rect x="80" y="80" width="64" height="60" class="fi-paper"/>
+      <text x="112" y="106" class="tx-mid tx-sm">instr.</text>
+      <text x="112" y="124" class="tx-mid tx-sm">memory</text>
+      <line x1="56" y1="110" x2="78" y2="110" marker-end="url(#arr)"/>
+      <rect x="190" y="80" width="80" height="60" class="fi-paper"/>
+      <text x="230" y="106" class="tx-mid tx-sm">register</text>
+      <text x="230" y="124" class="tx-mid tx-sm">file</text>
+      <line x1="144" y1="100" x2="188" y2="100" marker-end="url(#arr)"/>
+      <rect x="190" y="162" width="80" height="26" class="fi-paper"/>
+      <text x="230" y="180" class="tx-mid tx-sm">offset</text>
+      <line x1="144" y1="130" x2="170" y2="130" class="st-muted"/>
+      <line x1="170" y1="130" x2="170" y2="175" class="st-muted"/>
+      <line x1="170" y1="175" x2="188" y2="175" class="st-muted" marker-end="url(#arr-muted)"/>
+      <circle cx="310" cy="95" r="16" class="fi-paper sw-2"/>
+      <text x="310" y="101" class="tx-mid tx-lg tx-bold">=</text>
+      <circle cx="310" cy="150" r="16" class="fi-paper sw-2"/>
+      <text x="310" y="156" class="tx-mid tx-lg tx-bold">+</text>
+      <line x1="270" y1="90" x2="292" y2="90" marker-end="url(#arr)"/>
+      <line x1="270" y1="100" x2="292" y2="100" marker-end="url(#arr)"/>
+      <line x1="270" y1="175" x2="282" y2="175" class="st-muted"/>
+      <line x1="282" y1="175" x2="282" y2="156" class="st-muted"/>
+      <line x1="282" y1="156" x2="293" y2="156" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="38" y1="124" x2="38" y2="144" class="st-muted"/>
+      <line x1="38" y1="144" x2="293" y2="144" class="st-muted" marker-end="url(#arr-muted)"/>
+      <path d="M 326 95 L 350 95 L 350 42 L 38 42 L 38 94" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="190" y="36" class="tx-mid tx-sm halo">branch outcome</text>
+      <path d="M 326 150 L 346 150 L 346 206 L 26 206 L 26 126" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="190" y="222" class="tx-mid tx-sm halo">target address</text>
+      <rect x="382" y="160" width="56" height="40" class="fi-soft st-muted dash"/>
+      <text x="410" y="185" class="tx-mid tx-sm tx-muted">ALU</text>
+      <text x="462" y="110" class="tx-mid tx-hand">moved from EX</text>
+      <text x="462" y="150" class="tx-mid tx-hand">into ID</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> Early branch evaluation, after the notes' Figure 11 (p. 35): the comparator and the adder sit in ID, and their results go straight back to the PC.</figcaption>
+  </figure>
+
+  <h3>The price: a branch that is hungry for its operands</h3>
+
+  <p>The comparator in ID wants its operands one stage earlier than an ALU would. If the instruction right before the branch produces one of them, forwarding cannot help — the producer is still in EX when the branch asks in ID — so the branch waits one cycle, two after a load. Hence the sentence of every VLIW exercise of the three papers, "1 Integer ALU with 1 cycle latency to next Int/FP/L/S &amp; 2 cycle latency to next Branch": the loop counter must be updated at least one instruction before the branch that tests it.</p>
+
+<pre><code>      ADDUI R1, R1, 4      # produces R1 in EX
+      BNE   R1, R2, LOOP   # needs R1 in ID: one stall cycle
+</code></pre>
+
+  <figure class="tbl-fig">
+    <figcaption>An ALU instruction immediately before the branch that reads its result, branch solved in ID.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th></th><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th><th>C6</th><th>C7</th></tr></thead>
+        <tbody>
+          <tr><td><code>ADDUI</code></td><td>IF</td><td>ID</td><td>EX</td><td>ME</td><td>WB</td><td></td><td></td></tr>
+          <tr class="is-key"><td><code>BNE</code></td><td></td><td>IF</td><td>stall</td><td>ID</td><td>EX</td><td>ME</td><td>WB</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>One independent instruction between them removes the stall. Early resolution buys a short penalty and a hungrier branch: both halves are exam material.</p>
+
+  <h3>Stall or flush: the CPI formula</h3>
+
+  <p>Stalling pays the penalty on every branch; a guessed fetch pays it only when wrong. The derivation turns that into the one formula of this lesson that is not on the formula sheet.</p>
+
+  <ol class="steps" id="l04-steps-cpi">
+    <li>
+      <p>The formula sheet's cycle count for IC instructions on the 5-stage pipeline (4 = the pipeline fill):</p>
+      \[ \text{cycles} = \text{IC} + 4 + \text{stalls} . \]
+    </li>
+    <li>
+      <p>A fraction \(f_b\) of the instructions are branches; each costs \(r - 1\) cycles when fetch guessed wrong, with probability \(p_{\text{mis}}\):</p>
+      \[ \text{stalls}_b = \text{IC} \cdot f_b \,(r - 1)\, p_{\text{mis}} . \]
+    </li>
+    <li>
+      <p>Divide by IC; for a long program the fill term \(4 / \text{IC}\) vanishes:</p>
+      \[ \text{CPI} = 1 + f_b\,(r - 1)\,p_{\text{mis}} . \]
+    </li>
+    <li>
+      <p>Stalling is "always wrong", \(p_{\text{mis}} = 1\). A predictor pays only when wrong: always not taken has \(p_{\text{mis}} = p_T\), the taken fraction; always taken has \(1 - p_T\).</p>
+    </li>
+    <li>
+      <p>With \(f_b = 0.2\), \(p_T = 0.6\) and the branch solved in ID: stall 1.20, always not taken 1.12, always taken 1.08. With the PC written in ME: 1.60, 1.36, 1.24 — a machine built for CPI = 1 runs at 1.6 before a single cache miss.</p>
+    </li>
+  </ol>
+
+  <div class="formula">
+    \[ \text{CPI} = 1 + f_b \cdot \text{penalty} \cdot p_{\text{mis}} \]
+    \[ \text{penalty} = r - 1 \]
+    <dl class="legend">
+      <dt>\(f_b\)</dt><dd>fraction of executed instructions that are branches (about one in five in integer code)</dd>
+      <dt>\(r\)</dt><dd>stage at whose end the next PC is written: 2 for ID, 4 for ME</dd>
+      <dt>\(p_{\text{mis}}\)</dt><dd>probability that fetch went the wrong way: 1 when stalling, \(p_T\) for always not taken, \(1 - p_T\) for always taken</dd>
+    </dl>
+  </div>
+
+  <aside class="margin-note">The letters \(f_b\), \(r\) and \(p_{\text{mis}}\) are this lesson's: the formula sheet has no branch line, so this is the one to copy onto your A4.</aside>
+
+  <div class="widget" id="l04-w-pipe">
+    <h3 class="widget-title">One branch, three ways to pay</h3>
+    <p class="widget-intro">The diagram shows <code>BNE R1, R2, LOOP</code> of the loop above and the three instructions fetched after it. When the branch is taken the correct continuation is <code>I0 LD</code>, <code>I1 FADD</code>, <code>I2 SD</code> at LOOP; when it falls through it is I5, I6, I7, whatever follows the loop. The highlighted cell is where the next PC is finally known; orange cells are stall bubbles; crossed cells are instructions fetched on the wrong path and flushed. The CPI readout uses the two sliders.</p>
+    <ol class="tasks">
+      <li>Before touching anything: with fetch stalled and the PC written in ME, how many empty fetch slots do you expect? Now switch the resolution to EX and then to ID. What rule links the lost cycles to the stage?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Three bubbles, then two, then one: the lost cycles are always the resolution stage minus one, because the first correct fetch can only happen in the cycle after the PC is written. Nothing else about the diagram changes.</p></details>
+      </li>
+      <li>Keep ID and choose "predict not taken". The branch is taken, so the guess is wrong: predict how many cycles are lost compared with stalling. Then flip the switch so the branch is not taken.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Wrong guess: exactly one cycle, the same as stalling — the I5 fetched in cycle 2 is crossed out and the LD is fetched in cycle 3. Right guess: zero lost cycles, I5 simply continues. Prediction never makes a single branch cheaper than stalling; it makes the <em>average</em> cheaper, because you pay only when wrong.</p></details>
+      </li>
+      <li>Set \(p_T = 0.8\) (four taken branches out of five, like the loop). Which policy gives the lowest CPI, and does the answer change when you move \(p_T\) to 0.2?
+        <details class="answer"><summary>What you should see</summary>
+          <p>With \(p_T = 0.8\) "predict taken" wins (\(p_{\text{mis}} = 0.2\)); with \(p_T = 0.2\) "predict not taken" wins. Stalling never depends on \(p_T\): its CPI stays at \(1 + f_b \cdot \text{penalty}\). The whole of the next section is about choosing the guess that matches the branch.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l04-w-pipe', function (root, ui) {
+    var ST = ['IF', 'ID', 'EX', 'ME', 'WB'];
+    var FALL = ['I5', 'I6', 'I7'], TARGET = ['I0 LD', 'I1 FADD', 'I2 SD'];
+    var res = ui.select('next PC written at the end of', [
+      { value: '2', label: 'ID — early evaluation' },
+      { value: '3', label: 'EX' },
+      { value: '4', label: 'ME — basic pipeline' }], null, '4');
+    var pol = ui.select('what fetch does meanwhile', [
+      { value: 'stall', label: 'stall until the branch is resolved' },
+      { value: 'nt', label: 'predict not taken: fetch PC + 4' },
+      { value: 't', label: 'predict taken: fetch the target (BTB hit)' }], null, 'stall');
+    var taken = ui.toggle('this time the branch is taken', true);
+    var fb = ui.slider({ label: 'branches among executed instructions f<sub>b</sub>', min: 0.05, max: 0.4, step: 0.05, value: 0.2 });
+    var pt = ui.slider({ label: 'fraction of branches taken p<sub>T</sub>', min: 0, max: 1, step: 0.05, value: 0.8 });
+    var roPen = ui.readout('lost cycles on this branch', { digits: 0 });
+    var roCyc = ui.readout('cycles for BNE + 3 instructions', { digits: 0 });
+    var roMis = ui.readout('p<sub>mis</sub> of this policy');
+    var roCpi = ui.readout('CPI = 1 + f<sub>b</sub> · penalty · p<sub>mis</sub>');
+    var note = ui.note('');
+    var svg = ui.svg(560, 240, { label: 'Pipeline diagram of the branch and the three instructions fetched after it, with stall bubbles or flushed wrong-path instructions depending on the policy' });
+    ui.legend([
+      { label: 'stall bubble (fetch idle)', color: 's2', mark: 'square' },
+      { label: 'fetched on the wrong path, flushed', color: 'bad', mark: 'cross' },
+      { label: 'the cycle in which the next PC is known', color: 'ink', mark: 'hl' }
+    ]);
+
+    function model() {
+      var r = parseInt(res.value, 10), pen = r - 1, p = pol.value, tk = !!taken.value, i;
+      var wrong = (p === 'nt' && tk) || (p === 't' && !tk);
+      var lost = (p === 'stall' || wrong) ? pen : 0;
+      var good = tk ? TARGET : FALL, bad = tk ? FALL : TARGET;
+      var rows = [{ label: 'I4 BNE', start: 1, kind: 'branch' }];
+      if (p === 'stall') {
+        for (i = 0; i < 3; i++) rows.push({ label: good[i], start: r + 1 + i, kind: 'ok', bubbles: i === 0 ? pen : 0 });
+      } else if (wrong) {
+        for (i = 0; i < pen; i++) rows.push({ label: bad[i], start: 2 + i, kind: 'flushed', done: r - (2 + i) + 1 });
+        for (i = 0; i < 3; i++) rows.push({ label: good[i], start: r + 1 + i, kind: 'ok', bubbles: 0 });
+      } else {
+        for (i = 0; i < 3; i++) rows.push({ label: good[i], start: 2 + i, kind: 'ok', bubbles: 0 });
+      }
+      var pmis = p === 'stall' ? 1 : (p === 'nt' ? pt.value : 1 - pt.value);
+      return { r: r, pen: pen, p: p, tk: tk, wrong: wrong, lost: lost, rows: rows, pmis: pmis, cpi: 1 + fb.value * pen * pmis };
+    }
+
+    function draw(m) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var X0 = 86, CW = 36, RH = 24, RP = 28, Y0 = 30, COLS = 11, c, k, i, row;
+      svg.setAttribute('viewBox', '0 0 560 ' + (Y0 + m.rows.length * RP + 10));
+      Course.svg('text', { x: 80, y: 21, 'class': 'tx-end tx-sm tx-muted', text: 'cycle' }, svg);
+      for (c = 1; c <= COLS; c++) Course.svg('text', { x: X0 + (c - 0.5) * CW, y: 21, 'class': 'tx-mid tx-sm tx-muted', text: String(c) }, svg);
+      var firstGood = null;
+      for (i = 0; i < m.rows.length; i++) {
+        row = m.rows[i];
+        var y = Y0 + i * RP;
+        Course.svg('text', { x: 80, y: y + 17, 'class': 'tx-end tx-mono tx-sm', text: row.label }, svg);
+        if (row.kind === 'ok' && firstGood === null) firstGood = { y: y, col: row.start };
+        if (row.bubbles) for (k = 0; k < row.bubbles; k++) Course.svg('rect', { x: X0 + (1 + k) * CW, y: y, width: CW, height: RH, rx: 3, 'class': 'fw-s2 st-s2 dash' }, svg);
+        if (row.kind === 'branch') Course.svg('rect', { x: X0 + (m.r - 1) * CW, y: y, width: CW, height: RH, rx: 3, 'class': 'hl' }, svg);
+        var n = row.kind === 'flushed' ? row.done : 5;
+        for (k = 0; k < n; k++) {
+          var x = X0 + (row.start - 1 + k) * CW;
+          Course.svg('rect', { x: x, y: y, width: CW, height: RH, rx: 3, 'class': row.kind === 'flushed' ? 'fi-soft st-muted' : 'fi-paper' }, svg);
+          Course.svg('text', { x: x + CW / 2, y: y + 17, 'class': 'tx-mid tx-mono tx-sm' + (row.kind === 'flushed' ? ' tx-muted' : ''), text: ST[k] }, svg);
+          if (row.kind === 'flushed') {
+            Course.svg('line', { x1: x + 6, y1: y + 5, x2: x + CW - 6, y2: y + RH - 5, 'class': 'st-bad sw-2' }, svg);
+            Course.svg('line', { x1: x + CW - 6, y1: y + 5, x2: x + 6, y2: y + RH - 5, 'class': 'st-bad sw-2' }, svg);
+          }
+        }
+      }
+      if (firstGood) {
+        Course.svg('line', { x1: X0 + (m.r - 0.5) * CW, y1: Y0 + RH, x2: X0 + (firstGood.col - 0.5) * CW - 2, y2: firstGood.y - 2, 'class': 'sw-2', 'marker-end': 'url(#arr)' }, svg);
+      }
+    }
+
+    ui.onChange(function () {
+      var m = model();
+      draw(m);
+      roPen.set(m.lost, m.lost ? 'bad' : 'good');
+      roCyc.set(8 + m.lost);
+      roMis.set(m.p === 'stall' ? '1 (pays every time)' : Course.fmt(m.pmis, 2));
+      roCpi.set(m.cpi);
+      var stage = m.r === 2 ? 'ID' : (m.r === 3 ? 'EX' : 'ME');
+      var s = 'The next PC is written at the end of ' + stage + ' (stage ' + m.r + '), so cycles 2 to ' + m.r + ' cannot be fetched with certainty: penalty ' + m.pen + '. ';
+      if (m.p === 'stall') s += 'Fetch waits: the penalty is paid on every branch, whatever its outcome.';
+      else if (m.wrong) s += 'Fetch guessed ' + (m.p === 'nt' ? 'not taken' : 'taken') + ' and the branch went the other way: the ' + m.pen + ' instruction' + (m.pen > 1 ? 's' : '') + ' fetched meanwhile ' + (m.pen > 1 ? 'are' : 'is') + ' flushed and fetch restarts at the right address.';
+      else s += 'Fetch guessed right: the instructions fetched meanwhile are the correct ones and nothing is lost.';
+      note.set(s);
+    });
+  });
+  </script>
+</section>
+
+<section id="l04-static">
+  <h2>Guessing with no memory: the four static schemes</h2>
+
+  <p>Branch prediction is speculation: guess the outcome, fetch along the guessed path, flush and restart if the guess was wrong. One rule keeps it safe (p. 37): "the processor must avoid updating its internal state (registers, memory, etc.) until the branch outcome is known with certainty". With the branch solved in ID that is free, since the wrongly fetched instruction is still in IF; the out-of-order machines of <a href="l17.html">lesson 17</a> need a reorder buffer for it.</p>
+
+  <p>A <mark class="key">static</mark> scheme guesses the same way for a given branch every time — a fixed hardware rule or a compiler hint; "static" means nothing is learned at run time, not "the compiler decides". <mark class="key">Dynamic</mark> schemes (<a href="l05.html">lessons 5</a> and <a href="l06.html">6</a>) learn from the branch's history. The notes' four static rules, each with its cost and its failure case:</p>
+
+  <h3>Always not taken, always taken — and why one of them needs a table</h3>
+
+  <p><mark class="key">Branch always not taken</mark> costs nothing: keep fetching PC + 4 "without any need to determine or access the Branch Target Address" (p. 39). When the branch turns out taken, the one instruction fetched after it becomes a NOP and fetch restarts at the target — one cycle in the ID-resolved pipeline (the notes' Figure 12, left panel below). The right bet for an if whose else path is rare — the notes' example (p. 39) is <code>if (z &gt; 0) w = x; else w = y;</code> with z usually positive, so the branch to the else part is usually not taken — and the wrong one for every loop-closing branch.</p>
+
+  <p><mark class="key">Branch always taken</mark> mirrors it in direction but not in cost: to fetch the target in the next cycle you must know it <em>while the branch is still in IF</em>, before decoding — and in IF nothing can be computed about a branch, only remembered, indexed by its PC. That memory is the <mark class="key">Branch Target Buffer</mark>, "a specialized cache in the processor designed to predict the target address of a taken branch instruction before the branch condition is actually resolved" (p. 41): key, the address of the branch; value, the predicted target. In the notes' Example 1 (p. 42) the entry 0x100 → 0x80 sends fetch to 0x80 as soon as the branch at 0x100 is fetched; if the branch is then not taken, the instruction from 0x80 is flushed and fetch resumes at 0x104 — again one cycle. On a miss the processor "might default to sequential execution (PC + 4) or wait for the BTA to be calculated". The BTB is <a href="l05.html">lesson 5</a>; here, remember that without it always taken has nothing to fetch, since the target is known no earlier than the outcome.</p>
+
+  <figure class="fig fig--pair" id="l04-fig-flush">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="Predict not taken fails: the branch is taken, the sequential instruction fetched in cycle 2 is flushed and the target is fetched in cycle 3">
+        <text x="50" y="21" class="tx-end tx-sm tx-muted">cycle</text>
+        <text x="68" y="21" class="tx-mid tx-sm tx-muted">1</text><text x="92" y="21" class="tx-mid tx-sm tx-muted">2</text><text x="116" y="21" class="tx-mid tx-sm tx-muted">3</text><text x="140" y="21" class="tx-mid tx-sm tx-muted">4</text><text x="164" y="21" class="tx-mid tx-sm tx-muted">5</text><text x="188" y="21" class="tx-mid tx-sm tx-muted">6</text><text x="212" y="21" class="tx-mid tx-sm tx-muted">7</text><text x="236" y="21" class="tx-mid tx-sm tx-muted">8</text>
+        <text x="50" y="45" class="tx-end tx-mono tx-sm">BNE</text>
+        <text x="50" y="73" class="tx-end tx-mono tx-sm">I5</text>
+        <text x="50" y="101" class="tx-end tx-mono tx-sm">LD</text>
+        <text x="50" y="129" class="tx-end tx-mono tx-sm">FADD</text>
+        <rect x="80" y="30" width="24" height="22" class="hl"/>
+        <rect x="56" y="30" width="24" height="22" class="fi-paper"/><rect x="80" y="30" width="24" height="22" class="fi-paper"/><rect x="104" y="30" width="24" height="22" class="fi-paper"/><rect x="128" y="30" width="24" height="22" class="fi-paper"/><rect x="152" y="30" width="24" height="22" class="fi-paper"/>
+        <text x="68" y="45" class="tx-mid tx-mono tx-sm">IF</text><text x="92" y="45" class="tx-mid tx-mono tx-sm">ID</text><text x="116" y="45" class="tx-mid tx-mono tx-sm">EX</text><text x="140" y="45" class="tx-mid tx-mono tx-sm">ME</text><text x="164" y="45" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="80" y="58" width="24" height="22" class="fi-soft st-muted"/>
+        <text x="92" y="73" class="tx-mid tx-mono tx-sm tx-muted">IF</text>
+        <line x1="84" y1="62" x2="100" y2="76" class="st-bad sw-2"/><line x1="100" y1="62" x2="84" y2="76" class="st-bad sw-2"/>
+        <rect x="104" y="86" width="24" height="22" class="fi-paper"/><rect x="128" y="86" width="24" height="22" class="fi-paper"/><rect x="152" y="86" width="24" height="22" class="fi-paper"/><rect x="176" y="86" width="24" height="22" class="fi-paper"/><rect x="200" y="86" width="24" height="22" class="fi-paper"/>
+        <text x="116" y="101" class="tx-mid tx-mono tx-sm">IF</text><text x="140" y="101" class="tx-mid tx-mono tx-sm">ID</text><text x="164" y="101" class="tx-mid tx-mono tx-sm">EX</text><text x="188" y="101" class="tx-mid tx-mono tx-sm">ME</text><text x="212" y="101" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="128" y="114" width="24" height="22" class="fi-paper"/><rect x="152" y="114" width="24" height="22" class="fi-paper"/><rect x="176" y="114" width="24" height="22" class="fi-paper"/><rect x="200" y="114" width="24" height="22" class="fi-paper"/><rect x="224" y="114" width="24" height="22" class="fi-paper"/>
+        <text x="140" y="129" class="tx-mid tx-mono tx-sm">IF</text><text x="164" y="129" class="tx-mid tx-mono tx-sm">ID</text><text x="188" y="129" class="tx-mid tx-mono tx-sm">EX</text><text x="212" y="129" class="tx-mid tx-mono tx-sm">ME</text><text x="236" y="129" class="tx-mid tx-mono tx-sm">WB</text>
+        <line x1="92" y1="52" x2="114" y2="86" class="sw-2" marker-end="url(#arr)"/>
+        <text x="170" y="74" class="tx-hand">flushed</text>
+        <text x="150" y="163" class="tx-mid tx-hand">restart from the target</text>
+      </svg>
+      <p class="fig-label">Predicted not taken, actually taken (notes' Fig. 12)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="Predict taken with a BTB fails: the branch is not taken, the target instruction fetched in cycle 2 is flushed and the sequential instruction is fetched in cycle 3">
+        <text x="50" y="21" class="tx-end tx-sm tx-muted">cycle</text>
+        <text x="68" y="21" class="tx-mid tx-sm tx-muted">1</text><text x="92" y="21" class="tx-mid tx-sm tx-muted">2</text><text x="116" y="21" class="tx-mid tx-sm tx-muted">3</text><text x="140" y="21" class="tx-mid tx-sm tx-muted">4</text><text x="164" y="21" class="tx-mid tx-sm tx-muted">5</text><text x="188" y="21" class="tx-mid tx-sm tx-muted">6</text><text x="212" y="21" class="tx-mid tx-sm tx-muted">7</text><text x="236" y="21" class="tx-mid tx-sm tx-muted">8</text>
+        <text x="50" y="45" class="tx-end tx-mono tx-sm">BNE</text>
+        <text x="50" y="73" class="tx-end tx-mono tx-sm">LD</text>
+        <text x="50" y="101" class="tx-end tx-mono tx-sm">I5</text>
+        <text x="50" y="129" class="tx-end tx-mono tx-sm">I6</text>
+        <rect x="80" y="30" width="24" height="22" class="hl"/>
+        <rect x="56" y="30" width="24" height="22" class="fi-paper"/><rect x="80" y="30" width="24" height="22" class="fi-paper"/><rect x="104" y="30" width="24" height="22" class="fi-paper"/><rect x="128" y="30" width="24" height="22" class="fi-paper"/><rect x="152" y="30" width="24" height="22" class="fi-paper"/>
+        <text x="68" y="45" class="tx-mid tx-mono tx-sm">IF</text><text x="92" y="45" class="tx-mid tx-mono tx-sm">ID</text><text x="116" y="45" class="tx-mid tx-mono tx-sm">EX</text><text x="140" y="45" class="tx-mid tx-mono tx-sm">ME</text><text x="164" y="45" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="80" y="58" width="24" height="22" class="fi-soft st-muted"/>
+        <text x="92" y="73" class="tx-mid tx-mono tx-sm tx-muted">IF</text>
+        <line x1="84" y1="62" x2="100" y2="76" class="st-bad sw-2"/><line x1="100" y1="62" x2="84" y2="76" class="st-bad sw-2"/>
+        <rect x="104" y="86" width="24" height="22" class="fi-paper"/><rect x="128" y="86" width="24" height="22" class="fi-paper"/><rect x="152" y="86" width="24" height="22" class="fi-paper"/><rect x="176" y="86" width="24" height="22" class="fi-paper"/><rect x="200" y="86" width="24" height="22" class="fi-paper"/>
+        <text x="116" y="101" class="tx-mid tx-mono tx-sm">IF</text><text x="140" y="101" class="tx-mid tx-mono tx-sm">ID</text><text x="164" y="101" class="tx-mid tx-mono tx-sm">EX</text><text x="188" y="101" class="tx-mid tx-mono tx-sm">ME</text><text x="212" y="101" class="tx-mid tx-mono tx-sm">WB</text>
+        <rect x="128" y="114" width="24" height="22" class="fi-paper"/><rect x="152" y="114" width="24" height="22" class="fi-paper"/><rect x="176" y="114" width="24" height="22" class="fi-paper"/><rect x="200" y="114" width="24" height="22" class="fi-paper"/><rect x="224" y="114" width="24" height="22" class="fi-paper"/>
+        <text x="140" y="129" class="tx-mid tx-mono tx-sm">IF</text><text x="164" y="129" class="tx-mid tx-mono tx-sm">ID</text><text x="188" y="129" class="tx-mid tx-mono tx-sm">EX</text><text x="212" y="129" class="tx-mid tx-mono tx-sm">ME</text><text x="236" y="129" class="tx-mid tx-mono tx-sm">WB</text>
+        <line x1="92" y1="52" x2="114" y2="86" class="sw-2" marker-end="url(#arr)"/>
+        <text x="170" y="74" class="tx-hand">flushed</text>
+        <text x="150" y="163" class="tx-mid tx-hand">restart from I5</text>
+      </svg>
+      <p class="fig-label">Predicted taken via the BTB, actually not taken (notes' Fig. 13, corrected)</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> The two mispredictions of the ID-resolved pipeline: the price is always the one fetch slot used while the branch sat in ID; only the flushed instruction and the restart address differ.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="43">
+    <p class="claim">"Figure 13: Branch Always Taken techniques failed and the processor must flush instruction i+1 and restart execution from the BTA."</p>
+    <p class="fix">When always taken fails, the branch was <em>not</em> taken: the processor flushes the instruction fetched from the target (supplied by the BTB) and restarts from PC + 4, that is from instruction i+1.</p>
+    <p class="because">The caption is a copy of Figure 12's; the figure itself (crossed-out row "Branch target", rows "Instruction + 1, + 2, + 3" from cycle 3) and the text of p. 42 are right. Repeating the caption describes the opposite misprediction.</p>
+  </aside>
+
+  <h3>Backward taken, forward not taken</h3>
+
+  <p>The two uniform rules are each right on one kind of branch, so combine them with the one bit that tells the kinds apart: the <em>direction</em>. <mark class="key">BTFNT</mark> predicts a backward branch (target below the current PC) as taken, because backward branches close loops and a loop of N iterations takes its bottom branch N − 1 times; a forward branch as not taken, because forward branches usually guard an else path or an error handler that is rarely entered. The notes (p. 44) call it "just a comparison of the target address vs the current PC"; in hardware it is the sign bit of the offset. It is not adaptive — a forward branch taken 90 % of the time is mispredicted 90 % of the time. And the sign bit is only known after decoding, when the ID-resolved pipeline knows the outcome anyway: in the course's pipeline the guess pays off only if it is stored, with the target, in the BTB entry of the branch, so that it is available in IF. The tables of this lesson assume that.</p>
+
+  <figure class="fig fig--plain" id="l04-fig-direction">
+    <svg class="dia" viewBox="0 0 560 340" role="img" aria-label="Two loops: in the first the BNE at the bottom jumps backward to LOOP, so its offset is negative and BTFNT predicts it taken; in the second the BEQ at the top jumps forward to DONE, so its offset is positive and BTFNT predicts it not taken">
+      <text x="62" y="47" class="tx-end tx-mono tx-sm">LOOP:</text>
+      <rect x="70" y="30" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="47" class="tx-mono">LD F0, 0(R1)</text>
+      <rect x="70" y="58" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="75" class="tx-mono">FADD F2, F0, F0</text>
+      <rect x="70" y="86" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="103" class="tx-mono">SD F2, 0(R1)</text>
+      <rect x="70" y="114" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="131" class="tx-mono">ADDUI R1, R1, 4</text>
+      <rect x="70" y="142" width="190" height="24" rx="4" class="fw-s1 st-s1"/><text x="78" y="159" class="tx-mono">BNE R1, R2, LOOP</text>
+      <path d="M 262 154 C 330 154 330 42 266 42" class="sw-2" marker-end="url(#arr)"/>
+      <text x="340" y="84" class="tx-sm">offset &lt; 0 : backward</text>
+      <text x="440" y="124" class="tx-mid tx-hand">predict taken</text>
+      <text x="62" y="207" class="tx-end tx-mono tx-sm">LOOP:</text>
+      <rect x="70" y="190" width="190" height="24" rx="4" class="fw-s1 st-s1"/><text x="78" y="207" class="tx-mono">BEQ R1, R2, DONE</text>
+      <rect x="70" y="218" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="235" class="tx-mono">ADD R5, R5, R4</text>
+      <rect x="70" y="246" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="263" class="tx-mono">ADDUI R1, R1, 1</text>
+      <rect x="70" y="274" width="190" height="24" rx="4" class="fi-paper"/><text x="78" y="291" class="tx-mono">J LOOP</text>
+      <text x="62" y="319" class="tx-end tx-mono tx-sm">DONE:</text>
+      <rect x="70" y="302" width="190" height="24" rx="4" class="fi-soft st-muted dash"/><text x="78" y="319" class="tx-mono tx-muted">...</text>
+      <path d="M 262 202 C 330 202 330 314 266 314" class="sw-2" marker-end="url(#arr)"/>
+      <text x="340" y="244" class="tx-sm">offset &gt; 0 : forward</text>
+      <text x="440" y="284" class="tx-mid tx-hand">predict not taken</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The two loops of the hook: the June 2025 <code>BNE</code> jumps back (taken 4 times in 5), the midterm's <code>BEQ</code> jumps forward (taken once in 101). BTFNT reads the sign of the offset and gets both right.</figcaption>
+  </figure>
+
+  <h3>Profile-driven prediction</h3>
+
+  <p>The fourth scheme lets the compiler decide per branch, from evidence: run the program on representative inputs, record how often each branch was taken, and encode the verdict as a hint bit in the instruction, 1 if usually taken, 0 if not. The notes' pattern (p. 45), T T T T T T T T NT NT NT, gives the hint "taken" and about 27 % mispredictions if future runs look like the profile. The processor only reads a bit; the costs are a profile-compile cycle, a profile that goes stale when the inputs change, and an instruction format with a spare bit — RISC-V has none, so compilers there lay the code out so that the frequent path falls through.</p>
+
+  <p>The notes' Table 2 (p. 47), with the delayed branch of section 4 included:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>The notes' Table 2 (p. 47), lightly reworded.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Technique</th><th>Prediction source</th><th>Complexity</th><th>Risk</th><th>Best for</th></tr></thead>
+        <tbody>
+          <tr><td>Always not taken</td><td>assume PC + 4</td><td>very low</td><td>mispredicts backward branches</td><td>if-then-else</td></tr>
+          <tr><td>Always taken</td><td>assume the jump to the BTA</td><td>moderate (BTB)</td><td>mispredicts forward branches</td><td>loops (backward branches)</td></tr>
+          <tr><td>BTFNT</td><td>direction of the branch</td><td>low</td><td>errors in irregular control flow</td><td>mixed code</td></tr>
+          <tr><td>Profile-driven</td><td>data of prior runs</td><td>high (compile time)</td><td>profile mismatch</td><td>stable, performance-tuned code</td></tr>
+          <tr><td>Delayed branch</td><td>compiler-scheduled slot</td><td>high (compiler)</td><td>wasted work if the slot cannot be filled</td><td>RISC pipelines such as MIPS</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="widget" id="l04-w-score">
+    <h3 class="widget-title">Two branches, three schemes, one bit</h3>
+    <p class="widget-intro">The top strip is the backward loop branch, executed N times: taken on every iteration but the last (T = taken, N = not taken). The bottom strip is a forward if-branch executed 20 times, taken with the probability you choose. Under each outcome row, the guess of every scheme; an orange cell is a misprediction. The readouts count them.</p>
+    <ol class="tasks">
+      <li>Before moving anything, predict the number of mispredictions of "always not taken" and "always taken" on a loop of N = 5. Then set N = 20. Which scheme's count stays at 1 whatever N is?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Always not taken is wrong N − 1 times (4, then 19): every iteration but the exit. Always taken and BTFNT are wrong exactly once, at the exit, for any N — a loop branch is the easiest branch in the world for a scheme that says "taken".</p></details>
+      </li>
+      <li>Now the if-branch: with the taken probability at 0.1, which scheme is worst, and by how much? Raise the probability past 0.5 and watch the ranking.
+        <details class="answer"><summary>What you should see</summary>
+          <p>At 0.1 "always taken" is wrong about 9 times in 10 — the exact opposite of its loop performance — while "not taken" and BTFNT are wrong about 1 in 10. Past 0.5 the ranking flips: a forward branch that is usually taken fools BTFNT exactly as badly as it fools "always not taken".</p></details>
+      </li>
+      <li>Look at the "both branches" readout. Can either uniform rule ever beat BTFNT on the two branches together?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only when the if-branch is taken more often than not. Below that, BTFNT equals the better of the two uniform rules on each branch — it is "always taken" for the loop and "always not taken" for the if, chosen by the sign of the offset. That one bit is the whole trick.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l04-w-score', function (root, ui) {
+    var M = 20, rng = Course.rng(7), U = [], i;
+    for (i = 0; i < M; i++) U.push(rng.random());
+    var nIt = ui.slider({ label: 'iterations of the loop N', min: 2, max: 20, step: 1, value: 5 });
+    var pIf = ui.slider({ label: 'probability that the if-branch is taken', min: 0, max: 1, step: 0.05, value: 0.1 });
+    var roLoop = ui.readout('loop branch: mispredictions NT / T / BTFNT');
+    var roIf = ui.readout('if-branch: mispredictions NT / T / BTFNT');
+    var roAll = ui.readout('both branches together: NT / T / BTFNT');
+    var note = ui.note('');
+    var svg = ui.svg(560, 290, { label: 'Outcome strips of a backward loop branch and a forward if-branch with the guesses of always not taken, always taken and BTFNT; mispredicted executions are marked' });
+    ui.legend([
+      { label: 'misprediction', color: 's2', mark: 'square' },
+      { label: 'correct guess', color: 'muted', mark: 'ring' }
+    ]);
+
+    function strips() {
+      var N = Math.round(nIt.value), p = pIf.value, loop = [], iff = [], k;
+      for (k = 0; k < N; k++) loop.push(k < N - 1);
+      for (k = 0; k < M; k++) iff.push(U[k] < p);
+      return { loop: loop, iff: iff, p: p };
+    }
+    function count(out, guess) { var c = 0; for (var k = 0; k < out.length; k++) if (out[k] !== guess[k]) c++; return c; }
+    function guessOf(scheme, out, backward) {
+      return out.map(function () { return scheme === 'nt' ? false : scheme === 't' ? true : backward; });
+    }
+    function block(y0, title, out, backward) {
+      var X0 = 100, CW = 22, RH = 22, RP = 26, schemes = [['nt', 'always NT'], ['t', 'always T'], ['bt', 'BTFNT']], k, s;
+      Course.svg('text', { x: X0, y: y0 - 11, 'class': 'tx-sm tx-muted', text: title }, svg);
+      Course.svg('text', { x: 92, y: y0 + 16, 'class': 'tx-end tx-sm', text: 'outcome' }, svg);
+      for (k = 0; k < out.length; k++) {
+        Course.svg('rect', { x: X0 + k * CW, y: y0, width: CW, height: RH, 'class': 'fi-soft st-muted' }, svg);
+        Course.svg('text', { x: X0 + k * CW + CW / 2, y: y0 + 16, 'class': 'tx-mid tx-mono tx-sm', text: out[k] ? 'T' : 'N' }, svg);
+      }
+      for (s = 0; s < schemes.length; s++) {
+        var g = guessOf(schemes[s][0], out, backward), y = y0 + (s + 1) * RP;
+        Course.svg('text', { x: 92, y: y + 16, 'class': 'tx-end tx-sm', text: schemes[s][1] }, svg);
+        for (k = 0; k < out.length; k++) {
+          var wrong = g[k] !== out[k];
+          Course.svg('rect', { x: X0 + k * CW, y: y, width: CW, height: RH, 'class': wrong ? 'fw-s2 st-s2' : 'fi-paper' }, svg);
+          Course.svg('text', { x: X0 + k * CW + CW / 2, y: y + 16, 'class': 'tx-mid tx-mono tx-sm' + (wrong ? '' : ' tx-muted'), text: g[k] ? 'T' : 'N' }, svg);
+        }
+      }
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      block(30, 'loop branch, backward: BNE R1, R2, LOOP', st.loop, true);
+      block(170, 'if-branch, forward: BEQ R1, R0, SKIP', st.iff, false);
+    }
+    ui.onChange(function () {
+      var st = strips(), N = st.loop.length;
+      draw(st);
+      var lNT = count(st.loop, guessOf('nt', st.loop, true)), lT = count(st.loop, guessOf('t', st.loop, true)), lB = count(st.loop, guessOf('bt', st.loop, true));
+      var iNT = count(st.iff, guessOf('nt', st.iff, false)), iT = count(st.iff, guessOf('t', st.iff, false)), iB = count(st.iff, guessOf('bt', st.iff, false));
+      roLoop.set(lNT + ' / ' + lT + ' / ' + lB + ' of ' + N);
+      roIf.set(iNT + ' / ' + iT + ' / ' + iB + ' of ' + M + ' (expected ' + Math.round(st.p * 100) + ' % / ' + Math.round((1 - st.p) * 100) + ' % / ' + Math.round(st.p * 100) + ' %)');
+      roAll.set((lNT + iNT) + ' / ' + (lT + iT) + ' / ' + (lB + iB) + ' of ' + (N + M));
+      note.set('Loop: always NT is wrong on every iteration but the last (N − 1 = ' + (N - 1) + '), always T and BTFNT only at the exit. If-branch: NT and BTFNT are wrong whenever it is taken, always T whenever it is not. BTFNT chooses the rule by the direction of the branch, so it equals the better uniform rule on each strip as long as a forward branch is taken less than half the time.');
+    });
+  });
+  </script>
+</section>
+
+<section id="l04-numbers">
+  <h2>Putting numbers on it: the two exam loops</h2>
+
+  <p>The exam asks for a table and a rate, so do both loops of the hook by hand once. The June 2025 <code>BNE</code> executes with R1 = 4, 8, 12, 16, 20 against R2 = 20: five executions, T T T T NT. The midterm <code>BEQ</code> executes with R1 = 0 … 100 against R2 = 100: 101 executions, NT 100 times, then T at the exit.</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Mispredictions of the static schemes, branch solved in ID. Loop A: the June 2025 BNE, backward, 5 executions. Loop B: the midterm BEQ, forward, 101 executions. The last row is what the 2025 paper actually asked (<a href="l05.html">lesson 5</a>).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Scheme</th><th>Loop A (backward BNE)</th><th>Loop B (forward BEQ)</th></tr></thead>
+        <tbody>
+          <tr><td>stall, no guess</td><td>pays on all 5: 5 cycles</td><td>pays on all 101: 101 cycles</td></tr>
+          <tr><td>always not taken</td><td class="num">4 of 5 = 80 %</td><td class="num">1 of 101 ≈ 1 %</td></tr>
+          <tr><td>always taken, BTB hit</td><td class="num">1 of 5 = 20 %</td><td class="num">100 of 101 ≈ 99 %</td></tr>
+          <tr class="is-key"><td>BTFNT</td><td class="num">1 of 5 = 20 %</td><td class="num">1 of 101 ≈ 1 %</td></tr>
+          <tr><td>profile hint (T for A, NT for B)</td><td class="num">1 of 5 = 20 %</td><td class="num">1 of 101 ≈ 1 %</td></tr>
+          <tr><td>2-bit BHT from Strongly NT</td><td class="num">3 of 5 = 60 %</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>To turn a rate into cycles, count. The 2025 program executes 2 + 5 × 5 = 27 instructions; with branch stalls only (the body's load-use hazard is left out on purpose), stalling costs 27 + 4 + 5 = 36 cycles (CPI 1.33), always not taken 35 (1.30), always taken 32 (1.19). In the formula sheet's loop notation, m = 5 and k = 1 stall per iteration give CPI<sub>∞</sub> = (m + k) / m = 1.2 for the stalled loop; a correctly predicted branch has k = 0.</p>
+
+  <div class="tip">
+    <p>The 2025 paper's table has columns "1st … 5th iteration" and rows "Prediction State", "Prediction", "Branch Outcome". For a static scheme the state row is constant: write the prediction row, the outcome row T T T T NT, mark the mismatches, then the rate. A bare "80 %" loses the motivation point.</p>
+  </div>
+</section>
+
+<section id="l04-delay">
+  <h2>The delay slot: the bubble becomes a contract</h2>
+
+  <p>The <mark class="key">delayed branch</mark> stops guessing and changes the rules: the instruction right after the branch — the <mark class="key">branch delay slot</mark> — "is always executed, regardless of whether the branch is taken or not" (p. 46), and the branch takes effect only after it. The bubble gets a meaning and the compiler gets the job of filling it; if it finds nothing it writes a NOP, which is exactly the stall you were trying to avoid.</p>
+
+  <figure class="tbl-fig">
+    <figcaption>The notes' Figure 14 (p. 46) on the widget's loop: the slot instruction (<code>FMUL F4, F4, F0</code>) is fetched while the branch is in ID; the branch steers only the fetch of cycle 3.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th></th><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th><th>C6</th><th>C7</th><th>C8</th></tr></thead>
+        <tbody>
+          <tr><td><code>BNE</code></td><td>IF</td><td>ID</td><td>EX</td><td>ME</td><td>WB</td><td></td><td></td><td></td></tr>
+          <tr class="is-key"><td><code>FMUL</code> (slot)</td><td></td><td>IF</td><td>ID</td><td>EX</td><td>ME</td><td>WB</td><td></td><td></td></tr>
+          <tr><td><code>LD</code> at LOOP</td><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>ME</td><td>WB</td><td></td></tr>
+          <tr><td>next</td><td></td><td></td><td></td><td>IF</td><td>ID</td><td>EX</td><td>ME</td><td>WB</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The compiler's checklist (p. 46): the candidate must be independent of the branch decision — it must not produce a register the branch compares and must not be a branch itself — and safe to execute whether the branch is taken or not. It can come from three places.</p>
+
+  <figure class="fig fig--plain" id="l04-fig-sources">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="The three places a delay-slot instruction can come from: an instruction before the branch, the first instruction of the target, or the instruction after the branch on the fall-through path">
+      <rect x="195" y="30" width="170" height="24" rx="4" class="fi-paper"/><text x="202" y="47" class="tx-mono">FMUL F4, F4, F0</text>
+      <rect x="195" y="70" width="170" height="24" rx="4" class="fw-s1 st-s1"/><text x="202" y="87" class="tx-mono">BNE R1, R2, LOOP</text>
+      <rect x="195" y="110" width="170" height="24" rx="4" class="hl"/>
+      <rect x="195" y="110" width="170" height="24" rx="4" class="fi-paper st-ink dash"/><text x="280" y="127" class="tx-mid tx-sm tx-muted">delay slot</text>
+      <rect x="195" y="150" width="170" height="24" rx="4" class="fi-paper"/><text x="202" y="167" class="tx-mono">SD F2, 0(R3)</text>
+      <rect x="390" y="110" width="150" height="24" rx="4" class="fi-paper"/><text x="397" y="127" class="tx-mono">LD F0, 0(R1)</text>
+      <text x="465" y="100" class="tx-mid tx-sm tx-muted">at LOOP</text>
+      <path d="M 193 42 L 165 42 L 165 116 L 191 116" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M 193 162 L 178 162 L 178 128 L 191 128" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M 388 122 L 369 122" class="sw-2" marker-end="url(#arr)"/>
+      <text x="90" y="88" class="tx-mid tx-hand">from before</text>
+      <text x="465" y="72" class="tx-mid tx-hand">from the target</text>
+      <text x="280" y="212" class="tx-mid tx-hand">from the fall-through</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> Three sources for the slot: an instruction that had to execute anyway; the first instruction of the taken path, copied; the first instruction of the not-taken path, moved up.</figcaption>
+  </figure>
+
+  <h3>From before: always a win</h3>
+
+  <p>Take an instruction above the branch that the branch does not depend on and move it below. It had to execute on both paths, so the slot is useful whatever the outcome, with no safety condition beyond independence and no code growth. The notes' Example 2 (p. 48) in the papers' mnemonics: the <code>ADD</code> writes R1 and reads R2, R3; the branch reads R2 and R4; nothing links them.</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before: the slot holds a stall">
+<pre><code>ADD  R1, R2, R3
+BEQ  R2, R4, L1
+NOP              # delay slot</code></pre>
+    </div>
+    <div class="compare-col" data-label="After: the ADD fills the slot">
+<pre><code>BEQ  R2, R4, L1
+ADD  R1, R2, R3  # delay slot</code></pre>
+    </div>
+  </div>
+
+  <aside class="redpen" data-page="48">
+    <p class="claim">"After scheduling: beq x1, x2, x3 / add x1, x2, x3 # delay slot filled"</p>
+    <p class="fix">The scheduled code must read <code>beq x2, x4, L1</code> — the branch unchanged — followed by <code>add x1, x2, x3</code> in the slot.</p>
+    <p class="because"><code>beq x1, x2, x3</code> is not a valid branch, and read literally it compares x1, the register the <code>add</code> writes, which would forbid the move: an instruction the branch depends on may never go into its slot. The notes' own sentence underneath ("the add … has no dependency on the branch condition") describes the intended code.</p>
+  </aside>
+
+  <h3>From the target: a bet on "taken"</h3>
+
+  <p>When nothing independent sits above the branch, copy the first instruction of the target into the slot and retarget the branch to the instruction after it. Taken, the slot did exactly what came next — for a loop, almost every time. Not taken, the slot instruction executes all the same, so it must be <em>harmless</em> on the fall-through path: typically it writes a register that path overwrites before reading. The notes' Example 3 (p. 49), with the loop made explicit:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before: the SUB is the target">
+<pre><code>L1:  SUB  R4, R5, R6
+     ADD  R1, R2, R3
+     BEQ  R1, R0, L1
+     NOP              # delay slot</code></pre>
+    </div>
+    <div class="compare-col" data-label="After: a copy of the SUB fills the slot">
+<pre><code>L1:  SUB  R4, R5, R6  # kept: first entry
+L2:  ADD  R1, R2, R3  # new target
+     BEQ  R1, R0, L2
+     SUB  R4, R5, R6  # slot: the copy</code></pre>
+    </div>
+  </div>
+
+  <p>The <code>SUB</code> now exists twice — the <mark class="key">instruction duplication</mark> of p. 50. Only this branch is retargeted, to L2; the original stays at L1, because the first entry into the loop and any other branch that jumps to L1 still need it there. The price is code size and two copies to keep consistent; the gain is one cycle on every taken iteration — why the notes recommend it for loops, "particularly do-while constructs".</p>
+
+  <aside class="margin-note">A slip in the notes' comments on p. 49: the line marked "# branch instruction" is the add; the branch is the line below it.</aside>
+
+  <p>The example also hides the stall of section 1: <code>ADD R1, R2, R3</code> produces R1 and <code>BEQ R1, R0, L1</code> tests it in the very next cycle. Any instruction between the two would cure it; the quiz asks about this.</p>
+
+  <h3>From the fall-through: a bet on "not taken"</h3>
+
+  <p>The mirror bet moves the instruction that follows the branch on the sequential path into the slot. Not taken, the slot was needed anyway; taken, it still executes, so its result must be dead on the target path. The notes' Example 4 (p. 51): <code>OR R7, R8, R9</code> is the fall-through instruction, <code>SUB R4, R5, R6</code> at L1 the target.</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before">
+<pre><code>     ADD  R1, R2, R3
+     BEQ  R1, R0, L1
+     NOP              # slot
+     OR   R7, R8, R9  # not taken
+L1:  SUB  R4, R5, R6  # taken</code></pre>
+    </div>
+    <div class="compare-col" data-label="After: the OR fills the slot">
+<pre><code>     ADD  R1, R2, R3
+     BEQ  R1, R0, L1
+     OR   R7, R8, R9  # slot
+L1:  SUB  R4, R5, R6</code></pre>
+    </div>
+  </div>
+
+  <p>The condition: R7 is not read at L1 or after it before being written again. Rarely-taken forward branches are the natural customers.</p>
+
+  <aside class="redpen" data-page="49">
+    <p class="claim">"Challenge: If the branch is not taken, this instruction may be invalid and might have to be flushed (if mispredicted), or it must be safe to execute even if not needed."</p>
+    <p class="fix">Nothing is ever flushed: the slot instruction is always executed, so an instruction taken from the target (or, on p. 51, from the fall-through) must be harmless on the other path. There is no "or".</p>
+    <p class="because">Page 46 states the rule correctly, and the exam's VLIW convention relies on it: the slot is a counted cycle in which something executes. A squashed slot exists only in the cancelling ("branch likely") branch described below, which the notes never introduce; at the exam, "flushed" in a delay-slot answer describes a machine the course does not have.</p>
+  </aside>
+
+  <aside class="redpen" data-page="46">
+    <p class="claim">"… 4. Section 2.5.5.4, page 53 - From after the branch. We’ll explore each of these four scheduling strategies step-by-step next."</p>
+    <p class="fix">There are three sources — from before, from the target, from the fall-through. "From after" (p. 53), hoisting an instruction from further down the fall-through path, is the fall-through strategy applied to a later instruction, under the ordinary rule that it must be independent of what it jumps over. The three conditions of p. 53 are nevertheless a good checklist for any fill: no data dependence on the instructions it jumps over, safe if executed when it was not needed, no control-flow condition broken.</p>
+    <p class="because">Hennessy &amp; Patterson (Appendix C, the figure the notes' Examples 2–4 come from) list exactly these three. Answer "three" at the exam; the claim on p. 53 that the fourth is "rarely used because it is too complex to be practical" has no source.</p>
+  </aside>
+
+  <h3>What the slot really costs, and why RISC-V has none</h3>
+
+  <p>Two background facts complete the picture. A variant in which the slot <em>is</em> squashed exists — the <mark class="key">cancelling branch</mark> (MIPS "branch likely"), whose slot executes only if the branch goes the predicted way: "from target" fills become safe, at the price of a flush when the prediction fails. And the slot writes the depth of one pipeline into the instruction set: a deeper pipeline has several bubbles and one slot hides only the first, a superscalar front end would need several slots, and an exception in the slot of a taken branch must restart at two non-adjacent addresses. Compilers fill a single slot usefully only about half of the time (Hennessy &amp; Patterson: about 60 % filled, 80 % of those useful).</p>
+
+  <div class="story" data-year="MIPS, SPARC, HP-PA to RISC-V">
+    <p>MIPS, SPARC and HP-PA each have one architecturally visible delay slot. RISC-V's designers rejected delay slots, with condition codes, as features that "complicate higher performance implementations"; its specification says control-transfer instructions in RV32I "do not have architecturally visible delay slots". McFarling had written in 1993 that delayed branches are "decreasingly effective as the number of delay slots to fill increases". The course uses RISC-V syntax <em>with</em> a MIPS-style slot as a convention; at the exam the exam text wins.</p>
+  </div>
+
+  <h3>The exam's convention: "branch solved in ID stage, 1 cycle delay slot"</h3>
+
+  <p>Now read the sentence every VLIW exercise of the 2024, 2025 and 2026 papers repeats: "The branch is completed with 1 cycle delay slot (branch solved in ID stage). No branch prediction." "Solved in ID" is early evaluation, hence the integer unit's "2 cycle latency to next Branch". "1 cycle delay slot" is the bubble of that pipeline, counted as a cycle of the iteration and written as "(delay slot)" in the row after the branch; nothing is scheduled in it, because the branch is the last instruction of the iteration and the exercise forbids the loop transformations that would move an instruction past it. "No branch prediction": the fetch after the slot waits for the ID-stage decision. The 2026 paper's LOOP1 (<a href="l20.html">lesson 20</a> derives it):</p>
+
+  <figure class="tbl-fig">
+    <figcaption>EX2 of the 22 June 2026 paper, LOOP1, 3-issue VLIW (Memory 3, FP 3, Integer 1 — 2 to a branch), as the readers recomputed it: critical path 10 cycles with the slot, CPI = 10 / 5 = 2, code efficiency = 5 / (10 × 3) ≈ 0.17.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Memory Unit</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+        <tbody>
+          <tr><td>C1</td><td><code>LD F2, 0(R1)</code></td><td></td><td></td></tr>
+          <tr><td>C2</td><td></td><td></td><td></td></tr>
+          <tr><td>C3</td><td></td><td></td><td></td></tr>
+          <tr><td>C4</td><td></td><td><code>FADD F6, F2, F2</code></td><td></td></tr>
+          <tr><td>C5</td><td></td><td></td><td></td></tr>
+          <tr><td>C6</td><td></td><td></td><td></td></tr>
+          <tr><td>C7</td><td><code>SD F6, 0(R1)</code></td><td></td><td><code>ADDUI R1, R1, 4</code></td></tr>
+          <tr><td>C8</td><td></td><td></td><td></td></tr>
+          <tr><td>C9</td><td></td><td></td><td><code>BNE R1, R3, LOOP1</code></td></tr>
+          <tr class="is-key"><td>C10</td><td colspan="3">(delay slot)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">In every exam table the delay slot is a cycle you count: the branch goes two cycles after the ADDUI that it tests, the slot is the next row, and the critical path ends there.</mark></p>
+
+  <div class="widget" id="l04-w-slot">
+    <h3 class="widget-title">Fill the slot</h3>
+    <p class="widget-intro">The loop on the left sums and multiplies the elements of an array; its branch has an empty delay slot. Choose an instruction for the slot. The widget checks whether the move is legal and shows what executes on each path: the taken path continues at LOOP, the fall-through path continues with the <code>SD</code> after the loop. Green means the slot does work that path needed, orange means work that path did not need, a red cross means the program would be wrong. Every instruction here spends one cycle in EX.</p>
+    <ol class="tasks">
+      <li>Before choosing: which of the seven candidates do you expect to be illegal, and why? Then try <code>ADDUI R1, R1, 8</code> and the second <code>BNE</code>.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Three are illegal. <code>ADDUI R1, R1, 8</code> produces the R1 the branch compares, so the branch would test a stale value; the <code>LD</code> moved down from the top is read by the <code>FADD</code> and <code>FMUL</code> above the slot; and a branch cannot sit in a delay slot at all. Legality is about dependences, never about how useful the instruction is.</p></details>
+      </li>
+      <li>Choose <code>FMUL F4, F4, F0</code> and then the <code>LD</code> "from the target". Both give five cycles per iteration — so what is the difference between them?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The FMUL is green on both paths: it is work every iteration needed, so nothing can go wrong. The LD is green when taken but orange on the exit path: the slot loads one element past the end of the array, which must be harmless (readable address, F0 dead after the loop), and the branch had to be retargeted with a copy of the LD placed before the loop. "From before" is a sure win; "from the target" is a bet that must be covered.</p></details>
+      </li>
+      <li>Choose <code>SD F2, 0(R3)</code>, the instruction after the loop. Is it legal? Is it a good idea for this branch?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Legal, but a poor bet: the store is useful only once, when the loop exits, and runs needlessly on every taken iteration (and must be harmless then). The cycles per iteration stay at six. "From the fall-through" pays off on branches that are usually <em>not</em> taken; a loop branch is the opposite.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l04-w-slot', function (root, ui) {
+    var BODY = ['LD F0, 0(R1)', 'ADDUI R1, R1, 8', 'FADD F2, F2, F0', 'FMUL F4, F4, F0', 'BNE R1, R2, LOOP'];
+    var SHORT = ['LD F0', 'ADDUI R1', 'FADD F2', 'FMUL F4', 'BNE'];
+    var AFTER = 'SD F2, 0(R3)', AFTER_SHORT = 'SD F2';
+    var CAND = [
+      { id: 'nop', label: 'NOP — leave the slot empty', text: 'NOP', short: 'NOP', src: 'nothing (a stall)', legal: true, moved: -1, taken: 'wasted', nt: 'wasted', cyc: 6,
+        why: 'Legal, and it is exactly the stall you wanted to avoid: six cycles per iteration for five useful instructions.' },
+      { id: 'fmul', label: 'FMUL F4, F4, F0 — from before (I3)', text: BODY[3], short: SHORT[3], src: 'before the branch', legal: true, moved: 3, taken: 'useful', nt: 'useful', cyc: 5,
+        why: 'Legal: it writes F4, which the branch does not read, and it is not a branch. Both paths needed it anyway, so the slot is useful whatever BNE does — five cycles per iteration, no condition to check.' },
+      { id: 'fadd', label: 'FADD F2, F2, F0 — from before (I2)', text: BODY[2], short: SHORT[2], src: 'before the branch', legal: true, moved: 2, taken: 'useful', nt: 'useful', cyc: 5,
+        why: 'Also legal: the branch reads only R1 and R2. Any instruction above the branch that the branch does not depend on will do, and it is useful on both paths.' },
+      { id: 'addui', label: 'ADDUI R1, R1, 8 — from before (I1)', text: BODY[1], short: SHORT[1], src: 'before the branch', legal: false, moved: 1, taken: 'wrong', nt: 'wrong', cyc: 0,
+        why: 'Illegal: BNE compares R1, and this instruction produces it. Below the branch, the test would read the old R1 — the loop would run one iteration too many.' },
+      { id: 'ldbefore', label: 'LD F0, 0(R1) moved down from the top (I0)', text: BODY[0], short: SHORT[0], src: 'before the branch', legal: false, moved: 0, taken: 'wrong', nt: 'wrong', cyc: 0,
+        why: 'Illegal: FADD and FMUL read the F0 this load produces, and they sit above the slot. An instruction may be delayed only past instructions that do not depend on it.' },
+      { id: 'ldtarget', label: 'LD F0, 0(R1) — from the target: the next iteration’s load', text: BODY[0], short: SHORT[0], src: 'the target (copied, branch retargeted to ADDUI)', legal: true, moved: 0, target: true, taken: 'useful', nt: 'wasted', cyc: 5,
+        why: 'Legal with two provisions: a copy of the LD runs once before the loop and the branch now targets the ADDUI (duplication). When taken, the slot does the next iteration’s load: five cycles per iteration. When the loop exits, the slot loads one element past the end — harmless only if that address is readable and F0 is dead after the loop.' },
+      { id: 'sd', label: 'SD F2, 0(R3) — from the fall-through (I5)', text: AFTER, short: AFTER_SHORT, src: 'the fall-through path', legal: true, moved: 5, taken: 'wasted', nt: 'useful', cyc: 6,
+        why: 'Legal, but the store now runs on every iteration: harmless only if nothing reads 0(R3) inside the loop. It saves one cycle once, at the exit, and wastes the slot on every taken iteration — the wrong bet for a loop branch.' },
+      { id: 'bne', label: 'BNE R1, R2, LOOP — a second branch', text: BODY[4], short: SHORT[4], src: 'a branch', legal: false, moved: -1, taken: 'wrong', nt: 'wrong', cyc: 0,
+        why: 'Illegal: a branch cannot sit in a delay slot. The slot of that second branch would be the next instruction, and two branches would be deciding the PC at once.' }
+    ];
+    var sel = ui.select('instruction for the delay slot', CAND.map(function (c) { return { value: c.id, label: c.label }; }), null, 'nop');
+    var roLegal = ui.readout('legal?');
+    var roSrc = ui.readout('comes from');
+    var roCyc = ui.readout('cycles per iteration');
+    var roUse = ui.readout('the slot’s work is');
+    var note = ui.note('');
+    var svg = ui.svg(560, 300, { label: 'The loop with its delay slot filled by the chosen instruction, and the sequence of instructions executed on the taken path and on the fall-through path' });
+    ui.legend([
+      { label: 'useful on this path', color: 'good', mark: 'square' },
+      { label: 'executed but not needed on this path', color: 's2', mark: 'square' },
+      { label: 'wrong result', color: 'bad', mark: 'cross' },
+      { label: 'the delay slot', color: 'ink', mark: 'hl' }
+    ]);
+    function cand() { for (var i = 0; i < CAND.length; i++) if (CAND[i].id === sel.value) return CAND[i]; return CAND[0]; }
+    function box(x, y, w, text, cls, tcls, mid) {
+      Course.svg('rect', { x: x, y: y, width: w, height: 24, rx: 4, 'class': cls }, svg);
+      Course.svg('text', { x: mid ? x + w / 2 : x + 7, y: y + 17, 'class': (mid ? 'tx-mid ' : '') + tcls, text: text }, svg);
+    }
+    function cross(x, y, w) {
+      Course.svg('line', { x1: x + 8, y1: y + 4, x2: x + w - 8, y2: y + 20, 'class': 'st-bad sw-2' }, svg);
+      Course.svg('line', { x1: x + w - 8, y1: y + 4, x2: x + 8, y2: y + 20, 'class': 'st-bad sw-2' }, svg);
+    }
+    function pathCls(v) { return v === 'useful' ? 'fw-good st-good' : v === 'wasted' ? 'fw-s2 st-s2 dash' : 'fi-soft st-muted'; }
+    function draw(c) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var X = 60, W = 190, y = 30, i, order = [], ro;
+      Course.svg('text', { x: X, y: 20, 'class': 'tx-sm tx-muted', text: 'the loop' }, svg);
+      if (c.target) { box(X, y, W, BODY[0], 'fi-soft st-muted', 'tx-mono tx-muted'); Course.svg('text', { x: X - 6, y: y + 17, 'class': 'tx-end tx-sm tx-muted', text: 'once' }, svg); }
+      y += 32;
+      var labelRow = c.target ? 1 : 0;
+      for (i = 0; i < 5; i++) {
+        if (i === labelRow) Course.svg('text', { x: X - 6, y: y + 17, 'class': 'tx-end tx-mono tx-sm', text: 'LOOP:' }, svg);
+        if (c.moved === i && !c.target) { box(X, y, W, '(moved into the slot)', 'fi-none st-muted dash', 'tx-sm tx-muted'); }
+        else if (c.moved === i && c.target) { box(X, y, W, '(copied: see the slot)', 'fi-none st-muted dash', 'tx-sm tx-muted'); }
+        else { box(X, y, W, BODY[i], i === 4 ? 'fw-s1 st-s1' : 'fi-paper', 'tx-mono'); order.push(i); }
+        y += 32;
+      }
+      Course.svg('rect', { x: X, y: y, width: W, height: 24, rx: 4, 'class': 'hl' }, svg);
+      box(X, y, W, c.text, c.legal ? 'fi-paper' : 'fi-soft st-muted', 'tx-mono');
+      if (!c.legal) cross(X, y, W);
+      Course.svg('text', { x: X - 6, y: y + 17, 'class': 'tx-end tx-sm tx-muted', text: 'slot' }, svg);
+      y += 32;
+      if (c.moved === 5) box(X, y, W, '(moved into the slot)', 'fi-none st-muted dash', 'tx-sm tx-muted');
+      else box(X, y, W, AFTER, 'fi-paper', 'tx-mono');
+      /* traces */
+      var TX = 290, TW = 120, NX = 430, ty = 62;
+      Course.svg('text', { x: TX + TW / 2, y: 20, 'class': 'tx-mid tx-sm tx-muted', text: 'taken' }, svg);
+      Course.svg('text', { x: NX + TW / 2, y: 20, 'class': 'tx-mid tx-sm tx-muted', text: 'not taken' }, svg);
+      var nextT = order.filter(function (k) { return k !== 4; }).slice(0, 2).map(function (k) { return SHORT[k]; });
+      var nextN = [c.moved === 5 ? '...' : AFTER_SHORT, '...'];
+      var rowsT = ['BNE', c.short].concat(nextT), rowsN = ['BNE', c.short].concat(nextN);
+      for (i = 0; i < 4; i++) {
+        var yy = ty + i * 32, slotRow = i === 1;
+        box(TX, yy, TW, rowsT[i], slotRow ? (c.legal ? pathCls(c.taken) : 'fi-soft st-muted') : (i === 0 ? 'fw-s1 st-s1' : 'fi-paper'), 'tx-mono' + (rowsT[i] === '...' ? ' tx-muted' : ''), true);
+        box(NX, yy, TW, rowsN[i], slotRow ? (c.legal ? pathCls(c.nt) : 'fi-soft st-muted') : (i === 0 ? 'fw-s1 st-s1' : 'fi-paper'), 'tx-mono' + (rowsN[i] === '...' ? ' tx-muted' : ''), true);
+        if (slotRow && !c.legal) { cross(TX, yy, TW); cross(NX, yy, TW); }
+      }
+      Course.svg('text', { x: TX + TW / 2, y: ty + 4 * 32 + 14, 'class': 'tx-mid tx-sm tx-muted', text: 'back at LOOP' }, svg);
+      Course.svg('text', { x: NX + TW / 2, y: ty + 4 * 32 + 14, 'class': 'tx-mid tx-sm tx-muted', text: 'after the loop' }, svg);
+    }
+    ui.onChange(function () {
+      var c = cand();
+      draw(c);
+      roLegal.set(c.legal ? 'yes' : 'no', c.legal ? 'good' : 'bad');
+      roSrc.set(c.src);
+      roCyc.set(c.legal ? '6 → ' + c.cyc : '—');
+      var use = c.legal ? (c.taken === 'useful' && c.nt === 'useful' ? 'useful on both paths' : c.taken === 'useful' ? 'useful when taken, wasted when not' : c.nt === 'useful' ? 'useful when not taken, wasted when taken' : 'wasted on both paths') : 'a wrong program';
+      roUse.set(use, c.legal && c.taken === 'useful' && c.nt === 'useful' ? 'good' : (c.legal ? undefined : 'bad'));
+      note.set(c.why);
+    });
+  });
+  </script>
+
+  <h3>The puzzle, solved</h3>
+
+  <p>The number in the hook is the branch offset. The June 2025 <code>BNE</code> points back to LOOP, its offset is negative, and a predictor that reads that bit says "taken": right on four iterations, wrong at the exit. The midterm <code>BEQ</code> points forward to DONE, its offset is positive, the same predictor says "not taken" and is right 100 times out of 101 — "always taken", blind to the sign, is the one wrong 100 times. The three lost cycles of the basic pipeline are the distance from IF to the end of ME; the course's pipeline moves the decision to ID, pays one, and the delayed branch gives even that cycle a job.</p>
+</section>
+
+<section id="l04-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l04-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques for handling branches in a pipelined RISC-V processor: 1. Branch always not taken; 2. Branch always taken with a Branch Target Buffer; 3. Backward taken, forward not taken; 4. Delayed branch with delay-slot scheduling.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1. Branch always not taken.</b> Fetch continues at PC + 4 as if the branch were an ordinary instruction; no hardware and no target address are needed. When the branch is not taken the cost is zero; when it is taken the one instruction fetched after the branch is flushed (turned into a NOP) and fetch restarts at the target: a 1-cycle penalty with the branch solved in ID. Good for if-then-else with a rare else path, bad for loop-closing branches, which are taken almost always.</p>
+        <p><b>2. Branch always taken with a BTB.</b> Fetch continues at the target. The target is needed while the branch is still in IF, before decoding, so a Branch Target Buffer — a cache indexed by the address of the branch instruction whose entry holds the predicted target address — supplies it; on a hit the target is fetched in the next cycle. When the branch is not taken the instruction fetched from the target is flushed and fetch resumes at PC + 4 (1 cycle). On a BTB miss the processor falls back to PC + 4 or waits for the target. Good for backward loop branches; without a BTB the scheme has no benefit in a 5-stage pipeline because the target is not known before the outcome.</p>
+        <p><b>3. BTFNT.</b> Use the direction of the branch, i.e. the sign of the offset: backward branches (loops) are predicted taken, forward branches (if-then-else, rarely entered paths) not taken. Needs only one bit of the instruction and no learning hardware; better accuracy than either uniform rule on mixed code. Not adaptive: a forward branch that is usually taken is mispredicted most of the time; and the direction is only known after decoding, so the guess is stored in the BTB entry to be usable in IF.</p>
+        <p><b>4. Delayed branch.</b> The instruction in the slot after the branch is always executed, whatever the outcome; the branch takes effect after it. The compiler fills the slot with an instruction from before the branch (independent of it: always useful), from the target (useful when taken; must be harmless when not; usually duplicated at the label) or from the fall-through (useful when not taken; harmless when taken). A filled slot hides the 1-cycle bubble of the ID-resolved pipeline; a NOP in the slot is a stall. Benefit: no guessing and no flush logic; drawbacks: the slot ties the ISA to one pipeline depth, deeper or multiple-issue pipelines cannot be covered by one slot, and about half of the slots are not usefully filled — which is why RISC-V has no delay slot.</p>
+      </div>
+      <div class="exam-note">
+        <p>The 2026 paper gives five lines per sub-point: name the mechanism, say what it costs, what it buys, and when it fails. For point 2 the examiner looks for "indexed by the branch PC" and "target needed in IF"; for point 4 for "always executed" and the three sources with their conditions.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l04-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Consider the following loop executed on a 5-stage pipeline where the branch is solved in the ID stage (misprediction penalty 1 cycle):</p>
+<pre><code>INIT: ADDUI R1, R0, 0
+      ADDUI R2, R0, 20
+LOOP: LD    F0, 0(R1)
+      FADD  F2, F0, F0
+      SD    F2, 0(R1)
+      ADDUI R1, R1, 4
+      BNE   R1, R2, LOOP</code></pre>
+      <p>For (a) branch always not taken, (b) branch always taken with a BTB that always hits, (c) BTFNT, complete the table (prediction, branch outcome, penalty for each iteration), then give the misprediction rate on the BNE and the total branch stall cycles.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>The BNE executes with R1 = 4, 8, 12, 16, 20 against R2 = 20: five executions, outcomes T T T T NT.</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Iteration</th><th>1st</th><th>2nd</th><th>3rd</th><th>4th</th><th>5th</th></tr></thead>
+            <tbody>
+              <tr><td>Branch Outcome</td><td>T</td><td>T</td><td>T</td><td>T</td><td>NT</td></tr>
+              <tr><td>(a) Prediction: always NT</td><td>NT</td><td>NT</td><td>NT</td><td>NT</td><td>NT</td></tr>
+              <tr><td>(a) Penalty</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">0</td></tr>
+              <tr><td>(b) Prediction: always T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td></tr>
+              <tr><td>(b) Penalty</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td></tr>
+              <tr><td>(c) Prediction: BTFNT (backward → T)</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td></tr>
+              <tr><td>(c) Penalty</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>(a) 4 mispredictions of 5 = 80 %, 4 stall cycles. (b) 1 of 5 = 20 %, 1 stall cycle. (c) LOOP is above the BNE, the offset is negative, the branch is predicted taken: identical to (b), 20 %, 1 stall cycle.</p>
+      </div>
+      <div class="exam-note">
+        <p>The rate is only worth the point with the row of outcomes underneath it. The commonest slip is counting four executions instead of five: list the values of R1 at the branch before writing anything else.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="1.12" data-tol="0.005" id="l04-exam-cpi">
+    <div class="exam-q" lang="en">
+      <p>In a program 20 % of the executed instructions are conditional branches and 60 % of the branches are taken. The pipeline solves branches in the ID stage and uses branch always not taken; branches are the only source of stalls and the pipeline fill is negligible. Compute the CPI.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ \text{CPI} = 1 + f_b \cdot \text{penalty} \cdot p_{\text{mis}} \]
+        \[ = 1 + 0.2 \cdot 1 \cdot 0.6 = 1.12 \]
+        <p>Always not taken mispredicts exactly the taken branches, so \(p_{\text{mis}} = 0.6\). For comparison: stalling gives 1.20, always taken with a perfect BTB 1.08; with the PC written in ME (penalty 3) the three become 1.60, 1.36, 1.24.</p>
+      </div>
+      <div class="exam-note">
+        <p>Write the formula first, then the numbers. The examiner checks that the penalty is 1 for an ID-resolved branch and that the misprediction probability of "not taken" is the <em>taken</em> fraction, not its complement.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l04-exam-slot">
+    <div class="exam-q" lang="en">
+      <p>The pipeline solves branches in ID and has one delay slot that is always executed. Fill the slot of the following loop with the "from target" strategy: write the scheduled code, give the cycles per iteration before and after, and state the conditions that make the transformation legal.</p>
+<pre><code>LOOP: LD    F0, 0(R1)
+      ADDUI R1, R1, 8
+      FADD  F2, F2, F0
+      FMUL  F4, F4, F0
+      BNE   R1, R2, LOOP
+      NOP              # delay slot</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>      LD    F0, 0(R1)      # copy of the target, runs once
+LOOP: ADDUI R1, R1, 8      # new target
+      FADD  F2, F2, F0
+      FMUL  F4, F4, F0
+      BNE   R1, R2, LOOP
+      LD    F0, 0(R1)      # delay slot: next iteration's load</code></pre>
+        <p>Before: 5 instructions + 1 NOP = 6 cycles per iteration (m = 5, k = 1, CPI<sub>∞</sub> = 1.2). After: 5 cycles per iteration (k = 0, CPI<sub>∞</sub> = 1), because the slot now holds the next iteration's load. Legal because: the moved LD does not produce an operand of the branch (R1, R2); the slot LD writes F0, which the next FADD reads with the ADDUI in between, so no load-use stall appears; the ADDUI stays at least one instruction before the BNE that tests R1 (2-cycle ALU-to-branch latency); and on the exit path the extra load past the end of the array must be harmless — the address readable and F0 dead after the loop. The copy before the loop is the duplication cost of the strategy.</p>
+      </div>
+      <div class="exam-note">
+        <p>Four things earn the marks: the retargeted label, the copy before the loop, the cycle count before/after, and the exit-path condition. Forgetting the copy makes the first iteration read an F0 that was never loaded.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l04-exam-mcq1">
+    <div class="exam-q" lang="en">
+      <p>In a 5-stage pipeline where the branch outcome and the target address are computed in the ID stage, the penalty of a mispredicted branch under branch always not taken is:</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>0 cycles <span class="fb">Zero is the cost of a <em>correct</em> guess; the wrong one loses the fetch slot used while the branch was in ID.</span></li>
+      <li data-correct>1 cycle <span class="fb">The instruction fetched in the cycle the branch spends in ID is flushed; fetch restarts from the target in the next cycle.</span></li>
+      <li>2 cycles <span class="fb">Two would be the penalty of a branch resolved at the end of EX.</span></li>
+      <li>3 cycles <span class="fb">Three is the penalty of the basic pipeline, where the PC is written at the end of ME.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>1 cycle: penalty = resolution stage − 1 = 2 − 1.</p></div>
+      <div class="exam-note"><p>The quiz is matched against the course's pipeline, in which "branch solved in ID stage" is the standing assumption.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l04-exam-mcq2">
+    <div class="exam-q" lang="en">
+      <p>With the delayed branch technique, the instruction placed in the branch delay slot:</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>is executed only if the branch is taken <span class="fb">That describes a cancelling ("branch likely") branch predicted taken, not the plain delayed branch of the course.</span></li>
+      <li>is executed only if the branch is not taken <span class="fb">No: the slot does not depend on the outcome at all.</span></li>
+      <li data-correct>is always executed, whatever the outcome <span class="fb">The branch takes effect after the slot; the compiler must choose an instruction that is correct on both paths.</span></li>
+      <li>is flushed whenever the prediction is wrong <span class="fb">There is no prediction and no flush in a delayed branch — this is exactly the wording the notes get wrong on pp. 49 and 51.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>It is always executed, regardless of the branch outcome.</p></div>
+      <div class="exam-note"><p>Single answer. The distractor "flushed" is attractive because of the notes' wording; the rule of the ISA is the one on p. 46.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l04-exam-mcq3">
+    <div class="exam-q" lang="en">
+      <p>Which statements about the Branch Target Buffer used with branch always taken are true? (Multiple answers.)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>It is indexed by the address of the branch instruction <span class="fb">At fetch time the PC is the only thing the hardware has; the instruction bits are not yet available.</span></li>
+      <li data-correct>It stores the predicted target address <span class="fb">Key: branch PC; value: predicted target (the notes' 0x100 → 0x80).</span></li>
+      <li>It decides whether the branch is taken <span class="fb">The direction comes from the static rule (here) or from a history table (<a href="l05.html">lesson 5</a>); the BTB only says <em>where</em>.</span></li>
+      <li data-correct>On a hit the target is fetched in the cycle after the branch's IF <span class="fb">That is the whole point: the target is available during IF, before decoding.</span></li>
+      <li>It is required by branch always not taken too <span class="fb">Not taken needs no target: PC + 4 is always known.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True: indexed by the branch PC; stores the predicted target; on a hit the target is fetched in the next cycle. False: it does not decide the direction, and always not taken does not need it.</p></div>
+      <div class="exam-note"><p>The 2026 paper has "Multiple Choice – Multiple answer" quizzes; tick every true statement and no false one.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l04-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Always taken needs a Branch Target Buffer and always not taken does not. Why?</p>
+    <ul class="options">
+      <li data-correct>Because PC + 4 is known in IF, while the target of a taken branch is not known before the instruction is decoded <span class="fb">To fetch the target in the next cycle it must come from somewhere other than the instruction bits: a table indexed by the PC.</span></li>
+      <li>Because taken branches are rarer than not-taken ones <span class="fb">Frequency has nothing to do with it; loop branches are taken almost always.</span></li>
+      <li>Because the BTB stores the outcome of the branch <span class="fb">The BTB stores the target, not the direction.</span></li>
+      <li>Because without a BTB the branch instruction itself would be flushed <span class="fb">The branch is never flushed; without a BTB the scheme simply cannot fetch anything useful before ID.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A loop runs 10 times; its branch sits at the bottom and jumps back. How many mispredictions do always not taken and always taken make, in that order?</p>
+    <ul class="options">
+      <li data-correct>9 and 1 <span class="fb">Not taken is wrong on the 9 taken iterations; taken is wrong only at the exit.</span></li>
+      <li>10 and 0 <span class="fb">The branch is not taken once, at the exit: that iteration is right for "not taken" and wrong for "taken".</span></li>
+      <li>1 and 9 <span class="fb">Reversed: a backward loop branch is taken on every iteration but the last.</span></li>
+      <li>5 and 5 <span class="fb">A static scheme has no coin to toss; it is right or wrong by the structure of the loop.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about the branch delay slot are true?</p>
+    <ul class="options">
+      <li data-correct>The instruction in the slot executes whatever the branch does <span class="fb">The rule of the ISA: the branch takes effect after the slot.</span></li>
+      <li data-correct>A NOP in the slot costs exactly the cycle the slot was meant to save <span class="fb">The slot is a cycle either way; a NOP makes it the stall of the stalled pipeline.</span></li>
+      <li>The hardware flushes the slot instruction when the branch is taken <span class="fb">Nothing is flushed; that is why a "from target" instruction must be harmless on the other path.</span></li>
+      <li data-correct>The compiler, not the hardware, chooses what goes into the slot <span class="fb">Only the compiler knows which instructions are independent and which registers are dead on each path.</span></li>
+      <li>An instruction the branch depends on may go into the slot if it is short <span class="fb">Never: the branch would read a stale value. Length is irrelevant.</span></li>
+    </ul>
+    <p class="q-fb">The slot is a contract, not a guess: always executed, filled by the compiler, and a NOP there is the bubble back again.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Early evaluation moved the branch comparison into ID. What is the hidden cost, in the words the exam papers use?</p>
+    <ul class="options">
+      <li data-correct>An ALU result reaches a following branch only after 2 cycles: an ADDUI immediately before the BNE that tests its result stalls one cycle <span class="fb">"1 cycle latency to next Int/FP/L/S &amp; 2 cycle latency to next Branch" — the branch asks for its operand in ID, one stage earlier than an ALU would.</span></li>
+      <li>The branch penalty grows to 2 cycles <span class="fb">The opposite: the penalty shrinks from 3 to 1. The cost is on the operand side.</span></li>
+      <li>Loads can no longer be forwarded to ALU instructions <span class="fb">Forwarding to the ALU is untouched; it is the branch that reads too early for forwarding to help.</span></li>
+      <li>Nothing: the comparator is free <span class="fb">The hardware is cheap, but the data hazard is real and the exam's integer-unit sentence exists because of it.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The notes' Example 3 has <code>ADD R1, R2, R3</code> immediately followed by <code>BEQ R1, R0, L1</code>. In the course's pipeline, with the branch solved in ID, what happens at the branch?</p>
+    <ul class="options">
+      <li data-correct>It waits one cycle in ID for R1, because the ADD is still in EX when the branch needs the value <span class="fb">The 2-cycle ALU-to-branch latency: one independent instruction between them would remove the stall.</span></li>
+      <li>Nothing: forwarding delivers R1 in time <span class="fb">Forwarding delivers to EX, not to ID; the branch asks one stage too early.</span></li>
+      <li>The ADD is moved into the delay slot automatically <span class="fb">The hardware moves nothing; and the ADD could not go into the slot anyway, since the branch depends on it.</span></li>
+      <li>The branch is mispredicted <span class="fb">No prediction is involved; this is a data hazard, not a control hazard.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A forward branch guards a rarely entered error handler and is taken 2 % of the time; a backward loop branch is taken 95 % of the time. Which schemes predict both branches well?</p>
+    <ul class="options">
+      <li data-correct>BTFNT <span class="fb">Forward → not taken (right 98 %), backward → taken (right 95 %): the direction bit is exactly the information that separates the two.</span></li>
+      <li>Always not taken <span class="fb">Right 98 % on the if, but wrong 95 % of the time on the loop.</span></li>
+      <li>Always taken <span class="fb">Right 95 % on the loop, but wrong 98 % of the time on the error test.</span></li>
+      <li data-correct>Profile-driven prediction with a representative profile <span class="fb">The hint bit says not taken for the first branch and taken for the second — as long as the profiled inputs behave like the real ones.</span></li>
+    </ul>
+    <p class="q-fb">The two uniform rules are each an expert on one kind of branch; BTFNT and a good profile know which expert to ask.</p>
+  </div>
+</section>
+
+<section class="recap" id="l04-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A branch produces its outcome and its target address late, while fetch needs the next PC every cycle; the branch penalty is the resolution stage minus one — 3 cycles with the PC written in ME, 1 with the branch solved in ID.</li>
+    <li>Early evaluation adds a comparator, an adder and a mux to ID and makes the branch hungry for its operands: an ALU result reaches a following branch only after 2 cycles, a load's after 3 — the exam's "2 cycle latency to next Branch".</li>
+    <li>Stalling pays the penalty on every branch; a predictor pays it only when wrong: CPI = 1 + f<sub>b</sub> · penalty · p<sub>mis</sub>, with p<sub>mis</sub> = 1 for stalling, p<sub>T</sub> for always not taken, 1 − p<sub>T</sub> for always taken.</li>
+    <li>Always not taken costs no hardware and loses on loops; always taken wins on loops but needs the target in IF, hence a Branch Target Buffer indexed by the branch PC; BTFNT reads the sign of the offset and gets both loops and ifs right; profile-driven prediction puts a hint bit chosen from earlier runs into the instruction.</li>
+    <li>The delay-slot instruction is always executed, never flushed. Filling it from before the branch is always a win; from the target (copy, retarget, duplicate) or from the fall-through it is a bet that must be harmless on the other path; a NOP in the slot is the stall back again.</li>
+    <li>The exam's VLIW convention "branch solved in ID stage, 1 cycle delay slot, no branch prediction" means: the branch goes two cycles after the ADDUI it tests, the next row reads (delay slot), and the critical path is counted through it.</li>
+  </ul>
+  <aside class="cheat" id="l04-cheat">
+    <dl>
+      <dt>Branch penalty</dt><dd>\(r - 1\) cycles, \(r\) = stage at whose end the PC is written (ID: 1, EX: 2, ME: 3)</dd>
+      <dt>CPI with branches</dt><dd>\(\text{CPI} = 1 + f_b \cdot \text{penalty} \cdot p_{\text{mis}}\); \(f_b\) = branch fraction</dd>
+      <dt>Misprediction probability</dt><dd>stall: 1; always NT: \(p_T\); always T (BTB hit): \(1 - p_T\); BTFNT: \(p_T\) of forward branches, \(1 - p_T\) of backward ones</dd>
+      <dt>Loop of N iterations, branch at the bottom</dt><dd>always NT: \(N - 1\) mispredictions; always T and BTFNT: 1 (the exit)</dd>
+      <dt>Exit test at the top, N iterations</dt><dd>executed \(N + 1\) times: always NT 1 miss, always T \(N\)</dd>
+      <dt>Cycles of a program</dt><dd>\(\text{IC} + 4 + \text{stalls}\); per iteration \(m + k + 4\), \(\text{CPI}_\infty = (m + k)/m\)</dd>
+      <dt>Delay slot</dt><dd>always executed; from before: no condition; from target: harmless if not taken, copy at the label; from fall-through: harmless if taken; NOP = stall</dd>
+      <dt>Exam convention</dt><dd>branch solved in ID, ALU → branch latency 2, one counted delay slot "(delay slot)", no prediction</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l04-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=nczJ58WvtYo" target="_blank" rel="noopener">How Branch Prediction Works in CPUs</a>
+      <span class="res-by">Computerphile, Matt Godbolt</span><span class="res-dur">26 min</span>
+      <p class="res-why">Why a pipeline has to guess and what a wrong guess costs, built up with drawings from "always guess the same" — the static schemes of this lesson — to the counters of the next one.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://ripes.dk/" target="_blank" rel="noopener">Ripes, a visual RISC-V pipeline simulator</a>
+      <span class="res-by">Morten Borup Petersen</span><span class="res-dur">10 min</span>
+      <p class="res-why">Type the June 2025 loop, step cycle by cycle and watch the instruction after a taken branch being flushed in a real 5-stage datapath: Fig. 3 in motion.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://courses.grainger.illinois.edu/CS433/fa2020/slides/appendixC.pdf" target="_blank" rel="noopener">Hennessy &amp; Patterson, Appendix C — lecture slides (CS433, Illinois)</a>
+      <span class="res-by">University of Illinois</span><span class="res-dur">45 slides</span>
+      <p class="res-why">The static schemes exactly as the exam expects them: freeze or flush, predict not taken, predict taken ("not practical for our basic pipeline" without a target), the three ways to fill the slot and a worked CPI-penalty example to redo by hand.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.doc.ic.ac.uk/~phjk/AdvancedCompArchitecture/Lectures/pdfs/Ch03-part1-BranchPrediction.pdf" target="_blank" rel="noopener">Branch direction prediction (Imperial College lecture slides)</a>
+      <span class="res-by">Paul H. J. Kelly</span><span class="res-dur">45 slides</span>
+      <p class="res-why">The delay-slot statistics quoted in this lesson (about 60 % of slots filled, 80 % of those useful) and the bridge to the history tables of <a href="l05.html">lesson 5</a>.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html" target="_blank" rel="noopener">The RISC-V unprivileged ISA, RV32I control-transfer instructions</a>
+      <span class="res-by">RISC-V International</span><span class="res-dur">5 min</span>
+      <p class="res-why">The primary source for "no architecturally visible delay slots": read it once so that the exam's MIPS-style slot on RISC-V syntax does not confuse you.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>A static scheme bets the same way every time it meets a branch. The next lesson gives the predictor a memory — one bit, then two, in a table indexed by the PC — and shows why one bit of memory can be worse than no memory at all.</p>
+</aside>
+
+</main>
+</body>
+</html>

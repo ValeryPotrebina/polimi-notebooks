@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Why Cray threw away the cache: Flynn, SIMD and the vector idea · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l30">
+
+<header class="lesson-head">
+  <h1>Why Cray threw away the cache: Flynn, SIMD and the vector idea</h1>
+  <p class="lede">After this lesson you will place any machine in Flynn's taxonomy by counting its streams, show with numbers why a pipelined vector unit beats an array of processing elements, give the reason behind each design choice of a Cray-style vector machine, and say where 572 of the 578 instructions of scalar DAXPY disappear on VMIPS.</p>
+</header>
+
+<div class="hook" data-label="A puzzle from 1976">
+  <p>In January 1968 IBM announced the System/360 Model 85, the first commercially available computer with a cache memory. Eight years later Seymour Cray's company shipped the Cray-1. It was "10 times faster than competing machines" and the fastest computer in the world from 1976 to 1982, in the Computer History Museum's words — and it had no data cache at all. Its operands travelled between a main memory of sixteen banks and its registers, among them eight vector registers of 64 elements each.</p>
+  <p>Lessons 22–28 showed why a modern core starves without its caches. So why would the fastest machine of its decade leave the data cache out, and how could it still win?</p>
+  <p>A second number points to the answer. On VMIPS, the textbook machine built on the Cray-1's model, the loop <code>Y[i] = a*X[i] + Y[i]</code> over 64 elements takes 6 instructions. The scalar MIPS loop needs 578.</p>
+</div>
+
+<section id="l30-dlp">
+  <h2>Past the walls of ILP: data-level parallelism</h2>
+
+  <p><a href="l08.html#l08-limits">Lesson 8</a> ended at the limits of <abbr title="instruction-level parallelism">ILP</abbr>, which the notes group as three walls (p. 387): control (a misprediction costs more the deeper the pipeline), memory (misses and pointer chasing starve the out-of-order window) and complexity/energy (renaming, reservation stations and reorder buffers grow faster than the IPC they buy: "a lot of energy is spent to squeeze out a few more IPCs"). The way past is another kind of parallelism: threads (<abbr title="thread-level parallelism">TLP</abbr>, <a href="l29.html">lesson 29</a>), independent requests (<abbr title="request-level parallelism">RLP</abbr>), or data — this lesson and the next two.</p>
+
+  <p>Take the plainest loop there is, <code>Z[i] = X[i] + Y[i]</code> for i = 0 … 63. Iteration 17 never needs the result of iteration 16, so in principle all 64 additions could happen at the same moment. Change one index and the picture flips: in <code>X[i] = X[i] + X[i-1]</code>, statement S1 of the July 2024 quiz on loop-carried dependences, every addition waits for the one before.</p>
+
+  <figure class="fig fig--pair" id="l30-fig-dlp">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Six additions z[i] = x[i] + y[i] for i from 0 to 5: each adder takes its own two inputs and gives its own result, and no arrow connects the columns">
+        <text x="26" y="30" class="tx-sm tx-mid">x₀</text><text x="44" y="30" class="tx-sm tx-mid">y₀</text>
+        <text x="72" y="30" class="tx-sm tx-mid">x₁</text><text x="90" y="30" class="tx-sm tx-mid">y₁</text>
+        <text x="118" y="30" class="tx-sm tx-mid">x₂</text><text x="136" y="30" class="tx-sm tx-mid">y₂</text>
+        <text x="164" y="30" class="tx-sm tx-mid">x₃</text><text x="182" y="30" class="tx-sm tx-mid">y₃</text>
+        <text x="210" y="30" class="tx-sm tx-mid">x₄</text><text x="228" y="30" class="tx-sm tx-mid">y₄</text>
+        <text x="256" y="30" class="tx-sm tx-mid">x₅</text><text x="274" y="30" class="tx-sm tx-mid">y₅</text>
+        <line x1="27" y1="37" x2="30" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="43" y1="37" x2="40" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="73" y1="37" x2="76" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="89" y1="37" x2="86" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="119" y1="37" x2="122" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="135" y1="37" x2="132" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="165" y1="37" x2="168" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="181" y1="37" x2="178" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="211" y1="37" x2="214" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="227" y1="37" x2="224" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="257" y1="37" x2="260" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="273" y1="37" x2="270" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <rect x="19" y="66" width="32" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="65" y="66" width="32" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="111" y="66" width="32" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="157" y="66" width="32" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="203" y="66" width="32" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="249" y="66" width="32" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="35" y="85" class="tx-mid tx-bold">+</text><text x="81" y="85" class="tx-mid tx-bold">+</text><text x="127" y="85" class="tx-mid tx-bold">+</text>
+        <text x="173" y="85" class="tx-mid tx-bold">+</text><text x="219" y="85" class="tx-mid tx-bold">+</text><text x="265" y="85" class="tx-mid tx-bold">+</text>
+        <line x1="35" y1="94" x2="35" y2="116" class="st-s1" marker-end="url(#arr-s1)"/><line x1="81" y1="94" x2="81" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="127" y1="94" x2="127" y2="116" class="st-s1" marker-end="url(#arr-s1)"/><line x1="173" y1="94" x2="173" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="219" y1="94" x2="219" y2="116" class="st-s1" marker-end="url(#arr-s1)"/><line x1="265" y1="94" x2="265" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <text x="35" y="136" class="tx-sm tx-mid">z₀</text><text x="81" y="136" class="tx-sm tx-mid">z₁</text><text x="127" y="136" class="tx-sm tx-mid">z₂</text>
+        <text x="173" y="136" class="tx-sm tx-mid">z₃</text><text x="219" y="136" class="tx-sm tx-mid">z₄</text><text x="265" y="136" class="tx-sm tx-mid">z₅</text>
+        <text x="150" y="180" class="tx-mid tx-hand">no element waits</text>
+      </svg>
+      <p class="fig-label">Z[i] = X[i] + Y[i]: data-level parallelism</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Six additions x[i] = x[i] + x[i-1]: each adder needs the result of the adder on its left, so the six form a chain of dependences and can only run one after another">
+        <text x="35" y="30" class="tx-sm tx-mid">x₀</text><text x="81" y="30" class="tx-sm tx-mid">x₁</text><text x="127" y="30" class="tx-sm tx-mid">x₂</text>
+        <text x="173" y="30" class="tx-sm tx-mid">x₃</text><text x="219" y="30" class="tx-sm tx-mid">x₄</text><text x="265" y="30" class="tx-sm tx-mid">x₅</text>
+        <line x1="35" y1="37" x2="35" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="81" y1="37" x2="81" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="127" y1="37" x2="127" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="173" y1="37" x2="173" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="219" y1="37" x2="219" y2="62" class="st-s1" marker-end="url(#arr-s1)"/><line x1="265" y1="37" x2="265" y2="62" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="2" y1="80" x2="17" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="49" y1="80" x2="63" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="95" y1="80" x2="109" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="141" y1="80" x2="155" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="187" y1="80" x2="201" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="233" y1="80" x2="247" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <rect x="21" y="66" width="28" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="67" y="66" width="28" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="113" y="66" width="28" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="159" y="66" width="28" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="205" y="66" width="28" height="28" rx="6" class="fi-paper sw-2"/>
+        <rect x="251" y="66" width="28" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="35" y="85" class="tx-mid tx-bold">+</text><text x="81" y="85" class="tx-mid tx-bold">+</text><text x="127" y="85" class="tx-mid tx-bold">+</text>
+        <text x="173" y="85" class="tx-mid tx-bold">+</text><text x="219" y="85" class="tx-mid tx-bold">+</text><text x="265" y="85" class="tx-mid tx-bold">+</text>
+        <line x1="35" y1="94" x2="35" y2="116" class="st-s1" marker-end="url(#arr-s1)"/><line x1="81" y1="94" x2="81" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="127" y1="94" x2="127" y2="116" class="st-s1" marker-end="url(#arr-s1)"/><line x1="173" y1="94" x2="173" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="219" y1="94" x2="219" y2="116" class="st-s1" marker-end="url(#arr-s1)"/><line x1="265" y1="94" x2="265" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <text x="35" y="136" class="tx-sm tx-mid">x₀′</text><text x="81" y="136" class="tx-sm tx-mid">x₁′</text><text x="127" y="136" class="tx-sm tx-mid">x₂′</text>
+        <text x="173" y="136" class="tx-sm tx-mid">x₃′</text><text x="219" y="136" class="tx-sm tx-mid">x₄′</text><text x="265" y="136" class="tx-sm tx-mid">x₅′</text>
+        <text x="150" y="180" class="tx-mid tx-hand">one at a time</text>
+      </svg>
+      <p class="fig-label">X[i] = X[i] + X[i−1]: a loop-carried chain</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Left: every sum reads its own two elements and nothing connects the columns, so all six — or all 64 — can be computed at once. Right: the loop-carried dependence of the July 2024 quiz, where every addition needs the result of the one before it (orange arrows): no hardware can run these side by side.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn>Data-level parallelism (DLP)</dfn> — the same operation applied independently to many data items, so that no element waits for the result of another: "same instruction, multiple data" (p. 387). It is a property of the program; SIMD and vector hardware are ways of exploiting it.</p>
+  </div>
+
+  <p>Why bother, when an out-of-order core would also find those 64 independent additions? Because of what finding them costs. A superscalar core fetches, decodes, renames, schedules and commits every single instruction, and that machinery, not the adder, is where most of its energy goes. A SIMD or vector machine "only needs to fetch one instruction per data operation" (p. 387): one instruction says "add these 64 pairs". Hence the claim this lesson has to justify: on such loops an in-order vector processor can match or beat a complex out-of-order core, at lower energy.</p>
+
+  <aside class="redpen" data-page="387">
+    <p class="claim">"An in-order vector processor can match or surpass the performance of a complex out-of-order (OoO) core on such workloads by relying on data locality (DLP)"</p>
+    <p class="fix">It relies on data-level parallelism (DLP) — the independence of the element operations — served by predictable, high-bandwidth memory accesses, not on data locality.</p>
+    <p class="because">Locality means reuse, which caches exploit; a stream such as DAXPY touches each element once. The notes themselves give the classic vector machine "Little or No Data Cache" (p. 397), which a machine relying on locality could not afford.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">DLP is the same operation on many independent elements; a SIMD or vector machine pays for one instruction and gets many element operations, so the front-end cost per element almost vanishes.</mark></p>
+</section>
+
+<section id="l30-flynn">
+  <h2>Flynn counts streams, not width</h2>
+
+  <p>Two machines each start four operations in the same clock cycle. The first is a 4-wide superscalar: it reads four instructions from one program counter — a load, a multiply, an add, an index update — and sends each to its own unit. The second is a SIMD array: it reads one instruction, <code>ADD R1, R2, R3</code>, and broadcasts it to four processing elements, each adding its own pair of registers. Both are parallel. Only one of them is SIMD.</p>
+
+  <figure class="fig fig--pair" id="l30-fig-streams">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 260" role="img" aria-label="A 4-wide superscalar: one program counter fetches four different instructions, a load, a multiply, an add and an index update, which go to four different functional units">
+        <rect x="20" y="14" width="56" height="30" rx="4" class="fi-paper sw-2"/>
+        <text x="48" y="34" class="tx-mid tx-mono">PC</text>
+        <line x1="48" y1="44" x2="48" y2="62" marker-end="url(#arr)"/>
+        <rect x="20" y="66" width="150" height="24" rx="4" class="fw-s1 st-s1"/>
+        <rect x="20" y="98" width="150" height="24" rx="4" class="fw-s1 st-s1"/>
+        <rect x="20" y="130" width="150" height="24" rx="4" class="fw-s1 st-s1"/>
+        <rect x="20" y="162" width="150" height="24" rx="4" class="fw-s1 st-s1"/>
+        <text x="28" y="82" class="tx-mono tx-sm">LD F2, 0(R1)</text>
+        <text x="28" y="114" class="tx-mono tx-sm">FMUL F6, F4, F0</text>
+        <text x="28" y="146" class="tx-mono tx-sm">FADD F8, F8, F10</text>
+        <text x="28" y="178" class="tx-mono tx-sm">ADDUI R2, R2, 8</text>
+        <line x1="170" y1="78" x2="196" y2="78" marker-end="url(#arr)"/>
+        <line x1="170" y1="110" x2="196" y2="110" marker-end="url(#arr)"/>
+        <line x1="170" y1="142" x2="196" y2="142" marker-end="url(#arr)"/>
+        <line x1="170" y1="174" x2="196" y2="174" marker-end="url(#arr)"/>
+        <rect x="200" y="66" width="84" height="24" rx="4" class="fi-paper sw-2"/>
+        <rect x="200" y="98" width="84" height="24" rx="4" class="fi-paper sw-2"/>
+        <rect x="200" y="130" width="84" height="24" rx="4" class="fi-paper sw-2"/>
+        <rect x="200" y="162" width="84" height="24" rx="4" class="fi-paper sw-2"/>
+        <text x="242" y="82" class="tx-mid tx-sm">Load unit</text>
+        <text x="242" y="114" class="tx-mid tx-sm">Multiplier</text>
+        <text x="242" y="146" class="tx-mid tx-sm">Adder</text>
+        <text x="242" y="178" class="tx-mid tx-sm">Int ALU</text>
+        <text x="150" y="214" class="tx-mid tx-sm">one PC: four different instructions</text>
+        <text x="150" y="246" class="tx-mid tx-hand">one stream</text>
+      </svg>
+      <p class="fig-label">4-wide superscalar: SISD</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 260" role="img" aria-label="A SIMD array: one program counter fetches one instruction, ADD R1, R2, R3, which is broadcast to four processing elements, each adding its own pair of registers">
+        <rect x="20" y="14" width="56" height="30" rx="4" class="fi-paper sw-2"/>
+        <text x="48" y="34" class="tx-mid tx-mono">PC</text>
+        <line x1="48" y1="44" x2="48" y2="62" marker-end="url(#arr)"/>
+        <rect x="20" y="66" width="150" height="24" rx="4" class="fw-s1 st-s1"/>
+        <text x="28" y="82" class="tx-mono tx-sm">ADD R1, R2, R3</text>
+        <line x1="95" y1="90" x2="95" y2="110" class="sw-2"/>
+        <line x1="50" y1="110" x2="248" y2="110" class="sw-3"/>
+        <line x1="50" y1="110" x2="50" y2="128" marker-end="url(#arr)"/>
+        <line x1="116" y1="110" x2="116" y2="128" marker-end="url(#arr)"/>
+        <line x1="182" y1="110" x2="182" y2="128" marker-end="url(#arr)"/>
+        <line x1="248" y1="110" x2="248" y2="128" marker-end="url(#arr)"/>
+        <rect x="22" y="132" width="56" height="36" rx="4" class="fw-s1 st-s1"/>
+        <rect x="88" y="132" width="56" height="36" rx="4" class="fw-s1 st-s1"/>
+        <rect x="154" y="132" width="56" height="36" rx="4" class="fw-s1 st-s1"/>
+        <rect x="220" y="132" width="56" height="36" rx="4" class="fw-s1 st-s1"/>
+        <text x="50" y="155" class="tx-mid tx-mono tx-sm">PE0</text>
+        <text x="116" y="155" class="tx-mid tx-mono tx-sm">PE1</text>
+        <text x="182" y="155" class="tx-mid tx-mono tx-sm">PE2</text>
+        <text x="248" y="155" class="tx-mid tx-mono tx-sm">PE3</text>
+        <text x="50" y="190" class="tx-mid tx-sm">R2₀+R3₀</text>
+        <text x="116" y="190" class="tx-mid tx-sm">R2₁+R3₁</text>
+        <text x="182" y="190" class="tx-mid tx-sm">R2₂+R3₂</text>
+        <text x="248" y="190" class="tx-mid tx-sm">R2₃+R3₃</text>
+        <text x="150" y="214" class="tx-mid tx-sm">one PC: one instruction, four data</text>
+        <text x="150" y="246" class="tx-mid tx-hand">one stream, four data</text>
+      </svg>
+      <p class="fig-label">SIMD array of 4 PEs: SIMD</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> Both machines start four operations per cycle. The superscalar fetches four different instructions from one program counter: one instruction stream, parallelism across instructions. The SIMD array fetches one instruction and broadcasts it to four processing elements, each working on its own registers (the notes' example, p. 390): one instruction stream, four data streams.</figcaption>
+  </figure>
+
+  <p>In 1966 Michael Flynn classified computers by how many instruction streams and how many data streams they handle at once (p. 388):</p>
+
+  <figure class="tbl-fig" id="l30-tbl-flynn">
+    <figcaption>Flynn's four classes with the notes' examples (pp. 388–389): rows count instruction streams, columns count data streams.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>one data stream</th><th>many data streams</th></tr></thead>
+        <tbody>
+          <tr><th>one instruction stream</th><td><b>SISD</b> — a scalar RISC pipeline, an in-order MIPS, and also an out-of-order superscalar: one PC, one stream</td><td><b>SIMD</b> — vector processors (Cray, VMIPS), packed-SIMD extensions (MMX, SSE, AVX), GPUs in their warp execution</td></tr>
+          <tr><th>many instruction streams</th><td><b>MISD</b> — essentially hypothetical; fault-tolerant redundant pipelines are sometimes cited</td><td><b>MIMD</b> — multicores, clusters, distributed-memory systems: one PC per thread</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">The notes write the vector add as ADDV V1, V2, V3; the papers and VMIPS write ADDVV.D: two vector operands, double precision. Same instruction.</aside>
+
+  <p>The rule that settles the confusing cases is the notes' own: "Flynn's classification is about streams, not width" (p. 388). A superscalar may issue four, six or eight instructions per cycle, but all come from one PC, each a different instruction on its own operands: parallelism across instructions, ILP, still SISD. A SIMD machine fetches one instruction and applies it to many elements, as <code>ADDVV.D V3, V1, V2</code> computes V3[i] = V1[i] + V2[i] for every i: parallelism across data, DLP. Multithreaded and multicore processors run one stream per thread: MIMD, TLP. Vector processors are the textbook SIMD machine.</p>
+
+  <h3>The SIMD machine: one PC, many processing elements</h3>
+
+  <p>A SIMD machine has a single control unit with one program counter: each instruction is fetched once and broadcast to all the <mark class="key">processing elements</mark> (PEs), which execute it in lockstep, each on its own local data (p. 390). The notes' picture is a classroom: one teacher says "add 5 to your number", and 32 students do it at once, each in their own notebook. A PE is much simpler than a core — a few registers, an ALU or FPU, sometimes a slice of local memory — and has no PC, no branch predictor and no cache: it relies on the controller.</p>
+
+  <p>One PC buys three things (p. 391): energy, with one fetch and decode per operation instead of one per PE; compact code, written once for all PEs; and simplicity, because PEs stepping in lockstep never need to synchronise. The price is lockstep: all PEs execute the same instruction, or some are masked off (lesson 31). A MIMD multicore makes the opposite trade: every core has its own PC and can run anything, and synchronisation — locks, barriers — becomes the programmer's problem.</p>
+
+  <p>Real machines mix the two (p. 391): a scalar unit runs ordinary SISD code and the SIMD instructions go to the PE array — MIPS plus the vector unit of VMIPS, scalar x86 plus AVX-512. GPUs, with their thousands of threads, are "essentially SIMD under the hood": a warp of threads executes one instruction at a time in lockstep. The notes' Figure 30 (p. 392) draws a vector processor next to a GPU's SIMD processor, which Hennessy and Patterson call a multithreaded SIMD processor; <a href="l32.html">lesson 32</a> takes the pair apart.</p>
+
+  <p class="memo"><mark class="key">Count instruction streams and data streams, never instructions per cycle: superscalar = SISD (ILP), vector unit and GPU warp = SIMD (DLP), multicore = MIMD (TLP).</mark></p>
+</section>
+
+<section id="l30-pipe">
+  <h2>Space or time: arrays of PEs and pipelined vector units</h2>
+
+  <p>"Not all SIMD is created equal" (p. 394). The first way to build it is the <mark class="key">SIMD array</mark> — Illiac IV, the Connection Machine: the programmer sees an array of PEs with local memories, and each broadcast instruction runs on all of them at once. Such arrays are awkward to program (you think in PEs, local memories and communication) and handle branches badly: they are "of historical interest". The second way is the <mark class="key">vector processor</mark> of Cray and VMIPS: the programmer sees vector registers, writes one instruction for a whole array, and the hardware streams the elements through deeply pipelined functional units — "classical SIMD, just presented in a more programmer-friendly way" (p. 392).</p>
+
+  <p>The difference shows in time. Suppose the add takes 6 cycles. In the array each PE executes the <code>ADD</code> "exactly like a tiny CPU would" and stays "frozen" until it finishes, so "latency is exposed": every operation pays all of it (p. 395). In the vector unit the add is a pipeline: in cycle 1 the first pair of elements enters the adder, in cycle 2 the second pair enters while the first is still inside, and so on. After the 6-cycle start-up one result leaves every cycle: 64 elements take 6 + 64 = 70 cycles, on a "conveyor belt" where "latency is only paid once".</p>
+
+  <figure class="fig fig--pair" id="l30-fig-spacetime">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Four unpipelined processing elements at cycle 10: each holds one element, e5 to e8, and has done 4 of its 6 cycles; e1 to e4 are written and e9 onwards wait">
+        <text x="20" y="22" class="tx-sm tx-muted">cycle 10</text>
+        <text x="32" y="56" class="tx-end tx-mono tx-sm">e5</text>
+        <text x="32" y="94" class="tx-end tx-mono tx-sm">e6</text>
+        <text x="32" y="132" class="tx-end tx-mono tx-sm">e7</text>
+        <text x="32" y="170" class="tx-end tx-mono tx-sm">e8</text>
+        <rect x="38" y="36" width="236" height="30" rx="4" class="fi-paper sw-2"/>
+        <rect x="38" y="74" width="236" height="30" rx="4" class="fi-paper sw-2"/>
+        <rect x="38" y="112" width="236" height="30" rx="4" class="fi-paper sw-2"/>
+        <rect x="38" y="150" width="236" height="30" rx="4" class="fi-paper sw-2"/>
+        <text x="46" y="56" class="tx-mono tx-sm">PE0</text>
+        <text x="46" y="94" class="tx-mono tx-sm">PE1</text>
+        <text x="46" y="132" class="tx-mono tx-sm">PE2</text>
+        <text x="46" y="170" class="tx-mono tx-sm">PE3</text>
+        <rect x="88" y="42" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="118" y="42" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="148" y="42" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="178" y="42" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="208" y="42" width="26" height="18" rx="2" class="fi-paper st-muted"/><rect x="238" y="42" width="26" height="18" rx="2" class="fi-paper st-muted"/>
+        <rect x="88" y="80" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="118" y="80" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="148" y="80" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="178" y="80" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="208" y="80" width="26" height="18" rx="2" class="fi-paper st-muted"/><rect x="238" y="80" width="26" height="18" rx="2" class="fi-paper st-muted"/>
+        <rect x="88" y="118" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="118" y="118" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="148" y="118" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="178" y="118" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="208" y="118" width="26" height="18" rx="2" class="fi-paper st-muted"/><rect x="238" y="118" width="26" height="18" rx="2" class="fi-paper st-muted"/>
+        <rect x="88" y="156" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="118" y="156" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="148" y="156" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="178" y="156" width="26" height="18" rx="2" class="fw-s1 st-s1"/><rect x="208" y="156" width="26" height="18" rx="2" class="fi-paper st-muted"/><rect x="238" y="156" width="26" height="18" rx="2" class="fi-paper st-muted"/>
+        <text x="20" y="208" class="tx-sm">written: e1–e4 · waiting: e9 to e64</text>
+        <text x="150" y="238" class="tx-mid tx-hand">4 results every 6 cycles</text>
+      </svg>
+      <p class="fig-label">In space: 4 PEs, each frozen for 6 cycles</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="One adder cut into 6 stages at cycle 10: elements e10 to e5 occupy stages 1 to 6; e1 to e4 are written, and from now on one result leaves every cycle">
+        <text x="20" y="22" class="tx-sm tx-muted">cycle 10</text>
+        <text x="50" y="46" class="tx-mid tx-sm tx-muted">1</text><text x="90" y="46" class="tx-mid tx-sm tx-muted">2</text><text x="130" y="46" class="tx-mid tx-sm tx-muted">3</text>
+        <text x="170" y="46" class="tx-mid tx-sm tx-muted">4</text><text x="210" y="46" class="tx-mid tx-sm tx-muted">5</text><text x="250" y="46" class="tx-mid tx-sm tx-muted">6</text>
+        <rect x="30" y="54" width="40" height="40" class="fw-s1 st-s1"/><rect x="70" y="54" width="40" height="40" class="fw-s1 st-s1"/><rect x="110" y="54" width="40" height="40" class="fw-s1 st-s1"/>
+        <rect x="150" y="54" width="40" height="40" class="fw-s1 st-s1"/><rect x="190" y="54" width="40" height="40" class="fw-s1 st-s1"/><rect x="230" y="54" width="40" height="40" class="fw-s1 st-s1"/>
+        <rect x="27" y="51" width="246" height="46" rx="4" class="fi-none sw-2"/>
+        <text x="50" y="79" class="tx-mid tx-mono tx-sm">e10</text><text x="90" y="79" class="tx-mid tx-mono tx-sm">e9</text><text x="130" y="79" class="tx-mid tx-mono tx-sm">e8</text>
+        <text x="170" y="79" class="tx-mid tx-mono tx-sm">e7</text><text x="210" y="79" class="tx-mid tx-mono tx-sm">e6</text><text x="250" y="79" class="tx-mid tx-mono tx-sm">e5</text>
+        <line x1="3" y1="74" x2="24" y2="74" marker-end="url(#arr)"/>
+        <line x1="275" y1="74" x2="296" y2="74" marker-end="url(#arr)"/>
+        <text x="150" y="124" class="tx-mid tx-sm">one adder in 6 stages</text>
+        <text x="150" y="160" class="tx-mid tx-sm">written: e1–e4</text>
+        <text x="150" y="184" class="tx-mid tx-sm">next: e5 in cycle 11, e6 in cycle 12 …</text>
+        <text x="150" y="232" class="tx-mid tx-hand">one result every cycle</text>
+      </svg>
+      <p class="fig-label">In time: 1 adder, 6 elements in flight</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> The same 64-element add at cycle 10, with a 6-cycle latency. Left: four unpipelined PEs, each frozen for 6 cycles on its element, deliver 4 results every 6 cycles. Right: one adder cut into six stages holds six elements at once, each a stage further on; after the first 6 cycles it delivers one result every cycle, with a quarter of the hardware. Both have written e1–e4 by now; the array's next four arrive together in cycle 13, and from cycle 15 on the pipeline stays ahead.</figcaption>
+  </figure>
+
+  <aside class="margin-note">The Cray-1's floating-point adder took exactly 6 clock periods (Russell, 1978): the notes' example is the real machine.</aside>
+
+  <p>Count both machines with the rule of the Tomasulo tables: a result is written \(L\) cycles after its operation starts (\(L\) the latency of the adder, \(n\) the number of elements).</p>
+
+  <ol class="steps" id="l30-steps-time">
+    <li><p>Pipelined unit. Element \(k\) enters the adder in cycle \(k\) and is written \(L\) cycles later (WRITE RESULT = START EXEC + latency):</p> \[ t_{\text{write}}(k) = k + L \]</li>
+    <li><p>The last element, \(k = n\), is written in cycle \(n + L\):</p> \[ T_{\text{vector}} = L + n \] <p>With \(L = 6\) and \(n = 64\): 70 cycles, the notes' count.</p></li>
+    <li><p>Array of \(N\) unpipelined PEs. \(N\) elements start together and keep their PEs frozen for \(L\) cycles; the next \(N\) start \(L\) cycles later. Round \(r\) starts and writes in</p> \[ t_{\text{start}}(r) = (r-1)L + 1 \] \[ t_{\text{write}}(r) = rL + 1 \]</li>
+    <li><p>\(n\) elements need \(\lceil n/N \rceil\) rounds, so the last results are written in cycle</p> \[ T_{\text{array}} = L \left\lceil \frac{n}{N} \right\rceil + 1 \] <p>With \(L = 6\), \(n = 64\) and \(N = 8\): 6 · 8 + 1 = 49 cycles. With \(N = 1\), a single unpipelined adder: 385. The final 1 is the write cycle that the pipeline's \(L + n\) already contains.</p></li>
+    <li><p>Divide the results by the hardware: the pipelined adder alone delivers 64/70 = 0.91 results per cycle, each of the 8 array adders 64/(8 · 49) = 0.16, about one every \(L\) cycles:</p> \[ \frac{n}{L+n} \quad \text{vs} \quad \frac{1}{L} \] <p>The pipeline wins on hardware, not on latency: one \(L\)-stage pipelined unit does the work of about \(L\) unpipelined ones, once the vector is long enough to keep it full.</p></li>
+  </ol>
+
+  <p>Why can a vector unit be pipelined so deeply? Because of <mark class="key">element independence</mark>: the element entering the adder never needs the result of an element still inside it, since <code>V3[17] = V1[17] + V2[17]</code> does not read <code>V3[16]</code>. No hazard check is needed between consecutive elements, so the unit can be cut into many short stages and clocked fast (p. 397).</p>
+
+  <aside class="redpen" data-page="395">
+    <p class="claim">"Generic SIMD: think of it as N little scalar processors all stalling on latency. Each vector op takes latency × vector length."</p>
+    <p class="fix">With \(N\) processing elements a vector operation takes \(\lceil n/N \rceil\) rounds of \(L\) cycles: \(L \cdot \lceil n/N \rceil\) cycles of computation, just \(L\) when \(N \ge n\). "Latency × vector length" is only the case \(N = 1\), a single unpipelined unit.</p>
+    <p class="because">The sentence contradicts its own picture: \(N\) processors that stall together also finish together. Check with the stepper: \(N = 8\) gives 8 rounds, 48 cycles of computation (49 with the final write), not 6 × 64 = 384. The real contrast: the array pays the latency on every round, the pipeline once per vector, with one adder.</p>
+  </aside>
+
+  <p>The widget adds a third machine: a scalar loop doing the same additions, the body of the papers' strip-mining quiz, <code>Y[i] = X[i] + Y[i]</code>:</p>
+
+<pre><code>LOOP: LD    F2, 0(R1)      ; X[i]
+      LD    F4, 0(R2)      ; Y[i]
+      FADD  F4, F4, F2     ; X[i] + Y[i]
+      SD    F4, 0(R2)      ; Y[i] &#8592; F4
+      ADDUI R1, R1, 8
+      ADDUI R2, R2, 8
+      BNE   R1, R3, LOOP   ; R3 = end of X</code></pre>
+
+  <p>Counted optimistically — one cycle for each of the six other instructions, \(L\) cycles for the <code>FADD</code> because the <code>SD</code> waits for its result, no other stall — every element costs \(L + 6\) cycles. The scalar loop also loads and stores each element, which a single <code>ADDVV.D</code> does not: the fair whole-loop comparison is lesson 31's. Watch how often each machine pays the latency.</p>
+
+  <div class="widget" id="l30-w-stream">
+    <h3 class="widget-title">The element streamer</h3>
+    <p class="widget-intro">Top: the pipelined adder and the array of PEs at the cursor cycle t — each number is the element inside a stage of the adder or inside a PE. Bottom: how many results each machine has written by every cycle. The one thing to see: the pipelined unit pays the latency once per vector and then streams one result per cycle; the array pays it once per round, the scalar loop once per element.</p>
+    <ol class="tasks">
+      <li>Keep L = 6 and n = 64. Before you look at the readouts: in which cycle does the pipelined adder write its last result, and how many elements are inside it at cycle 30? Then check with the cursor.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Cycle 70 (6 + 64). At cycle 30 the belt holds elements 25 to 30, one per stage — six in flight — and 24 results are already written. From cycle 7 to cycle 70 the pipeline's curve climbs by exactly one result per cycle.</p></details>
+      </li>
+      <li>How many PEs must the array have to keep up with the single pipelined adder? Predict, then find the smallest N with the slider.
+        <details class="answer"><summary>What you should see</summary>
+          <p>N = 6: 11 rounds, 6 × 11 + 1 = 67 cycles, just under 70; with N = 5 it needs 13 rounds, 79 cycles. Six adders to match one: the readout "results per cycle per adder" shows 0.91 for the pipeline against about 0.16 ≈ 1/6 for an array adder — less when N does not divide 64, because some PEs sit idle in the last round. Pipelining is parallelism in time.</p></details>
+      </li>
+      <li>Set N = 1 and tick the scalar loop. How many times does each machine pay the 6-cycle latency, and how long does each take?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The pipeline once (70 cycles); the one-PE array 64 times, 6 × 64 + 1 = 385 cycles — the notes' "latency × vector length", true only for N = 1; the scalar loop 64 times as well, plus six instructions per element: 64 × 12 = 768 cycles. The plot has to zoom out to show it.</p></details>
+      </li>
+      <li>Make the vector short: n = 4, with N = 8. Which machine wins now, and why?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The array: 7 cycles against 10. The pipeline spends 6 of its 10 cycles filling up and delivers 4 results in 10 cycles, 0.40 per cycle, against 0.91 at n = 64. A pipeline pays off only on long vectors — one reason vector registers are long, and the reason lesson 31's chime count can ignore the start-up.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l30-w-stream', function (root, ui) {
+    var sL = ui.slider({ label: 'adder latency L (cycles)', min: 1, max: 12, step: 1, value: 6 });
+    var sn = ui.slider({ label: 'vector length n (elements)', min: 1, max: 64, step: 1, value: 64 });
+    var sN = ui.slider({ label: 'processing elements in the array N', min: 1, max: 64, step: 1, value: 8 });
+    var sT = ui.slider({ label: 'cursor: clock cycle t', min: 1, max: 80, step: 1, value: 30 });
+    var showS = ui.toggle('show the scalar loop (L + 6 cycles per element)', false);
+    var roP = ui.readout('pipelined unit'), roA = ui.readout('array of N PEs'), roS = ui.readout('scalar loop'),
+        roT = ui.readout('at the cursor'), roR = ui.readout('results per cycle per adder');
+    var belt = ui.svg(560, 116, { label: 'The pipelined adder (top row) and the array of processing elements (bottom row) at the cursor cycle; each number is the element inside a stage of the adder or inside a processing element' });
+    var plot = ui.plot({ x: [0, 80], y: [0, 70], xLabel: 'clock cycle', yLabel: 'results written', aspect: 2,
+      label: 'Results written by each clock cycle by the pipelined vector unit, the array of processing elements and the scalar loop' });
+    ui.legend([
+      { label: 'pipelined vector unit: 1 adder, L stages', color: 's5', mark: 'line' },
+      { label: 'array of N unpipelined PEs', color: 's4', mark: 'line' },
+      { label: 'scalar loop', color: 'ink', mark: 'dash' },
+      { label: 'element inside a unit at the cursor', color: 's1', mark: 'square' }
+    ]);
+
+    function state() {
+      var L = sL.value, n = sn.value, N = sN.value, t = sT.value, R = Math.ceil(n / N);
+      return { L: L, n: n, N: N, t: t, R: R, Tp: L + n, Ta: L * R + 1, c: L + 6, Ts: n * (L + 6) };
+    }
+    function wP(s, c) { return Math.max(0, Math.min(s.n, c - s.L)); }                       /* written by cycle c */
+    function wA(s, c) { var r = Math.min(s.R, Math.floor((c - 1) / s.L)); return Math.max(0, Math.min(s.n, r * s.N)); }
+    function wS(s, c) { return Math.max(0, Math.min(s.n, Math.floor(c / s.c))); }
+    function inP(s) { var lo = Math.max(1, s.t - s.L + 1), hi = Math.min(s.n, s.t); return Math.max(0, hi - lo + 1); }
+    function round(s) { return Math.floor((s.t - 1) / s.L) + 1; }
+    function inA(s) { var r = round(s); return r > s.R ? 0 : Math.min(s.N, s.n - (r - 1) * s.N); }
+    function xMax(s) { var X = Math.max(s.Tp, s.Ta, s.t + 2, 20); if (showS.value) X = Math.max(X, s.Ts); return Math.ceil(X * 1.04) + 1; }
+    function steps(f, X) {                                                                    /* a step curve, one point pair per change */
+      var p = [[0, 0]], prev = 0, v;
+      for (var c = 1; c <= X; c++) { v = f(c); if (v !== prev) { p.push([c, prev]); p.push([c, v]); prev = v; } }
+      p.push([X, prev]);
+      return p;
+    }
+    function times(k) { return k === 1 ? 'once' : k + ' times'; }
+
+    function drawBelt(s) {
+      while (belt.firstChild) belt.removeChild(belt.firstChild);
+      var x0 = 64, w = Math.min(40, 440 / s.L), k, e, on;
+      Course.svg('text', { x: 8, y: 48, 'class': 'tx-sm', text: 'pipe' }, belt);
+      for (k = 1; k <= s.L; k++) {
+        e = s.t - k + 1; on = e >= 1 && e <= s.n;                                            /* stage k holds element t - k + 1 */
+        Course.svg('rect', { x: x0 + (k - 1) * w, y: 26, width: w, height: 34, 'class': on ? 'fw-s1 st-s1' : 'fi-paper st-muted' }, belt);
+        if (on) Course.svg('text', { x: x0 + (k - 0.5) * w, y: 48, 'class': 'tx-mid tx-mono tx-sm', text: String(e) }, belt);
+      }
+      Course.svg('line', { x1: x0 + s.L * w + 4, y1: 43, x2: x0 + s.L * w + 26, y2: 43, 'marker-end': 'url(#arr)' }, belt);
+      Course.svg('text', { x: 8, y: 96, 'class': 'tx-sm', text: 'array' }, belt);
+      var m = Math.min(s.N, 16), w2 = Math.min(40, 440 / m), r = round(s), act = inA(s);
+      for (k = 0; k < m; k++) {
+        on = k < act;
+        Course.svg('rect', { x: x0 + k * w2, y: 74, width: w2, height: 34, 'class': on ? 'fw-s1 st-s1' : 'fi-paper st-muted' }, belt);
+        if (on) Course.svg('text', { x: x0 + (k + 0.5) * w2, y: 96, 'class': 'tx-mid tx-mono tx-sm', text: String((r - 1) * s.N + k + 1) }, belt);
+      }
+      if (s.N > 16) Course.svg('text', { x: x0 + m * w2 + 8, y: 96, 'class': 'tx-sm tx-muted', text: '+' + (s.N - 16) }, belt);
+    }
+
+    plot.draw(function (g) {
+      var s = state(), X = xMax(s);
+      if (showS.value) g.line(steps(function (c) { return wS(s, c); }, X), { color: 'ink', width: 2, dash: true });
+      g.line(steps(function (c) { return wA(s, c); }, X), { color: 's4', width: 2.5 });
+      g.line(steps(function (c) { return wP(s, c); }, X), { color: 's5', width: 2.5 });
+      g.vline(s.t, { color: 'muted', dash: true, label: 't = ' + s.t });
+      g.points([[s.Ta, s.n]], { color: 's4', shape: 'square', r: 5 });
+      g.points([[s.Tp, s.n]], { color: 's5', r: 5 });
+    });
+
+    ui.onChange(function () {
+      var s = state();
+      plot.setView({ x: [0, xMax(s)], y: [0, s.n * 1.08 + 0.6] });
+      roP.set(s.L + ' + ' + s.n + ' = ' + s.Tp + ' cycles · latency paid once');
+      roA.set('⌈' + s.n + '/' + s.N + '⌉ = ' + s.R + (s.R === 1 ? ' round' : ' rounds') + ': ' + s.L + ' × ' + s.R + ' + 1 = ' + s.Ta + ' cycles · latency paid ' + times(s.R));
+      roS.set(showS.value ? s.n + ' × (' + s.L + ' + 6) = ' + s.Ts + ' cycles · latency paid ' + times(s.n) : 'hidden: tick the box');
+      roT.set('cycle ' + s.t + ': pipeline ' + inP(s) + ' inside, ' + wP(s, s.t) + ' written · array ' + inA(s) + ' inside, ' + wA(s, s.t) + ' written');
+      roR.set('pipeline ' + Course.fmt(s.n / s.Tp, 2) + ' · array ' + Course.fmt(s.n / (s.N * s.Ta), 2));
+      drawBelt(s);
+    });
+  });
+  </script>
+
+  <div class="pitfall">
+    <p>"A vector unit does its 64 additions at once." It does one per cycle per unit: six or so are in flight at any moment, each at a different stage. Doing 64 at once takes 64 adders; vector machines add parallel copies of a unit as lanes — their PEs — without changing a single instruction (lesson 31).</p>
+  </div>
+
+  <p class="memo"><mark class="key">An array of \(N\) PEs pays the latency once per round of \(N\) elements; a pipelined vector unit pays it once per vector and then streams one result per cycle: one \(L\)-stage pipelined adder does the work of about \(L\) unpipelined ones — on long vectors.</mark></p>
+</section>
+
+<section id="l30-cray">
+  <h2>Cray's choices: where the transistors went</h2>
+
+  <div class="story" data-year="1964–1978">
+    <p>Seymour Cray designed the CDC 6600 (1964), then founded Cray Research, whose Cray-1 (1976) was the first commercially successful vector supercomputer (p. 396). Its designers tied its speed to its size: "a cylindrical shape was chosen for the CRAY-1 in order to keep wiring distances small", and smallness "allows a 12.5 nanosecond clock period" (Russell, 1978). The padded bench around the base, which earned it the name "the world's most expensive love-seat", hid the power supplies and some of the Freon plumbing.</p>
+  </div>
+
+  <aside class="margin-note">The notes call the C shape "a practical cooling solution" (p. 396); its designers wrote that the cylinder kept the wires short.</aside>
+
+  <p>When people say "vector processor" they usually mean this Cray-style design, and VMIPS is a simplified version of it (p. 396). Its philosophy, in the notes' words: "don't waste transistors on speculation or caches; spend them on wide datapaths and memory bandwidth" (p. 398). The target is scientific code with long arrays — matrix operations, PDE solvers, simulations — and with no giant instruction window and no speculative logic the result is "much higher throughput per watt than OoO ILP" (p. 398). Five choices follow, each with a reason and a price:</p>
+
+  <figure class="tbl-fig" id="l30-tbl-choices">
+    <figcaption>The five design choices of a classic vector machine (pp. 396–398), with the reason each one fits data-level parallelism and what it costs.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Choice</th><th>Why it fits DLP</th><th>What it costs</th></tr></thead>
+        <tbody>
+          <tr><td><b>1. One instruction, many elements</b> — the vector ISA</td><td>One fetch and decode for 64 element operations; no loop overhead, no loop branches; dependences checked once per vector, not per element</td><td>Helps only loops with independent iterations; scalar code runs at scalar speed</td></tr>
+          <tr><td><b>2. Register-to-register</b> — vector registers</td><td>Each element is loaded once and reused by several instructions; the pipelines stream from registers, one element per cycle in order, instead of stalling on memory, unlike the memory-to-memory vector machines before the Cray-1 (CDC STAR-100)</td><td>A large register file with many ports (VMIPS: 4 KB, 16 read and 8 write ports)</td></tr>
+          <tr><td><b>3. Deeply pipelined functional units</b></td><td>Element independence allows deep pipelines with no hazard checks between elements: one result per cycle, start-up amortised over the vector</td><td>Every instruction pays a start-up latency; short vectors waste most of it</td></tr>
+          <tr><td><b>4. Interleaved (banked) main memory</b></td><td>Consecutive words sit in consecutive banks, so one word per cycle streams in although each bank is busy for several cycles (Cray-1: 16 banks, 4 clock periods per access)</td><td>Many banks; strides that keep hitting the same bank collide (lesson 31)</td></tr>
+          <tr><td><b>5. Little or no data cache</b></td><td>A vector load states exactly which words it needs, and a stream uses each of them once: a cache would add latency and area for no reuse, while the banks give the bandwidth directly</td><td>Scalar and irregular code get no cache help; at most a scalar cache serves the scalar side, which the vector side bypasses (p. 397)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Three supporting pieces complete the machine (p. 397), all put to work in lesson 31: <mark class="key">vector mask registers</mark>, which switch off elements so that loops with an <code>if</code> stay vectorisable; <mark class="key">multiple lanes</mark>, parallel copies of the units (4 lanes, 4 elements per cycle); and a scalar unit for control flow and scalar data.</p>
+
+  <aside class="redpen" data-page="396">
+    <p class="claim">"Preferred low-latency, high-throughput memory (banked DRAM) instead of large caches."</p>
+    <p class="fix">Interleaved banks buy bandwidth, not latency — and the Cray-1's banks were not DRAM: sixteen banks of bipolar memory chips (static RAM), each busy for 4 clock periods per access, together streaming one word per clock period.</p>
+    <p class="because">Banking multiplies throughput and does nothing for the latency of a single access, as the notes themselves say on p. 397: "our memory provides bandwidth rather than low latency". Russell's Cray-1 paper (1978) lists "1024 × 1 bit bipolar memory chips (50 nanosecond cycle time)", "16 independent banks" and a "4 clock period bank cycle time".</p>
+  </aside>
+
+  <aside class="margin-note">The notes count Intel AVX-512 among Cray's descendants (p. 396). It borrowed masks and gather/scatter, but its width is fixed in every opcode, with no vector-length register: packed SIMD (lesson 32).</aside>
+
+  <p class="memo"><mark class="key">A Cray-style machine bets on regularity: one instruction for many elements, vector registers, deep pipelines, interleaved banks — and no data cache, because a stream has nothing to reuse.</mark></p>
+</section>
+
+<section id="l30-vmips">
+  <h2>VMIPS, and DAXPY in six instructions</h2>
+
+  <p><mark class="key">VMIPS</mark> is not a commercial computer but Hennessy and Patterson's teaching model: the MIPS you know plus "a Cray-style vector coprocessor", simple enough to count cycles by hand, faithful enough that the counts mean something, and a bridge to the SIMD units of today's processors (p. 399). The February 2025 paper prints its block diagram (notes p. 578), redrawn here.</p>
+
+  <figure class="fig fig--plain" id="l30-fig-vmips">
+    <svg class="dia" viewBox="0 0 560 400" role="img" aria-label="VMIPS block diagram: main memory in interleaved banks; a vector load/store unit moving one word per cycle; eight vector registers of 64 elements; a crossbar with 16 read and 8 write ports between the vector registers and five pipelined functional units, FP add/subtract, FP multiply, FP divide, integer and logical; scalar registers supplying addresses to the load/store unit and scalar operands through the crossbar">
+      <text x="160" y="30" class="tx-end tx-sm">main memory</text>
+      <text x="160" y="48" class="tx-end tx-sm tx-muted">in banks</text>
+      <rect x="170" y="14" width="240" height="40" class="fi-paper sw-2"/>
+      <line x1="200" y1="14" x2="200" y2="54" class="st-muted"/><line x1="230" y1="14" x2="230" y2="54" class="st-muted"/><line x1="260" y1="14" x2="260" y2="54" class="st-muted"/>
+      <line x1="290" y1="14" x2="290" y2="54" class="st-muted"/><line x1="320" y1="14" x2="320" y2="54" class="st-muted"/><line x1="350" y1="14" x2="350" y2="54" class="st-muted"/><line x1="380" y1="14" x2="380" y2="54" class="st-muted"/>
+      <text x="185" y="39" class="tx-mid tx-mono tx-sm">0</text><text x="215" y="39" class="tx-mid tx-mono tx-sm">1</text><text x="245" y="39" class="tx-mid tx-mono tx-sm">2</text><text x="275" y="39" class="tx-mid tx-mono tx-sm">3</text>
+      <text x="305" y="39" class="tx-mid tx-mono tx-sm">4</text><text x="335" y="39" class="tx-mid tx-mono tx-sm">5</text><text x="365" y="39" class="tx-mid tx-mono tx-sm">6</text><text x="395" y="39" class="tx-mid tx-mono tx-sm">7</text>
+      <line x1="270" y1="56" x2="270" y2="80" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="310" y1="82" x2="310" y2="58" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="326" y="76" class="tx-hand">one word per cycle</text>
+      <rect x="170" y="84" width="240" height="34" class="fi-paper sw-2"/>
+      <text x="290" y="106" class="tx-mid tx-sm">vector load/store unit</text>
+      <line x1="270" y1="120" x2="270" y2="144" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="310" y1="146" x2="310" y2="122" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+
+      <text x="20" y="166" class="tx-sm">vector</text>
+      <text x="20" y="184" class="tx-sm">registers</text>
+      <text x="20" y="206" class="tx-sm tx-muted">8 × 64 × 64 bit</text>
+      <text x="192" y="160" class="tx-end tx-mono tx-sm">V0</text><text x="192" y="180" class="tx-end tx-mono tx-sm">V1</text><text x="192" y="200" class="tx-end tx-mono tx-sm">V2</text><text x="192" y="220" class="tx-end tx-mono tx-sm">V3</text>
+      <text x="192" y="240" class="tx-end tx-mono tx-sm">V4</text><text x="192" y="260" class="tx-end tx-mono tx-sm">V5</text><text x="192" y="280" class="tx-end tx-mono tx-sm">V6</text><text x="192" y="300" class="tx-end tx-mono tx-sm">V7</text>
+      <rect x="200" y="148" width="128" height="16" class="fi-paper"/><rect x="200" y="168" width="128" height="16" class="fi-paper"/><rect x="200" y="188" width="128" height="16" class="fi-paper"/><rect x="200" y="208" width="128" height="16" class="fi-paper"/>
+      <rect x="200" y="228" width="128" height="16" class="fi-paper"/><rect x="200" y="248" width="128" height="16" class="fi-paper"/><rect x="200" y="268" width="128" height="16" class="fi-paper"/><rect x="200" y="288" width="128" height="16" class="fi-paper"/>
+      <path d="M216,148V304M232,148V304M248,148V304M264,148V304M280,148V304M296,148V304M312,148V304" class="st-muted sw-1 fi-none"/>
+      <rect x="352" y="148" width="16" height="16" class="fi-paper"/><rect x="352" y="168" width="16" height="16" class="fi-paper"/><rect x="352" y="188" width="16" height="16" class="fi-paper"/><rect x="352" y="208" width="16" height="16" class="fi-paper"/>
+      <rect x="352" y="228" width="16" height="16" class="fi-paper"/><rect x="352" y="248" width="16" height="16" class="fi-paper"/><rect x="352" y="268" width="16" height="16" class="fi-paper"/><rect x="352" y="288" width="16" height="16" class="fi-paper"/>
+      <text x="340" y="160" class="tx-mid tx-sm tx-muted">…</text><text x="340" y="180" class="tx-mid tx-sm tx-muted">…</text><text x="340" y="200" class="tx-mid tx-sm tx-muted">…</text><text x="340" y="220" class="tx-mid tx-sm tx-muted">…</text>
+      <text x="340" y="240" class="tx-mid tx-sm tx-muted">…</text><text x="340" y="260" class="tx-mid tx-sm tx-muted">…</text><text x="340" y="280" class="tx-mid tx-sm tx-muted">…</text><text x="340" y="300" class="tx-mid tx-sm tx-muted">…</text>
+      <path d="M368,156H384M368,176H384M368,196H384M368,216H384M368,236H384M368,256H384M368,276H384M368,296H384" class="st-muted fi-none"/>
+
+      <rect x="384" y="144" width="12" height="170" class="fw-ink st-muted"/>
+      <rect x="422" y="146" width="130" height="28" class="fi-paper sw-2"/>
+      <rect x="422" y="178" width="130" height="28" class="fi-paper sw-2"/>
+      <rect x="422" y="210" width="130" height="28" class="fi-paper sw-2"/>
+      <rect x="422" y="242" width="130" height="28" class="fi-paper sw-2"/>
+      <rect x="422" y="274" width="130" height="28" class="fi-paper sw-2"/>
+      <text x="480" y="165" class="tx-mid tx-sm">FP add/sub</text>
+      <text x="480" y="197" class="tx-mid tx-sm">FP multiply</text>
+      <text x="480" y="229" class="tx-mid tx-sm">FP divide</text>
+      <text x="480" y="261" class="tx-mid tx-sm">integer</text>
+      <text x="480" y="293" class="tx-mid tx-sm">logical</text>
+      <path d="M536,152V168M541,152V168M546,152V168M536,184V200M541,184V200M546,184V200M536,216V232M541,216V232M546,216V232M536,248V264M541,248V264M546,248V264M536,280V296M541,280V296M546,280V296" class="st-muted sw-1 fi-none"/>
+      <line x1="396" y1="155" x2="418" y2="155" class="st-s1" marker-end="url(#arr-s1)"/><line x1="420" y1="166" x2="400" y2="166" class="st-s1" marker-end="url(#arr-s1)"/>
+      <line x1="396" y1="187" x2="418" y2="187" class="st-s1" marker-end="url(#arr-s1)"/><line x1="420" y1="198" x2="400" y2="198" class="st-s1" marker-end="url(#arr-s1)"/>
+      <line x1="396" y1="219" x2="418" y2="219" class="st-s1" marker-end="url(#arr-s1)"/><line x1="420" y1="230" x2="400" y2="230" class="st-s1" marker-end="url(#arr-s1)"/>
+      <line x1="396" y1="251" x2="418" y2="251" class="st-s1" marker-end="url(#arr-s1)"/><line x1="420" y1="262" x2="400" y2="262" class="st-s1" marker-end="url(#arr-s1)"/>
+      <line x1="396" y1="283" x2="418" y2="283" class="st-s1" marker-end="url(#arr-s1)"/><line x1="420" y1="294" x2="400" y2="294" class="st-s1" marker-end="url(#arr-s1)"/>
+      <text x="480" y="322" class="tx-mid tx-sm tx-muted">all pipelined</text>
+
+      <text x="20" y="228" class="tx-sm">scalar</text>
+      <text x="20" y="244" class="tx-sm">registers</text>
+      <rect x="40" y="254" width="40" height="18" class="fi-paper"/><rect x="40" y="272" width="40" height="18" class="fi-paper"/><rect x="40" y="290" width="40" height="18" class="fi-paper"/>
+      <rect x="40" y="308" width="40" height="18" class="fi-paper"/><rect x="40" y="326" width="40" height="18" class="fi-paper"/>
+      <text x="60" y="267" class="tx-mid tx-mono tx-sm">F0</text><text x="60" y="285" class="tx-mid tx-mono tx-sm">F2</text><text x="60" y="303" class="tx-mid tx-mono tx-sm">…</text>
+      <text x="60" y="321" class="tx-mid tx-mono tx-sm">R1</text><text x="60" y="339" class="tx-mid tx-mono tx-sm">R2</text>
+      <path d="M40,317H12V101H166" class="sw-2 fi-none" marker-end="url(#arr)"/>
+      <text x="24" y="94" class="tx-sm halo">address</text>
+      <path d="M80,263H160V330H390V318" class="sw-2 fi-none" marker-end="url(#arr)"/>
+      <text x="270" y="350" class="tx-mid tx-sm">scalar operand</text>
+      <text x="390" y="362" class="tx-mid tx-sm tx-muted">crossbar</text>
+      <text x="390" y="388" class="tx-mid tx-sm">16 read · 8 write ports</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> VMIPS, after Hennessy and Patterson's figure reprinted in the February 2025 paper. Eight vector registers of 64 elements of 64 bits feed five fully pipelined functional units through a crossbar with 16 read and 8 write ports (arrows to a unit: operands read; arrows back: results written). One vector load/store unit streams whole vectors between the registers and the interleaved memory banks, one word per cycle after its latency. The scalar registers supply addresses and scalar operands such as the a of DAXPY.</figcaption>
+  </figure>
+
+  <p>Its three pillars, plus the scalar side (pp. 399–401):</p>
+
+  <ul>
+    <li><b>Vector register file.</b> Eight registers, each holding 64 elements of 64 bits: 4 KB in all. Its 16 read and 8 write ports, connected to the units by a crossbar, let several units and the load/store unit use it in the same cycle. It is a compiler-controlled buffer between memory and the units: the compiler decides what is loaded and when, so it is not a cache.</li>
+    <li><b>Vector functional units.</b> Five of them — FP add/subtract, FP multiply, FP divide, integer, logical — all fully pipelined, each accepting a new element every cycle. One unit's output can feed another element by element, without waiting for the whole vector: <mark class="key">chaining</mark>, the vector form of forwarding (lesson 31).</li>
+    <li><b>Vector load/store unit.</b> Moves a whole vector between memory and a register: the memory latency is paid once, then one word per cycle. Memory is interleaved — word 0 in bank 0, word 1 in bank 1 — so a sequential load never waits for a busy bank. Besides unit stride it can load every k-th word (strided access, for matrix columns) and gather or scatter elements through an index vector (sparse data).</li>
+    <li><b>Scalar side.</b> The MIPS core runs the code that does not vectorise, computes addresses and supplies scalar operands such as a.</li>
+  </ul>
+
+  <aside class="margin-note">Check it by hand: five units each read two elements and write one per cycle; the load/store unit adds one read (a store) or one write (a load). That is at most 11 reads and 6 writes, under the 16 and 8 ports.</aside>
+
+  <p>The instructions, in the papers' spelling (Hennessy and Patterson write <code>LV</code> and <code>SV</code> for <code>L.V</code> and <code>S.V</code>):</p>
+
+  <figure class="tbl-fig" id="l30-tbl-isa">
+    <figcaption>The VMIPS instructions a lesson or an exam uses. The papers print L.V, S.V, ADDVV.D, ADDVS.D and MULVS.D, with the scalar operand in an F or S register (F1, S1).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Instruction</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>L.V V1, R1</code> · <code>S.V V1, R1</code></td><td>load / store the whole vector V1 at the address in R1 (unit stride)</td></tr>
+          <tr><td><code>LVWS V1, (R1, R2)</code> · <code>SVWS (R1, R2), V1</code></td><td>load / store with stride R2: every R2-th word</td></tr>
+          <tr><td><code>LVI V1, (R1+V2)</code> · <code>SVI (R1+V2), V1</code></td><td>gather / scatter: element i at address R1 + V2[i]</td></tr>
+          <tr><td><code>ADDVV.D V1, V2, V3</code> · <code>ADDVS.D V1, V2, F0</code></td><td>V1[i] = V2[i] + V3[i] · V1[i] = V2[i] + F0 (vector-vector, vector-scalar)</td></tr>
+          <tr><td><code>SUBVV.D</code> <code>SUBVS.D</code> <code>SUBSV.D</code> · <code>MULVV.D</code> <code>MULVS.D</code> · <code>DIVVV.D</code> <code>DIVVS.D</code> <code>DIVSV.D</code></td><td>the same for subtract, multiply (vector-vector also written MULV.D) and divide; SV puts the scalar first</td></tr>
+          <tr><td><code>SNEVS.D V1, F0</code> and the other compares (EQ, GT, LT, GE, LE; VV or VS)</td><td>compare element by element and set the vector mask register</td></tr>
+          <tr><td><code>MTC1 VLR, R1</code> · <code>MFC1 R1, VLR</code></td><td>write / read the vector-length register (lesson 31)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The exam's machines are variations on VMIPS: "32 vectors of 16 elements" in July 2024 and June 2026, of 8 elements in June 2025. Always read the vector length from the question.</p>
+
+  <h3>DAXPY, instruction by instruction</h3>
+
+  <p><mark class="key">DAXPY</mark>, "Double-precision A·X Plus Y", is the loop of the opening puzzle (p. 402):</p>
+
+  \[ Y[i] = a \cdot X[i] + Y[i] \]
+
+  <p>A BLAS kernel and the inner loop of the Linpack benchmark that ranks supercomputers, it does one multiply and one add per element, with no dependence between elements, so it isolates the effect of vectorisation. The scalar MIPS loop for 64 elements, in the papers' mnemonics:</p>
+
+  <aside class="margin-note">The notes' 578 is Hennessy and Patterson's code, which tests the bound with DSUBU and BNEZ: nine instructions per element. The papers' BNE R1, R4 needs no SUB: 8 per element, 514 in all, still about 86 times VMIPS.</aside>
+
+<pre><code>        LD    F0, 0(R3)     ; F0 &#8592; a
+        ADDUI R4, R1, 512   ; R4 = end of X
+LOOP:   LD    F2, 0(R1)     ; X[i]
+        FMUL  F2, F2, F0    ; a * X[i]
+        LD    F4, 0(R2)     ; Y[i]
+        FADD  F4, F4, F2    ; a * X[i] + Y[i]
+        SD    F4, 0(R2)     ; Y[i] &#8592; F4
+        ADDUI R1, R1, 8     ; next X
+        ADDUI R2, R2, 8     ; next Y
+        SUB   R5, R4, R1    ; elements left?
+        BNE   R5, R0, LOOP  ; R0 is always 0</code></pre>
+
+  <p>And on VMIPS, the same work:</p>
+
+<pre><code>        LD      F0, 0(R3)   ; F0 &#8592; a
+        L.V     V1, R1      ; V1 &#8592; X[0..63]
+        MULVS.D V2, V1, F0  ; V2 &#8592; a * X
+        L.V     V3, R2      ; V3 &#8592; Y[0..63]
+        ADDVV.D V4, V2, V3  ; V4 &#8592; a * X + Y
+        S.V     V4, R2      ; Y &#8592; V4</code></pre>
+
+  <ol class="steps" id="l30-steps-count">
+    <li><p>Set-up, executed once: <code>LD F0</code> (the scalar a) and <code>ADDUI R4</code> (the end of X), 2 instructions.</p></li>
+    <li><p>Loop body, executed once per element: 9 instructions. Five do the work — two loads, the multiply, the add, the store — and four only run the loop: two pointer updates, the bound test and the branch.</p></li>
+    <li><p>For 64 elements:</p> \[ 2 + 9 \times 64 = 578 \] <p>dynamic instructions, the notes' "≈ 578".</p></li>
+    <li><p>VMIPS: the scalar <code>LD F0</code> plus one vector instruction per operation of the body; no loop, so no pointers, no bound, no branch:</p> \[ 578 - 6 = 572 \]</li>
+    <li><p>Where the 572 went: the 320 element instructions (5 × 64) became 5 vector instructions, 315 fewer; the 3 × 64 = 192 pointer updates and bound tests vanished, and so did the 64 branches and the bound set-up:</p> \[ 315 + 192 + 64 + 1 = 572 \]</li>
+  </ol>
+
+  <p>Fetch and decode are not all: the scalar pipeline also resolves the four dependences that carry the data through the body — <code>LD</code> to <code>FMUL</code>, <code>FMUL</code> to <code>FADD</code>, <code>LD</code> to <code>FADD</code>, <code>FADD</code> to <code>SD</code> — once per element, 256 times; VMIPS resolves each of them once. The widget counts both.</p>
+
+  <div class="widget" id="l30-w-daxpy">
+    <h3 class="widget-title">Where the 572 instructions go</h3>
+    <p class="widget-intro">Each row is one instruction of the scalar loop body; its bar grows by one cell per element as the loop runs, 9 rows by 64 elements. Under it, the whole VMIPS program at the same scale. The one thing to see: the scalar machine fetches, decodes and checks one instruction per element operation, the vector machine one per data operation.</p>
+    <ol class="tasks">
+      <li>Before you press "Run the loop": how many instructions will MIPS fetch and decode for the 64 elements, and how many VMIPS?
+        <details class="answer"><summary>What you should see</summary>
+          <p>2 + 9 × 64 = 578 for MIPS, 6 for VMIPS: 96 times fewer. The counter climbs by 9 per iteration while the VMIPS row never grows.</p></details>
+      </li>
+      <li>Step ten iterations with "One iteration". What share of the fetched instructions only runs the loop? Does the share change as the loop goes on?
+        <details class="answer"><summary>What you should see</summary>
+          <p>41 of 92, 45 %; at the end 257 of 578, 44 %. The share hardly moves, because the overhead is paid per element: four of every nine instructions do no arithmetic and move no data.</p></details>
+      </li>
+      <li>Let the loop finish. Of the 572 saved instructions, is the bigger part the loop overhead or the element instructions? Could complete unrolling give you the same saving?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The element instructions: 315, against 192 + 64 + 1 = 257 of overhead. Complete unrolling removes the 257 at most and leaves 1 + 5 × 64 = 321 instructions; only a vector instruction does 64 element operations with one fetch and one decode.</p></details>
+      </li>
+      <li>How many times does the scalar pipeline resolve the dependence of <code>FADD</code> on <code>FMUL</code>, and how many times does VMIPS resolve that of <code>ADDVV.D</code> on <code>MULVS.D</code>?
+        <details class="answer"><summary>What you should see</summary>
+          <p>64 against 1: once per element against once per vector. Over the four dependences of the body the readout ends at 256 against 4 — a scalar pipeline checks, and may stall, on every element.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l30-w-daxpy', function (root, ui) {
+    var ROWS = ['LD', 'FMUL', 'LD', 'FADD', 'SD', 'ADDUI', 'ADDUI', 'SUB', 'BNE'];
+    var player = ui.player({ ms: 110, max: 64, label: 'Run the loop', stepLabel: 'One iteration' });
+    var roF = ui.readout('MIPS instructions fetched and decoded'), roO = ui.readout('of which only run the loop'),
+        roE = ui.readout('element operations done'), roD = ui.readout('RAW dependences resolved'),
+        roI = ui.readout('instructions per element operation');
+    var note = ui.note('');
+    var svgEl = ui.svg(560, 336, { label: 'Nine rows, one per instruction of the scalar DAXPY loop body, each a bar that grows by one cell per element executed, 64 in all; below, the six VMIPS instructions at the same scale and, after the last iteration, a bar showing where the 572 saved instructions went' });
+    ui.legend([
+      { label: 'does the work: load, multiply, add, store', color: 's1', mark: 'area' },
+      { label: 'only runs the loop: pointers, bound, branch', color: 's2', mark: 'area' }
+    ]);
+    var CW = 7, X0 = 64, Y0 = 26, RH = 22;
+    function T(x, y, cls, txt) { Course.svg('text', { x: x, y: y, 'class': cls, text: txt }, svgEl); }
+    function draw(k) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var r, i, y;
+      for (r = 0; r < 9; r++) {
+        y = Y0 + r * RH;
+        T(56, y + 12, 'tx-end tx-mono tx-sm', ROWS[r]);
+        Course.svg('rect', { x: X0, y: y, width: 64 * CW, height: 16, 'class': 'fi-paper st-grid' }, svgEl);
+        if (k > 0) Course.svg('rect', { x: X0, y: y, width: k * CW, height: 16, 'class': r < 5 ? 'fw-s1 st-s1' : 'fw-s2 st-s2' }, svgEl);
+      }
+      [0, 16, 32, 48, 64].forEach(function (v) { T(X0 + v * CW, 238, 'tx-mid tx-sm tx-muted', String(v)); });
+      T(X0 + 32 * CW, 258, 'tx-mid tx-sm tx-muted', 'elements done, one iteration each');
+      T(56, 286, 'tx-end tx-mono tx-sm', 'VMIPS');
+      for (i = 0; i < 6; i++) Course.svg('rect', { x: X0 + i * CW, y: 274, width: CW, height: 16, 'class': 'fw-s1 st-s1' }, svgEl);
+      T(X0 + 6 * CW + 18, 288, 'tx-hand', 'the whole loop: 6 instructions');
+      T(56, 320, 'tx-end tx-sm', 'saved');
+      if (k >= 64) {
+        var sc = 448 / 572, x = X0;
+        [[315, 'fw-s1 st-s1'], [192, 'fw-s2 st-s2'], [64, 'fw-s2 st-s2'], [1, 'fw-s2 st-s2']].forEach(function (sg) {
+          var w = sg[0] * sc;
+          Course.svg('rect', { x: x, y: 308, width: w, height: 16, 'class': sg[1] }, svgEl);
+          if (sg[0] > 10) T(x + w / 2, 320, 'tx-mid tx-mono tx-sm', String(sg[0]));
+          x += w;
+        });
+      } else {
+        Course.svg('rect', { x: X0, y: 308, width: 64 * CW, height: 16, 'class': 'fi-paper st-grid dash' }, svgEl);
+        T(X0 + 32 * CW, 320, 'tx-mid tx-sm tx-muted', 'shown after the last iteration');
+      }
+    }
+    ui.onChange(function () {
+      var k = player.ticks, F = 2 + 9 * k, O = 1 + 4 * k;
+      roF.set('2 + 9 × ' + k + ' = ' + F + (k >= 64 ? ' · VMIPS: 6' : ''));
+      roO.set('1 + 4 × ' + k + ' = ' + O + ' (' + Math.round(100 * O / F) + ' %)');
+      roE.set('MIPS ' + 5 * k + ' of 320 · VMIPS all 320, with 6 instructions');
+      roD.set('MIPS ' + 4 * k + ' (4 per element) · VMIPS 4 (once each)');
+      roI.set('MIPS ' + (k ? Course.fmt(F / (5 * k), 2) : '—') + ' · VMIPS ' + Course.fmt(6 / 320, 3));
+      note.set(k >= 64 ? '578 − 6 = 572 saved: 315 element instructions (320 became 5 vector instructions), 192 pointer updates and bound tests, 64 branches and 1 set-up instruction.' : 'Press “Run the loop”, or step one iteration at a time.');
+      draw(k);
+    });
+  });
+  </script>
+
+  <p>How long the six instructions take is the subject of <a href="l31.html">lesson 31</a>.</p>
+
+  <h3>The opening puzzle, solved</h3>
+
+  <p>Back to 1976. A cache pays off when data are reused or when the hardware has to guess what comes next, and a vector loop offers neither: a vector load states exactly which 64 words it wants, and DAXPY uses each once. A stream needs bandwidth and a way to pay latency once, and that is where the Cray-1's transistors went: sixteen banks, each busy for 4 clock periods, delivering one word per clock period (Russell, 1978); pipelined units that pay their latency once per 64 elements; and 4 KB of vector registers, the buffer a cache would have been, filled by the compiler, so nothing misses. The 578 against 6 is the same decision seen from the instruction side.</p>
+
+  <p class="memo"><mark class="key">VMIPS is MIPS plus 8 vector registers of 64 × 64-bit elements (16 read, 8 write ports), five pipelined units and one pipelined load/store unit over interleaved banks; on it, DAXPY's 578 scalar instructions become 6.</mark></p>
+</section>
+
+<section id="l30-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <p>The February 2025 paper asked an open question on the VMIPS figure of section 5: present its main concepts, then the advantages of vector over scalar execution, each with the feature that provides it. Its model answer is in <a href="l31.html">lesson 31</a>, once convoys and chaining are on the table.</p>
+
+  <div class="exam" data-kind="open" data-points="8" id="l30-exam-concepts">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following topics of SIMD and vector architectures: 1. Data-level parallelism; 2. Flynn's taxonomy and the class of a superscalar processor; 3. SIMD execution with a single program counter; 4. Array processors vs pipelined vector processors; 5. Vector register file; 6. Deeply pipelined vector functional units; 7. Interleaved memory banks; 8. Little or no data cache.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1. Data-level parallelism.</b> The same operation applied independently to many data items, as in Z[i] = X[i] + Y[i]: no element waits for another. It is a property of the program, exploited by SIMD and vector hardware with one instruction per data operation instead of one per element; the fetch, decode and issue cost per element is divided by the vector length, so it costs far less energy than extracting the same parallelism as ILP.</p>
+        <p><b>2. Flynn's taxonomy and the superscalar.</b> Flynn classifies machines by the number of instruction streams and data streams. A superscalar fetches several different instructions per cycle from one program counter: one instruction stream, each instruction on its own operands, so it is SISD and exploits ILP. The benefit of the classification is to separate ILP (more instructions per cycle from one stream), DLP (one instruction on many data, SIMD) and TLP (many streams, MIMD): Flynn counts streams, not width.</p>
+        <p><b>3. SIMD with a single PC.</b> One control unit fetches each instruction once and broadcasts it to many processing elements, which execute it in lockstep on their own data. Benefits: one fetch and decode per operation instead of per PE (energy), compact code, no synchronisation between PEs. Drawback: divergent control flow must be handled by masking off elements.</p>
+        <p><b>4. Array vs vector processors.</b> An array processor has N processing elements working side by side; an operation with latency L keeps them frozen, so it takes L × ⌈n/N⌉ cycles and the latency is exposed on every round, and the programmer thinks in PEs and local memories. A vector processor pipelines its units: the latency is paid once and then one result per cycle, L + n cycles (6 + 64 = 70), and the programmer thinks in vector registers. On long vectors one L-stage pipelined unit does the work of about L unpipelined ones.</p>
+        <p><b>5. Vector register file.</b> Registers holding whole vectors (VMIPS: 8 registers of 64 × 64-bit elements, 16 read and 8 write ports through a crossbar), used register-to-register: each element is loaded once and reused by several instructions, and the pipelines are fed from registers without stalling on memory. It is compiler-controlled, unlike a cache: no tags, no misses.</p>
+        <p><b>6. Deeply pipelined functional units.</b> Each unit accepts a new element every cycle. Element independence means no hazard checks between elements, so the pipelines can be deep and fast, and the start-up latency is amortised over the whole vector: about one result per cycle per unit. Cost: every instruction pays its start-up, so short vectors are inefficient.</p>
+        <p><b>7. Interleaved memory banks.</b> Consecutive words are placed in consecutive banks; each bank is busy for several cycles after an access, but together they deliver one word per cycle to the vector load/store unit (Cray-1: 16 banks, 4-cycle bank busy time). Benefit: the bandwidth needed by streaming loads and stores; cost: many banks, and conflicts when a stride keeps hitting the same bank.</p>
+        <p><b>8. Little or no data cache.</b> Vector accesses are predictable — the instruction states which words it needs — and streaming kernels use each element once, so a cache would add latency and area for little reuse. Bandwidth comes from the banks, latency is amortised by pipelining and buffered in the vector registers; a small scalar cache may serve the scalar side, which the vector side bypasses.</p>
+      </div>
+      <div class="exam-note"><p>The 22 June 2026 paper asks its 8-point question in exactly this form, there on Tomasulo-style techniques, with five lines per item. For each item write the mechanism in one sentence, then the benefit, then a cost or a condition. Items 2 and 4 carry the two traps of the topic: "superscalar = SIMD" and the notes' "latency × vector length" for arrays.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l30-exam-flynn">
+    <div class="exam-q" lang="en">
+      <p>Let's consider Flynn's taxonomy. In which class is an out-of-order superscalar processor that issues up to 4 instructions per clock cycle from a single thread? (Single answer.)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>SISD <span class="fb">One program counter, one instruction stream: the four instructions of a cycle are different instructions of the same stream. Parallelism across instructions is ILP, not a second stream.</span></li>
+      <li>SIMD <span class="fb">SIMD is one instruction applied to many data elements; the superscalar issues several different instructions, each on its own operands.</span></li>
+      <li>MISD <span class="fb">MISD would need several instruction streams on a single data stream; it is essentially hypothetical.</span></li>
+      <li>MIMD <span class="fb">MIMD needs several instruction streams, one PC per thread or core; a single core running one thread has one.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 1: SISD. Flynn's classification counts instruction and data streams, not issue width: a superscalar fetches all its instructions from one program counter.</p></div>
+      <div class="exam-note"><p>The notes file it under "Practical clarification" (p. 388) because it is the classic confusion. A good motivation line: "streams, not width; superscalar = ILP within one stream".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l30-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: in a vector processor with fully pipelined functional units, the latency of a functional unit is paid once for each element of the vector.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">That describes a single unpipelined unit (the array with N = 1) or a scalar loop: L × n. In a pipelined unit the elements overlap, L + n cycles.</span></li>
+      <li data-correct>False <span class="fb">The latency (start-up) is paid once per vector instruction; after it, one element completes every cycle: 6 + 64 = 70 cycles for 64 elements with a 6-cycle adder.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. The latency is paid once per vector instruction (the start-up); then the pipeline delivers one result per clock cycle, so n elements take about L + n cycles, not L × n.</p></div>
+      <div class="exam-note"><p>The True/False form of the June 2025 paper's GPU quiz, on the idea behind every vector timing in lesson 31. If asked to motivate, give both counts with numbers.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l30-exam-nocache">
+    <div class="exam-q" lang="en">
+      <p>Which features allow a classic (Cray-style) vector processor to keep its functional units busy with little or no data cache? (Multiple answers.)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Interleaved memory banks that together deliver one word per clock cycle <span class="fb">Each bank is busy for several cycles, but consecutive words sit in different banks: bandwidth without a cache.</span></li>
+      <li data-correct>Vector registers loaded and reused under compiler control <span class="fb">They buffer whole vectors next to the units; the compiler decides what is loaded, so nothing misses.</span></li>
+      <li data-correct>Pipelined load/store and arithmetic units that pay the latency once per vector <span class="fb">Memory latency is paid once per vector load, then one word per cycle: it is amortised, not hidden by a cache.</span></li>
+      <li>A large branch target buffer that predicts the next memory address <span class="fb">A BTB predicts branch targets, not data addresses; a vector loop has no per-element branches to predict anyway.</span></li>
+      <li>The high temporal reuse of the vector elements <span class="fb">Streaming kernels use each element once; it is the lack of reuse that makes a cache useless here.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 2 and 3. Vector accesses are predictable and stream each element once: interleaved banks supply the bandwidth, pipelined units pay the latency once per vector, and the vector registers act as a compiler-managed buffer.</p></div>
+      <div class="exam-note"><p>The last option is the trap: caches live on reuse, and the reason vector machines drop them is that streams have none. Choosing it means confusing locality with data-level parallelism — the slip of the notes on p. 387.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="70" data-tol="0.5" data-unit="cycles" id="l30-exam-startup">
+    <div class="exam-q" lang="en">
+      <p>Let's consider a vector processor whose FP add unit is fully pipelined with a start-up latency of 6 clock cycles. How many clock cycles does <code>ADDVV.D V3, V1, V2</code> take on vectors of 64 elements, counting the start-up and then one result per cycle?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ T = \text{start-up} + n = 6 + 64 = 70 \ \text{cycles} \]
+        <p>For comparison: one unpipelined adder would need 6 × 64 = 384 cycles of computation; an array of 64 unpipelined PEs about 6, with 64 adders instead of one.</p>
+      </div>
+      <div class="exam-note"><p>The papers' convoy quizzes ignore the start-up (cycles = convoys × vector length, lesson 31); a question about one instruction with a given start-up counts it. Read which of the two the question wants.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="96.3" data-tol="0.5" id="l30-exam-ratio">
+    <div class="exam-q" lang="en">
+      <p>Let's consider DAXPY on 64 elements. The scalar MIPS code has 2 set-up instructions and a loop body of 9 instructions executed once per element; the VMIPS code has 6 instructions. By what factor does vectorisation reduce the number of executed instructions?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ IC_{\text{MIPS}} = 2 + 9 \times 64 = 578 \]
+        \[ \frac{IC_{\text{MIPS}}}{IC_{\text{VMIPS}}} = \frac{578}{6} = 96.3 \]
+      </div>
+      <div class="exam-note"><p>Write the instruction count before dividing: 9 × 64 = 576 forgets the set-up. If the question asks where the difference goes, 572 = 315 element instructions + 192 pointer and bound updates + 64 branches + 1 set-up.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l30-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these are SIMD in Flynn's sense? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>A vector unit executing <code>ADDVV.D V3, V1, V2</code> on 64 elements <span class="fb">One instruction, 64 element operations: one instruction stream, many data streams.</span></li>
+      <li data-correct>A GPU warp of 32 threads executing one instruction in lockstep <span class="fb">Within a warp one instruction is broadcast to all lanes: "essentially SIMD under the hood" (p. 391).</span></li>
+      <li>A 4-issue out-of-order superscalar running one program <span class="fb">Four different instructions per cycle from one PC: one stream, ILP — SISD.</span></li>
+      <li>A quad-core processor running four threads <span class="fb">Four PCs, four instruction streams: MIMD.</span></li>
+    </ul>
+    <p class="q-fb">Ask two questions: how many PCs, and does one instruction touch one element or many?</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An array of 64 unpipelined PEs with a 6-cycle add finishes a 64-element add in 7 cycles; a single 6-stage pipelined adder needs 70. Why did vector machines choose the pipeline?</p>
+    <ul class="options">
+      <li data-correct>The pipelined adder keeps all its stages busy and delivers about one result per cycle, while each array adder delivers one result every 6 or 7 cycles and waits in between <span class="fb">Per adder: 0.91 results per cycle against 0.14. On long vectors one pipelined adder does what the array needs about six adders for.</span></li>
+      <li>The array cannot add 64 numbers in parallel <span class="fb">It can: that is exactly what its 64 PEs do, in 7 cycles.</span></li>
+      <li>The pipelined adder has a shorter latency <span class="fb">Both need 6 cycles for the first result; the pipeline wins on throughput per unit of hardware, not on latency.</span></li>
+      <li>A pipelined adder needs no vector registers <span class="fb">It needs them most of all: the elements stream out of and into vector registers.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can a vector add unit be cut into many short pipeline stages without the hazard-detection logic of a scalar pipeline?</p>
+    <ul class="options">
+      <li data-correct>The element entering the unit never needs the result of an element still inside it <span class="fb">Element independence: V3[17] does not depend on V3[16], so there is nothing to check between consecutive elements.</span></li>
+      <li>The compiler inserts NOPs between the elements <span class="fb">There are no instructions between elements: one instruction covers all of them.</span></li>
+      <li>Vector registers have more ports than scalar registers <span class="fb">Ports let several units stream at once; they do not remove dependences.</span></li>
+      <li>The unit stalls for one cycle after every element <span class="fb">Then it would deliver one result every two cycles; a vector unit delivers one per cycle.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">VMIPS keeps 4 KB of vector registers next to its functional units. What makes them different from a 4 KB data cache?</p>
+    <ul class="options">
+      <li data-correct>The compiler decides what goes into them and when, with explicit L.V and S.V; there are no tags and no misses <span class="fb">A compiler-controlled buffer (p. 400): like scalar registers, only 64 elements wide.</span></li>
+      <li>Nothing but the name: both are filled by hardware on demand <span class="fb">A cache is filled by hardware when an access misses; a vector register only by an explicit vector load.</span></li>
+      <li>They keep the most recently used data and replace the rest by LRU <span class="fb">There is no replacement policy: a register keeps its contents until an instruction overwrites it.</span></li>
+      <li>They are slower than a cache but hold more data <span class="fb">They are faster — a register file next to the units — and here the same size.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An out-of-order superscalar and a vector processor both perform DAXPY's 64 multiplications and 64 additions, with floating-point units of similar cost. Where does the vector machine save most of its energy?</p>
+    <ul class="options">
+      <li data-correct>In the front end and the scheduling logic: one fetch, decode and dependence check per vector instead of per element, and no renaming or reorder buffer <span class="fb">The arithmetic is the same; what disappears is the per-instruction machinery: "one instruction controls many ALUs, so fetch/decode overhead is amortized" (p. 387).</span></li>
+      <li>In the adders and multipliers, because vector units are smaller <span class="fb">They do the same arithmetic; a pipelined vector unit is not cheaper per operation.</span></li>
+      <li>In the data cache, because the vector machine hits more often <span class="fb">A classic vector machine has little or no data cache to hit in; the saving is in the front end.</span></li>
+      <li>In memory traffic, because a vector load reads fewer words <span class="fb">Both read every X[i] and Y[i] once: the same words, only delivered as a stream.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does the VMIPS vector register file have 16 read ports and 8 write ports?</p>
+    <ul class="options">
+      <li data-correct>So that several functional units and the load/store unit can stream elements out of and into different registers in the same cycle <span class="fb">Five units reading two elements and writing one, plus the load/store unit: up to 11 reads and 6 writes per cycle.</span></li>
+      <li>One port for every four elements of a 64-element register <span class="fb">Ports serve units, not elements: a unit streams its elements through its port one per cycle.</span></li>
+      <li>To replace the data cache <span class="fb">Ports give bandwidth between registers and units; what replaces the cache is the vector registers as a buffer plus the memory banks.</span></li>
+      <li>Because VMIPS issues 16 instructions per cycle <span class="fb">VMIPS issues at most one vector instruction per cycle; the ports serve the units of the instructions already running.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l30-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>ILP hit three walls — control, memory, complexity/energy; data-level parallelism, the same operation on many independent elements, lets a machine pay one fetch and decode per data operation instead of one per element.</li>
+    <li>Flynn counts instruction and data streams, not instructions per cycle: a superscalar is SISD (ILP), a vector unit or a GPU warp is SIMD (DLP), a multicore is MIMD (TLP).</li>
+    <li>An array of \(N\) unpipelined PEs pays the latency on every round, \(L \cdot \lceil n/N \rceil\) cycles; a pipelined vector unit pays it once and then streams one result per cycle, \(L + n\) — so on long vectors one \(L\)-stage pipelined unit does the work of about \(L\) unpipelined ones.</li>
+    <li>A Cray-style machine spends its transistors on one instruction for many elements, vector registers, deep pipelines made safe by element independence and interleaved banks for bandwidth — and keeps little or no data cache, because a stream has nothing to reuse.</li>
+    <li>VMIPS is MIPS plus 8 vector registers of 64 × 64-bit elements (16 read and 8 write ports), five pipelined functional units and one pipelined load/store unit over interleaved banks.</li>
+    <li>DAXPY on 64 elements takes 578 MIPS instructions (2 + 9 × 64) and 6 VMIPS ones; the 572 saved are 315 element instructions, 192 pointer and bound updates, 64 branches and one set-up instruction.</li>
+  </ul>
+  <aside class="cheat" id="l30-cheat">
+    <dl>
+      <dt>Pipelined vector unit</dt><dd>\(T = L + n\) cycles (\(L\) start-up latency, \(n\) elements): 6 + 64 = 70</dd>
+      <dt>Array of \(N\) unpipelined PEs</dt><dd>\(T = L \cdot \lceil n/N \rceil\) cycles of computation (+1 to write the last results)</dd>
+      <dt>Results per cycle per adder</dt><dd>pipelined \(n/(L+n) \to 1\); unpipelined \(\approx 1/L\)</dd>
+      <dt>Flynn rule</dt><dd>count instruction streams × data streams, not issue width: superscalar = SISD, vector = SIMD, multicore = MIMD</dd>
+      <dt>DAXPY</dt><dd>\(Y[i] = a \cdot X[i] + Y[i]\); MIPS 2 + 9 × 64 = 578 instructions, VMIPS 6</dd>
+      <dt>VMIPS</dt><dd>8 × 64 × 64-bit vector registers (4 KB), 16 read / 8 write ports; 5 pipelined units; 1 load/store unit</dd>
+      <dt>No data cache, because</dt><dd>streams have no reuse; banks give bandwidth; latency paid once per vector</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l30-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=gkMaO3yJMz0" target="_blank" rel="noopener">Digital Design and Comp. Arch. — Lecture 19: SIMD Architectures (Vector and Array Processors)</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span>
+      <p class="res-why">Array processors against vector processors — the same operation on many elements in space or in time — drawn step by step: the picture of section 3 before you meet it.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.computerhistory.org/revolution/supercomputers/10/7" target="_blank" rel="noopener">The Cray-1 Supercomputer</a>
+      <span class="res-by">Computer History Museum</span>
+      <p class="res-why">Photos of the machine of the opening puzzle: over 60 miles of hand-laid wire with no segment longer than 3 feet, Freon cooling and 115 kW of power.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://ocw.mit.edu/courses/6-823-computer-system-architecture-fall-2005/0baf1f59ca3a4a80f0198bb91b688de0_l22_vector.pdf" target="_blank" rel="noopener">Vector Computers (6.823, lecture 22)</a>
+      <span class="res-by">Joel Emer, with notes by Krste Asanović and Arvind — MIT OpenCourseWare</span>
+      <p class="res-why">The Cray-1 block diagram and the vector programming model, in the order of this lesson and the next: compare the diagram with Fig. 4 while you read section 5.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.eecg.utoronto.ca/~moshovos/ACA05/read/cray1.pdf" target="_blank" rel="noopener">The CRAY-1 Computer System</a>
+      <span class="res-by">Richard M. Russell, Communications of the ACM, 1978</span>
+      <p class="res-why">Tables I and II hold the numbers of this lesson: 16 banks with a 4-clock bank cycle, eight 64-element vector registers, the 6-clock floating-point adder — and chaining in its designers' words, the start of lesson 31.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://users.cs.utah.edu/~hari/teaching/paralg/Flynn72.pdf" target="_blank" rel="noopener">Some Computer Organizations and Their Effectiveness</a>
+      <span class="res-by">Michael J. Flynn, IEEE Transactions on Computers, 1972</span>
+      <p class="res-why">The four classes in their author's words, with the SIMD machines of the time as examples.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You have the machine and the six instructions of DAXPY, but not their running time. Five units and one load/store unit: which instructions can stream at the same time, and how can the add start before the multiply has finished? Next: convoys, chimes and chaining — the vector quiz of every paper.</p>
+</aside>
+
+</main>
+</body>
+</html>

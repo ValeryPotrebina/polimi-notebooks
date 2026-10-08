@@ -1,0 +1,1028 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The compiler takes the wheel: what a VLIW is · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l19">
+
+<header class="lesson-head">
+  <h1>The compiler takes the wheel: what a VLIW is</h1>
+  <p class="lede">After this lesson you will read a VLIW bundle slot by slot, say who handles each hazard — the compiler, or the little hardware that is left — and weigh what static scheduling buys against what it costs.</p>
+</header>
+
+<div class="hook" data-label="A true story, and a puzzle">
+  <p>In 1984 Josh Fisher — the researcher who coined the term instruction-level parallelism — could not find a company willing to build his very-long-instruction-word machine, so he founded one. Multiflow's TRACE 28/200 issued up to 28 operations from a single 1024-bit instruction word.</p>
+  <p>Twenty-eight operations leave in the same clock cycle, and in a VLIW no circuit compares their registers to see whether one of them needs the result of another. The notes say it plainly: "No need for runtime dependency checking anymore" (p. 267). How can such a machine compute the right answer?</p>
+  <p>And if it can, why did the idea stay out of general-purpose processors? Multiflow closed in 1990 after about 125 machines; Intel's Itanium, built on the same idea, became the "Itanic" — a nickname coined the very day its name was announced in 1999; and the processor in your laptop still checks every dependence in hardware. Keep the two questions: section 2 answers the first, section 6 the second.</p>
+</div>
+
+<section id="l19-bundle">
+  <h2>One long word, one slot per unit</h2>
+
+  <p>Your first architecture course built a pipeline that issues one instruction per cycle. <a href="l08.html#l08-static">Lesson 8</a> widened it: a superscalar issues several per cycle, and its hardware decides at run time which ones may go together. A VLIW issues several per cycle too, but the decision was taken earlier, by the compiler, and written into the program.</p>
+
+  <div class="def">
+    <p><dfn>VLIW (Very Long Instruction Word)</dfn> — a processor that executes several operations per clock cycle and relies on the compiler, not on dynamic hardware, to detect and schedule the parallelism. Independent operations are grouped into one long instruction word, the <dfn>bundle</dfn>, made of fixed slots, each corresponding to a functional unit (p. 266).</p>
+  </div>
+
+  <p>The notes sum the idea up in one highlighted line: "VLIW architectures represent a shift of complexity from the hardware to the compiler" (p. 267). A statically scheduled processor trusts "the compiler to 'fill the pipeline' and avoid hazards at compile time" (p. 266).</p>
+
+  <p>The operations inside a bundle are also called "syllables" (p. 267). A 4-issue VLIW has four slots per bundle, a 5-issue one five. The 2024 and 2026 papers use a 3-issue machine, June 2025 a 4-issue one with a second memory unit, and the sentence that describes the machine comes back almost word for word in all three.</p>
+
+  <div class="tip" data-label="The exam's machine, as the July 2024 paper prints it">
+    <p>"a 3-issue VLIW machine with fully pipelined functional units: 1 Memory Units with 3 cycles latency; 1 FP ALUs with 3 cycles latency; 1 Integer ALU with 1 cycle latency to next Int/FP/L/S &amp; 2 cycle latency to next Branch. The branch is completed with 1 cycle delay slot (branch solved in ID stage). No branch prediction. In the Register File, it is possible to read and write at the same address at the same clock cycle."</p>
+    <p>Read it once slowly: every schedule of this lesson uses it.</p>
+  </div>
+
+  <aside class="margin-note">Older papers put a dollar sign in front of the register names; the 2026 paper drops it, and so does this course. The 2024 and 2026 VLIW exercises also print ADDDUI for ADDUI.</aside>
+
+  <p>Put a loop on that machine: the first loop of the 22 June 2026 paper.</p>
+
+<pre><code>LOOP1: LD    F2, 0(R1)      ; I0
+       FADD  F6, F2, F2     ; I1
+       SD    F6, 0(R1)      ; I2
+       ADDUI R1, R1, 4      ; I3
+       BNE   R1, R3, LOOP1  ; I4</code></pre>
+
+  <p>The compiler fills a timetable with one row per clock cycle and one column per unit. The LD goes in C1. The FADD needs F2, which the memory unit delivers 3 cycles later: C4. The SD needs F6, ready 3 cycles after the FADD: C7. The ADDUI overwrites R1, which the SD still has to read; since the register file allows a read and a write of the same register in one cycle, the ADDUI may share C7 with the SD. The BNE needs the new R1, and an integer result reaches a branch 2 cycles later: C9. C10 is the delay slot.</p>
+
+  <figure class="tbl-fig" id="l19-tbl-loop1">
+    <figcaption>Table 1. LOOP1 on the papers' 3-issue VLIW, one row per bundle. Every empty cell is a NOP in the program.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Memory Unit</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+        <tbody>
+          <tr><th>C1</th><td><code>LD F2, 0(R1)</code></td><td></td><td></td></tr>
+          <tr><th>C2</th><td></td><td></td><td></td></tr>
+          <tr><th>C3</th><td></td><td></td><td></td></tr>
+          <tr><th>C4</th><td></td><td><code>FADD F6, F2, F2</code></td><td></td></tr>
+          <tr><th>C5</th><td></td><td></td><td></td></tr>
+          <tr><th>C6</th><td></td><td></td><td></td></tr>
+          <tr class="is-key"><th>C7</th><td><code>SD F6, 0(R1)</code></td><td></td><td><code>ADDUI R1, R1, 4</code></td></tr>
+          <tr><th>C8</th><td></td><td></td><td></td></tr>
+          <tr><th>C9</th><td></td><td></td><td><code>BNE R1, R3, LOOP1</code></td></tr>
+          <tr><th>C10</th><td>(delay slot)</td><td></td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Ten bundles of three slots: 30 slots, 5 operations, 25 empty. In the exam you leave the empty cells blank — the papers say "Please do not write in NOPs" — but in the program each one is a <mark class="key">NOP</mark>, an operation that does nothing and still occupies its slot of the word (p. 266). The example formula sheet on the course page, prepared by a student, measures the waste in one line:</p>
+
+  <div class="formula">
+    \[ \text{code efficiency} = \frac{IC}{\#\text{cycles} \times \#\text{issues}} \]
+    \[ \text{LOOP1:}\quad \frac{5}{10 \times 3} = 0.17 \]
+    <dl class="legend">
+      <dt>\(IC\)</dt><dd>operations scheduled in one iteration (NOPs not counted)</dd>
+      <dt>\(\#\text{cycles}\)</dt><dd>length of the iteration, delay slot included</dd>
+      <dt>\(\#\text{issues}\)</dt><dd>slots per bundle, the issue width</dd>
+    </dl>
+  </div>
+
+  <p>The papers ask three more numbers about the same table, all treated in <a href="l20.html">lesson 20</a>: the critical path, by the papers' convention the 10 cycles of the iteration with its delay slot; the CPI, cycles over instructions, 10 / 5 = 2; and the FP operations per cycle, 1 / 10 = 0.1.</p>
+
+  <p>Fig. 1 zooms into one row, bundle C7. Three rules keep such a word cheap for the hardware (pp. 267, 269). There is a single program counter, and each fetch brings one whole bundle. A bundle holds at most one branch, so each cycle has one next-PC decision to make. And each slot is wired to its own unit, so the decoder routes nothing.</p>
+
+  <figure class="fig fig--plain" id="l19-fig-bundle">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="One program counter addresses the instruction cache, which delivers one long instruction word per cycle. The word has a Memory, an FP and an Integer slot, each wired straight to its own unit. In bundle C7 of LOOP1 the Memory slot holds SD F6, 0(R1), the FP slot a NOP and the Integer slot ADDUI R1, R1, 4.">
+      <rect x="20" y="14" width="60" height="30" rx="4" class="fi-paper sw-2"/>
+      <text x="50" y="34" class="tx-mid tx-mono">PC</text>
+      <line x1="80" y1="29" x2="124" y2="29" marker-end="url(#arr)"/>
+      <rect x="128" y="14" width="90" height="30" rx="4" class="fi-paper"/>
+      <text x="173" y="34" class="tx-mid tx-sm">I-cache</text>
+      <line x1="173" y1="44" x2="173" y2="86" marker-end="url(#arr)"/>
+      <text x="240" y="52" class="tx-hand">one bundle per fetch</text>
+      <text x="96" y="80" class="tx-mid tx-sm tx-muted">Memory slot</text>
+      <text x="280" y="80" class="tx-mid tx-sm tx-muted">FP slot</text>
+      <text x="453" y="80" class="tx-mid tx-sm tx-muted">Integer slot</text>
+      <rect x="20" y="90" width="173" height="36" class="fw-s1 st-s1 sw-2"/>
+      <rect x="193" y="90" width="173" height="36" class="fi-soft sw-2"/>
+      <rect x="366" y="90" width="173" height="36" class="fw-s1 st-s1 sw-2"/>
+      <text x="106" y="113" class="tx-mid tx-mono">SD F6, 0(R1)</text>
+      <text x="280" y="113" class="tx-mid tx-mono tx-muted">NOP</text>
+      <text x="453" y="113" class="tx-mid tx-mono">ADDUI R1, R1, 4</text>
+      <line x1="106" y1="126" x2="106" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="280" y1="126" x2="280" y2="166" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <line x1="453" y1="126" x2="453" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="126" y="158" class="tx-hand">no arbiter</text>
+      <rect x="56" y="172" width="100" height="44" class="fw-s1 st-s1 sw-2"/>
+      <rect x="230" y="172" width="100" height="44" class="fi-paper sw-2"/>
+      <rect x="403" y="172" width="100" height="44" class="fw-s1 st-s1 sw-2"/>
+      <line x1="61" y1="180" x2="61" y2="208" class="st-muted sw-1"/>
+      <line x1="64" y1="180" x2="64" y2="208" class="st-muted sw-1"/>
+      <line x1="67" y1="180" x2="67" y2="208" class="st-muted sw-1"/>
+      <line x1="235" y1="180" x2="235" y2="208" class="st-muted sw-1"/>
+      <line x1="238" y1="180" x2="238" y2="208" class="st-muted sw-1"/>
+      <line x1="241" y1="180" x2="241" y2="208" class="st-muted sw-1"/>
+      <line x1="408" y1="180" x2="408" y2="208" class="st-muted sw-1"/>
+      <line x1="411" y1="180" x2="411" y2="208" class="st-muted sw-1"/>
+      <line x1="414" y1="180" x2="414" y2="208" class="st-muted sw-1"/>
+      <text x="114" y="199" class="tx-mid">Memory</text>
+      <text x="288" y="199" class="tx-mid">FP</text>
+      <text x="461" y="199" class="tx-mid">Integer</text>
+      <text x="106" y="238" class="tx-mid tx-sm tx-muted">latency 3</text>
+      <text x="280" y="238" class="tx-mid tx-sm tx-muted">latency 3</text>
+      <text x="453" y="238" class="tx-mid tx-sm tx-muted">1 (2 to a branch)</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> Bundle C7 of LOOP1. One program counter fetches one long word per cycle; each slot is wired to its own fully pipelined unit (the three ticks), so no arbiter decides who goes where. The FP slot has no work in this cycle and carries a NOP.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">A bundle is one row of the compiler's timetable: one slot per functional unit, an operation or a NOP in each, fetched by a single program counter.</mark></p>
+</section>
+
+<section id="l19-who">
+  <h2>Who handles each hazard</h2>
+
+  <p>"The key difference compared to traditional superscalar processors lies in who decides what can run in parallel" (p. 266). A superscalar's hardware analyses dependences while the program runs; in a VLIW "this analysis is performed entirely at compile time" (p. 266). The compiler's job list on the same page has four lines: identify independent operations, solve structural hazards, solve data hazards, insert NOPs where nothing fits. Table 2 sets the two answers side by side.</p>
+
+  <figure class="tbl-fig wide" id="l19-tbl-who">
+    <figcaption>Table 2. Who handles each hazard: the compiler of a VLIW, before the program runs, against the hardware of the dynamically scheduled superscalar of lessons 8–18, while it runs.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Hazard</th><th>VLIW:<br>the compiler</th><th>Superscalar:<br>the hardware</th></tr></thead>
+        <tbody>
+          <tr><td>RAW</td><td>places the consumer at least one latency after the producer; fills the gap with independent operations or NOPs</td><td>holds the consumer until the operand arrives (scoreboard, reservation stations)</td></tr>
+          <tr><td>WAR, WAW</td><td>issues a WAR writer no earlier than the last reader (the same cycle is allowed) and makes a WAW writer's result land after the earlier one — or renames to another register</td><td>renames into reservation-station or ROB tags (the scoreboard of <a href="l09.html">lesson 9</a> stalls the writer instead)</td></tr>
+          <tr><td>Structural</td><td>one operation per slot: the format itself keeps two operations off one unit</td><td>the issue logic checks for a free unit and station</td></tr>
+          <tr><td>Branch</td><td>may give a static hint; the hardware detects a misprediction and flushes (p. 271)</td><td>predicts dynamically and flushes on a misprediction</td></tr>
+          <tr><td>Data-cache miss</td><td>cannot be foreseen: the processor stalls (p. 272)</td><td>independent instructions keep executing around the miss</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The RAW row is where the compiler earns its keep. The notes' example: if <code>C = A * B</code> takes two cycles, "the compiler may schedule a NOP after it, before allowing an instruction that depends on C to execute" — or an independent instruction that has to run anyway (p. 270). A pipelined unit does not change the rule. The papers' FP ALU is fully pipelined: it accepts a new FADD every cycle, yet each FADD's result appears 3 cycles after it issues.</p>
+
+  <div class="pitfall">
+    <p>"Fully pipelined means latency 1." No. Pipelining fixes the throughput, one new operation per unit per cycle; the latency stays. In LOOP1 an independent FADD could issue in C5, right behind the first one, while the SD that needs F6 cannot go before C7.</p>
+  </div>
+
+  <p>Name dependences cost less: a WAR or a WAW shares a register name but carries no value (<a href="l07.html">lesson 7</a>). The compiler resolves them by "appropriately choosing the timing of operations" or by "using register renaming techniques" (p. 270), that is, by writing the result into another register. Structural hazards disappear "through scheduling decisions" (p. 270): with one memory slot, two memory operations simply never share a bundle.</p>
+
+  <p>So nothing on the chip checks the schedule. A schedule that ignores a latency does not run slower: it computes a wrong value. That is the meaning of "This static management of hazards is crucial because the hardware in VLIW processors does not dynamically detect or resolve data hazards during execution" (p. 270) — and the answer to the first question of the puzzle: the TRACE did not check its 28 operations because its compiler already had.</p>
+
+  <div class="widget" id="l19-w-who">
+    <h3 class="widget-title">Who schedules? The same loop on two machines</h3>
+    <p class="widget-intro">Both machines have the papers' three units and latencies and see one iteration at a time (no branch prediction). The superscalar receives the plain code and applies the compiler's rules in hardware, without renaming: every cycle its issue logic re-examines each waiting instruction — operands ready, unit free, no earlier reader or writer of the register it overwrites still pending — and sends the oldest ready one to each unit. The VLIW receives bundles the compiler packed with the same rules, and sends each slot straight to its unit. Step through the cycles; every operation and NOP counts 4 bytes of code.</p>
+    <ol class="tasks">
+      <li>LOOP1, superscalar. Before stepping: in which cycle will the comparators let the FADD go, and what will they say about it in C2? Then step to C4.
+        <details class="answer"><summary>What you should see</summary>
+          <p>In C1, C2 and C3 its check reads "F2 ready C4": the load issued in C1 delivers F2 three cycles later. In C4 it issues. The same checks hold the SD until C7 and the BNE until C9 — the hardware discovers, cycle by cycle, the timetable of Table 1.</p></details>
+      </li>
+      <li>Switch to VLIW with LOOP1. Predict the code size and the number of NOPs, then read them. Did the code efficiency change?
+        <details class="answer"><summary>What you should see</summary>
+          <p>30 slots, 5 operations, 25 NOPs: 120 bytes instead of 20, six times the code. The code efficiency is 0.17 in both modes — the slots are just as empty on the superscalar, but there the empty slots are lost at run time and take no room in memory.</p></details>
+      </li>
+      <li>Choose the July 2024 loop. Which cycle starts three instructions together, and who found that group in each mode?
+        <details class="answer"><summary>What you should see</summary>
+          <p>C4: SD F8, FADD F6 and ADDUI R2 — the ADDUI may join because the register file lets it overwrite R2 in the cycle in which SD F8 reads it. On the superscalar the comparators find the group in C4 of every iteration; on the VLIW the compiler found it once and wrote it into bundle C4.</p></details>
+      </li>
+      <li>Compare the readout "dependence checks at run time" in the two modes for the July 2024 loop. What does each machine pay that the other does not?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The superscalar makes 44 instruction checks per iteration and keeps the code at 40 bytes; the VLIW makes none and stores 120 bytes, 80 of them NOPs. Same cycles, same groups, same efficiency: the parallelism is identical; only who finds it, when, and who pays for it change.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l19-w-who', function (root, ui) {
+    var LAT = { M: 3, F: 3, I: 1 };
+    var UNIT = { M: 'Memory', F: 'FP', I: 'Integer' };
+    var UY = { M: 96, F: 176, I: 256 };
+    var PROGS = {
+      loop1: [
+        { t: 'LD F2', u: 'M', d: 'F2', s: ['R1'] },
+        { t: 'FADD F6', u: 'F', d: 'F6', s: ['F2'] },
+        { t: 'SD F6', u: 'M', d: null, s: ['F6', 'R1'] },
+        { t: 'ADDUI R1', u: 'I', d: 'R1', s: ['R1'] },
+        { t: 'BNE', u: 'I', d: null, s: ['R1', 'R3'], br: true }
+      ],
+      loop2024: [
+        { t: 'LD F2', u: 'M', d: 'F2', s: ['R1'] },
+        { t: 'LD F4', u: 'M', d: 'F4', s: ['R2'] },
+        { t: 'FADD F4', u: 'F', d: 'F4', s: ['F4'] },
+        { t: 'FADD F6', u: 'F', d: 'F6', s: ['F2'] },
+        { t: 'FADD F8', u: 'F', d: 'F8', s: ['F0'] },
+        { t: 'SD F6', u: 'M', d: null, s: ['F6', 'R1'] },
+        { t: 'SD F8', u: 'M', d: null, s: ['F8', 'R2'] },
+        { t: 'ADDUI R1', u: 'I', d: 'R1', s: ['R1'] },
+        { t: 'ADDUI R2', u: 'I', d: 'R2', s: ['R2'] },
+        { t: 'BNE', u: 'I', d: null, s: ['R1', 'R3'], br: true }
+      ]
+    };
+
+    /* the rules both machines obey: RAW = producer + latency (integer to branch 2), WAR = not before the reader,
+       WAW = the later result lands after the earlier one, branch last */
+    function build(P) {
+      var E = [], i, j, at = [], c = 0, done = 0, waiting = [], issuedAt = [];
+      for (j = 0; j < P.length; j++) {
+        for (i = 0; i < j; i++) {
+          var a = P[i], b = P[j];
+          if (a.d && b.s.indexOf(a.d) >= 0) E.push({ f: i, t: j, min: (a.u === 'I' && b.br) ? 2 : LAT[a.u], k: 'RAW', r: a.d });
+          if (b.d && a.s.indexOf(b.d) >= 0) E.push({ f: i, t: j, min: 0, k: 'WAR', r: b.d });
+          if (a.d && b.d && a.d === b.d) E.push({ f: i, t: j, min: Math.max(0, LAT[a.u] - LAT[b.u] + 1), k: 'WAW', r: a.d });
+          if (b.br) E.push({ f: i, t: j, min: 0, k: 'CTRL', r: '' });
+        }
+      }
+      for (i = 0; i < P.length; i++) at.push(0);
+      function ok(k, cyc) {
+        return E.every(function (e) { return e.t !== k || (at[e.f] > 0 && at[e.f] + e.min <= cyc); });
+      }
+      while (done < P.length && c < 40) {
+        c++;
+        var busy = {}, n = 0, progress = true;
+        for (i = 0; i < P.length; i++) if (!at[i]) n++;
+        waiting.push(n);
+        while (progress) {
+          progress = false;
+          for (i = 0; i < P.length; i++) {
+            if (at[i] || busy[P[i].u] || !ok(i, c)) continue;
+            at[i] = c; busy[P[i].u] = true; done++; progress = true;
+            break;
+          }
+        }
+      }
+      var br = 0;
+      for (i = 0; i < P.length; i++) if (P[i].br) br = i;
+      var cycles = at[br] + 1, checks = 0;
+      for (i = 0; i < waiting.length; i++) checks += waiting[i];
+      return { P: P, E: E, at: at, cycles: cycles, waiting: waiting, checks: checks };
+    }
+    var S = { loop1: build(PROGS.loop1), loop2024: build(PROGS.loop2024) };
+
+    /* why instruction k is still waiting in cycle c (first rule that blocks it) */
+    function reason(m, k, c) {
+      var i, e, P = m.P, at = m.at, order = ['RAW', 'WAR', 'WAW', 'CTRL'];
+      for (var o = 0; o < order.length; o++) {
+        for (i = 0; i < m.E.length; i++) {
+          e = m.E[i];
+          if (e.t !== k || e.k !== order[o]) continue;
+          if (e.k === 'RAW') {
+            if (at[e.f] > c) return 'needs ' + e.r;
+            if (at[e.f] + e.min > c) return e.r + ' ready C' + (at[e.f] + e.min);
+          } else if (at[e.f] + e.min > c) {
+            if (e.k === 'WAR') return e.r + ' still read';
+            if (e.k === 'WAW') return e.r + ' written first';
+            return 'goes last';
+          }
+        }
+      }
+      return UNIT[P[k].u] + ' busy';
+    }
+    /* why the compiler put instruction k where it is */
+    function placed(m, k) {
+      var c = m.at[k], best = 1, why = 'nothing to wait for', i, e;
+      for (i = 0; i < m.E.length; i++) {
+        e = m.E[i];
+        if (e.t !== k) continue;
+        var t = m.at[e.f] + e.min;
+        if (t >= best) {
+          best = t;
+          if (e.k === 'RAW') why = e.r + ' ready at C' + m.at[e.f] + ' + ' + e.min;
+          else if (e.k === 'WAR') why = 'shares the cycle of the last reader of ' + e.r;
+          else if (e.k === 'WAW') why = 'after the earlier write of ' + e.r;
+          else why = 'the branch closes the iteration';
+        }
+      }
+      if (best < c) why = 'the ' + UNIT[m.P[k].u] + ' unit was taken earlier';
+      return why;
+    }
+
+    var prog = ui.select('program', [
+      { value: 'loop1', label: 'LOOP1, 22 June 2026 (5 instructions)' },
+      { value: 'loop2024', label: 'LOOP, 15 July 2024 (10 instructions)' }
+    ], null, 'loop1');
+    var mode = ui.select('who schedules', [
+      { value: 'sup', label: 'superscalar: the hardware, at run time' },
+      { value: 'vliw', label: 'VLIW: the compiler, at compile time' }
+    ], null, 'sup');
+    var steps = [];
+    for (var s0 = 1; s0 <= 10; s0++) steps.push('cycle C' + s0);
+    var stepper = ui.stepper({ steps: steps });
+    var roCyc = ui.readout('cycles per iteration', { digits: 0 });
+    var roUsed = ui.readout('slots used');
+    var roEmpty = ui.readout('empty slots');
+    var roCode = ui.readout('code size');
+    var roEff = ui.readout('code efficiency IC / (cycles × 3)');
+    var roChk = ui.readout('dependence checks at run time');
+    var note = ui.note('');
+    var svg = ui.svg(560, 362, { label: 'One iteration cycle by cycle: on the superscalar, the sequential code with the check made on every waiting instruction; on the VLIW, the bundles with their NOPs. Arrows show what enters the Memory, FP and Integer units in the current cycle.' });
+
+    function T(x, y, cls, txt) { return Course.svg('text', { x: x, y: y, 'class': cls, text: txt }, svg); }
+    function R(x, y, w, h, cls, rx) { return Course.svg('rect', { x: x, y: y, width: w, height: h, rx: rx || 0, 'class': cls }, svg); }
+    function L(x1, y1, x2, y2, cls, mk) {
+      var a = { x1: x1, y1: y1, x2: x2, y2: y2, 'class': cls };
+      if (mk) a['marker-end'] = 'url(#' + mk + ')';
+      return Course.svg('line', a, svg);
+    }
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var m = S[prog.value], P = m.P, c = stepper.index + 1, vliw = mode.value === 'vliw', i, y, busy = {};
+      /* units */
+      ['M', 'F', 'I'].forEach(function (u) {
+        var used = false;
+        for (var k = 0; k < P.length; k++) if (P[k].u === u && m.at[k] === c) used = true;
+        busy[u] = used;
+        R(438, UY[u] - 22, 100, 44, used ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2');
+        L(443, UY[u] - 12, 443, UY[u] + 12, 'st-muted sw-1'); L(446, UY[u] - 12, 446, UY[u] + 12, 'st-muted sw-1'); L(449, UY[u] - 12, 449, UY[u] + 12, 'st-muted sw-1');
+        T(494, UY[u] - 2, 'tx-mid', UNIT[u]);
+        T(494, UY[u] + 15, 'tx-mid tx-sm tx-muted', 'lat ' + LAT[u]);
+      });
+      T(494, 24, 'tx-mid tx-sm tx-muted', 'units');
+      if (!vliw) {
+        T(10, 24, 'tx-sm tx-muted', 'sequential code');
+        T(172, 24, 'tx-sm tx-muted', 'issue logic');
+        for (i = 0; i < P.length; i++) {
+          y = 40 + 28 * i;
+          var now = m.at[i] === c, before = m.at[i] < c;
+          T(36, y + 15, 'tx-end tx-mono tx-sm', 'I' + i);
+          R(42, y, 118, 22, now ? 'fw-s1 st-s1 sw-2' : (before ? 'fi-soft' : 'fi-paper'), 4);
+          T(50, y + 15, 'tx-mono tx-sm' + (before ? ' tx-muted' : ''), P[i].t);
+          if (before) { T(200, y + 15, 'tx-sm tx-muted', 'issued C' + m.at[i]); continue; }
+          Course.svg('circle', { cx: 181, cy: y + 11, r: 12, 'class': now ? 'fi-paper st-s1 sw-2' : 'fi-paper st-muted' }, svg);
+          T(181, y + 15, 'tx-mid tx-sm', '=?');
+          if (now) {
+            T(200, y + 15, 'tx-sm tx-bold', 'issue');
+            L(280, y + 11, 434, UY[P[i].u], 'st-s1 sw-2', 'arr-s1');
+          } else {
+            T(200, y + 15, 'tx-sm', reason(m, i, c));
+          }
+        }
+        T(10, 350, 'tx-sm', 'code: ' + P.length + ' instructions × 4 B = ' + (4 * P.length) + ' B');
+      } else {
+        T(93, 24, 'tx-mid tx-sm tx-muted', 'Memory');
+        T(193, 24, 'tx-mid tx-sm tx-muted', 'FP');
+        T(293, 24, 'tx-mid tx-sm tx-muted', 'Integer');
+        for (var r = 1; r <= m.cycles; r++) {
+          y = 40 + 28 * (r - 1);
+          var cur = r === c;
+          T(36, y + 15, 'tx-end tx-mono tx-sm' + (cur ? ' tx-bold' : ''), 'C' + r);
+          ['M', 'F', 'I'].forEach(function (u, sIdx) {
+            var op = null;
+            for (var k = 0; k < P.length; k++) if (P[k].u === u && m.at[k] === r) op = P[k];
+            var x = 45 + 100 * sIdx;
+            R(x, y, 96, 22, op ? (cur ? 'fw-s1 st-s1 sw-2' : 'fi-paper') : (cur ? 'fi-soft st-s1 sw-2' : 'fi-soft'), 3);
+            T(x + 48, y + 15, 'tx-mid tx-mono tx-sm' + (op ? '' : ' tx-muted'), op ? op.t : 'NOP');
+            if (op && cur) L(343, y + 11, 434, UY[u], 'st-s1 sw-2', 'arr-s1');
+          });
+        }
+        T(10, 350, 'tx-sm', 'code: ' + m.cycles + ' bundles × 3 slots × 4 B = ' + (12 * m.cycles) + ' B');
+      }
+    }
+
+    ui.onChange(function () {
+      var m = S[prog.value], P = m.P, c = stepper.index + 1, vliw = mode.value === 'vliw', IC = P.length, slots = 3 * m.cycles, i;
+      roCyc.set(m.cycles);
+      roUsed.set(IC + ' of ' + slots);
+      roEmpty.set(vliw ? (slots - IC) + ' NOPs, stored in the code' : (slots - IC) + ', lost at run time, not stored');
+      roCode.set(vliw ? (12 * m.cycles) + ' B' : (4 * IC) + ' B');
+      roEff.set(IC + ' / ' + slots + ' = ' + Course.fmt(IC / slots, 2));
+      roChk.set(vliw ? '0 (done once, by the compiler)' : m.checks + ' instruction checks per iteration');
+      var go = [], wait = [];
+      for (i = 0; i < P.length; i++) {
+        if (m.at[i] === c) go.push(i);
+        else if (m.at[i] > c) wait.push(i);
+      }
+      var txt;
+      if (c > m.cycles) {
+        txt = '<b>C' + c + '</b> · this iteration ended in C' + m.cycles + ' (its delay slot); step back.';
+      } else if (c === m.cycles) {
+        txt = '<b>C' + c + '</b> · the delay slot: the BNE was resolved in ID during C' + (c - 1) + ', and with no prediction nothing of the next iteration has been fetched yet. ' + (vliw ? 'The bundle is three NOPs.' : 'This cycle is simply lost.');
+      } else if (vliw) {
+        txt = '<b>C' + c + '</b> · bundle [' + ['M', 'F', 'I'].map(function (u) {
+          for (var k = 0; k < P.length; k++) if (P[k].u === u && m.at[k] === c) return P[k].t;
+          return 'NOP';
+        }).join(' | ') + '] goes straight to the units, unchecked.';
+        if (go.length) txt += ' The compiler put ' + go.map(function (k) { return P[k].t + ' here: ' + placed(m, k); }).join('; ') + '.';
+        else txt += ' The compiler found nothing that could run in this cycle.';
+      } else {
+        txt = '<b>C' + c + '</b> · the issue logic examines ' + m.waiting[c - 1] + ' waiting instruction' + (m.waiting[c - 1] === 1 ? '' : 's') + '. ';
+        txt += go.length ? 'Issued: ' + go.map(function (k) { return P[k].t; }).join(', ') + '.' : 'Nothing can issue.';
+        if (wait.length) txt += ' Waiting: ' + wait.map(function (k) { return P[k].t + ' (' + reason(m, k, c) + ')'; }).join(', ') + '.';
+      }
+      note.set(txt);
+      draw();
+    });
+  });
+  </script>
+
+  <aside class="redpen" data-page="271">
+    <p class="claim">"An important constraint in VLIW processors is that all operations in a bundle should complete their write-back stage at the same clock cycle. [...] If operations within a bundle have different latencies, they are all forced to align to the longest latency operation among them."</p>
+    <p class="fix">Each operation completes after its own latency, and the compiler — not a synchronised write-back — keeps two writes from colliding and every WAR and WAW in order. Lock-step completion is one possible hardware simplification, not a VLIW invariant, and not the model of the exam: the papers give the integer ALU "1 cycle latency to next Int/FP/L/S &amp; 2 cycle latency to next Branch", whatever else sits in its bundle.</p>
+    <p class="because">The notes' own solution of the May 2025 midterm (p. 511) puts <code>ADDUI R2, R2, 8</code> in C4, next to the 3-cycle <code>LD F2, 16(R2)</code>, and already reads R2 in <code>ADD R3, R2, R1</code> at C5. If every result of that bundle were aligned to the load, R2 would arrive only in C7 and the notes' 8-cycle table would be wrong. The papers' machine sentence gives each unit its own latency, and every schedule of this lesson relies on it.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">In a VLIW the compiler resolves RAW, WAR, WAW and structural hazards with latencies it knows in advance; the hardware only stalls on what nobody can foresee, a cache miss, and flushes a mispredicted branch.</mark></p>
+</section>
+
+<section id="l19-hw">
+  <h2>The hardware that stays</h2>
+
+  <p>Moving the scheduler into the compiler removes the scoreboard, the reservation stations and the dependence checks — "no complex dynamic scheduling (like Tomasulo or Scoreboarding)" (p. 275). It does not remove everything. Fig. 2 redraws the VLIW datapath of the notes (p. 268).</p>
+
+  <figure class="fig fig--plain" id="l19-fig-datapath">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="The VLIW pipeline: the instruction cache delivers one bundle in IF; the decoder D splits it into four operations in ID; the register file serves eight reads in RR; a crossbar routes the operations to the functional units FU1, FU2 and a load/store unit with its data cache in EX; a second crossbar brings the results to the register file, four writes, and to the data cache in WB.">
+      <rect x="74" y="56" width="8" height="180" class="fi-soft"/>
+      <rect x="182" y="56" width="8" height="180" class="fi-soft"/>
+      <rect x="270" y="56" width="8" height="180" class="fi-soft"/>
+      <rect x="450" y="56" width="8" height="180" class="fi-soft"/>
+      <rect x="10" y="126" width="50" height="40" class="fi-paper"/>
+      <text x="35" y="151" class="tx-mid">I$</text>
+      <line x1="60" y1="146" x2="74" y2="146" class="sw-3"/>
+      <line x1="82" y1="146" x2="94" y2="146" class="sw-3" marker-end="url(#arr)"/>
+      <rect x="98" y="96" width="44" height="100" class="fi-paper sw-2"/>
+      <text x="120" y="151" class="tx-mid">D</text>
+      <text x="156" y="88" class="tx-mid tx-sm">4 ops</text>
+      <line x1="142" y1="108" x2="180" y2="108" marker-end="url(#arr)"/>
+      <line x1="142" y1="132" x2="180" y2="132" marker-end="url(#arr)"/>
+      <line x1="142" y1="160" x2="180" y2="160" marker-end="url(#arr)"/>
+      <line x1="142" y1="184" x2="180" y2="184" marker-end="url(#arr)"/>
+      <line x1="190" y1="108" x2="202" y2="108"/>
+      <line x1="190" y1="132" x2="202" y2="132"/>
+      <line x1="190" y1="160" x2="202" y2="160"/>
+      <line x1="190" y1="184" x2="202" y2="184"/>
+      <rect x="202" y="96" width="56" height="100" class="fi-paper sw-2"/>
+      <text x="230" y="151" class="tx-mid">RF</text>
+      <text x="230" y="218" class="tx-mid tx-sm">8 reads</text>
+      <line x1="258" y1="108" x2="270" y2="108"/>
+      <line x1="258" y1="132" x2="270" y2="132"/>
+      <line x1="258" y1="160" x2="270" y2="160"/>
+      <line x1="258" y1="184" x2="270" y2="184"/>
+      <line x1="278" y1="108" x2="290" y2="108"/>
+      <line x1="278" y1="132" x2="290" y2="132"/>
+      <line x1="278" y1="160" x2="290" y2="160"/>
+      <line x1="278" y1="184" x2="290" y2="184"/>
+      <rect x="290" y="56" width="26" height="180" class="fi-paper"/>
+      <line x1="292" y1="60" x2="314" y2="232" class="st-muted"/>
+      <line x1="314" y1="60" x2="292" y2="232" class="st-muted"/>
+      <text x="300" y="40" class="tx-hand">dispatch network</text>
+      <rect x="330" y="64" width="64" height="28" class="fi-paper sw-2"/>
+      <text x="362" y="83" class="tx-mid tx-sm">FU1</text>
+      <rect x="330" y="104" width="64" height="28" class="fi-paper sw-2"/>
+      <text x="362" y="123" class="tx-mid tx-sm">FU2</text>
+      <text x="362" y="156" class="tx-mid tx-sm">…</text>
+      <rect x="330" y="172" width="64" height="28" class="fi-paper sw-2"/>
+      <text x="362" y="191" class="tx-mid tx-sm">L/S</text>
+      <rect x="330" y="214" width="64" height="24" class="fi-paper"/>
+      <text x="362" y="231" class="tx-mid tx-sm">D$</text>
+      <line x1="362" y1="200" x2="362" y2="214"/>
+      <line x1="316" y1="78" x2="328" y2="78" marker-end="url(#arr)"/>
+      <line x1="316" y1="118" x2="328" y2="118" marker-end="url(#arr)"/>
+      <line x1="316" y1="186" x2="328" y2="186" marker-end="url(#arr)"/>
+      <line x1="394" y1="78" x2="410" y2="78"/>
+      <line x1="394" y1="118" x2="410" y2="118"/>
+      <line x1="394" y1="186" x2="410" y2="186"/>
+      <rect x="410" y="56" width="26" height="180" class="fi-paper"/>
+      <line x1="412" y1="60" x2="434" y2="232" class="st-muted"/>
+      <line x1="434" y1="60" x2="412" y2="232" class="st-muted"/>
+      <line x1="436" y1="86" x2="450" y2="86"/>
+      <line x1="436" y1="110" x2="450" y2="110"/>
+      <line x1="436" y1="134" x2="450" y2="134"/>
+      <line x1="436" y1="202" x2="450" y2="202"/>
+      <line x1="458" y1="86" x2="468" y2="86" marker-end="url(#arr)"/>
+      <line x1="458" y1="110" x2="468" y2="110" marker-end="url(#arr)"/>
+      <line x1="458" y1="134" x2="468" y2="134" marker-end="url(#arr)"/>
+      <line x1="458" y1="202" x2="468" y2="202" marker-end="url(#arr)"/>
+      <rect x="470" y="70" width="80" height="80" class="fi-paper sw-2"/>
+      <text x="510" y="115" class="tx-mid">RF</text>
+      <text x="510" y="171" class="tx-mid tx-sm">4 writes</text>
+      <rect x="470" y="184" width="80" height="36" class="fi-paper"/>
+      <text x="510" y="207" class="tx-mid tx-sm">D$</text>
+      <line x1="10" y1="262" x2="78" y2="262" class="st-muted"/>
+      <line x1="78" y1="262" x2="186" y2="262" class="st-muted"/>
+      <line x1="186" y1="262" x2="274" y2="262" class="st-muted"/>
+      <line x1="274" y1="262" x2="454" y2="262" class="st-muted"/>
+      <line x1="454" y1="262" x2="550" y2="262" class="st-muted"/>
+      <line x1="10" y1="256" x2="10" y2="268" class="st-muted"/>
+      <line x1="78" y1="256" x2="78" y2="268" class="st-muted"/>
+      <line x1="186" y1="256" x2="186" y2="268" class="st-muted"/>
+      <line x1="274" y1="256" x2="274" y2="268" class="st-muted"/>
+      <line x1="454" y1="256" x2="454" y2="268" class="st-muted"/>
+      <line x1="550" y1="256" x2="550" y2="268" class="st-muted"/>
+      <text x="44" y="288" class="tx-mid tx-bold">IF</text>
+      <text x="132" y="288" class="tx-mid tx-bold">ID</text>
+      <text x="230" y="288" class="tx-mid tx-bold">RR</text>
+      <text x="364" y="288" class="tx-mid tx-bold">EX</text>
+      <text x="502" y="288" class="tx-mid tx-bold">WB</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The VLIW datapath of the notes (p. 268), redrawn for a 4-issue machine. One bundle enters per cycle and the decoder splits it into its operations; the register file serves all of them at once, 8 reads and 4 writes per cycle; the two crossbars form the dispatch network, needed only when the units outnumber the slots.</figcaption>
+  </figure>
+
+  <p>It is the five-stage pipeline of your first course, widened, with a stage of its own for the register read and the data-cache access inside EX: Instruction Fetch, Instruction Decode, Register Read, Execution and Write Back (p. 268). IF fetches one bundle; ID splits it into its operations; from then on "each operation within a bundle proceeds independently through the functional units connected to the pipeline" (p. 268).</p>
+
+  <p>The register file is what the notes call "one of the non-trivial aspects of the hardware design" (p. 268). An operation reads up to two registers and writes one, and all the operations of a bundle do it in the same cycle: a 4-issue VLIW needs a register file able to "read eight source operands and write four destination results every clock cycle" (p. 268). This is the shared, <mark class="key">multi-ported register file</mark>.</p>
+
+  <div class="formula">
+    \[ \text{read ports} = 2k \]
+    \[ \text{write ports} = k \]
+    <dl class="legend">
+      <dt>\(k\)</dt><dd>issue width: operations per bundle, each with up to two sources and one destination (4-issue: 8 + 4; the papers' 3-issue machine: 6 + 3)</dd>
+    </dl>
+  </div>
+
+  <p>As background from the textbooks, not from the notes: every port adds its own access lines to every cell of the register file, so its area and power grow roughly with the square of the number of ports. That is the bill behind the clustered VLIWs of section 4.</p>
+
+  <p>Decoding stays trivial when there is one unit per slot: "each operation is directed straight to its corresponding functional unit for execution without the need for complex arbitration" (p. 269). With more units than slots, the machine needs a <mark class="key">dispatch network</mark> — the crossbars of Fig. 2 — that forwards each operation, with its operands, to a free unit of the right kind (p. 269).</p>
+
+  <p>Two run-time events escape the compiler (p. 272). Whether a load misses in the data cache depends on the run: "If a cache miss occurs, the processor experiences a stall, which was not anticipated during static scheduling" — the whole timetable freezes until the data arrives. And a static branch hint can be wrong: the hardware must detect the misprediction and flush the bundles fetched behind it (pp. 271–272). Even a VLIW keeps an interlock for misses and flush logic for branches.</p>
+
+  <p class="memo"><mark class="key">Gone: the hardware that finds parallelism. Kept: the pipeline, a register file with 2k read and k write ports, a dispatch network when units outnumber slots, a stall on a data-cache miss and a flush on a misprediction.</mark></p>
+</section>
+
+<section id="l19-regs">
+  <h2>Every result needs a name: register pressure</h2>
+
+  <p>Take the notes' example (p. 271). A bundle carries two FP operations of five cycles each; their destination registers "remain occupied for the entire duration of those five cycles". A new bundle issues every cycle, so by the time the first two results are written, five bundles have issued: 2 × 5 = 10 registers are reserved for results that do not exist yet. Put such operations in all four slots and you reach the notes' "up to twenty operations competing for register resources".</p>
+
+  <div class="formula">
+    \[ N_{\text{flight}} = n \times L \]
+    <dl class="legend">
+      <dt>\(N_{\text{flight}}\)</dt><dd>registers held by results in flight</dd>
+      <dt>\(n\)</dt><dd>results started per cycle (destinations per bundle, one bundle per cycle)</dd>
+      <dt>\(L\)</dt><dd>latency of those operations; add a term \(n_i L_i\) for each kind of unit</dd>
+    </dl>
+  </div>
+
+  <p>It is the count of people in a queue: arrivals per minute times minutes each one stays. This pressure on the register file is what the notes call <mark class="key">register pressure</mark>.</p>
+
+  <p>Predict: every cycle, a 4-issue bundle starts one load (latency 3), two FP operations (latency 5) and one integer operation (latency 1). How many registers do results in flight hold?</p>
+
+  <details class="answer"><summary>Check yourself</summary>
+    <p>One term per kind of unit: 1 × 3 + 2 × 5 + 1 × 1 = 14. Not 4 × 5 = 20 — that is the notes' "up to twenty", the worst case in which every slot holds a 5-cycle operation.</p></details>
+
+  <aside class="margin-note">The notes write "physical register". A VLIW has no renaming hardware, so its physical registers are the architectural ones: the names the compiler writes.</aside>
+
+  <p>Renaming makes it worse (p. 271). To remove a WAR or a WAW, the compiler writes the later result into a different register: it "avoids conflicts" but "increases the number of physical register needed". In a VLIW those are the architectural registers, the F0 … F31 the instruction set names; there is no hidden pool behind them. <a href="l15.html">Lesson 15</a> did exactly this to an unrolled loop: the two registers each copy writes became eight.</p>
+
+  <p>Compare <a href="l11.html#l11-names">Tomasulo</a>. There the code keeps naming F2 and F4, and the hardware renames every result into a reservation-station tag that no program ever sees. The values in flight still need storage — but it is silicon, bought once with the chip, not names taken from the fixed budget of the instruction set.</p>
+
+  <div class="widget" id="l19-w-regs">
+    <h3 class="widget-title">The register-pressure counter</h3>
+    <p class="widget-intro">Twelve bundles issue one per cycle, each with some FP operations. Every bar is one result: the solid part while its operation is in flight (L cycles), the dashed part while the finished value waits to be read. One row is one place where a value lives, and the vertical dashed line counts the bars alive at one cycle once the pipeline has filled. On the VLIW each row is an F register the compiler must name, and the horizontal dashed line is how many it has; on the Tomasulo machine each row is a reservation station.</p>
+    <ol class="tasks">
+      <li>The sliders start at the notes' example: two FP operations per bundle, latency 5, each result read as soon as it is ready. Predict how many F registers are busy once the first bundles have filled the pipeline, then read the counter.
+        <details class="answer"><summary>What you should see</summary>
+          <p>10 = 2 × 5. The staircase climbs by two rows per cycle for five cycles, then each new result takes the register a finished one has just freed: five bundles in flight, two results each.</p></details>
+      </li>
+      <li>Put four operations in every bundle and find the notes' "up to twenty". The compiler still has 16 F registers. What can it do — and what can it not?
+        <details class="answer"><summary>What you should see</summary>
+          <p>20 values alive at once. With 16 registers, four results in flight have no register — the rows above the dashed line. Nothing is waiting (the wait is 0), so nothing can be spilled: a result in flight does not exist yet and cannot be stored. The compiler must start fewer operations, at most 16 / 5 = 3.2 per cycle, so three per bundle.</p></details>
+      </li>
+      <li>Back to two operations per bundle, latency 5, but now each result waits 2 cycles before it is read, and only 12 registers are free. Predict the overflow first. Would spilling a waiting value to memory fix it?
+        <details class="answer"><summary>What you should see</summary>
+          <p>14 = 2 × (5 + 2) values alive, two more than the 12 registers. Spilling does not help: on the papers' memory unit the reload must issue 3 cycles before the use and holds its register from then on — longer than the 2-cycle wait it was meant to free — and the store and the reload take two memory slots. The compiler must start fewer operations, at most 12 / 7 ≈ 1.7 per cycle. A spill pays only for a value that waits longer than the reload takes.</p></details>
+      </li>
+      <li>Keep the settings of task 2 (four operations, latency 5, 16 registers) and switch to "the hardware (Tomasulo)". Which number collapses, and which one does not move?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The F registers the code must name drop to four (F2, F4, F6, F8) and nothing overflows, while the twenty values alive do not move: they now sit in reservation stations. Same bars, different owner: static scheduling moves the cost of renaming from hardware tags to architectural registers.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l19-w-regs', function (root, ui) {
+    var N = 12, XMAX = 23, LMEM = 3;   /* LMEM: latency of the papers' memory unit, the reload of a spilled value */
+    var sk = ui.slider({ label: 'FP operations per bundle', min: 1, max: 4, step: 1, value: 2 });
+    var sl = ui.slider({ label: 'latency L (cycles)', min: 1, max: 6, step: 1, value: 5 });
+    var sw = ui.slider({ label: 'wait before the result is read (cycles)', min: 0, max: 4, step: 1, value: 0 });
+    var sr = ui.slider({ label: 'F registers free for these results', min: 4, max: 32, step: 2, value: 16 });
+    var who = ui.select('who renames', [
+      { value: 'vliw', label: 'the compiler (VLIW)' },
+      { value: 'toma', label: 'the hardware (Tomasulo)' }
+    ], null, 'vliw');
+    var roLive = ui.readout('values alive at once');
+    var roNames = ui.readout('F registers the code must name');
+    var roFit = ui.readout('what does not fit');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0, XMAX], y: [0, 18], xLabel: 'cycle', yLabel: 'one row = one place for a value', aspect: 1.9,
+      label: 'Lifetimes of the FP results of twelve bundles: one bar per result, in flight for L cycles and then waiting to be read, one row per register or reservation station, with the number of F registers available drawn as a line' });
+
+    function model() {
+      var k = sk.value, L = sl.value, W = sw.value, R = sr.value;
+      var need = k * (L + W), infl = k * L, wait = k * W, over = Math.max(0, need - R);
+      /* without spilling, at most R / (L + W) results can be started per cycle */
+      return { k: k, L: L, W: W, R: R, need: need, infl: infl, wait: wait, over: over, rate: R / (L + W), vliw: who.value === 'vliw' };
+    }
+    function names(k) { var a = []; for (var i = 0; i < k; i++) a.push('F' + (2 + 2 * i)); return a.join(', '); }
+
+    plot.draw(function (g) {
+      var m = model(), c, j;
+      if (m.vliw && m.over > 0) g.rect(0, m.R, XMAX, m.need, { color: 'key', alpha: 0.32, stroke: false });
+      for (c = 1; c <= N; c++) {
+        for (j = 0; j < m.k; j++) {
+          var row = ((c - 1) * m.k + j) % m.need;
+          g.rect(c, row + 0.14, c + m.L, row + 0.86, { color: 's1', alpha: 0.45 });
+          if (m.W > 0) g.rect(c + m.L, row + 0.14, c + m.L + m.W, row + 0.86, { color: 's2', alpha: 0.2, dash: true });
+        }
+      }
+      if (m.vliw) g.hline(m.R, { color: 's6', dash: true, label: m.R + ' F registers' });
+      g.vline(m.L + m.W + 0.5, { color: 'muted', dash: true, label: m.need + ' alive here' });
+    });
+    ui.legend([
+      { label: 'result in flight (L cycles)', color: 's1', mark: 'area' },
+      { label: 'result waiting to be read', color: 's2', mark: 'area' },
+      { label: 'F registers available', color: 's6', mark: 'dash' },
+      { label: 'no register left', color: 'key', mark: 'area' }
+    ]);
+    ui.onChange(function () {
+      var m = model();
+      plot.setView({ x: [0, XMAX], y: [0, Math.max(m.need, m.R) + 2] });
+      roLive.set(m.need + ' = ' + m.k + ' × (' + m.L + ' + ' + m.W + '): ' + m.infl + ' in flight, ' + m.wait + ' waiting');
+      if (m.vliw) {
+        roNames.set(m.need + ' of ' + m.R + ' available', m.over ? 'key' : 'good');
+        roFit.set(m.over
+          ? m.over + ' value' + (m.over > 1 ? 's' : '') + ' with no F register: start at most R / (L + W) ' + (Math.abs(m.rate * 10 - Math.round(m.rate * 10)) < 1e-9 ? '= ' : '≈ ') + Course.fmt(m.rate, 1) + ' per cycle'
+          : 'nothing: every result has its own F register');
+        var spillTxt;
+        if (m.W === 0) spillTxt = 'Nothing is waiting, and a result still in flight cannot be spilled: it does not exist yet.';
+        else if (m.W <= LMEM) spillTxt = 'Spilling cannot help: the reload must issue ' + LMEM + ' cycles before the use and holds a register from then on, longer than the ' + m.W + '-cycle wait.';
+        else spillTxt = 'A waiting value could be spilled: an SD now and an LD issued ' + LMEM + ' cycles before the use free its register for about W − ' + LMEM + ' = ' + (m.W - LMEM) + ' cycle' + (m.W - LMEM > 1 ? 's' : '') + ', at the price of two memory slots.';
+        note.set(m.over
+          ? 'The rows above the dashed line have no F register, so the compiler must start fewer operations. ' + spillTxt
+          : 'Every bar has an F register of its own, renamed by the compiler: ' + m.need + ' names out of ' + m.R + '.');
+      } else {
+        roNames.set(m.k + ' (' + names(m.k) + ')', 'good');
+        roFit.set('nothing: the ' + m.need + ' values sit in reservation stations');
+        note.set('Same bars, but each row is now a reservation station: storage the hardware provides and no program names. The code keeps reusing ' + names(m.k) + ', and the instruction set’s F registers are not consumed.');
+      }
+    });
+  });
+  </script>
+
+  <p>When the names run out, the compiler has the two ways out the widget shows (p. 271): "careful allocation strategies" — fewer operations in flight and a longer schedule — or "spilling values temporarily to memory": a store now and a reload later, both in memory slots, which pays only for a value that waits longer than the reload takes. The open challenges of the notes add a hardware remedy: <mark class="key">clustered VLIW</mark> designs, several smaller register files, each serving a subset of the units (p. 274).</p>
+
+  <p class="memo"><mark class="key">Static scheduling moves the cost of renaming from hardware tags to architectural registers: every result in flight needs a name the instruction set provides.</mark></p>
+</section>
+
+<section id="l19-correct">
+  <h2>As fast as possible, without changing the answer</h2>
+
+  <p>Code scheduling is "the process of rearranging program instructions to maximize parallelism during execution" (p. 275). Its goal is to reorder the instructions statically so that the execution time is minimised and semantic correctness is preserved: "we want the program to run as fast as possible without changing what it computes" (p. 275). On a VLIW nobody downstream reorders anything. If the compiler schedules badly, "the result is many NOPs and a waste of hardware resources" (p. 275).</p>
+
+  <p><mark class="key">Semantic correctness</mark> has a precise meaning (p. 275): every RAW is respected — a read comes after the write it depends on — and no WAR or WAW is violated; the scheduler analyses the dependence graph, reorders only when it is safe, and renames to remove false dependences. Try three tempting moves on LOOP1.</p>
+
+  <figure class="tbl-fig" id="l19-tbl-moves">
+    <figcaption>Table 3. Three moves on the schedule of Table 1, checked against the rules.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Move</th><th>Rule at stake</th><th>Verdict</th></tr></thead>
+        <tbody>
+          <tr><td><code>FADD F6, F2, F2</code> up to C2, to fill a slot</td><td>RAW on F2: the FADD would read F2 before the load has written it</td><td>wrong value</td></tr>
+          <tr><td><code>ADDUI R1, R1, 4</code> up to C1, "it has nothing to wait for"</td><td>WAR on R1: the SD in C7 would read the new R1 and store into the next element</td><td>wrong address — legal only as <code>SD F6, -4(R1)</code>, an index change the papers forbid</td></tr>
+          <tr><td><code>ADDUI R1, R1, 4</code> in C7, beside the SD</td><td>WAR on R1, kept: the register file reads the old R1 and writes the new one in the same cycle</td><td>allowed (Table 1)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The second move would even pay: with the ADDUI in C1 and the SD rewritten as <code>SD F6, -4(R1)</code>, the BNE could close the iteration in C7 and LOOP1 would take 8 cycles instead of 10. The papers rule this out in so many words — "do NOT introduce any software pipelining, loop unrolling and modifications to loop indexes" — so in the exam you reorder, you do not rewrite.</p>
+
+  <p>Such a scheduler works on a <mark class="key">basic block</mark>, "a straight-line code sequence without branches except at the entry and exit points" (p. 273). Basic blocks are short — "for typical programs, only around 4 to 7 instructions are found between branches" (p. 273) — and the RAW chains inside them limit the parallelism further. LOOP1 is a five-instruction block whose chain LD → FADD → SD leaves 25 of its 30 slots empty. Filling them needs techniques that look beyond one block: unrolling, software pipelining and trace scheduling, the subject of <a href="l21.html">lesson 21</a>.</p>
+
+  <p class="memo"><mark class="key">A correct schedule keeps every RAW and lets no write overtake a read (WAR) or another write (WAW) of the same register; within those rules, the shortest one wins.</mark></p>
+</section>
+
+<section id="l19-balance">
+  <h2>What you buy, what you pay — and the answer to the puzzle</h2>
+
+  <p>The notes list three advantages (p. 273). A VLIW exploits ILP statically, with high performance "even without the complex runtime scheduling hardware used in superscalar designs". The compiler analyses the program "with a much larger instruction window than would be feasible in hardware" — a whole loop, a whole function — especially after unrolling or software pipelining. And less hardware means "smaller die areas", "cheaper production costs and lower power consumption, making VLIWs attractive for embedded applications"; the fixed format simplifies decoding, and adding a unit means adding a slot.</p>
+
+  <p>Against them stand four open challenges (pp. 273–274). The machine needs strong compiler technology, inside basic blocks and across them. Code grows, with fixed bundles and NOPs, and compression "add[s] extra decoding complexity". Register management suffers from renaming, which clustered designs only partly fix. And the fourth is "a major limitation", <mark class="key">binary incompatibility</mark>: "Even small changes in the number of slots, the types of functional units, or their latencies can render code compiled for one VLIW processor incompatible with another, even if they share the same instruction set architecture" (p. 274).</p>
+
+  <figure class="fig fig--pair" id="l19-fig-compat">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 190" role="img" aria-label="Compiled for and run on an FP latency of 3: the FADD issued in C4 writes F6 at the end of C6, and the SD issued in C7 reads the new F6.">
+        <line x1="80" y1="30" x2="80" y2="126" class="st-grid"/>
+        <line x1="120" y1="30" x2="120" y2="126" class="st-grid"/>
+        <line x1="160" y1="30" x2="160" y2="126" class="st-grid"/>
+        <line x1="200" y1="30" x2="200" y2="126" class="st-grid"/>
+        <line x1="240" y1="30" x2="240" y2="126" class="st-grid"/>
+        <line x1="280" y1="30" x2="280" y2="126" class="st-grid"/>
+        <text x="100" y="22" class="tx-mid tx-sm tx-muted">C4</text>
+        <text x="140" y="22" class="tx-mid tx-sm tx-muted">C5</text>
+        <text x="180" y="22" class="tx-mid tx-sm tx-muted">C6</text>
+        <text x="220" y="22" class="tx-mid tx-sm tx-muted">C7</text>
+        <text x="260" y="22" class="tx-mid tx-sm tx-muted">C8</text>
+        <text x="74" y="58" class="tx-end tx-mono tx-sm">FADD F6</text>
+        <rect x="82" y="44" width="116" height="20" class="fw-s1 st-s1"/>
+        <rect x="194" y="45" width="6" height="18" class="fi-s1"/>
+        <text x="74" y="108" class="tx-end tx-mono tx-sm">SD F6</text>
+        <rect x="202" y="94" width="36" height="20" class="fw-s1 st-s1"/>
+        <line x1="198" y1="66" x2="214" y2="90" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="186" y="86" class="tx-end tx-mono tx-sm halo">F6</text>
+        <text x="140" y="152" class="tx-mid tx-sm">SD reads the new F6</text>
+        <path d="M 226 146 L 232 153 L 244 139" class="st-good sw-3"/>
+      </svg>
+      <p class="fig-label">Before: compiled for, and run on, an FP latency of 3</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 190" role="img" aria-label="The same binary on an FP latency of 4: the FADD now writes F6 at the end of C7, but the SD still issues in C7, as the binary says, and reads the old F6.">
+        <line x1="80" y1="30" x2="80" y2="126" class="st-grid"/>
+        <line x1="120" y1="30" x2="120" y2="126" class="st-grid"/>
+        <line x1="160" y1="30" x2="160" y2="126" class="st-grid"/>
+        <line x1="200" y1="30" x2="200" y2="126" class="st-grid"/>
+        <line x1="240" y1="30" x2="240" y2="126" class="st-grid"/>
+        <line x1="280" y1="30" x2="280" y2="126" class="st-grid"/>
+        <text x="100" y="22" class="tx-mid tx-sm tx-muted">C4</text>
+        <text x="140" y="22" class="tx-mid tx-sm tx-muted">C5</text>
+        <text x="180" y="22" class="tx-mid tx-sm tx-muted">C6</text>
+        <text x="220" y="22" class="tx-mid tx-sm tx-muted">C7</text>
+        <text x="260" y="22" class="tx-mid tx-sm tx-muted">C8</text>
+        <text x="74" y="58" class="tx-end tx-mono tx-sm">FADD F6</text>
+        <rect x="82" y="44" width="156" height="20" class="fw-s1 st-s1"/>
+        <rect x="234" y="45" width="6" height="18" class="fi-s1"/>
+        <text x="74" y="108" class="tx-end tx-mono tx-sm">SD F6</text>
+        <rect x="202" y="94" width="36" height="20" class="fw-s1 st-s1"/>
+        <line x1="206" y1="98" x2="234" y2="110" class="st-bad sw-2"/>
+        <line x1="234" y1="98" x2="206" y2="110" class="st-bad sw-2"/>
+        <rect x="242" y="94" width="36" height="20" class="fw-s2 st-s2 dash"/>
+        <line x1="240" y1="66" x2="256" y2="90" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="270" y="86" class="tx-mono tx-sm halo">F6</text>
+        <text x="140" y="152" class="tx-mid tx-sm tx-bad">SD reads the old F6</text>
+        <text x="150" y="180" class="tx-mid tx-hand">nothing checks</text>
+      </svg>
+      <p class="fig-label">After: the same binary on an FP latency of 4</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Bundles C4 to C8 of LOOP1 on two implementations of the same instruction set. The binary fixes the SD in C7, three cycles after the FADD. With a 4-cycle FP ALU the value arrives for C8 (dashed cell), but the SD still issues in C7 and stores the F6 of the previous iteration — and no hardware notices. A dynamically scheduled machine would simply wait one more cycle.</figcaption>
+  </figure>
+
+  <p>A dynamically scheduled processor has no such problem: there "binary compatibility is preserved across generations" (p. 274). A just-in-time compiler could reschedule the binary for each new chip, but such solutions "introduce additional complexity and are rarely adopted in practice"; so VLIW processors live mainly "in embedded systems, where binaries can be compiled specifically for the target hardware" (p. 274).</p>
+
+  <div class="story" data-year="1999–2021">
+    <p>Intel announced the name Itanium on 4 October 1999, and the Usenet nickname "Itanic" appeared the same day; it stuck as the sales forecasts kept shrinking. The first systems shipped in June 2001, the last shipments ended on 29 July 2021. As textbook background: its EPIC format was meant to soften one form of binary incompatibility, a change in the number of slots — 128-bit bundles carry three 41-bit operations and a 5-bit template whose "stop" bits mark where a group of independent operations ends, so that a wider successor could issue more of them at once from the same binary.</p>
+  </div>
+
+  <p>Now the second question. The TRACE's compiler knew every unit and every latency and wrote its answer into the bundles, NOPs included. The price is this section's list: a compiler that must find the parallelism, code that carries its empty slots, register names spent on results in flight, stalls on misses the schedule could not foresee — and above all a binary welded to the latencies of one machine.</p>
+
+  <p>A laptop must run yesterday's programs on tomorrow's chip, so it keeps the scheduler in hardware and pays for it in area and power. A signal processor or an embedded controller runs one binary on one chip, so it can let the compiler drive. As textbook background, not in the notes: the Texas Instruments C6000 signal processors are VLIWs, and many GPUs and AI accelerators schedule statically in the same spirit. Multiflow's machines did not survive, but its compiler did: Intel, HP, DEC, Fujitsu and others licensed it.</p>
+
+  <p class="memo"><mark class="key">VLIW trades hardware for compiler work: simpler, cheaper, lower-power chips and a large scheduling window, paid for with code size, register names, stalls on unforeseen misses and binaries tied to one implementation.</mark></p>
+</section>
+
+<section id="l19-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l19-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used by VLIW processors:</p>
+      <ol>
+        <li>Static scheduling by the compiler</li>
+        <li>Bundle with fixed slots</li>
+        <li>NOP insertion</li>
+        <li>Single program counter with at most one branch per bundle</li>
+        <li>Shared multi-ported register file</li>
+        <li>Fully pipelined functional units with exposed latencies</li>
+        <li>Register renaming by the compiler</li>
+        <li>Hardware support for dynamic events (data-cache misses, branch mispredictions)</li>
+      </ol>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> The compiler analyses data dependences and resource constraints at compile time and decides which operations execute together and in which cycle; the hardware executes the schedule without checking it. Benefit: no dynamic scheduling hardware (no scoreboard, reservation stations or run-time dependence checks), hence less area and power; the compiler sees a much larger instruction window than any hardware. Cost: it must know all latencies and cannot see run-time events.</p>
+        <p><b>2.</b> Independent operations are grouped into one very long instruction word; each slot corresponds to one functional unit (e.g. Memory, FP, Integer). Benefit: one fetch delivers k operations, decode is trivial (slot i goes to unit i, no arbitration), and scaling means adding slots.</p>
+        <p><b>3.</b> When no independent operation is available for a slot, or a latency must elapse, the compiler fills the slot with a NOP. Benefit: the fixed format and the timing stay explicit, so no stall logic is needed. Cost: wasted slots and larger code; code efficiency = IC / (#cycles × #issues).</p>
+        <p><b>4.</b> One PC fetches one bundle per cycle, and a bundle contains at most one branch. Benefit: a single next-PC decision per cycle keeps branch handling simple (in the exam's model the branch is solved in ID with one delay slot).</p>
+        <p><b>5.</b> All the operations of a bundle read their operands in the same cycle, and every unit can write a result in every cycle: two read ports and one write port per operation, 8 + 4 for a 4-issue machine. Benefit: every unit gets its operands and writes its result without a bottleneck. Cost: area and power grow quickly with the number of ports, which leads to clustered VLIWs (several smaller register files, each serving a subset of the units).</p>
+        <p><b>6.</b> Every unit accepts a new operation each cycle, and its result is available after a fixed latency (e.g. Memory 3, FP 3, Integer 1, 2 to a branch); the compiler places each consumer at least one latency after its producer and fills the gap with independent operations. Benefit: one operation per unit per cycle with no interlocks. Cost: the schedule, hence the binary, depends on the latencies of one implementation.</p>
+        <p><b>7.</b> To remove WAR and WAW dependences the compiler writes results into different architectural registers. Benefit: more freedom to reorder and overlap operations, more ILP. Cost: register pressure — every result in flight needs an architectural register; when the register file saturates, values are spilled to memory.</p>
+        <p><b>8.</b> The compiler cannot know whether a load will miss in the data cache or whether a static branch hint is wrong. On a miss the processor stalls; on a misprediction the hardware flushes the wrongly fetched bundles. Benefit: correct execution despite unpredictable events, while the regular flow stays free of checks. Cost: a stall freezes the whole schedule, which assumed the hit latency.</p>
+      </div>
+      <div class="exam-note"><p>The June 2026 paper asks exactly this shape — eight techniques, five lines each, for the Tomasulo-style superscalar; this is its VLIW twin. Give each sub-point its concept in one sentence and its benefit in the next; for 3, 5, 6 and 7 add the cost too, since there the benefit only makes sense against it. Use the precise terms (bundle, slot, NOP, latency, WAR / WAW, renaming, spill), and never let the VLIW hardware "check" or "rename" anything.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l19-exam-sched">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the following LOOP1 code, where Ri are integer registers and Fi are floating-point registers:</p>
+<pre><code>LOOP1: LD    F2, 0(R1)
+       FADD  F6, F2, F2
+       SD    F6, 0(R1)
+       ADDUI R1, R1, 4
+       BNE   R1, R3, LOOP1</code></pre>
+      <p>Given a 3-issue VLIW machine with fully pipelined functional units: 1 Memory Unit with 3 cycles latency; 1 FP ALU with 4 cycles latency; 1 Integer ALU with 1 cycle latency to next Int/FP/L/S &amp; 2 cycle latency to next Branch. The branch is completed with 1 cycle delay slot (branch solved in ID stage). No branch prediction. In the Register File, it is possible to read and write at the same address at the same clock cycle. Considering one iteration of the loop, complete the following table (Memory Unit | Floating Point Unit | Integer Unit, rows C1 … C15) by using the list-based scheduling (do NOT introduce any software pipelining, loop unrolling and modifications to loop indexes) on the 3-issue VLIW machine including the BRANCH DELAY SLOT. Please do not write in NOPs. (C1 is given: LD F2, 0(R1) in the Memory Unit.)</p>
+      <p>How long is the critical path for a single iteration? What CPI did you achieve? What performance did you achieve in FP ops per cycle? How much is the code efficiency?</p>
+      <p>Extra question of this lesson, not of the papers: the same loop compiled for a 3-cycle FP ALU (SD in C7) runs unchanged on this machine. Which instruction reads a wrong value?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th></th><th>Memory Unit</th><th>Floating Point Unit</th><th>Integer Unit</th></tr></thead>
+            <tbody>
+              <tr><th>C1</th><td><code>LD F2, 0(R1)</code></td><td></td><td></td></tr>
+              <tr><th>C2</th><td></td><td></td><td></td></tr>
+              <tr><th>C3</th><td></td><td></td><td></td></tr>
+              <tr><th>C4</th><td></td><td><code>FADD F6, F2, F2</code></td><td></td></tr>
+              <tr><th>C5</th><td></td><td></td><td></td></tr>
+              <tr><th>C6</th><td></td><td></td><td></td></tr>
+              <tr><th>C7</th><td></td><td></td><td></td></tr>
+              <tr><th>C8</th><td><code>SD F6, 0(R1)</code></td><td></td><td><code>ADDUI R1, R1, 4</code></td></tr>
+              <tr><th>C9</th><td></td><td></td><td></td></tr>
+              <tr><th>C10</th><td></td><td></td><td><code>BNE R1, R3, LOOP1</code></td></tr>
+              <tr><th>C11</th><td>(delay slot)</td><td></td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>FADD at C1 + 3 = C4 (F2 from the memory unit); SD at C4 + 4 = C8 (F6 from the FP ALU); ADDUI in C8 with the SD, its last reader of R1 (read and write in the same cycle); BNE at C8 + 2 = C10; delay slot C11.</p>
+        <p>Critical path = 11 cycles. CPI = 11 / 5 = 2.2. FP ops per cycle = 1 / 11 = 0.09. Code efficiency = 5 / (11 × 3) = 0.15.</p>
+        <p>Old binary: <code>SD F6, 0(R1)</code> in C7 reads F6 one cycle before the 4-cycle FADD (issued in C4) writes it, so it stores the F6 of the previous iteration. A VLIW has no hardware that detects the RAW hazard.</p>
+      </div>
+      <div class="exam-note"><p>The table is the June 2026 EX2 (LOOP1) with one number changed, FP latency 4 instead of 3. Four placements decide it: the RAW distances (3 after the load, 4 after the FADD), the ADDUI in the same cycle as the SD, the 2-cycle distance to the branch and the delay slot counted in the 11. The extra question is this lesson's point: on a VLIW a latency change does not slow the old binary down, it makes it wrong.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l19-exam-pc">
+    <div class="exam-q" lang="en">
+      <p>True or False: "A 4-issue VLIW processor requires 4 Program Counters to load the necessary instructions in the 4 parallel lanes."</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">The four operations travel together in one bundle, fetched with one address; four PCs would mean four instruction streams, as in multithreading.</span></li>
+      <li data-correct>False <span class="fb">A VLIW has a single program counter: each fetch brings one bundle, and a bundle holds at most one branch, so there is one next-PC decision per cycle.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. One PC fetches one bundle per cycle; the bundle carries up to 4 operations in its 4 slots, one per functional unit, and at most one of them is a branch.</p></div>
+      <div class="exam-note"><p>A True/False quiz of the 11 February 2025 paper, as the notes transcribe it (p. 582). The statement mixes up the issue width (operations per bundle) with the number of instruction streams. If a motivation line is asked, name the single PC and the one-branch-per-bundle rule.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l19-exam-bb">
+    <div class="exam-q" lang="en">
+      <p>True or False: "In VLIW architectures, the compiler can detect parallelism only in basic blocks of the code."</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Inside a basic block the dependences are easy to see, but a block holds only about 4 to 7 instructions; a compiler limited to it would leave most VLIW slots empty.</span></li>
+      <li data-correct>False <span class="fb">Loop unrolling, software pipelining and trace scheduling find and schedule parallelism across basic blocks and across loop iterations.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. A basic block (straight-line code with one entry and one exit) holds only about 4 to 7 instructions, and its RAW chains limit the parallelism further. VLIW compilers therefore schedule larger regions: loop unrolling and software pipelining overlap loop iterations, trace scheduling schedules the most likely path through several basic blocks.</p></div>
+      <div class="exam-note"><p>A True/False quiz of the 11 February 2025 paper, as the notes transcribe it (p. 581). The notes answer it themselves on p. 273: substantial speedups need "techniques that go beyond individual basic blocks". The three techniques are lesson 21.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l19-exam-who">
+    <div class="exam-q" lang="en">
+      <p>In a VLIW processor, which of the following are handled by the compiler at compile time? (MULTIPLE ANSWERS)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>RAW hazards between operations <span class="fb">The compiler places each consumer at least one latency after its producer and fills the gap with independent operations or NOPs.</span></li>
+      <li data-correct>WAR and WAW hazards <span class="fb">By the order of the operations (a WAR writer may share the cycle of its reader) or by renaming into other registers.</span></li>
+      <li data-correct>Structural hazards on the functional units <span class="fb">One operation per slot, one slot per unit: the bundle format itself prevents two operations on one unit.</span></li>
+      <li>Data-cache misses <span class="fb">Whether an access misses depends on the run; the hardware stalls the processor when it happens.</span></li>
+      <li>Branch mispredictions <span class="fb">The compiler may give a static hint, but detecting a wrong guess and flushing the pipeline is the hardware's job.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 2 and 3. Data hazards (RAW, WAR, WAW) and structural hazards are solved statically with known latencies and resources; cache misses and branch mispredictions are dynamic events handled by the hardware (stall, flush).</p></div>
+      <div class="exam-note"><p>Draw the line between compile time and run time exactly: everything known in advance (latencies, units, register names) belongs to the compiler; everything that depends on the data or on the path taken belongs to the hardware.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l19-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Why does a VLIW allow at most one branch per bundle?</p>
+    <ul class="options">
+      <li data-correct>One program counter fetches one bundle per cycle, so there is room for one next-PC decision <span class="fb">Right: two branches in one word could ask for two different next addresses in the same cycle.</span></li>
+      <li>A branch needs all the slots of the bundle <span class="fb">No: in LOOP1 the BNE sits in the Integer slot and the other slots could carry other operations.</span></li>
+      <li>The branch unit is not pipelined <span class="fb">Pipelining concerns throughput; the limit is about how many next-PC values one fetch can follow.</span></li>
+      <li>To keep the delay slot empty <span class="fb">The delay slot is the cycle after the branch, a separate matter; one branch per bundle would hold even without it.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">On the papers' fully pipelined FP ALU (latency 3), FADD F6 issues in C4. What is the earliest cycle for an independent FADD, and for an SD that stores F6?</p>
+    <ul class="options">
+      <li data-correct>C5 and C7 <span class="fb">Throughput: the pipelined unit takes a new FADD every cycle. Latency: F6 exists only 3 cycles after C4.</span></li>
+      <li>C7 and C7 <span class="fb">That treats the unit as busy for 3 cycles — true for a non-pipelined unit, not for the papers' "fully pipelined" ALU.</span></li>
+      <li>C5 and C5 <span class="fb">The independent FADD may go in C5, but the SD would read F6 two cycles before it is written.</span></li>
+      <li>C4 and C7 <span class="fb">The FP slot of C4 is already taken by the first FADD: one operation per unit per cycle.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A 4-issue superscalar and a 4-issue VLIW have the same functional units. Going from the first to the second, what changes? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>The issue logic that checks dependences at run time disappears <span class="fb">Yes: the compiler has done the checks; the hardware executes the bundles as they are.</span></li>
+      <li data-correct>Empty slots now take room in the code <span class="fb">Yes: on the superscalar an empty slot is just lost at run time; on the VLIW it is a NOP stored in the program.</span></li>
+      <li data-correct>The binary now depends on the units and latencies of this implementation <span class="fb">Yes: the schedule is part of the binary, so a chip with other latencies or slots needs a recompiled program.</span></li>
+      <li>The register file needs fewer ports <span class="fb">No: four operations still read up to eight registers and write four per cycle, whoever scheduled them.</span></li>
+      <li>Data-cache misses no longer stall the processor <span class="fb">No: the compiler cannot know which access will miss, so the VLIW stalls on a miss and its whole schedule freezes, while the dynamic superscalar could keep executing independent instructions around it.</span></li>
+    </ul>
+    <p class="q-fb">The work moves from silicon to the compiler; the register file and the misses stay where they were.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In LOOP1 the compiler wants to put <code>ADDUI R1, R1, 4</code> in C1, next to the LD, because it has nothing to wait for. What happens?</p>
+    <ul class="options">
+      <li>Allowed: the LD in C1 reads the old R1 in the same cycle <span class="fb">The LD is fine, but it is not the only reader of R1: the SD in C7 still has to read it.</span></li>
+      <li data-correct>Not allowed as written: the SD in C7 would read the new R1 and store into the next element (a WAR violated) <span class="fb">Right. Only an SD offset of −4(R1) would repair it, and the papers forbid modifying the loop index.</span></li>
+      <li>Not allowed: the ADDUI depends on the LD through a RAW on R1 <span class="fb">The LD reads R1 and does not write it: the pair is a WAR, not a RAW.</span></li>
+      <li>Allowed, and it saves two cycles with no other change <span class="fb">It would save two cycles only together with the offset change; without it the program stores to the wrong address.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">When does a VLIW need a dispatch network between the decoder and the functional units?</p>
+    <ul class="options">
+      <li data-correct>When it has more functional units than slots <span class="fb">Right (p. 269): the network must route each operation, with its operands, to a free unit of the right kind.</span></li>
+      <li>Always, because operations must be routed by priority <span class="fb">With one unit per slot, each operation goes straight to its unit, with no arbitration at all.</span></li>
+      <li>When two operations of a bundle depend on each other <span class="fb">Dependences decide the cycle, not the route: the compiler never puts a RAW pair in one bundle (a WAR pair may share one, like SD and ADDUI in C7 of LOOP1), and nothing is checked at run time.</span></li>
+      <li>When the register file has fewer ports than the operations need <span class="fb">Ports are a register-file matter: the multi-ported file is built with 2k read and k write ports.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Tomasulo renames registers without using up architectural registers. Why does the same renaming cost architectural registers on a VLIW?</p>
+    <ul class="options">
+      <li data-correct>A VLIW has no hidden storage: every value in flight must live in a register the compiler names, out of the fixed set of the instruction set <span class="fb">Right: Tomasulo hides the values behind tags in its reservation stations; the VLIW has only F0 … F31.</span></li>
+      <li>The VLIW renames in hardware too, but with fewer tags <span class="fb">A VLIW has no renaming hardware at all: the renaming is done by the compiler, in the code.</span></li>
+      <li>VLIW operations have longer latencies <span class="fb">The latencies are the same kind of number on both machines; the difference is where the values in flight are stored.</span></li>
+      <li>It does not: renaming never increases the number of registers needed <span class="fb">The notes say the opposite (p. 271): renaming "increases the number of physical register needed".</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the notes' solution of the May 2025 midterm (p. 511), bundle C4 holds <code>LD F2, 16(R2)</code> (latency 3) and <code>ADDUI R2, R2, 8</code> (latency 1). From which cycle can an integer operation read the new R2?</p>
+    <ul class="options">
+      <li>C4 <span class="fb">In C4 the ADDUI only issues; a reader in the same cycle still gets the old R2. That is what lets a WAR writer share its reader's cycle.</span></li>
+      <li data-correct>C5 <span class="fb">Right: each operation keeps its own exposed latency, 1 cycle on the integer ALU whatever else sits in its bundle. The notes' table reads R2 in <code>ADD R3, R2, R1</code> at C5.</span></li>
+      <li>C6 <span class="fb">Two cycles is the distance the papers give only from an integer operation to a branch.</span></li>
+      <li>C7 <span class="fb">That is the lock-step write-back of p. 271, every result of the bundle aligned to the 3-cycle load. It is not the papers' machine — with it, the notes' own 8-cycle table would be wrong.</span></li>
+    </ul>
+    <p class="q-fb">Per-operation latencies are the model of every VLIW table in the papers: the compiler, not a synchronised write-back, keeps the writes in order.</p>
+  </div>
+</section>
+
+<section class="recap" id="l19-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A VLIW fetches one long instruction word per cycle with a single program counter: fixed slots, one per functional unit, at most one branch per bundle, and a NOP in every slot the compiler cannot fill.</li>
+    <li>The compiler resolves RAW hazards (consumer at least one latency after the producer), WAR and WAW (ordering or renaming) and structural hazards (one operation per slot); nothing checks at run time, so a wrong schedule gives wrong results, not slow ones.</li>
+    <li>Each operation has its own exposed latency; a fully pipelined unit takes a new operation every cycle but delivers each result after L cycles. Bundles do not complete in lock step in the exam's model.</li>
+    <li>What stays in hardware: the five-stage pipeline, a register file with 2k read and k write ports (8 + 4 for 4-issue), a dispatch network when units outnumber slots, a stall on a data-cache miss and a flush on a misprediction.</li>
+    <li>Register pressure: results started per cycle × latency registers are held by values in flight, more with compiler renaming, because a VLIW has no hidden tags; when they run out, the compiler starts fewer operations or spills values that wait longer than a reload takes.</li>
+    <li>Gains: simpler, cheaper, lower-power hardware, a large compile-time window and easy scaling. Costs: compiler effort, code size, register management and binaries tied to one implementation — hence VLIWs live in embedded systems.</li>
+    <li>A correct schedule is the fastest order that keeps every RAW and violates no WAR or WAW; basic blocks of 4–7 instructions are too small to fill the slots on their own.</li>
+  </ul>
+  <aside class="cheat" id="l19-cheat">
+    <dl>
+      <dt>Code efficiency</dt><dd>\( IC / (\#\text{cycles} \times \#\text{issues}) \): IC operations scheduled, cycles including the delay slot, issues = slots per bundle (LOOP1: 5 / 30 = 0.17)</dd>
+      <dt>Other VLIW table metrics</dt><dd>critical path = cycles of one iteration, delay slot included; CPI = cycles / IC; FP ops per cycle = FP operations / cycles (LOOP1: 10, 2, 0.1)</dd>
+      <dt>Register-file ports, k-issue</dt><dd>2k read + k write (4-issue: 8 + 4)</dd>
+      <dt>Registers held by results in flight</dt><dd>results started per cycle × latency, summed over the kinds of unit (2 × 5 = 10)</dd>
+      <dt>RAW placement</dt><dd>issue(consumer) ≥ issue(producer) + L, with L: Memory 3, FP 3, Integer 1, Integer → branch 2</dd>
+      <dt>WAR placement</dt><dd>issue(writer) ≥ issue(last reader): the same cycle is allowed</dd>
+      <dt>WAW placement</dt><dd>the later result lands after the earlier one: issue(2nd) + L(2nd) &gt; issue(1st) + L(1st)</dd>
+      <dt>Branch</dt><dd>at most one per bundle, last in the iteration; the delay slot counts as a cycle</dd>
+      <dt>Who handles what</dt><dd>compiler: RAW, WAR, WAW, structural; hardware: stall on a cache miss, flush on a misprediction</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l19-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.lighterra.com/papers/modernmicroprocessors/" target="_blank" rel="noopener">Modern Microprocessors: A 90-Minute Guide!</a>
+      <span class="res-by">Jason R. C. Patterson, Lighterra</span><span class="res-dur">section "Explicit Parallelism – VLIW"</span>
+      <p class="res-why">A short, plain-English picture of the static approach next to the superscalar one, with real processor names. Come back to "The Brainiac Debate" after section 6: it is the same trade-off told as industry history.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=nHHsYp7ZkHQ" target="_blank" rel="noopener">Computer Architecture — Lecture 27: VLIW Architectures (Fall 2023)</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span>
+      <p class="res-why">The VLIW philosophy, lock-step execution, NOP padding, binary compatibility, how Itanium/EPIC and Transmeta tried to fix it, and why the idea survived in DSPs and GPUs rather than in general-purpose CPUs — section 6 at lecture length.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://ocw.mit.edu/courses/6-823-computer-system-architecture-fall-2005/d90b42c3bf0f65f9ab8e652040cc9f0d_l21_vliw.pdf" target="_blank" rel="noopener">VLIW/EPIC: Statically Scheduled ILP (L21)</a>
+      <span class="res-by">MIT 6.823, Arvind, Asanović and Emer</span><span class="res-dur">34 slides</span>
+      <p class="res-why">The whole static side in one deck: VLIW, then loop unrolling, software pipelining, trace scheduling, rotating registers and IA-64. Its VLIW slides go with this lesson; the rest previews lesson 21.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.csd.uoc.gr/~hy425/2002s/vliw-eli512.pdf" target="_blank" rel="noopener">Very Long Instruction Word Architectures and the ELI-512</a>
+      <span class="res-by">Joseph A. Fisher, ISCA 1983</span><span class="res-dur">11 pages</span>
+      <p class="res-why">The paper that coined the name, describing the ELI-512 — the machine no established company would build, which is why Fisher founded Multiflow. Read its argument for letting the compiler find the parallelism and hold it against the four open challenges of section 6.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You placed LOOP1's five operations by counting latencies in your head. With twelve operations and three units that stops working: the next lesson turns the counting into an algorithm — a dependence graph, its critical path, and the list schedule the papers' table asks for.</p>
+</aside>
+
+</main>
+</body>
+</html>

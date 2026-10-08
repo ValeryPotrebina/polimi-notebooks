@@ -1,0 +1,1075 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cheaper misses: reads first, the critical word, caches that do not block, the second level · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l26">
+
+<header class="lesson-head">
+  <h1>Cheaper misses: reads first, the critical word, caches that do not block, the second level</h1>
+  <p class="lede">After this lesson you will explain six ways to make a cache miss cheaper or to hide it, compute the stall of early restart and critical word first and the two-level AMAT of the formula sheet, and sort any cache technique into miss rate, miss penalty or hit time.</p>
+</header>
+
+<div class="hook" data-label="A warm-up puzzle">
+  <p>The paper of 8 January 2026, as the notes transcribe it (pp. 503–504), has a multiple-answer quiz: "Which of the following cache improvements are effective in reducing the miss penalty?" The four options, shortened: (1) higher associativity, to reduce collisions; (2) avoiding address translation during indexing of the cache; (3) a small, fast L1 combined with a larger, slower L2; (4) giving priority to read misses over writes.</p>
+  <p>The notes' worked solution ticks 2 and 3. Two of its four verdicts are wrong. Tick your own answer now and keep it. By the end of the lesson you will know which two are wrong, and you will have a one-sentence rule that sorts any cache technique.</p>
+</div>
+
+<section id="l26-cost">
+  <h2>What a miss costs once it has happened</h2>
+
+  <p><a href="l22.html">Lesson 22</a> split the average access into three terms, \(\text{AMAT} = HT + MR \times MP\). <a href="l25.html">Lesson 25</a> attacked the middle one. This lesson does not try to lower the miss rate: each miss gets cheaper, or stops holding the processor up. The notes collect six such techniques under "Reducing Miss Penalty" (§6.9.2, pp. 342–355).</p>
+
+  <div class="def">
+    <p><dfn>Miss penalty</dfn> — "the additional time required to service a cache miss, i.e. the time to fetch the block from the lower level (or memory) and make it usable by the processor" (notes, p. 504). Only the accesses that miss pay it.</p>
+  </div>
+
+  <p>Picture a mechanic who orders a part from a warehouse across town. The wait has four pieces: the van may first be busy taking back earlier returns; the drive takes time; the crates come off one at a time, the one with the part perhaps last; and all the while the mechanic stands idle. A read miss has the same four pieces, and each technique of this lesson attacks one of them (Fig. 1).</p>
+
+  <figure class="fig fig--plain" id="l26-fig-anatomy">
+    <svg class="dia" viewBox="0 0 560 222" role="img" aria-label="One read miss laid out in time. On the memory side it waits behind buffered writes, then waits the latency to the first word, then receives the block word by word. Read priority and the merging write buffer attack the first part, a second-level cache the second, sub-blocks, early restart and critical word first the third. Below, the processor stalls for the whole miss unless the cache is non-blocking.">
+      <text x="100" y="22" class="tx-mid tx-sm tx-bold">behind writes</text>
+      <text x="255" y="22" class="tx-mid tx-sm tx-bold">latency</text>
+      <text x="436" y="22" class="tx-mid tx-sm tx-bold">block transfer</text>
+      <rect x="30" y="32" width="140" height="30" class="fw-s2 st-s2 dash"/>
+      <rect x="180" y="32" width="150" height="30" class="fw-s2 st-s2"/>
+      <rect x="340" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="364" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="388" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="412" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="436" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="460" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="484" y="32" width="24" height="30" class="fi-paper"/>
+      <rect x="508" y="32" width="24" height="30" class="fi-paper"/>
+      <path d="M30 70V76H170V70" class="st-muted"/>
+      <path d="M180 70V76H330V70" class="st-muted"/>
+      <path d="M340 70V76H532V70" class="st-muted"/>
+      <text x="100" y="96" class="tx-mid tx-sm">read priority</text>
+      <text x="100" y="116" class="tx-mid tx-sm">merging write</text>
+      <text x="100" y="136" class="tx-mid tx-sm">buffer</text>
+      <text x="255" y="96" class="tx-mid tx-sm">second-level</text>
+      <text x="255" y="116" class="tx-mid tx-sm">cache</text>
+      <text x="436" y="96" class="tx-mid tx-sm">sub-blocks</text>
+      <text x="436" y="116" class="tx-mid tx-sm">early restart</text>
+      <text x="436" y="136" class="tx-mid tx-sm">critical word first</text>
+      <rect x="30" y="156" width="502" height="26" class="fw-s2 st-s2 dash"/>
+      <text x="281" y="174" class="tx-mid tx-sm">CPU stalled for the whole miss</text>
+      <path d="M30 190V196H532V190" class="st-muted"/>
+      <text x="281" y="214" class="tx-mid tx-sm">non-blocking cache: the CPU keeps working</text>
+    </svg>
+    <figcaption><b>Fig. 1.</b> One read miss, laid out in time from left to right (not to scale). Top: the memory side. The read may queue behind writes, then waits the latency of the next level until the first word comes, then receives the block word by word. Bottom: the processor, stalled throughout. Under each piece, the techniques that shrink it; a non-blocking cache instead lets the processor work while it lasts.</figcaption>
+  </figure>
+
+  <p>Sections 2 to 5 take the pieces in turn; section 6 sorts all fourteen techniques of the chapter and settles the quiz.</p>
+
+  <p class="memo"><mark class="key">Miss-penalty techniques do not reduce how many misses happen: they make each miss cheaper, or hide it from the processor.</mark></p>
+</section>
+
+<section id="l26-reads">
+  <h2>Reads first, writes later</h2>
+
+  <p>A load that misses holds the processor up: the instructions after it need its value (p. 342). A store has nobody waiting for it; it can sit in the write buffer of <a href="l23.html">lesson 23</a> and reach memory later. So when a read miss and pending writes compete for memory, which in the notes' model serves one miss at a time per port, the controller serves the read first. Competing does not mean the same cycle: a load misses in cycle 10, a store in cycle 12, and both are pending when memory becomes free.</p>
+
+  <h3>Write-through: bypass the buffer, but look into it first</h3>
+
+  <p>Take a direct-mapped, write-through cache in which addresses 512 and 1024 fall on the same line. This classic case is from Hennessy &amp; Patterson, rewritten in the papers' mnemonics (registers without the dollar sign, as the 2026 paper writes them; older papers write <code>$F2</code>):</p>
+
+<pre><code>I0: SD  F2, 512(R0)   ; store
+I1: LD  F4, 1024(R0)  ; miss
+I2: LD  F6, 512(R0)   ; miss</code></pre>
+
+  <p>I0 updates the cache line and drops the pair (512, F2) into the write buffer. I1 misses, and its block replaces the block of 512. I2 misses too. If the controller sends I2's read to memory ahead of the buffered write, it reads the old M[512]: the new value is still in the buffer. The notes call this a <mark class="key">RAW hazard through memory</mark> (p. 344).</p>
+
+  <p>The fix costs a comparison (pp. 342–343). Before going to memory, the controller compares the read address with every address in the write buffer. On a match it takes the data from the buffer; without one it sends the read miss to memory at once, ahead of the buffered writes. The other safe option, draining the whole buffer first, adds every pending write to the read-miss penalty.</p>
+
+  <h3>Write-back: park the dirty victim</h3>
+
+  <p>In a write-back cache the conflict comes from the victim (p. 343). A read miss must bring a block Y into a line that holds a block X. A clean X is simply overwritten. A dirty X, in the naive order, is written back first and Y fetched after: the processor waits for two block transfers. With read priority, X is copied into the write buffer, Y is fetched at once, and X goes to memory in the background (Fig. 2).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l26-fig-victim">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 190" role="img" aria-label="Before: the bus first writes the dirty block X back, then fetches Y; the processor is stalled for both transfers.">
+        <text x="20" y="20" class="tx-sm tx-bold">memory bus</text>
+        <rect x="20" y="28" width="126" height="26" class="fi-paper"/>
+        <text x="83" y="46" class="tx-mid tx-sm">write back X</text>
+        <rect x="150" y="28" width="126" height="26" class="fw-s1 st-s1"/>
+        <text x="213" y="46" class="tx-mid tx-sm">fetch Y</text>
+        <text x="20" y="76" class="tx-sm tx-muted">X goes to memory first</text>
+        <text x="20" y="98" class="tx-sm tx-bold">CPU</text>
+        <rect x="20" y="106" width="256" height="24" class="fw-s2 st-s2 dash"/>
+        <text x="148" y="123" class="tx-mid tx-sm">stalled: two transfers</text>
+        <line x1="276" y1="100" x2="276" y2="136" class="st-ink sw-3"/>
+        <line x1="20" y1="150" x2="282" y2="150" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="282" y="168" class="tx-end tx-sm tx-muted">time</text>
+        <text x="20" y="180" class="tx-hand">waits for both</text>
+      </svg>
+      <p class="fig-label">Before: write back, then fetch</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 190" role="img" aria-label="After: the bus fetches Y first while X waits in the write buffer; the processor resumes after one transfer and X is written back while it runs.">
+        <text x="20" y="20" class="tx-sm tx-bold">memory bus</text>
+        <rect x="20" y="28" width="126" height="26" class="fw-s1 st-s1"/>
+        <text x="83" y="46" class="tx-mid tx-sm">fetch Y</text>
+        <rect x="150" y="28" width="126" height="26" class="fi-paper"/>
+        <text x="213" y="46" class="tx-mid tx-sm">write back X</text>
+        <text x="20" y="76" class="tx-sm tx-muted">X waits in the write buffer</text>
+        <text x="20" y="98" class="tx-sm tx-bold">CPU</text>
+        <rect x="20" y="106" width="126" height="24" class="fw-s2 st-s2 dash"/>
+        <text x="83" y="123" class="tx-mid tx-sm">stalled</text>
+        <rect x="150" y="106" width="126" height="24" class="fw-s1 st-s1"/>
+        <text x="213" y="123" class="tx-mid tx-sm">runs</text>
+        <line x1="148" y1="100" x2="148" y2="136" class="st-ink sw-3"/>
+        <line x1="20" y1="150" x2="282" y2="150" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="282" y="168" class="tx-end tx-sm tx-muted">time</text>
+        <text x="20" y="180" class="tx-hand">waits for one</text>
+      </svg>
+      <p class="fig-label">After: fetch first, write back later</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> A read miss whose victim X is dirty, in a write-back cache (notes, p. 343). Before: X is written back, then Y is fetched, and the processor waits for both. After: X is copied into the write buffer, Y is fetched at once, and X reaches memory while the processor already runs. The thick tick marks the moment the processor resumes. The miss penalty drops from two block transfers to one.</figcaption>
+  </figure>
+
+  <p>The price (p. 344): a comparison against every buffer entry, logic that tracks which reads depend on which writes, and no help once the buffer fills up. The gain: as many misses as before, but each read miss stops paying for writes nobody waits for. That is a shorter miss penalty.</p>
+
+  <h3>The merging write buffer: fewer, fuller writes</h3>
+
+  <aside class="margin-note">P. 353 first sends only stores "that miss in the cache" to the buffer, then write hits too. In write-through every store goes.</aside>
+
+  <p>With write-through, every store goes to memory through the write buffer, and stores come in runs: <code>A[i]</code>, then <code>A[i+1]</code>, in the same block. Without merging, each store is a separate memory transaction; the bus is busy, and a read miss that needs it waits (p. 353). A <mark class="key">merging write buffer</mark> folds writes to the same block into one entry, sent as one transaction. An entry holds the <em>block address</em>, aligned to the block size; a <em>data field</em> as large as a block; and a <em>byte-valid mask</em>, one bit per byte (or per word), marking the bytes that hold new data.</p>
+
+  <p>The procedure (pp. 353–354), for 32-byte blocks and 8-byte stores: align the address to its block (0x1048 belongs to the block at 0x1040); if the buffer has an entry for that block, write the 8 bytes at their offset and set their mask bits, with no memory transaction yet; otherwise allocate an entry. At the flush a full mask becomes one full-block write, a partial mask a partial write with byte enables (if the bus has them) or a read-merge-write. The notes' Example 17 stores 8 bytes at 0x1000, 0x1008 and 0x1010: one entry, 24 of 32 bytes valid.</p>
+
+  <aside class="redpen" data-page="354">
+    <p class="claim">"When buffer flushes: send one 32B write to memory."</p>
+    <p class="fix">The three stores fill 24 of the 32 bytes: the mask is partial, so the flush is a partial write with byte enables or a read-merge-write (rule 3(b), same page). Only a fourth store, at 0x1018, makes it one full 32-byte write.</p>
+    <p class="because">Bytes 0x1018–0x101F were never written: a full-block write would overwrite them in memory with whatever the data field holds there. Tasks 1 and 2 of the widget show both cases, mask 1110 against 1111.</p>
+  </aside>
+
+  <aside class="margin-note">Example 17 writes the mask 00000011, "binary per word": 4-byte words, so an 8-byte store sets two bits, word 0 rightmost. The widget keeps one bit per 8-byte slot, left to right.</aside>
+
+  <div class="widget" id="l26-w-merge">
+    <h3 class="widget-title">Merging write buffer: one block, one transaction</h3>
+    <p class="widget-intro">A stream of 8-byte stores (<code>SD</code>, with R1 = 0x1000 and R2 = 0x2000) fills two four-entry buffers at once: on top a plain write buffer, one store per entry; below a merging buffer, one block per entry. Each entry shows its block address, four 8-byte slots (offsets +0 to +24) and the valid mask. The strip at the bottom is the bus time these writes will take, with a fixed cost per transaction plus one cycle per 8 bytes. The insight: fewer transactions leave the bus free sooner, so a read miss waits less behind the writes.</p>
+    <ol class="tasks">
+      <li>Keep Example 17, where the first store is already in, and move "stores executed" to 2, then to 3. Before each step, predict how many entries each buffer uses and how many write transactions each will need.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Plain buffer: three entries, three transactions. Merging buffer: one entry at 0x1000, mask 1110, one transaction. Only 24 of 32 bytes are valid, so the flush is a partial write with byte enables, or a read-merge-write. With the default cost of 4 cycles per transaction the bus is busy 15 cycles against 7.</p></details>
+      </li>
+      <li>Switch to "Example 17 plus a fourth store" and step to 4. What changes at the flush?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The mask becomes 1111: one full 32-byte write instead of four 8-byte writes. Bus time 8 cycles against 20.</p></details>
+      </li>
+      <li>Choose "two blocks, interleaved" and step through all six stores. When does the plain buffer stall the processor, and how long is the bus busy in each case?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The plain buffer is full after the fourth store, so the fifth and sixth must each wait for an entry to drain: two stalls. Six transactions, 30 bus cycles. The merging buffer uses two entries, never fills, and sends two transactions (0x1000 full, 0x2000 partial): 14 cycles. A read miss that needs the bus finds it busy 30 cycles against 14, which is why the notes count merging as a miss-penalty technique.</p></details>
+      </li>
+      <li>Keep the interleaved stream at six stores and set the cost per transaction to 0; then pick the 32-byte stride and step to 4. Predict where merging stops helping.
+        <details class="answer"><summary>What you should see</summary>
+          <p>With no fixed cost the bus time is the same, 6 against 6 for the interleaved stream: merging then saves only buffer entries and stalls. With the stride every store falls in a different block, so there is nothing to merge: four transactions either way. Merging pays when stores are adjacent and each transaction has a fixed cost.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l26-w-merge', function (root, ui) {
+    var S = Course.svg;
+    var PRESETS = {
+      ex17: { regs: ['F2', 'F4', 'F6'], addr: [0x1000, 0x1008, 0x1010] },
+      ex17b: { regs: ['F2', 'F4', 'F6', 'F8'], addr: [0x1000, 0x1008, 0x1010, 0x1018] },
+      two: { regs: ['F2', 'F4', 'F6', 'F8', 'F10', 'F12'], addr: [0x1000, 0x1008, 0x2000, 0x1010, 0x1018, 0x2008] },
+      stride: { regs: ['F2', 'F4', 'F6', 'F8'], addr: [0x1000, 0x1020, 0x1040, 0x1060] }
+    };
+    var pre = ui.select('store sequence', [
+      { value: 'ex17', label: 'Example 17: three stores, one block' },
+      { value: 'ex17b', label: 'Example 17 plus a fourth store' },
+      { value: 'two', label: 'two blocks, interleaved (six stores)' },
+      { value: 'stride', label: 'a 32-byte stride (four stores)' }
+    ], null, 'ex17');
+    var upto = ui.slider({ label: 'stores executed', min: 0, max: 3, step: 1, value: 1 });
+    var cost = ui.slider({ label: 'fixed cost of one bus transaction (cycles)', min: 0, max: 10, step: 1, value: 4 });
+    var roTx = ui.readout('write transactions: plain · merging'), roBus = ui.readout('bus cycles for these writes: plain · merging'),
+        roStall = ui.readout('stalls on a full buffer: plain · merging');
+    var note = ui.note('');
+    var svg = ui.svg(560, 412, { label: 'Two write buffers of four entries side by side in time: a plain buffer with one store per entry and a merging buffer with one block per entry, each entry with its block address, four 8-byte slots and a valid mask, and below them the bus time of the write transactions' });
+    ui.legend([
+      { label: 'slot holding a store', color: 's1', mark: 'square' },
+      { label: 'bus busy with a write transaction', color: 's2', mark: 'square' },
+      { label: 'the latest store', color: 'ink', mark: 'hl' }
+    ]);
+    var last = 'ex17';
+
+    function hex(a) { return '0x' + a.toString(16).toUpperCase(); }
+    function run(p, n, merge, O) {
+      var B = 32, CAP = 4, entries = [], txs = [], stalls = 0, s, e, x;
+      function txOf(en) { var b = 0; en.slots.forEach(function (v) { if (v !== null) b++; }); return { base: en.base, beats: b }; }
+      for (s = 0; s < n; s++) {
+        var a = p.addr[s], base = a - (a % B), slot = (a % B) / 8;
+        e = null;
+        if (merge) for (x = 0; x < entries.length; x++) if (entries[x].base === base) e = entries[x];
+        if (!e) {
+          if (entries.length === CAP) { txs.push(txOf(entries.shift())); stalls++; }
+          e = { base: base, slots: [null, null, null, null] };
+          entries.push(e);
+        }
+        e.slots[slot] = s;
+      }
+      entries.forEach(function (en) { txs.push(txOf(en)); });
+      var cyc = 0; txs.forEach(function (t) { cyc += O + t.beats; });
+      return { entries: entries, txs: txs, stalls: stalls, cycles: cyc };
+    }
+    function state() {
+      var p = PRESETS[pre.value] || PRESETS.ex17, N = p.addr.length;
+      if (pre.value !== last) { last = pre.value; upto.el.max = String(N); upto.set(1, true); }
+      if (+upto.el.max !== N) upto.el.max = String(N);
+      var n = Math.max(0, Math.min(N, Math.round(upto.value)));
+      var O = cost.value;
+      return { p: p, N: N, n: n, O: O, plain: run(p, n, false, O), merged: run(p, n, true, O) };
+    }
+    function buffer(st, b, y0, title) {
+      S('text', { x: 24, y: y0, 'class': 'tx-sm tx-bold', text: title }, svg);
+      var yh = y0 + 8, cols = [24, 64, 154, 214, 274, 334, 394, 536], hdr = ['E', 'block', '+0', '+8', '+16', '+24', 'mask'];
+      S('rect', { x: 24, y: yh, width: 512, height: 22, 'class': 'fw-s3 st-s3' }, svg);
+      hdr.forEach(function (h, i) { S('text', { x: (cols[i] + cols[i + 1]) / 2, y: yh + 16, 'class': 'tx-mono tx-sm tx-mid', text: h }, svg); });
+      for (var r = 0; r < 4; r++) {
+        var y = yh + 22 + r * 24, en = b.entries[r];
+        S('rect', { x: 24, y: y, width: 512, height: 24, 'class': 'fi-paper' }, svg);
+        for (var c = 1; c < 7; c++) S('line', { x1: cols[c], y1: y, x2: cols[c], y2: y + 24, 'class': 'st-muted sw-1' }, svg);
+        S('text', { x: 44, y: y + 17, 'class': 'tx-mono tx-sm tx-mid tx-muted', text: 'E' + r }, svg);
+        if (!en) continue;
+        S('text', { x: 109, y: y + 17, 'class': 'tx-mono tx-sm tx-mid', text: hex(en.base) }, svg);
+        var mask = '';
+        en.slots.forEach(function (v, k) {
+          mask += v === null ? '0' : '1';
+          if (v === null) return;
+          var x = cols[2 + k];
+          if (v === st.n - 1) S('line', { x1: x + 6, y1: y + 12, x2: x + 54, y2: y + 12, 'class': 'hl' }, svg);
+          S('rect', { x: x + 3, y: y + 3, width: 54, height: 18, rx: 3, 'class': 'fw-s1 st-s1' }, svg);
+          S('text', { x: x + 30, y: y + 17, 'class': 'tx-mono tx-sm tx-mid', text: st.p.regs[v] }, svg);
+        });
+        S('text', { x: 465, y: y + 17, 'class': 'tx-mono tx-sm tx-mid', text: mask }, svg);
+      }
+    }
+    function bus(st) {
+      var y0 = 350, x0 = 110, W = 400, maxC = Math.max(1, st.plain.cycles, st.merged.cycles), s = W / maxC;
+      S('text', { x: 24, y: y0, 'class': 'tx-sm tx-bold', text: 'bus time for these writes' }, svg);
+      [[st.plain, 'plain'], [st.merged, 'merging']].forEach(function (lane, i) {
+        var y = y0 + 12 + i * 26, x = x0;
+        S('text', { x: 24, y: y + 15, 'class': 'tx-sm', text: lane[1] }, svg);
+        if (!lane[0].txs.length) { S('text', { x: x0, y: y + 15, 'class': 'tx-sm tx-muted', text: 'no writes yet' }, svg); return; }
+        lane[0].txs.forEach(function (t) {
+          var w = (st.O + t.beats) * s;
+          S('rect', { x: x, y: y + 2, width: Math.max(1, w - 2), height: 18, 'class': 'fw-s2 st-s2' }, svg);
+          if (w >= 44) S('text', { x: x + w / 2 - 1, y: y + 15, 'class': 'tx-sm tx-mid', text: (t.beats * 8) + ' B' }, svg);
+          x += w;
+        });
+        S('text', { x: x + 6, y: y + 15, 'class': 'tx-sm', text: String(lane[0].cycles) }, svg);
+      });
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      for (var i = 0; i < st.N; i++) {
+        var x = 24 + i * 86, done = i < st.n;
+        if (i === st.n - 1) S('line', { x1: x + 6, y1: 34, x2: x + 74, y2: 34, 'class': 'hl' }, svg);
+        S('rect', { x: x, y: 8, width: 80, height: 22, rx: 4, 'class': done ? 'fw-s1 st-s1' : 'fi-paper st-muted' }, svg);
+        S('text', { x: x + 40, y: 24, 'class': 'tx-mono tx-sm tx-mid' + (done ? '' : ' tx-muted'), text: hex(st.p.addr[i]) }, svg);
+      }
+      buffer(st, st.plain, 62, 'plain write buffer: one store per entry');
+      buffer(st, st.merged, 206, 'merging write buffer: one block per entry');
+      bus(st);
+    }
+    ui.onChange(function () {
+      var st = state();
+      roTx.set(st.plain.txs.length + ' · ' + st.merged.txs.length);
+      roBus.set(st.plain.cycles + ' · ' + st.merged.cycles + ' cycles');
+      roStall.set(st.plain.stalls + ' · ' + st.merged.stalls);
+      var parts = st.merged.entries.map(function (en) {
+        var b = 0; en.slots.forEach(function (v) { if (v !== null) b++; });
+        return hex(en.base) + (b === 4 ? ': full, one 32-byte write' : ': ' + (b * 8) + ' of 32 bytes, a partial write (byte enables) or read-merge-write');
+      });
+      note.set(st.n === 0 ? 'Both buffers are empty. Move "stores executed" to add the stores one at a time.' : 'At the flush the merging buffer sends ' + parts.join('; ') + '.');
+      draw(st);
+    });
+  });
+  </script>
+
+  <p>The price of merging (p. 355): matching logic and masks on every entry, room for a whole block per entry, and no escape from a full buffer. It pays most with write-through caches, and also helps a write-back cache that evicts dirty lines in pieces.</p>
+
+  <p class="memo"><mark class="key">A load has a consumer waiting, a store has none: let read misses overtake buffered writes, check the buffer's addresses first, and pack the writes into whole blocks.</mark></p>
+</section>
+
+<section id="l26-word">
+  <h2>Fetch less, hand it over sooner</h2>
+
+  <p>Next in Fig. 1 comes the transfer: a normal miss fetches the whole block, say 64 bytes, and the processor waits for the last byte (p. 345). Three techniques shorten that wait: move less data, or hand over the word before the rest arrives.</p>
+
+  <h3>Sub-block placement: one tag, several valid bits</h3>
+
+  <p>Divide each block into <mark class="key">sub-blocks</mark>, each with its own valid bit, under a single tag (p. 345). On a miss only the requested sub-block is fetched; the others are marked invalid until they are needed. A hit now needs a matching tag <em>and</em> the valid bit of the right sub-block. Fig. 3 compares three ways to hold the same 32 bytes.</p>
+
+  <figure class="fig fig--plain" id="l26-fig-subblock">
+    <svg class="dia" viewBox="0 0 560 256" role="img" aria-label="Three ways to hold 32 bytes. One 32-byte block: one tag, one valid bit, a miss moves 32 bytes. Four 8-byte blocks: four tags, four valid bits, a miss moves 8 bytes. One 32-byte block in four sub-blocks: one tag, four valid bits, a miss moves 8 bytes, with only the requested sub-block valid.">
+      <text x="20" y="20" class="tx-sm tx-bold">one 32-byte block</text>
+      <rect x="20" y="28" width="24" height="26" class="fi-paper"/>
+      <text x="32" y="46" class="tx-mono tx-sm tx-mid">1</text>
+      <rect x="44" y="28" width="80" height="26" class="fw-s3 st-s3"/>
+      <text x="84" y="46" class="tx-mono tx-sm tx-mid">tag</text>
+      <rect x="124" y="28" width="104" height="26" class="fw-s1 st-s1"/>
+      <rect x="228" y="28" width="104" height="26" class="fw-s1 st-s1"/>
+      <rect x="332" y="28" width="104" height="26" class="fw-s1 st-s1"/>
+      <rect x="436" y="28" width="104" height="26" class="fw-s1 st-s1"/>
+      <text x="20" y="74" class="tx-sm tx-muted">1 tag, 1 valid bit; a miss moves all 32 bytes</text>
+
+      <text x="20" y="104" class="tx-sm tx-bold">four 8-byte blocks</text>
+      <rect x="20" y="112" width="20" height="26" class="fi-paper"/>
+      <text x="30" y="130" class="tx-mono tx-sm tx-mid">0</text>
+      <rect x="40" y="112" width="50" height="26" class="fw-s3 st-s3"/>
+      <text x="65" y="130" class="tx-mono tx-sm tx-mid">tag</text>
+      <rect x="90" y="112" width="60" height="26" class="fi-paper"/>
+      <rect x="150" y="112" width="20" height="26" class="fi-paper"/>
+      <text x="160" y="130" class="tx-mono tx-sm tx-mid">1</text>
+      <rect x="170" y="112" width="50" height="26" class="fw-s3 st-s3"/>
+      <text x="195" y="130" class="tx-mono tx-sm tx-mid">tag</text>
+      <rect x="220" y="112" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="280" y="112" width="20" height="26" class="fi-paper"/>
+      <text x="290" y="130" class="tx-mono tx-sm tx-mid">0</text>
+      <rect x="300" y="112" width="50" height="26" class="fw-s3 st-s3"/>
+      <text x="325" y="130" class="tx-mono tx-sm tx-mid">tag</text>
+      <rect x="350" y="112" width="60" height="26" class="fi-paper"/>
+      <rect x="410" y="112" width="20" height="26" class="fi-paper"/>
+      <text x="420" y="130" class="tx-mono tx-sm tx-mid">0</text>
+      <rect x="430" y="112" width="50" height="26" class="fw-s3 st-s3"/>
+      <text x="455" y="130" class="tx-mono tx-sm tx-mid">tag</text>
+      <rect x="480" y="112" width="60" height="26" class="fi-paper"/>
+      <text x="20" y="158" class="tx-sm tx-muted">4 tags, 4 valid bits; a miss moves 8 bytes</text>
+
+      <text x="20" y="188" class="tx-sm tx-bold">one 32-byte block in four sub-blocks</text>
+      <rect x="20" y="196" width="80" height="26" class="fw-s3 st-s3"/>
+      <text x="60" y="214" class="tx-mono tx-sm tx-mid">tag</text>
+      <rect x="100" y="196" width="22" height="26" class="fi-paper"/>
+      <text x="111" y="214" class="tx-mono tx-sm tx-mid">0</text>
+      <rect x="122" y="196" width="88" height="26" class="fi-paper"/>
+      <line x1="216" y1="226" x2="316" y2="226" class="hl"/>
+      <rect x="210" y="196" width="22" height="26" class="fi-paper"/>
+      <text x="221" y="214" class="tx-mono tx-sm tx-mid">1</text>
+      <rect x="232" y="196" width="88" height="26" class="fw-s1 st-s1"/>
+      <rect x="320" y="196" width="22" height="26" class="fi-paper"/>
+      <text x="331" y="214" class="tx-mono tx-sm tx-mid">0</text>
+      <rect x="342" y="196" width="88" height="26" class="fi-paper"/>
+      <rect x="430" y="196" width="22" height="26" class="fi-paper"/>
+      <text x="441" y="214" class="tx-mono tx-sm tx-mid">0</text>
+      <rect x="452" y="196" width="88" height="26" class="fi-paper"/>
+      <text x="20" y="246" class="tx-sm tx-muted">1 tag, 4 valid bits; a miss moves 8 bytes</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> Three ways to hold the same 32 bytes, after a miss on the second 8-byte piece. Violet: tags; blue: data brought in; the small cells hold the valid bits. Sub-block placement (bottom) keeps the single tag of the big block (top) and moves only what the small blocks (middle) move: the requested 8 bytes, underlined. It adds valid bits, not tags.</figcaption>
+  </figure>
+
+  <p>The gain: a shorter transfer and no bandwidth spent on words nobody asked for, useful when spatial locality is weak, bandwidth is limited or blocks are large (p. 345). The price: neighbouring words now miss later, so the miss rate creeps up a little, and valid bits and control logic grow. One term of AMAT is traded for another.</p>
+
+  <aside class="redpen" data-page="345">
+    <p class="claim">"Extra Tag/Valid Bit Storage: Need valid bits for each sub-block."</p>
+    <p class="fix">Sub-block placement adds valid bits, not tags: every block keeps exactly one tag, whatever the number of sub-blocks.</p>
+    <p class="because">Count the tags in Fig. 3: the sub-blocked line has the one tag of the plain 32-byte block, a quarter of the tags of the same 32 bytes in 8-byte blocks. One tag for a large block is the point of the technique, and the notes' own sentence names only valid bits as the extra storage.</p>
+  </aside>
+
+  <h3>Early restart and critical word first</h3>
+
+  <p>Take the notes' block of four words, W0 to W3, and a processor that asks for W2 (pp. 346–347). With <mark class="key">early restart</mark> the memory sends the block in normal order, W0, W1, W2, W3; the cache forwards W2 the moment it arrives, and the processor resumes while W3 is still coming. With <mark class="key">critical word first</mark>, or wrapped fetch, the memory starts at the requested word and wraps around: W2, W3, W0, W1. The requested word is fetched first, not just delivered first. The stepper turns the two orders into penalties.</p>
+
+  <ol class="steps" id="l26-steps-cwf">
+    <li><p>The model: after a request the memory needs \(L\) cycles before it starts sending, then sends one word per cycle. A block has \(n\) words, numbered from 0; the processor wants word \(k\).</p></li>
+    <li><p>The word sent \(p\)-th, counting from 0, arrives at the end of cycle</p> \[ t(p) = L + p + 1 . \] <p>That is \(L\) cycles of latency plus \(p + 1\) transfer cycles.</p></li>
+    <li><p>Waiting for the whole block, the processor resumes after the last word, \(p = n - 1\):</p> \[ MP_{\text{block}} = L + n . \]</li>
+    <li><p>Early restart keeps the normal order, so word \(k\) is sent \(k\)-th, \(p = k\):</p> \[ MP_{\text{ER}} = L + k + 1 . \]</li>
+    <li><p>Critical word first sends the requested word first, \(p = 0\), whatever \(k\) is:</p> \[ MP_{\text{CWF}} = L + 1 . \]</li>
+    <li><p>The savings over the whole block: early restart saves \(n - k - 1\) cycles, from \(n - 1\) for the first word down to 0 for the last, \((n - 1)/2\) on average; critical word first always saves \(n - 1\). For the notes' block (\(n = 4\), \(k = 2\)) with \(L = 10\): 14, 13 and 11 cycles.</p></li>
+  </ol>
+
+  <div class="widget" id="l26-w-cwf">
+    <h3 class="widget-title">Which word arrives first</h3>
+    <p class="widget-intro">Three rows, one per policy, show the order in which the words of one block arrive after the latency \(L\) (the dashed box). Blue is the requested word, underlined; orange cells are words the processor still waits for; white cells arrive after it has resumed; the thick tick marks the resume. The bars at the bottom draw the three stalls to scale. The insight: the gain of early restart depends on where the word sits, that of critical word first does not, and both matter only when the block is long compared with \(L\).</p>
+    <ol class="tasks">
+      <li>Start from the notes' example: 4 words, the processor wants W2, \(L = 10\). Predict the arrival order and the stall of each row, then compare.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Whole block: W0 W1 W2 W3, stall 14. Early restart: the same order, but the processor resumes on W2, stall 13, while W3 is still coming. Critical word first: W2 W3 W0 W1, stall 11.</p></details>
+      </li>
+      <li>Choose 8 words and move \(k\) from W0 to W7. Which row changes, which stays put, and at which \(k\) are two rows equal?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only early restart moves: \(L + k + 1\) grows with \(k\). At W0 it equals critical word first, at W7 it equals the whole block. Critical word first stays at \(L + 1\), the whole block at \(L + n\). Early restart helps most when the word is early in the block.</p></details>
+      </li>
+      <li>Set \(L = 30\) and the requested word to the last one. Predict which share of the penalty critical word first saves with 4 words, then with 16 words.
+        <details class="answer"><summary>What you should see</summary>
+          <p>4 words: 3 cycles of 34, about 9%. 16 words: 15 cycles of 46, about 33%. With a 30-cycle latency the transfer is a small part of a short block's penalty, so both techniques pay only with large blocks.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l26-w-cwf', function (root, ui) {
+    var S = Course.svg;
+    var nSel = ui.select('block size', [
+      { value: '4', label: '4 words (the notes’ example)' },
+      { value: '8', label: '8 words' },
+      { value: '16', label: '16 words' }
+    ], null, '4');
+    var kSl = ui.slider({ label: 'requested word k', min: 0, max: 3, step: 1, value: 2, format: function (v) { return 'W' + v; } });
+    var lSl = ui.slider({ label: 'latency L before the first word (cycles)', min: 1, max: 60, step: 1, value: 10 });
+    var roStall = ui.readout('stall: whole block · early restart · critical word first');
+    var roEr = ui.readout('early restart saves n − k − 1');
+    var roCwf = ui.readout('critical word first saves n − 1');
+    var svg = ui.svg(560, 362, { label: 'Three rows of word cells, one per policy, showing the arrival order of the words of one block after the latency, the requested word and the moment the processor resumes; below, three bars with the three stalls drawn to scale' });
+    ui.legend([
+      { label: 'requested word', color: 's1', mark: 'square' },
+      { label: 'what the processor waits for', color: 's2', mark: 'square' },
+      { label: 'the processor resumes', color: 'ink', mark: 'line' }
+    ]);
+
+    function model() {
+      var n = +nSel.value || 4;
+      if (+kSl.el.max !== n - 1) { kSl.el.max = String(n - 1); kSl.set(Math.min(Math.round(kSl.value), n - 1), true); }
+      var k = Math.max(0, Math.min(n - 1, Math.round(kSl.value))), L = lSl.value, seq = [], wrap = [], i;
+      for (i = 0; i < n; i++) { seq.push(i); wrap.push((k + i) % n); }
+      return { n: n, k: k, L: L, rows: [
+        { name: '1 · wait for the whole block', order: seq, at: n - 1, stall: L + n },
+        { name: '2 · early restart', order: seq, at: k, stall: L + k + 1 },
+        { name: '3 · critical word first', order: wrap, at: 0, stall: L + 1 }
+      ] };
+    }
+    function draw(m) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var cw = 28, x0 = 96;
+      m.rows.forEach(function (row, r) {
+        var y = 22 + r * 70, yl = y + 10;
+        S('text', { x: 24, y: y, 'class': 'tx-sm tx-bold', text: row.name }, svg);
+        S('text', { x: 536, y: y, 'class': 'tx-sm tx-end', text: 'stall ' + row.stall + ' cycles' }, svg);
+        S('rect', { x: 24, y: yl, width: 64, height: 26, 'class': 'fw-s2 st-s2 dash' }, svg);
+        S('text', { x: 56, y: yl + 18, 'class': 'tx-sm tx-mid', text: 'L = ' + m.L }, svg);
+        row.order.forEach(function (w, p) {
+          var x = x0 + p * cw, cls = w === m.k ? 'fw-s1 st-s1 sw-2' : (p <= row.at ? 'fw-s2 st-s2' : 'fi-paper');
+          if (w === m.k) S('line', { x1: x + 3, y1: yl + 33, x2: x + cw - 3, y2: yl + 33, 'class': 'hl' }, svg);
+          S('rect', { x: x, y: yl, width: cw, height: 26, 'class': cls }, svg);
+          S('text', { x: x + cw / 2, y: yl + 18, 'class': 'tx-mono tx-sm tx-mid', text: (m.n <= 8 ? 'W' : '') + w }, svg);
+        });
+        var xr = x0 + (row.at + 1) * cw;
+        S('line', { x1: xr, y1: yl - 5, x2: xr, y2: yl + 31, 'class': 'st-ink sw-3' }, svg);
+      });
+      var yb = 236, xb = 44, tot = m.L + m.n, s = 450 / tot;
+      S('text', { x: 24, y: yb, 'class': 'tx-sm tx-muted', text: 'the three stalls to scale (cycles)' }, svg);
+      m.rows.forEach(function (row, r) {
+        var y = 248 + r * 30, w = row.stall * s;
+        S('text', { x: 30, y: y + 13, 'class': 'tx-sm tx-mid', text: String(r + 1) }, svg);
+        S('rect', { x: xb, y: y, width: w, height: 16, 'class': 'fw-s2 st-s2' }, svg);
+        S('text', { x: xb + w + 6, y: y + 13, 'class': 'tx-sm', text: String(row.stall) }, svg);
+      });
+      var xl = xb + m.L * s;
+      S('line', { x1: xl, y1: 244, x2: xl, y2: 334, 'class': 'st-muted dash' }, svg);
+      S('line', { x1: xb, y1: 334, x2: xb + tot * s, y2: 334, 'class': 'st-muted' }, svg);
+      S('text', { x: xb, y: 352, 'class': 'tx-sm tx-mid tx-muted', text: '0' }, svg);
+      if (xl - xb >= 24) S('text', { x: xl, y: 352, 'class': 'tx-sm tx-mid tx-muted', text: 'L' }, svg);
+    }
+    ui.onChange(function () {
+      var m = model(), r = m.rows;
+      roStall.set(r[0].stall + ' · ' + r[1].stall + ' · ' + r[2].stall + ' cycles');
+      roEr.set((m.n - m.k - 1) + ' cycle' + (m.n - m.k - 1 === 1 ? '' : 's'));
+      roCwf.set((m.n - 1) + ' cycles = ' + Math.round(100 * (m.n - 1) / (m.L + m.n)) + '% of L + n');
+      draw(m);
+    });
+  });
+  </script>
+
+  <p>The price is in the controller and the memory (p. 347): critical word first needs wrap-around addressing and a memory that can start a burst mid-block; early restart only changes when the cache forwards a word. Both gain less when the processor needs another word of the block right away: it stalls again until that word arrives. Hennessy &amp; Patterson add that both pay mainly with large blocks, as the third task shows.</p>
+
+  <div class="tip"><p>Write the three penalties as one line on the A4 sheet: \(L + n\), \(L + k + 1\), \(L + 1\). Count \(k\) from 0, and check whether "latency" in the exam text already includes the first word.</p></div>
+
+  <p class="memo"><mark class="key">Early restart forwards the requested word when it arrives; critical word first makes it arrive first: \(L + n \to L + k + 1 \to L + 1\).</mark></p>
+</section>
+
+<section id="l26-nonblock">
+  <h2>Caches that keep working during a miss</h2>
+
+  <p>So far the processor has stood still during every miss. The notes show why that is wasteful with two lines of C, <code>sum += A[i]</code> and <code>sum += B[0]</code> (p. 348). In the papers' mnemonics:</p>
+
+<pre><code>I0: LD  F2, 0(R1)   ; A[i]: miss
+I1: LD  F4, 0(R2)   ; B[0]: hit</code></pre>
+
+  <p>A <mark class="key">blocking cache</mark> stalls the processor until the miss of I0 is resolved, even though B[0] is already in the cache. A <mark class="key">non-blocking cache</mark> (also called lockup-free) keeps serving accesses while a miss is outstanding. The processor keeps executing instructions that do not depend on the missing data, and the cache may have several memory transactions in flight. It tracks each outstanding miss in a <mark class="key">Miss Status Holding Register (MSHR)</mark> (p. 348), which records which block is coming and which instruction waits for it.</p>
+
+  <p>There are two levels of capability (pp. 348–349). <b>Hit under miss</b>: while one miss is outstanding, hits to other addresses are served; a second miss must wait for the first. <b>Miss under miss</b> (multiple outstanding misses): a second miss starts while the first is still being serviced. That needs several MSHRs, a memory controller that accepts several requests, and logic that matches each returning block to its MSHR, in whatever order the blocks come back.</p>
+
+  <p>The widget runs the three cases on six instructions. I0 always misses, and so does a second load, I3 by default; pick I1 or I4 instead and I5 adds F4 or F10 rather than F8.</p>
+
+<pre><code>I0: LD    F2, 0(R1)
+I1: LD    F4, 0(R2)
+I2: LD    F6, 8(R2)
+I3: LD    F8, 0(R3)
+I4: LD    F10, 16(R2)
+I5: FADD  F12, F2, F8</code></pre>
+
+  <div class="widget" id="l26-w-nonblock">
+    <h3 class="widget-title">Blocking, hit under miss, miss under miss</h3>
+    <p class="widget-intro">One row per instruction of the fragment above. Accesses reach the cache in program order, one per cycle; each lookup takes 1 cycle (blue) and a miss then waits MP cycles for memory (orange, dashed). Grey lines are cycles spent waiting for the cache or for data; the violet lanes show the MSHRs. The insight: a non-blocking cache does not make a miss shorter, it overlaps it, so the additive AMAT bookkeeping stops being exact.</p>
+    <ol class="tasks">
+      <li>Keep the blocking cache, MP = 10. Predict the cycle in which I5 executes.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Cycle 26 = 6 + 2 × 10: every access waits for the one before, so each miss adds its whole penalty. Here, and only here, the additive bookkeeping is exact.</p></details>
+      </li>
+      <li>Switch to hit under miss. Predict which instructions move earlier and where I5 ends up.
+        <details class="answer"><summary>What you should see</summary>
+          <p>I1 and I2 slide under the first miss, in cycles 2 and 3. I3 is a second miss, so it waits until the first one is back and starts in cycle 12; I4 waits behind it. I5 executes in cycle 23: three cycles hidden.</p></details>
+      </li>
+      <li>Switch to miss under miss. Before looking, predict I5's cycle. Then compare the orange bars with those of the blocking cache.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Cycle 15: I3's miss starts in cycle 4, both MSHRs are busy from cycle 5 to 11, and 11 of the 20 miss cycles are hidden. The orange bars are exactly as long as before: each miss still costs MP = 10. The sum 6 + 2 × MP still says 26; the timeline says 15.</p></details>
+      </li>
+      <li>Make I1 the second miss, so that the two misses are back to back, and compare the three modes again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Blocking 26, hit under miss 23, miss under miss 13. Two misses next to each other are the best case for several MSHRs: they overlap almost completely. This overlap of misses is the memory-level parallelism of the notes.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l26-w-nonblock', function (root, ui) {
+    var S = Course.svg;
+    var mode = ui.select('cache', [
+      { value: '0', label: 'blocking cache' },
+      { value: '1', label: 'hit under miss (1 MSHR)' },
+      { value: '2', label: 'miss under miss (2 MSHRs)' }
+    ], null, '0');
+    var sec = ui.select('second miss', [
+      { value: '3', label: 'I3 misses too' },
+      { value: '1', label: 'I1 misses too (back to back)' },
+      { value: '4', label: 'I4 misses too' }
+    ], null, '3');
+    var mp = ui.slider({ label: 'miss penalty MP (cycles)', min: 1, max: 20, step: 1, value: 10 });
+    var roT = ui.readout('I5 executes in cycle'), roSum = ui.readout('the AMAT sum: 6 + 2 × MP'),
+        roHid = ui.readout('miss cycles hidden by overlap'), roM = ui.readout('MSHRs busy at most');
+    var svg = ui.svg(560, 262, { label: 'A timeline of six instructions over the cycles: the cache access of each load, the cycles a miss waits for memory, the cycles an instruction waits for the cache or for its data, and two lanes showing when the miss status holding registers are busy' });
+    ui.legend([
+      { label: 'cache access, 1 cycle', color: 's1', mark: 'square' },
+      { label: 'miss waiting for memory', color: 's2', mark: 'square' },
+      { label: 'MSHR busy', color: 's3', mark: 'square' },
+      { label: 'waiting for the cache or for data', color: 'muted', mark: 'line' },
+      { label: 'no misses: 6 cycles', color: 's6', mark: 'dash' },
+      { label: 'the AMAT sum 6 + 2 × MP', color: 'muted', mark: 'dash' }
+    ]);
+    var DEST = ['F2', 'F4', 'F6', 'F8', 'F10'];
+
+    function sim(m, second, MP) {
+      var rows = [], t = 1, out = [], j;
+      for (j = 0; j < 5; j++) {
+        var miss = (j === 0 || j === second), start = t;
+        if (m > 0 && miss) {
+          var cap = m === 1 ? 1 : 2;
+          for (var guard = 0; guard < 50; guard++) {
+            var busy = out.filter(function (o) { return o.done >= start; });
+            if (busy.length < cap) break;
+            start = Math.min.apply(null, busy.map(function (o) { return o.done; })) + 1;
+          }
+        }
+        var done = miss ? start + MP : start;
+        rows.push({ j: j, miss: miss, ready: j + 1, start: start, done: done });
+        if (miss) out.push({ j: j, start: start, done: done });
+        t = m === 0 ? done + 1 : start + 1;
+      }
+      var opsReady = Math.max(rows[0].done, rows[second].done) + 1;
+      var f = m === 0 ? t : Math.max(t, opsReady);
+      rows.push({ j: 5, miss: false, ready: t, start: f, done: f });          // issues in order, after I4
+      var lanes = [], maxBusy = 0;
+      if (m > 0) out.forEach(function (o) {
+        var lane = 0;
+        while (lanes.some(function (l) { return l.lane === lane && !(o.start >= l.done || o.done <= l.start); })) lane++;
+        lanes.push({ lane: lane, j: o.j, start: o.start, done: o.done });
+      });
+      for (var c = 1; c <= f; c++) {
+        var b = lanes.filter(function (l) { return l.start < c && l.done >= c; }).length;
+        if (b > maxBusy) maxBusy = b;
+      }
+      return { rows: rows, total: f, lanes: lanes, maxBusy: maxBusy };
+    }
+    function state() {
+      var m = +mode.value || 0, second = +sec.value || 3, MP = mp.value;
+      return { m: m, second: second, MP: MP, r: sim(m, second, MP) };
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var x0 = 130, W = 416, T = 6 + 2 * st.MP, s = W / T;
+      function X(c) { return x0 + (c - 1) * s; }
+      for (var c = 1; c <= T; c++) {
+        if (c === 1 || c % 5 === 0) S('text', { x: X(c) + s / 2, y: 18, 'class': 'tx-sm tx-mid tx-muted', text: String(c) }, svg);
+      }
+      S('line', { x1: x0, y1: 26, x2: x0 + W, y2: 26, 'class': 'st-grid' }, svg);
+      S('line', { x1: X(7), y1: 28, x2: X(7), y2: 190, 'class': 'st-s6 dash sw-2' }, svg);      // drawn first: bars and labels paint over it
+      S('line', { x1: x0 + W, y1: 28, x2: x0 + W, y2: 190, 'class': 'st-muted dash' }, svg);
+      st.r.rows.forEach(function (row, i) {
+        var y = 34 + i * 26, name = i < 5 ? 'I' + i + ' LD ' + DEST[i] : 'I5 FADD';
+        S('text', { x: 118, y: y + 17, 'class': 'tx-mono tx-sm tx-end', text: name }, svg);
+        if (row.start > row.ready) S('line', { x1: X(row.ready) + 2, y1: y + 13, x2: X(row.start) - 2, y2: y + 13, 'class': 'st-muted sw-2' }, svg);
+        S('rect', { x: X(row.start), y: y + 4, width: s, height: 18, 'class': 'fw-s1 st-s1' }, svg);
+        if (row.miss) {
+          var w = st.MP * s;
+          S('rect', { x: X(row.start + 1), y: y + 4, width: w, height: 18, 'class': 'fw-s2 st-s2 dash' }, svg);
+          if (w >= 80) S('text', { x: X(row.start + 1) + 6, y: y + 18, 'class': 'tx-sm halo', text: 'MP = ' + st.MP }, svg);
+        }
+      });
+      var yL = 34 + 6 * 26 + 8;
+      [0, 1].forEach(function (lane) {
+        var y = yL + lane * 26;
+        S('text', { x: 118, y: y + 17, 'class': 'tx-mono tx-sm tx-end', text: 'MSHR ' + (lane + 1) }, svg);
+        S('rect', { x: x0, y: y + 4, width: W, height: 18, 'class': 'fi-paper st-muted sw-1' }, svg);
+      });
+      if (st.m === 0) S('text', { x: x0 + 8, y: yL + 17, 'class': 'tx-sm tx-muted', text: 'blocking: no MSHR, the cache waits' }, svg);
+      st.r.lanes.forEach(function (l) {
+        var y = yL + l.lane * 26, w = (l.done - l.start) * s;
+        S('rect', { x: X(l.start + 1), y: y + 4, width: w, height: 18, 'class': 'fw-s3 st-s3' }, svg);
+        if (w >= 30) S('text', { x: X(l.start + 1) + w / 2, y: y + 18, 'class': 'tx-mono tx-sm tx-mid', text: 'I' + l.j }, svg);
+      });
+    }
+    ui.onChange(function () {
+      var st = state(), tot = st.r.total, sum = 6 + 2 * st.MP;
+      roT.set(tot + ' (no misses: 6)');
+      roSum.set(sum + ' cycles');
+      roHid.set((sum - tot) + ' of ' + (2 * st.MP));
+      roM.set(st.m === 0 ? '0: the cache simply waits' : String(st.r.maxBusy));
+      draw(st);
+    });
+  });
+  </script>
+
+  <p>Each orange bar has the same length in every mode: a non-blocking cache does not shorten a miss, it overlaps it with hits and with other misses. That is why the notes say it reduces the <em>effective</em> miss penalty (p. 349). It also breaks the bookkeeping of AMAT: \(MR \times MP\) charges every miss its full penalty, true only of a blocking cache. With overlap the real stall is smaller, and it has to be measured, not added up.</p>
+
+  <div class="pitfall"><p>"A non-blocking cache makes misses faster." No: memory is exactly as slow. The gain needs independent work: an in-order pipeline has it only up to the first use of the missing value, I5 in the widget; an out-of-order core with reservation stations and a reorder buffer (<a href="l11.html">lesson 11</a>, <a href="l17.html">lesson 17</a>) finds much more, and a prefetch (<a href="l25.html">lesson 25</a>) is a miss nobody waits for.</p></div>
+
+  <p>The price (p. 349): tracking several misses is hard, MSHRs cost area and energy, and memory-ordering rules must hold when fills return out of order. The benefit grows with memory latency and with the number of cores: it maximises <mark class="key">memory-level parallelism (MLP)</mark>, the number of misses serviced at once.</p>
+
+  <div class="story" data-year="1981"><p>David Kroft, of Control Data Canada, described a "lockup-free" instruction fetch and prefetch cache at ISCA 1981. It kept accepting requests while misses were outstanding and recorded each in miss information/status holding registers: the MSHRs of the notes.</p></div>
+
+  <p class="memo"><mark class="key">A non-blocking cache does not shorten a miss, it overlaps it: hit under miss lets hits through, miss under miss overlaps misses in several MSHRs.</mark></p>
+</section>
+
+<section id="l26-l2">
+  <h2>A second level: a storeroom downstairs</h2>
+
+  <p>The last piece of Fig. 1 is the latency. Even with every trick so far, an L1 miss that goes to main memory costs "tens to hundreds of CPU cycles" (p. 350). The notes' answer is a <mark class="key">second-level cache</mark>, L2: larger and slower than L1, much faster than DRAM; an L3 may follow, larger still and often shared between cores. The path is CPU → L1 → L2 → L3 → main memory.</p>
+
+  <p>Count before you average, with the notes' Example 16 (p. 351): 5% of the accesses miss in L1, the L2 hits 90% of the accesses that reach it, an L2 hit takes 10 cycles and a trip to main memory 100. Send 1000 accesses through it (Fig. 4).</p>
+
+  <figure class="fig fig--plain" id="l26-fig-funnel">
+    <svg class="dia" viewBox="0 0 560 214" role="img" aria-label="Example 16 with 1000 accesses: all 1000 pay the L1 hit time; 50 miss in L1 and pay 10 cycles each in L2, 500 cycles; 5 of those miss in L2 and pay 100 cycles each in memory, 500 cycles. Per access the misses add 1 cycle, and one L1 miss costs 20 cycles on average.">
+      <path d="M310 32V26H540V32" class="st-muted"/>
+      <text x="540" y="16" class="tx-end tx-sm">10 + 0.1 × 100 = 20 per L1 miss</text>
+      <rect x="20" y="70" width="50" height="36" class="fi-paper sw-2"/>
+      <text x="45" y="93" class="tx-mid">CPU</text>
+      <rect x="150" y="70" width="60" height="36" class="fi-paper sw-2"/>
+      <text x="180" y="93" class="tx-mid">L1</text>
+      <rect x="310" y="70" width="60" height="36" class="fi-paper sw-2"/>
+      <text x="340" y="93" class="tx-mid">L2</text>
+      <rect x="450" y="70" width="90" height="36" class="fi-paper sw-2"/>
+      <text x="495" y="93" class="tx-mid">memory</text>
+      <line x1="70" y1="88" x2="146" y2="88" marker-end="url(#arr)"/>
+      <line x1="210" y1="88" x2="306" y2="88" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="370" y1="88" x2="446" y2="88" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="110" y="58" class="tx-mid tx-sm">1000</text>
+      <text x="260" y="58" class="tx-mid tx-sm">50 misses</text>
+      <text x="410" y="58" class="tx-mid tx-sm">5 misses</text>
+      <text x="180" y="132" class="tx-mid tx-sm">1000 × L1 HT</text>
+      <text x="340" y="132" class="tx-mid tx-sm">50 × 10 = 500</text>
+      <text x="540" y="132" class="tx-end tx-sm">5 × 100 = 500</text>
+      <text x="280" y="170" class="tx-mid tx-sm">per access: L1 HT + 500/1000 + 500/1000</text>
+      <text x="280" y="200" class="tx-mid tx-sm tx-bold">= L1 HT + 1 cycle</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> Example 16 (notes, p. 351) as a count of 1000 accesses. Every access pays the L1 hit time; 50 L1 misses pay the L2 hit time, 500 cycles in all; 5 of them also miss in L2 and pay main memory, another 500. The misses add 1000 cycles over 1000 accesses, one cycle each, and one L1 miss costs 20 cycles on average: that average is the L1 miss penalty.</figcaption>
+  </figure>
+
+  <p>The same count with letters is eq. (79) of the notes, the two-level formula of the example A4 sheet on the course page; <a href="l24.html">lesson 24</a> derives it and defines local and global miss rates.</p>
+
+  <div class="formula" data-label="(79)">
+    \[ \begin{aligned} &amp; \text{AMAT}_{L1,L2} = \text{L1 Hit Time} \\ &amp; + \text{L1 Miss Rate} \times (\text{L2 Hit Time} \\ &amp; + \text{L2 Miss Rate} \times \text{L2 Miss Penalty}) \end{aligned} \]
+    <dl class="legend">
+      <dt>L1 Hit Time</dt><dd>paid by every access</dd>
+      <dt>L1 Miss Rate</dt><dd>the fraction of accesses that miss in L1 and go to L2</dd>
+      <dt>L2 Hit Time</dt><dd>paid by every L1 miss</dd>
+      <dt>L2 Miss Rate</dt><dd>local: L2 misses over the accesses that reach L2; the product L1 Miss Rate × L2 Miss Rate is the global miss rate, here 0.05 × 0.10 = 0.5%</dd>
+      <dt>L2 Miss Penalty</dt><dd>the trip to main memory; the notes write "Main Memory Penalty"</dd>
+    </dl>
+  </div>
+
+  <p>The bracket is the L1 miss penalty: one L2 access always, a trip to memory sometimes. For Example 16 it is 20 cycles, so AMAT = L1 Hit Time + 0.05 × 20 = L1 Hit Time + 1; without the L2 the misses would add 0.05 × 100 = 5. As many L1 misses as before, each costing 20 cycles instead of 100: that is how an L2 reduces the miss penalty.</p>
+
+  <aside class="redpen" data-page="351">
+    <p class="claim">"L1 miss penalty (to L2) = 10 cycles."</p>
+    <p class="fix">The 10 cycles are the L2 hit time. The L1 miss penalty is the whole bracket of eq. (79): \(10 + 0.10 \times 100 = 20\) cycles.</p>
+    <p class="because">The notes' own second line computes \(0.05 \times (10 + 10)\): an L1 miss costs 10 cycles in L2 plus, on average, \(0.10 \times 100 = 10\) for the trips to memory, 20 in all. In the words of the formula sheet the example reads L2 Hit Time = 10, L2 Miss Rate = 1 − 0.90 = 0.10 (local), L2 Miss Penalty = 100 — and "How much is the miss penalty of L1?" expects 20.</p>
+  </aside>
+
+  <div class="pitfall"><p>"An L2 lowers the L1 miss rate." No: L1 misses exactly as often as before. The L2 lowers what each of those misses costs, and how many accesses reach main memory, the global miss rate.</p></div>
+
+  <h3>How the second level is built</h3>
+
+  <p>The notes list four design choices (pp. 350–351). <b>Size</b>: much larger than L1, hundreds of KB to MBs, against capacity misses; the slower hit is acceptable because L2 sits only on the path of L1 misses, not on the processor's critical cycle. <b>Associativity</b>: higher, often 8-way or 16-way, against conflict misses. <b>Shared or private</b>: a private L2 per core reduces contention, a shared L3 helps sharing and coherence. <b>Inclusion</b>, in Fig. 5: an <mark class="key">inclusive</mark> L2 holds everything L1 holds, which simplifies coherence in multiprocessors; an <mark class="key">exclusive</mark> L2 holds only blocks that are not in L1, which maximises the total capacity; a non-inclusive non-exclusive (NINE) hierarchy keeps no strict relation. Hennessy &amp; Patterson add that the second level is almost always write-back: a write-through L2 would pass every store on to memory.</p>
+
+  <figure class="fig fig--plain" id="l26-fig-inclusion">
+    <svg class="dia" viewBox="0 0 560 172" role="img" aria-label="Three inclusion policies drawn as sets of blocks. Inclusive: the L1 set lies inside the L2 set. Exclusive: the two sets are disjoint, so the capacities add up. NINE: the sets overlap with no rule.">
+      <text x="100" y="20" class="tx-mid tx-sm tx-bold">inclusive</text>
+      <text x="280" y="20" class="tx-mid tx-sm tx-bold">exclusive</text>
+      <text x="460" y="20" class="tx-mid tx-sm tx-bold">NINE</text>
+      <rect x="40" y="32" width="120" height="84" class="fi-paper sw-2"/>
+      <text x="52" y="56" class="tx-sm">L2</text>
+      <rect x="84" y="62" width="60" height="42" class="fw-s1 st-s1 sw-2"/>
+      <text x="114" y="88" class="tx-mid tx-sm">L1</text>
+      <rect x="208" y="62" width="50" height="42" class="fw-s1 st-s1 sw-2"/>
+      <text x="233" y="88" class="tx-mid tx-sm">L1</text>
+      <rect x="268" y="32" width="84" height="84" class="fi-paper sw-2"/>
+      <text x="310" y="78" class="tx-mid tx-sm">L2</text>
+      <rect x="420" y="32" width="110" height="84" class="fi-paper sw-2"/>
+      <text x="518" y="56" class="tx-end tx-sm">L2</text>
+      <rect x="376" y="62" width="70" height="42" class="fw-s1 st-s1 sw-2"/>
+      <text x="398" y="88" class="tx-mid tx-sm">L1</text>
+      <text x="100" y="140" class="tx-mid tx-sm">L2 holds all of L1</text>
+      <text x="100" y="160" class="tx-mid tx-sm tx-muted">simpler coherence</text>
+      <text x="280" y="140" class="tx-mid tx-sm">no block in both</text>
+      <text x="280" y="160" class="tx-mid tx-sm tx-muted">capacity L1 + L2</text>
+      <text x="460" y="140" class="tx-mid tx-sm">no strict rule</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> The three inclusion policies of the notes (p. 351), with each cache drawn as the set of blocks it holds. Inclusive: L1 lies inside L2, so a block that is not in L2 is in no cache of the core, which simplifies coherence. Exclusive: the sets are disjoint, so the two capacities add up. NINE: they may overlap, with no rule either way.</figcaption>
+  </figure>
+
+  <p>The price (p. 351): every L1 miss pays the L2 lookup before it can go to memory, and the extra level costs area, power and complexity. The gain: a much lower average miss penalty and less demand on memory bandwidth; the notes (p. 352) call multi-level caches latency buffers.</p>
+
+  <p class="memo"><mark class="key">An L2 does not touch the L1 miss rate: it turns the L1 miss penalty into L2 Hit Time + L2 Miss Rate × L2 Miss Penalty.</mark></p>
+</section>
+
+<section id="l26-key">
+  <h2>The answer key: three terms, fourteen techniques</h2>
+
+  <p>Sections 6.9.1 and 6.9.2 of the notes hold fourteen named techniques, and one question sorts them: what does the technique change? How many misses happen: miss rate. What a miss costs once it has happened: miss penalty. What every access pays, even a hit: hit time. The table is the answer key for "which of these reduce the miss penalty?" quizzes.</p>
+
+  <figure class="tbl-fig wide" id="l26-tbl-key">
+    <figcaption>Every technique of the notes' §6.9.1–6.9.2, with the term of AMAT it lowers and its main price, plus the hit-time techniques of §6.9.3.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Technique (notes §)</th><th>Term it lowers</th><th>How</th><th>Main price</th></tr></thead>
+        <tbody>
+          <tr><th colspan="4" scope="colgroup">Fewer misses: <a href="l25.html">lesson 25</a></th></tr>
+          <tr><td>Larger cache (6.9.1.1)</td><td>miss rate</td><td>fewer capacity misses</td><td>longer hit time, area, power</td></tr>
+          <tr><td>Larger blocks (6.9.1.2)</td><td>miss rate</td><td>fewer compulsory misses</td><td>larger miss penalty; fewer blocks, more conflicts</td></tr>
+          <tr><td>Higher associativity (6.9.1.3)</td><td>miss rate</td><td>fewer conflict misses</td><td>longer hit time, power</td></tr>
+          <tr><td>Victim cache (6.9.1.4)</td><td>miss rate (p. 321: miss penalty)</td><td>keeps the blocks just evicted</td><td>a small fully associative buffer</td></tr>
+          <tr><td>Way prediction, pseudo-associativity (6.9.1.5)</td><td>hit time; miss rate</td><td>guess the way; a second index</td><td>extra cycles on a wrong guess</td></tr>
+          <tr><td>Hardware prefetching (6.9.1.6)</td><td>miss rate</td><td>fetch the next blocks early</td><td>bandwidth; pollution if wrong</td></tr>
+          <tr><td>Software prefetching (6.9.1.7)</td><td>miss rate</td><td>prefetch instructions from the compiler</td><td>extra instructions</td></tr>
+          <tr><td>Compiler optimisations (6.9.1.8)</td><td>miss rate</td><td>better locality: merging, interchange, fusion, blocking</td><td>compiler effort</td></tr>
+          <tr><th colspan="4" scope="colgroup">Cheaper misses: this lesson</th></tr>
+          <tr><td>Read priority over writes (6.9.2.1)</td><td>miss penalty</td><td>a read miss does not wait for writes</td><td>address checks on the write buffer</td></tr>
+          <tr><td>Sub-block placement (6.9.2.2)</td><td>miss penalty</td><td>fetch one sub-block, not the whole block</td><td>valid bits; slightly more misses</td></tr>
+          <tr><td>Early restart, critical word first (6.9.2.3)</td><td>miss penalty</td><td>resume on the requested word</td><td>wrap-around fetch logic</td></tr>
+          <tr><td>Non-blocking caches (6.9.2.4)</td><td>effective miss penalty</td><td>overlap misses with hits and misses</td><td>MSHRs, complexity, ordering</td></tr>
+          <tr><td>Second-level caches (6.9.2.5)</td><td>miss penalty of L1</td><td>most L1 misses are served by L2</td><td>L2 lookup on every L1 miss; area</td></tr>
+          <tr><td>Merging write buffer (6.9.2.6)</td><td>miss penalty</td><td>fewer write transactions</td><td>masks and matching logic</td></tr>
+          <tr><th colspan="4" scope="colgroup">Faster hits: lessons <a href="l27.html">27</a> and <a href="l28.html">28</a></th></tr>
+          <tr><td>Small and simple L1 (6.9.3.1)</td><td>hit time</td><td>short wires, fast lookup</td><td>more misses</td></tr>
+          <tr><td>Avoiding address translation during indexing (6.9.3.2)</td><td>hit time</td><td>lookup starts before the TLB answers</td><td>size of one way limited by the page size</td></tr>
+          <tr><td>Pipelined writes (6.9.3.3)</td><td>hit time</td><td>overlap successive writes</td><td>pipeline control</td></tr>
+          <tr><td>Small sub-blocks for write-through caches (6.9.3.4)</td><td>hit time</td><td>a write updates and sends only its sub-block</td><td>valid and dirty bits per sub-block</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two rows need care. The victim cache sits in the notes' miss-rate section (p. 328) but in the miss-penalty list of p. 321: a hit there is a main-cache miss that costs a few cycles, so at the exam name the mechanism and both effects. Way prediction only speeds up finding a hit; pseudo-associativity, beside it in the notes, removes conflict misses.</p>
+
+  <p>Back to the quiz of the hook. Answer 1, higher associativity, removes conflict misses: miss rate. Answer 2 lets the cache index while the TLB translates, which shortens every hit: hit time, the subject of <a href="l27.html">lesson 27</a>. Answers 3 and 4 are sections 5 and 2: miss penalty. The correct answers are 3 and 4.</p>
+
+  <aside class="redpen" data-page="504">
+    <p class="claim">"Answer 2: Avoiding address translation during indexing... - Correct." … "Answer 4: Giving priority to read misses over writes... - Incorrect. While prioritizing read misses can improve overall performance by reducing stalls for read operations, it does not reduce the miss penalty itself."</p>
+    <p class="fix">Both verdicts are backwards: the correct answers are 3 and 4. Avoiding address translation during indexing reduces the hit time; giving priority to read misses over writes reduces the miss penalty.</p>
+    <p class="because">The notes themselves file "Avoiding address translation delays" under Reduce Hit Time and "Prioritizing reads" under Reduce Miss Penalty (pp. 321–322), and §6.9.2.1 is a miss-penalty section. The mechanism agrees: in Fig. 2 the read miss ends after one block transfer instead of two, so the time to service it, the solution's own definition of miss penalty, is shorter.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">Sort a cache technique by what it changes: how many misses (miss rate), what one miss costs (miss penalty), or what every hit costs (hit time).</mark></p>
+</section>
+
+<section id="l26-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <p>The questions follow the forms of the papers: an open question with eight sub-points as in June 2026, quizzes with single and multiple answers and a true/false, and exercises answered with every intermediate number. The model answers are computed here; there are no official solutions.</p>
+
+  <div class="exam" data-kind="open" data-points="8" id="l26-exam-theory">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used to reduce the cache miss penalty: 1. Giving priority to read misses over writes; 2. Sub-block placement; 3. Early restart; 4. Critical word first; 5. Non-blocking caches (hit under miss, miss under miss); 6. Second-level caches; 7. Inclusive and exclusive multilevel caches; 8. Merging write buffer. (Five lines each.)</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> A read miss soon stalls the processor, because the following instructions need the data; a write can wait in the write buffer. So when a read miss competes with pending writes, the read is served first. In a write-through cache the read miss first compares its address with those in the write buffer: on a match it takes the data from the buffer, because memory still holds the old value (a RAW hazard through memory); with no match it goes to memory ahead of the buffered writes. In a write-back cache a dirty victim is copied into the write buffer, the new block is fetched at once and the victim is written back afterwards. Benefit: the read-miss penalty no longer includes writes nobody waits for. Cost: comparators on the buffer; a full buffer still stalls.</p>
+        <p><b>2.</b> Each block is divided into sub-blocks, each with its own valid bit, under a single tag. On a miss only the requested sub-block is fetched; the others stay invalid until needed, and a hit requires both the tag match and the sub-block's valid bit. Benefit: the tag storage of a large block with the transfer time of a small one, so a lower miss penalty and less bandwidth, useful with large blocks or weak spatial locality. Cost: extra valid bits and control; less spatial locality exploited, so neighbouring words may miss later.</p>
+        <p><b>3.</b> The block is fetched in normal order, but the requested word is sent to the processor as soon as it arrives and the processor resumes while the rest of the block is filled in the background. With a latency L before the first word, one word per cycle, n words per block and the requested word at position k (from 0), the stall falls from L + n to L + k + 1 cycles. Benefit: no change to the memory; the gain is larger when the word is early in the block.</p>
+        <p><b>4.</b> Critical word first (wrapped fetch) asks the memory for the requested word first and then for the rest of the block, wrapping around (W2, W3, W0, W1). The stall is L + 1 cycles whatever the position of the word. Benefit: the largest gain when the word is late in the block. Cost: wrap-around fetch logic and a memory that supports it. Both 3 and 4 pay mainly with large blocks, where the transfer is a large part of the penalty, and both gain less when the processor soon needs another word of the block.</p>
+        <p><b>5.</b> A blocking cache stalls the processor on a miss even if the next accesses would hit. A non-blocking (lockup-free) cache keeps serving accesses while misses are outstanding, each tracked in a Miss Status Holding Register (MSHR). Hit under miss: hits proceed while one miss is pending. Miss under miss: several misses are serviced in parallel (memory-level parallelism), with several MSHRs and a memory that accepts several requests. Benefit: the miss penalty is overlapped with useful work and with other misses, so the effective miss penalty drops; each miss itself is not shorter. It needs a processor with independent work, such as an out-of-order core. Cost: MSHRs, complexity, memory ordering.</p>
+        <p><b>6.</b> An L2, larger and slower than L1 but much faster than main memory, catches most L1 misses: AMAT = L1 Hit Time + L1 Miss Rate × (L2 Hit Time + L2 Miss Rate × L2 Miss Penalty), with the local L2 miss rate; the bracket is the new L1 miss penalty. Example: 0.05 × (10 + 0.10 × 100) adds 1 cycle per access instead of 0.05 × 100 = 5. Design: much larger (hundreds of KB to MBs), more associative (8 to 16 ways), usually write-back, its slower hit time acceptable because it is not on the processor's critical cycle. Cost: every L1 miss pays the L2 lookup; area and power.</p>
+        <p><b>7.</b> Inclusive: L2 holds a copy of every block in L1, so a coherence check in a multiprocessor can rely on L2 alone; the price is duplicated capacity. Exclusive: a block is either in L1 or in L2, never in both, so the total capacity is the sum of the two. Non-inclusive non-exclusive (NINE): no strict relation. In multicores a private L2 per core reduces contention and a shared L3 helps sharing and coherence.</p>
+        <p><b>8.</b> In a write-through cache every store goes to memory through the write buffer; without merging, stores to adjacent addresses each become a memory transaction. A merging write buffer keeps block-sized entries with the aligned block address, a data field and a byte-valid mask; a store to a block already in the buffer is written into its entry instead of taking a new one. Benefit: fewer and larger transactions, less bus contention, so read misses wait less for the bus and the buffer fills less often. Cost: matching logic and masks; a partial entry needs a byte-enabled write or a read-merge-write; a full buffer still stalls.</p>
+      </div>
+      <div class="exam-note"><p>The form is the June 2026 question: eight sub-points, about five lines each. Give three things in each: the mechanism, the term of AMAT it attacks, and its cost. Sub-points 3 and 4 are best answered with the three penalties; sub-point 6 with the formula from the A4 sheet; sub-point 5 with the sentence "it overlaps the miss, it does not shorten it".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l26-exam-quiz">
+    <div class="exam-q" lang="en">
+      <p>(MULTIPLE ANSWERS) Which of the following cache improvements are effective in reducing the miss penalty?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Answer 1: Adopting higher associativity in designing the cache to reducing the impact of collisions when the correct block must be loaded in the cache. <span class="fb">Higher associativity removes conflict misses: it lowers the miss rate. A miss that still happens costs the same.</span></li>
+      <li>Answer 2: Avoiding address translation during indexing of the cache to minimize the management time of miss penalties. <span class="fb">This takes the TLB off the path of every hit: it lowers the hit time. The notes' solution ticks it; it is wrong.</span></li>
+      <li data-correct>Answer 3: Combining a small and fast level-1 cache with a slower but larger level-2 cache to capture many accesses that would go to the main memory. <span class="fb">An L1 miss is served by L2 most of the time: the L1 miss penalty becomes L2 Hit Time + L2 Miss Rate × L2 Miss Penalty.</span></li>
+      <li data-correct>Answer 4: Giving priority to read misses over writes, exploiting techniques to serve the reads before the writes have been completed. <span class="fb">The read miss no longer waits for buffered writes or for a dirty write-back: each read miss is serviced sooner. The notes' solution rejects it; it is correct.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 3 and 4. Answer 1 reduces the miss rate (conflict misses); Answer 2 reduces the hit time; Answer 3 replaces most trips to main memory with an L2 access; Answer 4 lets a read miss start its fetch without waiting for pending writes.</p></div>
+      <div class="exam-note"><p>This is the quiz of the 8 January 2026 paper as the notes transcribe it (pp. 503–504), with the options verbatim; the notes' worked solution picks 2 and 3 (red pen in section 6). If the paper asks you to motivate the answer, one line per option with the term of AMAT is enough.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l26-exam-cwf">
+    <div class="exam-q" lang="en">
+      <p>(SINGLE ANSWER) A cache has blocks of 8 words. On a miss, main memory needs an access latency of 30 clock cycles before the transfer starts, then transfers one word per clock cycle. The CPU requests word 5 (words are numbered from 0). How many stall cycles does the CPU pay with (i) a full-block fetch, (ii) early restart, (iii) critical word first?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Answer 1: 38, 36, 31 <span class="fb">30 + 8 = 38; word 5 is the sixth to arrive, 30 + 5 + 1 = 36; sent first, 30 + 1 = 31.</span></li>
+      <li>Answer 2: 37, 35, 30 <span class="fb">This counts the first word as arriving at the end of the latency, which the text excludes: the transfer starts after the 30 cycles.</span></li>
+      <li>Answer 3: 38, 35, 31 <span class="fb">Early restart waits for words 0 to 5, six words, not five: 30 + 6 = 36.</span></li>
+      <li>Answer 4: 38, 36, 36 <span class="fb">Critical word first sends word 5 first, so its position no longer matters.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 1. Full block: L + n = 30 + 8 = 38. Early restart: L + k + 1 = 30 + 5 + 1 = 36. Critical word first: L + 1 = 31.</p></div>
+      <div class="exam-note"><p>The whole question is in the off-by-one. Read how the text defines the latency, write \(t(p) = L + p + 1\) for the word sent \(p\)-th, and the three numbers follow.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l26-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>(True/False) In a non-blocking cache with miss-under-miss support, each individual miss is serviced in fewer clock cycles than in a blocking cache.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Main memory is just as slow: every miss still costs the full miss penalty. What changes is that the misses overlap each other and the hits.</span></li>
+      <li data-correct>False <span class="fb">Right: the cache overlaps misses, it does not shorten them. The effective penalty seen by the processor drops; the penalty of each miss does not.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. A non-blocking cache keeps serving hits and starts further misses while one is outstanding (tracked in MSHRs). Each miss takes as long as before; the processor simply does other work, so the stall it sees, the effective miss penalty, is smaller.</p></div>
+      <div class="exam-note"><p>The distinction between the miss penalty and the effective miss penalty is the point. The widget of section 4 shows it: the orange bars keep their length in every mode.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="50" data-tol="0.5" data-unit="clock cycles" id="l26-exam-er">
+    <div class="exam-q" lang="en">
+      <p>A cache has blocks of 16 words. On a miss, main memory needs an access latency of 40 clock cycles before the transfer starts, then transfers one word per clock cycle, in order from word 0. With early restart, how many clock cycles does the CPU stall when it requests word 9 (words numbered from 0)?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ L + k + 1 = 40 + 9 + 1 = 50 \text{ clock cycles} \]
+        <p>For comparison: full-block fetch 40 + 16 = 56, critical word first 40 + 1 = 41.</p>
+      </div>
+      <div class="exam-note"><p>Early restart does not change the order: words 0 to 9 must arrive, ten transfer cycles after the 40 of latency.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l26-exam-l2">
+    <div class="exam-q" lang="en">
+      <p>Let us consider a computer with L1 and L2 caches with the following parameters: Hit Time L1 = 1 clock cycle; Hit Rate L1 = 95%; Hit Time L2 = 10 clock cycles; Hit Rate L2 = 90%; Miss Penalty L2 = 100 clock cycles.</p>
+      <p>1. How much is the miss penalty of L1? 2. How much is the AMAT? 3. How much is the Global Miss Rate for the Last Level Cache? 4. How much would the AMAT be without L2, if the L1 misses were served by main memory in 100 clock cycles? 5. How much is the speed-up of the average memory access due to L2?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Miss Rate L1 = 1 − 0.95 = 0.05; Miss Rate L2 (local) = 1 − 0.90 = 0.10.</p>
+        <p>1. The L1 miss penalty, in clock cycles:</p>
+        \[ MP_{L1} = 10 + 0.10 \times 100 = 20 \]
+        <p>2. The AMAT, in clock cycles:</p>
+        \[ \text{AMAT} = 1 + 0.05 \times 20 = 2 \]
+        <p>3. The global miss rate of L2, the last-level cache:</p>
+        \[ 0.05 \times 0.10 = 0.005 = 0.5\% \]
+        <p>4. Without L2, in clock cycles:</p>
+        \[ \text{AMAT} = 1 + 0.05 \times 100 = 6 \]
+        <p>5. Speed-up of the average access: 6 / 2 = 3.</p>
+      </div>
+      <div class="exam-note"><p>These are the notes' Example 16 (p. 351) with an L1 hit time of 1 cycle, written in the form of the January 2026 quiz. The trap is item 1: the notes call the 10 cycles the L1 miss penalty, but they are the L2 hit time (red pen in section 5). Turn every hit rate into a miss rate before you substitute.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l26-exam-merge">
+    <div class="exam-q" lang="en">
+      <p>A write-through cache has a merging write buffer of 4 entries; each entry holds a 32-byte block with a byte-valid mask. With R1 = 0x1000 and R2 = 0x2000, the CPU executes the following stores (8 bytes each) before the bus becomes free:</p>
+<pre><code>SD  F2, 0(R1)
+SD  F4, 8(R1)
+SD  F6, 0(R2)
+SD  F8, 16(R1)
+SD  F10, 24(R1)
+SD  F12, 8(R2)</code></pre>
+      <p>Complete a table with the columns Store | Address | Block base | Action | Valid bytes of the entry after the store. How many write transactions reach memory with and without merging, and of which kind?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th>Store</th><th>Address</th><th>Block base</th><th>Action</th><th>Valid bytes after</th></tr></thead>
+            <tbody>
+              <tr><td>SD F2, 0(R1)</td><td class="num">0x1000</td><td class="num">0x1000</td><td>allocate E0</td><td>E0: 0–7</td></tr>
+              <tr><td>SD F4, 8(R1)</td><td class="num">0x1008</td><td class="num">0x1000</td><td>merge into E0</td><td>E0: 0–15</td></tr>
+              <tr><td>SD F6, 0(R2)</td><td class="num">0x2000</td><td class="num">0x2000</td><td>allocate E1</td><td>E1: 0–7</td></tr>
+              <tr><td>SD F8, 16(R1)</td><td class="num">0x1010</td><td class="num">0x1000</td><td>merge into E0</td><td>E0: 0–23</td></tr>
+              <tr><td>SD F10, 24(R1)</td><td class="num">0x1018</td><td class="num">0x1000</td><td>merge into E0</td><td>E0: 0–31 (full)</td></tr>
+              <tr><td>SD F12, 8(R2)</td><td class="num">0x2008</td><td class="num">0x2000</td><td>merge into E1</td><td>E1: 0–15 (partial)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>With merging: 2 entries and 2 transactions, one full 32-byte write for E0 and one partial 16-byte write for E1 (with byte enables, or a read-merge-write if the bus has none). Without merging: 6 transactions, one per store; the 4-entry buffer is full after the fourth store, so the fifth and the sixth store stall the CPU until an entry has been written to memory.</p>
+      </div>
+      <div class="exam-note"><p>The block base is the address with its 5 low bits cleared (32-byte blocks). Three points to get right: the alignment, the merge into an existing entry even when another block came in between (the third store), and the difference between a full and a partial flush. The widget of section 2 replays this stream ("two blocks, interleaved").</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l26-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A write-through cache with a write buffer. A load misses while three stores wait in the buffer, none of them to the load's block. What does read priority do?</p>
+    <ul class="options">
+      <li data-correct>The load's block is fetched first; the three stores go to memory afterwards <span class="fb">The load has a consumer waiting, the stores do not, and the address check found no match: nothing forces the read to wait.</span></li>
+      <li>The buffer drains first, then the load's block is fetched <span class="fb">That is the order without read priority: the read-miss penalty grows by three writes.</span></li>
+      <li>The load reads its value from the write buffer <span class="fb">Only when the buffer holds the load's address; here none matches.</span></li>
+      <li>The three stores are dropped, since the load is more urgent <span class="fb">Never: the stores are kept and written later. Read priority changes the order, not the work.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the three-instruction example of section 2 (SD to 512, LD of 1024, LD of 512), why must the controller compare the read address with the write buffer before sending the read to memory?</p>
+    <ul class="options">
+      <li data-correct>The newest value of M[512] may still be in the buffer, while memory holds the old one <span class="fb">The RAW hazard through memory: the store wrote 512, and the later load of 512 must see that value.</span></li>
+      <li>A write-through cache has dirty blocks to write back first <span class="fb">A write-through cache has no dirty blocks: every store already goes to memory.</span></li>
+      <li>To find out whether the read is a hit <span class="fb">The cache lookup already said it is a miss; the buffer check is about stale data in memory.</span></li>
+      <li>Reads and writes may not use the bus in the same cycle <span class="fb">True of a single bus, but it is not why the addresses are compared.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A block of n words, the processor wants word k. For which k do early restart and critical word first give the same stall?</p>
+    <ul class="options">
+      <li data-correct>k = 0, the first word of the block <span class="fb">Both deliver W0 first: L + 0 + 1 = L + 1.</span></li>
+      <li>k = n − 1, the last word <span class="fb">Then early restart waits for the whole block, L + n, while critical word first still pays L + 1.</span></li>
+      <li>Any k, as long as the latency L is large <span class="fb">The difference is n − k − 1 cycles whatever L is; a large L only makes it relatively small.</span></li>
+      <li>No k: critical word first is always faster <span class="fb">Try W0 in the widget of section 3: the two rows coincide.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which statements about non-blocking caches are true? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>A miss takes as long as in a blocking cache <span class="fb">Memory is not faster; the misses overlap with hits and with each other.</span></li>
+      <li data-correct>Hit under miss needs one MSHR, miss under miss several <span class="fb">One register per outstanding miss.</span></li>
+      <li>They lower the miss rate <span class="fb">The same accesses miss; only the stall the processor sees is reduced.</span></li>
+      <li data-correct>They pay off only if the processor has independent work, as an out-of-order core has <span class="fb">With nothing independent to do the processor waits for the miss anyway; an in-order pipeline stops at the first instruction that needs the missing value.</span></li>
+      <li>With them, the additive AMAT gives the exact stall time <span class="fb">The formula charges every miss its full penalty; overlapped misses cost less, so the sum overestimates.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">An L2 has a local miss rate of 50%. What does that tell you?</p>
+    <ul class="options">
+      <li data-correct>Half of the L1 misses still go to memory; the other half now cost only the L2 hit time <span class="fb">Local means L2 misses over the accesses that reach L2. Halving the trips to memory is a large gain when memory costs 100 cycles.</span></li>
+      <li>The L2 is useless: it misses as often as it hits <span class="fb">It removes half of the trips to memory, and those are the expensive accesses.</span></li>
+      <li>Half of all accesses go to memory <span class="fb">That would be a global miss rate of 50%; the global rate is the L1 miss rate times 0.5.</span></li>
+      <li>The L1 miss rate has halved <span class="fb">L1 misses exactly as before; L2 changes what those misses cost.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Which inclusion policy gives the largest total capacity with the same L1 and L2?</p>
+    <ul class="options">
+      <li data-correct>Exclusive <span class="fb">No block is stored twice, so L1 and L2 together hold as many different blocks as their sizes allow.</span></li>
+      <li>Inclusive <span class="fb">Every L1 block is duplicated in L2, so the total is L2's capacity alone. Its benefit is simpler coherence.</span></li>
+      <li>Non-inclusive non-exclusive (NINE) <span class="fb">Some blocks may be in both levels; the capacity lies between the other two cases.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A merging write buffer with 32-byte entries. The CPU stores 8-byte values at 0x1000, 0x1008, 0x1010, 0x1018 and 0x1020 before the buffer is flushed. How many write transactions reach memory?</p>
+    <ul class="options">
+      <li data-correct>2 <span class="fb">The first four fill the block 0x1000–0x101F: one full write. 0x1020 starts the next block: one partial write.</span></li>
+      <li>5 <span class="fb">That is a buffer without merging.</span></li>
+      <li>1 <span class="fb">0x1020 lies outside the block 0x1000–0x101F.</span></li>
+      <li>4 <span class="fb">Merging works per block: all four stores of the first block become one transaction.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l26-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>The six techniques of this lesson do not reduce the number of misses: they make each miss cheaper, or hide it from the processor.</li>
+    <li>Read misses go first: in write-through they bypass the buffered writes after an address check that guards against the RAW hazard through memory; in write-back a dirty victim waits in the write buffer while the new block is fetched.</li>
+    <li>Sub-block placement fetches one sub-block under one tag; early restart resumes on the requested word, critical word first fetches it first: \(L + n\), \(L + k + 1\), \(L + 1\), worth it with large blocks.</li>
+    <li>A non-blocking cache does not shorten a miss, it overlaps it: hits go on under one miss, several misses run in parallel in several MSHRs, and the additive AMAT is no longer exact.</li>
+    <li>An L2 turns the L1 miss penalty into L2 Hit Time + L2 Miss Rate × L2 Miss Penalty; it is large, highly associative, and inclusive, exclusive or NINE.</li>
+    <li>A merging write buffer folds the stores to one block into one transaction, so reads wait less for the bus.</li>
+    <li>Sort any technique by what it changes: how many misses, what a miss costs, or what every hit costs.</li>
+  </ul>
+
+  <aside class="cheat" id="l26-cheat">
+    <dl>
+      <dt>Two-level AMAT (A4 sheet)</dt><dd>AMAT = L1 Hit Time + L1 Miss Rate × (L2 Hit Time + L2 Miss Rate × L2 Miss Penalty), L2 Miss Rate local</dd>
+      <dt>L1 miss penalty with an L2</dt><dd>\(MP_{L1} = HT_{L2} + MR_{L2} \times MP_{L2}\): L2 hit time, local L2 miss rate, L2 miss penalty (the trip to memory)</dd>
+      <dt>Global miss rate of L2</dt><dd>\(MR_{L1} \times MR_{L2}\): the fraction of all accesses that reach memory</dd>
+      <dt>Whole-block miss</dt><dd>\(MP = L + n\): \(L\) cycles of latency, then \(n\) words, one per cycle</dd>
+      <dt>Early restart</dt><dd>\(MP = L + k + 1\), word \(k\) counted from 0</dd>
+      <dt>Critical word first</dt><dd>\(MP = L + 1\)</dd>
+      <dt>Read miss, write-through</dt><dd>compare with the write buffer: match → data from the buffer; no match → read before the buffered writes</dd>
+      <dt>Read miss, dirty victim</dt><dd>victim → write buffer; fetch the new block first; write the victim back afterwards</dd>
+      <dt>Merging write buffer</dt><dd>one entry and one transaction per block; full mask → full-block write, partial → byte-enabled write or read-merge-write</dd>
+      <dt>Non-blocking cache</dt><dd>hit under miss: one outstanding miss; miss under miss: one MSHR per outstanding miss</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l26-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Q9wD8I3Sehc" target="_blank" rel="noopener">Miss Under Miss Support in Caches</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech HPCA (Udacity)</span><span class="res-dur">a few minutes</span>
+      <p class="res-why">Watch it next to the widget of section 4: a short clip with a drawn example of a cache that keeps accepting requests while misses are pending.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.akkadia.org/drepper/cpumemory.pdf" target="_blank" rel="noopener">What Every Programmer Should Know About Memory</a>
+      <span class="res-by">Ulrich Drepper, 2007</span><span class="res-dur">section 3.5.2</span>
+      <p class="res-why">Section 3.5.2, "Critical Word Load", measures on a real machine the effect of where the requested word sits in its cache line: the second task of the widget in section 3, with data.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.auckland.ac.nz/courses/compsci703s1c/resources/Kroft.pdf" target="_blank" rel="noopener">Lockup-Free Instruction Fetch/Prefetch Cache Organization</a>
+      <span class="res-by">David Kroft, ISCA 1981</span><span class="res-dur">7 pages</span>
+      <p class="res-why">The paper that introduced the non-blocking cache and the miss status registers of section 4. Look at how a returning block is matched to the requests waiting for it.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://ftp.mirrorservice.org/sites/www.bitsavers.org/pdf/dec/tech_reports/WRL-91-12.pdf" target="_blank" rel="noopener">Cache Write Policies and Performance</a>
+      <span class="res-by">Norman P. Jouppi, DEC WRL report 91/12</span><span class="res-dur">48 pages</span>
+      <p class="res-why">For the write buffer of section 2: write-through against write-back, and a small write cache that gathers writes behind a write-through L1, measured.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Answer 2 of the quiz belongs to the hit time: avoiding address translation during indexing. But what is being translated, and why would a translation slow down every hit? The next lesson builds virtual memory in one go, then shows how a cache starts its lookup before the TLB answers.</p>
+</aside>
+
+</main>
+</body>
+</html>

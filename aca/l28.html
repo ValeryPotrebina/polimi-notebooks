@@ -1,0 +1,1228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hit time is the critical path: small L1, pipelined writes, and the nineteen-technique scorecard · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+  /* page-local: the scorecard board and the quiz block that the scorecard widget builds in its stage (tokens only) */
+  .l28-board, .l28-quiz { padding: 0.8rem 1rem 0.6rem; }
+  .l28-legend { margin: 0 0 0.5rem; font-family: var(--f-display); font-size: var(--t-xs); color: var(--ink-2); line-height: 1.45; }
+  .l28-tbl { width: auto; min-width: 100%; }
+  .l28-tbl th, .l28-tbl td { padding: 0.24rem 0.45rem; vertical-align: middle; line-height: 1.3; }
+  .l28-tbl thead th.l28-m { text-align: center; }
+  .l28-tbl td.l28-m { text-align: center; font-family: var(--f-mono); white-space: nowrap; min-width: 2.6rem; }
+  .l28-tbl tbody tr { cursor: pointer; }
+  .l28-tbl tbody tr:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+  .l28-pg { color: var(--ink-3); font-size: var(--t-xs); white-space: nowrap; }
+  .l28-st { font-size: var(--t-xs); white-space: nowrap; min-width: 3.2rem; }
+  .l28-ok { background: var(--good-bg); box-shadow: inset 0 0 0 1.5px var(--good); }
+  .l28-no { background: var(--bad-bg); box-shadow: inset 0 0 0 1.5px var(--bad); }
+  .l28-quiz p { margin: 0 0 0.6rem; font-family: var(--f-display); font-size: var(--t-sm); line-height: 1.5; }
+  .l28-quiz ol { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.4rem; font-family: var(--f-display); font-size: var(--t-sm); line-height: 1.45; }
+  .l28-quiz li { padding: 0.35rem 0.6rem; border: 1px solid var(--line); border-radius: 6px; }
+  .l28-why { display: block; color: var(--ink-2); font-size: var(--t-xs); margin-top: 0.15rem; }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l28">
+
+<header class="lesson-head">
+  <h1>Hit time is the critical path: small L1, pipelined writes, and the nineteen-technique scorecard</h1>
+  <p class="lede">After this lesson you will explain why the hit time bounds the clock, decide with one inequality when a small, simple L1 beats a bigger one, explain why a write hit is slower than a read hit and how pipelined writes and small sub-blocks hide the difference, and place every cache optimisation of the chapter on one scorecard.</p>
+</header>
+
+<div class="hook" data-label="A design puzzle">
+  <p>Generation after generation, processors have kept their first-level caches at a few tens of kilobytes, while the second and third levels grew by orders of magnitude (Hennessy &amp; Patterson). The notes put L1 caches at "small (16-64 KB) and fast" (p. 356). Yet a bigger cache misses less. Why keep small the one cache that every access goes through?</p>
+  <p>The notes' Example 18 puts the choice in two lines: a 32 KB 8-way L1 that "might take 2-3 cycles to access", or a 16 KB direct-mapped L1 that "could be accessed in 1 cycle" and misses more often. Pick one now and write your choice down. The right answer depends on a cache that the example does not mention.</p>
+</div>
+
+<section id="l28-path">
+  <h2>The one term that every access pays</h2>
+
+  <aside class="margin-note">Check it by hand: 1 + 0.10 × 20 = 3, the same as 2 + 0.05 × 20.</aside>
+
+  <p><a href="l22.html">Lesson 22</a> showed that every access pays the hit time, a miss included: the cache must be looked up before it knows that it missed (p. 303). Put a number on it with the L1 of the notes' Example 16 from <a href="l26.html">lesson 26</a>: 5 % misses, each costing 20 cycles on average behind the L2. With a 1-cycle hit, AMAT = 1 + 0.05 × 20 = 2 cycles. Add one cycle to the hit and AMAT becomes 3. To lose as much through the misses, the miss rate would have to double, to 10 %.</p>
+
+  <p>Now the hardware. In the five-stage pipeline of your first course, IF reads the instruction cache on every cycle and ME reads the data cache for every load and store, each in one clock cycle. The L1 sits on the <mark class="key">critical path</mark>: the slowest stage sets the clock period \(T_{CLK}\). Suppose every stage needs 1 ns except the access to the L1 data cache, which needs 1.25 ns, and take the load-use pair of <a href="l02.html">lesson 2</a>:</p>
+
+<pre><code>I0   LD   R2, 0(R1)
+I1   ADD  R3, R2, R4     # needs R2</code></pre>
+
+  <figure class="fig fig--pair fig--plain" id="l28-fig-clock">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 190" role="img" aria-label="Stretch the clock: the load goes IF, ID, EX, ME, WB in cycles 1 to 5; the ADD that needs R2 stalls once, in cycle 4, and executes in cycle 5 with the value forwarded from ME; every cycle lasts 1.25 ns, so the clock is 800 MHz">
+        <text x="90" y="20" class="tx-sm tx-mid tx-muted">1</text>
+        <text x="126" y="20" class="tx-sm tx-mid tx-muted">2</text>
+        <text x="162" y="20" class="tx-sm tx-mid tx-muted">3</text>
+        <text x="198" y="20" class="tx-sm tx-mid tx-muted">4</text>
+        <text x="234" y="20" class="tx-sm tx-mid tx-muted">5</text>
+        <text x="270" y="20" class="tx-sm tx-mid tx-muted">6</text>
+        <text x="62" y="48" class="tx-mono tx-end">LD</text>
+        <text x="62" y="82" class="tx-mono tx-end">ADD</text>
+        <rect x="73" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="109" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="145" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="181" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="217" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <text x="90" y="47" class="tx-mono tx-sm tx-mid">IF</text>
+        <text x="126" y="47" class="tx-mono tx-sm tx-mid">ID</text>
+        <text x="162" y="47" class="tx-mono tx-sm tx-mid">EX</text>
+        <text x="198" y="47" class="tx-mono tx-sm tx-mid">ME</text>
+        <text x="234" y="47" class="tx-mono tx-sm tx-mid">WB</text>
+        <rect x="109" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="145" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="181" y="64" width="34" height="26" rx="3" class="fw-s2 st-s2 dash"/>
+        <rect x="217" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="253" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <text x="126" y="81" class="tx-mono tx-sm tx-mid">IF</text>
+        <text x="162" y="81" class="tx-mono tx-sm tx-mid">ID</text>
+        <text x="234" y="81" class="tx-mono tx-sm tx-mid">EX</text>
+        <text x="270" y="81" class="tx-mono tx-sm tx-mid">ME</text>
+        <line x1="202" y1="52" x2="225" y2="66" class="st-s5 sw-3" marker-end="url(#arr-s5)"/>
+        <path d="M73 104 V116 M109 104 V116 M73 110 H109" class="st-ink"/>
+        <text x="118" y="114" class="tx-sm">one cycle = 1.25 ns</text>
+        <text x="73" y="140" class="tx-sm tx-bold">clock: 800 MHz</text>
+        <text x="73" y="176" class="tx-hand">every cycle is longer</text>
+      </svg>
+      <p class="fig-label">Stretch the clock</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 190" role="img" aria-label="Add a stage: the access is split into M1 and M2, so the load goes IF, ID, EX, M1, M2, WB; the ADD stalls twice, in cycles 4 and 5, and executes in cycle 6 with the value forwarded from M2; every cycle lasts 1 ns, the clock stays at 1 GHz">
+        <text x="90" y="20" class="tx-sm tx-mid tx-muted">1</text>
+        <text x="126" y="20" class="tx-sm tx-mid tx-muted">2</text>
+        <text x="162" y="20" class="tx-sm tx-mid tx-muted">3</text>
+        <text x="198" y="20" class="tx-sm tx-mid tx-muted">4</text>
+        <text x="234" y="20" class="tx-sm tx-mid tx-muted">5</text>
+        <text x="270" y="20" class="tx-sm tx-mid tx-muted">6</text>
+        <text x="62" y="48" class="tx-mono tx-end">LD</text>
+        <text x="62" y="82" class="tx-mono tx-end">ADD</text>
+        <rect x="73" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="109" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="145" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="181" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="217" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="253" y="30" width="34" height="26" rx="3" class="fi-paper"/>
+        <text x="90" y="47" class="tx-mono tx-sm tx-mid">IF</text>
+        <text x="126" y="47" class="tx-mono tx-sm tx-mid">ID</text>
+        <text x="162" y="47" class="tx-mono tx-sm tx-mid">EX</text>
+        <text x="198" y="47" class="tx-mono tx-sm tx-mid">M1</text>
+        <text x="234" y="47" class="tx-mono tx-sm tx-mid">M2</text>
+        <text x="270" y="47" class="tx-mono tx-sm tx-mid">WB</text>
+        <rect x="109" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="145" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <rect x="181" y="64" width="34" height="26" rx="3" class="fw-s2 st-s2 dash"/>
+        <rect x="217" y="64" width="34" height="26" rx="3" class="fw-s2 st-s2 dash"/>
+        <rect x="253" y="64" width="34" height="26" rx="3" class="fi-paper"/>
+        <text x="126" y="81" class="tx-mono tx-sm tx-mid">IF</text>
+        <text x="162" y="81" class="tx-mono tx-sm tx-mid">ID</text>
+        <text x="270" y="81" class="tx-mono tx-sm tx-mid">EX</text>
+        <line x1="238" y1="52" x2="261" y2="66" class="st-s5 sw-3" marker-end="url(#arr-s5)"/>
+        <path d="M73 104 V116 M109 104 V116 M73 110 H109" class="st-ink"/>
+        <text x="118" y="114" class="tx-sm">one cycle = 1 ns</text>
+        <text x="73" y="140" class="tx-sm tx-bold">clock: 1 GHz, as before</text>
+        <text x="73" y="176" class="tx-hand">one more stall</text>
+      </svg>
+      <p class="fig-label">Add a stage</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> A data cache that needs 1.25 ns in a pipeline whose other stages need 1 ns, and the load-use pair I0–I1. Left: every cycle lasts 1.25 ns; the pair keeps its single stall (orange, dashed), but every instruction is 25 % slower. Right: the clock stays at 1 GHz and the access takes two stages, M1 and M2; the loaded value comes one cycle later and the pair stalls twice. The magenta arrows are the forwarding paths.</figcaption>
+  </figure>
+
+  <p>The designer has two choices (Fig. 1). Stretch the clock: \(T_{CLK}\) = 1.25 ns, so \(f_{CLK}\) falls from 1 GHz to 800 MHz and every instruction runs 25 % slower, also the ones that never touch memory. In CPU time = IC × CPI × \(T_{CLK}\) the last factor grows. Or add a stage: the access is spread over two cycles, M1 and M2, and the clock stays at 1 GHz. The loaded value now arrives a cycle later, so the load-use pair stalls twice instead of once: CPI grows. Split the instruction cache in IF the same way and every mispredicted branch costs one more cycle too, because the branch is resolved one stage further from the fetch.</p>
+
+  <p>Either way the L1's access time ends up in the CPU time, cycle after cycle. The notes open the hit-time techniques with exactly this point, a hit "still lies on the critical path of every memory access" (p. 356), but their next sentence mixes up the two choices.</p>
+
+  <aside class="redpen" data-page="356">
+    <p class="claim">"The L1 cache is accessed every CPU cycle, so even a 1-cycle delay in hit time can slow down the processor's maximum clock frequency."</p>
+    <p class="fix">A delay counted in cycles cannot change the frequency. When the L1 access no longer fits in one cycle, the designer either lengthens the cycle (the maximum \(f_{CLK}\) falls and every instruction gets slower) or spreads the access over two cycles (\(f_{CLK}\) unchanged; the extra cycle appears in the CPI, as more load-use stalls and, for the instruction cache, a larger branch penalty).</p>
+    <p class="because">Fig. 1 shows both for the same 1.25 ns cache: a 1.25 ns clock, 800 MHz instead of 1 GHz; or a 1 GHz clock with a two-cycle hit and one more stall in the load-use pair. "A 1-cycle delay in hit time" is the second case, and there the frequency stays where it was.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">Every access pays the hit time, and the L1 is used on every cycle: a slower L1 lengthens the clock period, or adds a pipeline stage and its stalls.</mark></p>
+</section>
+
+<section id="l28-small">
+  <h2>Small and simple: short wires, one comparison</h2>
+
+  <p>Back to Example 18. Why should a 16 KB direct-mapped cache answer in one cycle and a 32 KB 8-way cache need two or three? The notes give four reasons (p. 356):</p>
+
+  <ul>
+    <li><b>Shorter wires</b> inside the cache array: a signal crosses a smaller array sooner.</li>
+    <li><b>Fewer sets</b>: a simpler decoder for the index.</li>
+    <li><b>A smaller tag array</b>: a faster tag comparison.</li>
+    <li><b>Lower associativity</b>: fewer tag comparators working in parallel.</li>
+  </ul>
+
+  <p>The last reason hides the biggest gain. A hit is a chain of steps: decode the index, read the tag and the data, compare the tags and, in a set-associative cache, let the comparison drive the way-select multiplexer (Fig. 2). A direct-mapped cache has one candidate line, so it hands the data on while the comparison is still running; if the tags differ, the data is simply dropped. It is the multiplexer that <a href="l25.html">lesson 25</a> drew for way prediction. "Simple" removes a whole step; "small" shortens the others.</p>
+
+  <figure class="fig fig--plain" id="l28-fig-hitpath">
+    <svg class="dia" viewBox="0 0 560 214" role="img" aria-label="The steps of a hit drawn in time. With one way: decode, read, and the data leaves at once while the tag comparison runs beside it. With eight ways: decode, read eight ways, compare eight tags, and only then the multiplexer selects the way and the data leaves, one step later.">
+      <line x1="266" y1="26" x2="266" y2="180" class="st-muted dash"/>
+      <line x1="426" y1="26" x2="426" y2="180" class="st-muted dash"/>
+      <text x="86" y="53" class="tx-sm tx-bold tx-end">1 way</text>
+      <rect x="96" y="34" width="80" height="28" class="fi-paper"/>
+      <rect x="176" y="34" width="90" height="28" class="fi-paper"/>
+      <rect x="266" y="70" width="110" height="28" class="fi-paper"/>
+      <text x="136" y="53" class="tx-sm tx-mid">decode</text>
+      <text x="221" y="53" class="tx-sm tx-mid">read</text>
+      <text x="321" y="89" class="tx-sm tx-mid">compare</text>
+      <line x1="266" y1="48" x2="530" y2="48" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="346" y="40" class="tx-sm tx-mid halo">data out</text>
+      <line x1="376" y1="84" x2="418" y2="84" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <text x="430" y="89" class="tx-sm">hit?</text>
+      <text x="346" y="124" class="tx-hand tx-mid">the mux waits</text>
+      <text x="86" y="153" class="tx-sm tx-bold tx-end">8 ways</text>
+      <rect x="96" y="134" width="80" height="28" class="fi-paper"/>
+      <rect x="176" y="134" width="90" height="28" class="fi-paper"/>
+      <rect x="266" y="134" width="110" height="28" class="fi-paper"/>
+      <rect x="376" y="134" width="50" height="28" class="fw-s2 st-s2"/>
+      <text x="136" y="153" class="tx-sm tx-mid">decode</text>
+      <text x="221" y="153" class="tx-sm tx-mid">read ×8</text>
+      <text x="321" y="153" class="tx-sm tx-mid">compare ×8</text>
+      <text x="401" y="153" class="tx-sm tx-mid">mux</text>
+      <line x1="426" y1="148" x2="530" y2="148" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="478" y="140" class="tx-sm tx-mid halo">data out</text>
+      <line x1="96" y1="194" x2="530" y2="194" class="st-muted" marker-end="url(#arr-muted)"/>
+      <text x="530" y="211" class="tx-sm tx-end tx-muted">time</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The steps of a hit, drawn in time (not to scale). With one candidate line the data can leave as soon as it is read, while the tag comparison runs beside it; on a mismatch it is dropped. With eight candidates the multiplexer can pick the way only after the comparisons: one more step on every hit (orange), on top of eight reads and eight comparators that all cost energy.</figcaption>
+  </figure>
+
+  <p>A second reason, which the notes do not give, is power. The L1 is read on almost every cycle, so the energy of one access is paid about a billion times per second at 1 GHz, and in the CACTI data that Hennessy &amp; Patterson show (5th edition) the energy of a read grows with both the size and the associativity of the cache.</p>
+
+  <h3>When does the smaller cache win?</h3>
+
+  <p>The price is in the notes' trade-off table (p. 356): a small cache has a low hit time and a high miss rate, a large one the reverse. AMAT decides which matters more. Write HT, MR and MP for the hit time, the miss rate and the miss penalty, with s for the small design and b for the big one. Both send their misses to the same next level, so they share the miss penalty.</p>
+
+  <ol class="steps" id="l28-steps-small">
+    <li><p>The small design is the better one when its average access is shorter:</p> \[ \text{AMAT}_s \lt \text{AMAT}_b \]</li>
+    <li><p>Write both with the formula of lesson 22, with the same MP on both sides:</p> \[ \begin{aligned} & HT_s + MR_s \cdot MP \\ & \lt HT_b + MR_b \cdot MP \end{aligned} \]</li>
+    <li><p>Collect the miss terms on the left and the hit times on the right. Left: the extra misses of the small cache times the price of each. Right: the cycles it saves on every access.</p> \[ (MR_s - MR_b)\, MP \lt HT_b - HT_s \]</li>
+    <li><p>When the small cache misses more, \(MR_s \gt MR_b\), divide: the two designs tie at the break-even miss penalty, and below it the small one wins.</p> \[ MP^{*} = \frac{HT_b - HT_s}{MR_s - MR_b} \]</li>
+    <li><p>Or fix MP and solve for the highest miss rate the small cache may have before it loses:</p> \[ MR_s^{*} = MR_b + \frac{HT_b - HT_s}{MP} \]</li>
+  </ol>
+
+  <p>Put numbers on Example 18. The notes give no miss rates, so take 4 % for the small cache and 2.5 % for the big one, with 1 and 2 cycles of hit time. Behind the L1 put the L2 of Example 16, where an L1 miss costs 20 cycles: AMAT = 1 + 0.04 × 20 = 1.80 cycles for the small cache and 2 + 0.025 × 20 = 2.50 for the big one. The extra 1.5 % of misses costs 0.3 cycles per access; the faster hit saves 1. Now take the L2 away and send every L1 miss to memory, 100 cycles: 5.0 against 4.5, and the big cache wins. The two tie at MP* = 1 / 0.015 ≈ 67 cycles.</p>
+
+  <div class="widget" id="l28-w-seesaw">
+    <h3 class="widget-title">The AMAT balance: small and simple against big</h3>
+    <p class="widget-intro">Left pan: the small, simple L1 of Example 18 (16 KB direct-mapped, 1-cycle hit). Right pan: the bigger one (32 KB 8-way, 2 or 3 cycles). Each pan carries its AMAT as two blocks on the same scale: the hit time below, the misses MR × MP above (orange, dashed). The heavier pan sinks; the pan that rises holds the faster cache. Below, the AMAT of both as the miss penalty grows.</p>
+    <ol class="tasks">
+      <li>Keep the start values: miss rates 4 % and 2.5 %, MP = 20 cycles, the L2 of Example 16. Before you look at the balance, compute both AMATs. Which pan rises, and by how much?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The small, simple L1 rises: 1.80 against 2.50 cycles. Its extra misses cost (0.04 − 0.025) × 20 = 0.3 cycles per access, its faster hit saves 1.</p></details>
+      </li>
+      <li>Now drag MP up, as if there were no L2 and every miss went to memory. Predict where the balance is level, then look at MP = 100.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Level at MP ≈ 67 cycles, the ring on the plot: (2 − 1) / (0.04 − 0.025). At 100 cycles it is 5.0 against 4.5, and the bigger L1 wins. The insight of the widget: a fast L2 is what makes small L1s pay.</p></details>
+      </li>
+      <li>Back to MP = 20. How far can the small L1's miss rate climb before it loses? Then choose hit times of 1 against 3 cycles and ask again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Up to 7.5 % = 2.5 % + 1/20; at 8 % it loses, 2.60 against 2.50. Against a 3-cycle cache the limit doubles its margin: 2.5 % + 2/20 = 12.5 %, beyond the end of the slider, so the small cache wins everywhere.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l28-w-seesaw', function (root, ui) {
+    var svgEl = ui.svg(560, 290, { label: 'A balance: on the left pan the small, simple L1, on the right pan the bigger L1. Each pan carries its average memory access time as two blocks drawn to the same scale, the hit time below and the misses, miss rate times miss penalty, above. The pan with the larger AMAT sinks.' });
+    var plot = ui.plot({ x: [0, 150], y: [0, 8], xLabel: 'MP (cycles)', yLabel: 'AMAT (cycles)', aspect: 2.4,
+      label: 'AMAT of the small, simple L1 and of the bigger L1 as the miss penalty grows from 0 to 150 cycles; the two lines cross at the break-even miss penalty' });
+    ui.legend([
+      { label: 'small, simple L1', color: 's4', mark: 'line' },
+      { label: 'bigger L1', color: 's5', mark: 'line' },
+      { label: 'misses: MR × MP', color: 's2', mark: 'area' },
+      { label: 'the miss penalty you set', color: 'ink', mark: 'hl' },
+      { label: 'break-even', color: 'ink', mark: 'ring' }
+    ]);
+    function pct(v) { return (Math.round(v * 10) / 10).toFixed(1) + ' %'; }
+    var mp = ui.slider({ label: 'miss penalty MP (cycles to serve an L1 miss)', min: 2, max: 150, step: 1, value: 20, format: function (v) { return Math.round(v) + ' cycles'; } });
+    var mrs = ui.slider({ label: 'miss rate of the small, simple L1', min: 1, max: 12, step: 0.5, value: 4, format: pct });
+    var mrb = ui.slider({ label: 'miss rate of the bigger L1', min: 0.5, max: 8, step: 0.5, value: 2.5, format: pct });
+    var hts = ui.select('hit times, small against bigger', [{ value: '2', label: '1 cycle against 2 cycles' }, { value: '3', label: '1 cycle against 3 cycles' }], null, '2');
+    var roS = ui.readout('AMAT, small and simple'), roB = ui.readout('AMAT, bigger'), roW = ui.readout('the pan that rises'),
+        roBE = ui.readout('break-even MP'), roMR = ui.readout('the small L1 may miss up to');
+
+    function state() {
+      var s = { HTs: 1, HTb: +hts.value, MRs: mrs.value / 100, MRb: mrb.value / 100, MP: Math.round(mp.value) };
+      s.As = s.HTs + s.MRs * s.MP;
+      s.Ab = s.HTb + s.MRb * s.MP;
+      var d = s.MRs - s.MRb;
+      s.be = d > 1e-9 ? (s.HTb - s.HTs) / d : null;
+      s.mrMax = s.MRb + (s.HTb - s.HTs) / Math.max(1, s.MP);
+      s.ymax = Math.max(4, Math.ceil(Math.max(s.HTs + s.MRs * 150, s.HTb + s.MRb * 150) + 0.5));
+      return s;
+    }
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function stack(x, y, ht, miss, ser, name, A, unit) {
+      var w = 76, h1 = ht * unit, h2 = miss * unit, y0 = y - 5;
+      S('rect', { x: x - w / 2, y: y0 - h1, width: w, height: h1, 'class': 'fw-' + ser + ' st-' + ser + ' sw-2' });
+      if (h2 > 0.5) S('rect', { x: x - w / 2, y: y0 - h1 - h2, width: w, height: h2, 'class': 'fw-s2 st-s2 dash' });
+      if (h1 >= 26) S('text', { x: x, y: y0 - h1 / 2 + 5, 'class': 'tx-sm tx-mid', text: 'hit' });
+      if (h2 >= 26) S('text', { x: x, y: y0 - h1 - h2 / 2 + 5, 'class': 'tx-sm tx-mid', text: 'misses' });
+      S('text', { x: x, y: y0 - h1 - h2 - 9, 'class': 'tx-sm tx-mid tx-bold', text: 'AMAT ' + A.toFixed(2) });
+      S('text', { x: x, y: 280, 'class': 'tx-sm tx-mid', text: name });
+    }
+    function drawBalance(s) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var px = 280, py = 190, L = 190;
+      var th = Course.clamp((s.As - s.Ab) * 0.2, -0.22, 0.22);
+      var lx = px - L * Math.cos(th), ly = py + L * Math.sin(th), rx = px + L * Math.cos(th), ry = py - L * Math.sin(th);
+      S('line', { x1: 64, y1: py, x2: 496, y2: py, 'class': 'st-muted dash' });
+      S('path', { d: 'M' + px + ' ' + py + ' L' + (px - 26) + ' ' + (py + 54) + ' H' + (px + 26) + ' Z', 'class': 'fi-soft' });
+      S('line', { x1: lx, y1: ly, x2: rx, y2: ry, 'class': 'st-ink sw-4' });
+      S('circle', { cx: px, cy: py, r: 5, 'class': 'fi-ink st-none' });
+      var unit = 116 / Math.max(s.As, s.Ab, 0.5);
+      stack(lx, ly, s.HTs, s.MRs * s.MP, 's4', 'small, simple L1', s.As, unit);
+      stack(rx, ry, s.HTb, s.MRb * s.MP, 's5', 'bigger L1', s.Ab, unit);
+    }
+    plot.draw(function (g) {
+      var s = state();
+      g.line(function (x) { return s.HTs + s.MRs * x; }, { color: 's4', width: 2.5 });
+      g.line(function (x) { return s.HTb + s.MRb * x; }, { color: 's5', width: 2.5 });
+      g.line([[s.MP, 0], [s.MP, s.ymax]], { color: 'ink', width: 1.5, highlight: true });
+      if (s.be !== null && s.be <= 150) g.points([[s.be, s.HTs + s.MRs * s.be]], { shape: 'ring', color: 'ink', r: 8 });
+      g.points([[s.MP, s.As]], { color: 's4', r: 5 });
+      g.points([[s.MP, s.Ab]], { color: 's5', r: 5, shape: 'square' });
+    });
+    ui.onChange(function () {
+      var s = state();
+      plot.setView({ x: [0, 150], y: [0, s.ymax] });
+      drawBalance(s);
+      roS.set('1 + ' + s.MRs.toFixed(3) + ' × ' + s.MP + ' = ' + s.As.toFixed(2) + ' cycles');
+      roB.set(s.HTb + ' + ' + s.MRb.toFixed(3) + ' × ' + s.MP + ' = ' + s.Ab.toFixed(2) + ' cycles');
+      var dd = s.Ab - s.As;
+      if (Math.abs(dd) < 0.005) roW.set('neither: the balance is level');
+      else roW.set((dd > 0 ? 'small, simple L1' : 'bigger L1') + ', faster by ' + Math.abs(dd).toFixed(2) + ' cycles', 'key');
+      roBE.set(s.be === null ? 'none: the small L1 does not miss more' : s.be.toFixed(1) + ' cycles');
+      roMR.set((100 * s.mrMax).toFixed(1) + ' %');
+    });
+  });
+  </script>
+
+  <p>This is why the L1 is small and the L3 is huge. The L3 is reached only by accesses that missed in L1 and L2: its latency is part of a miss penalty, never of the hit that every access pays. Hence the design practice of p. 356: keep the L1 "small enough for 1-cycle accesses at CPU clock speed" and "use L2 and L3 caches to absorb most misses from L1".</p>
+
+  <p>One tension is left. The same page recommends associativity "often 2-4 way in L1", while p. 364 notes that "many modern CPUs use 32 KB, 8-way L1 caches". Hit time pulls the associativity down. The rule of <a href="l27.html">lesson 27</a>, cache size / associativity ≤ page size, pulls it up as soon as the L1 grows beyond one page per way. Hennessy &amp; Patterson add two more upward pulls: many processors already take two or more cycles for an L1 hit, and several threads sharing one L1 cause more conflict misses. Way prediction gives designers both: the miss rate of an 8-way cache with, most of the time, the hit time of a direct-mapped one.</p>
+
+  <p class="memo"><mark class="key">A small, simple L1 wins while its extra misses, times the miss penalty, cost fewer cycles than it saves on every hit.</mark></p>
+</section>
+
+<section id="l28-writes">
+  <h2>Why a write hit is slower than a read hit</h2>
+
+  <p>The notes say that the write path is slow, "due to checking tags, updating data arrays, handling dirty bits" (p. 366), but not why a write hit is slower than a read hit. The reason is the order of two steps. A read hit may read the tag array and the data array at the same moment and use the data only if the tags match: a mismatch costs nothing but a wasted read. A write cannot do that. Writing the data before the comparison would overwrite a word of whatever block sits in that line (Fig. 3). So a write checks the tag first and writes afterwards, two steps in a row where a read needs one. This is the textbook's reason (Hennessy &amp; Patterson), and the first thing to say about pipelined writes.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l28-fig-rw">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 204" role="img" aria-label="A read hit: the index reads the tag array and the data array at the same time; the stored tag is compared with the address tag, and the data that comes out is used only if the tags match">
+        <rect x="20" y="12" width="120" height="22" class="fw-s3 st-s3"/>
+        <rect x="140" y="12" width="80" height="22" class="fi-paper"/>
+        <rect x="220" y="12" width="60" height="22" class="fi-soft"/>
+        <text x="80" y="27" class="tx-mono tx-sm tx-mid">tag</text>
+        <text x="180" y="27" class="tx-mono tx-sm tx-mid">index</text>
+        <text x="250" y="27" class="tx-mono tx-sm tx-mid">offset</text>
+        <rect x="40" y="62" width="100" height="34" class="fi-paper sw-2"/>
+        <rect x="170" y="62" width="100" height="34" class="fi-paper sw-2"/>
+        <text x="90" y="83" class="tx-sm tx-mid">tag array</text>
+        <text x="220" y="83" class="tx-sm tx-mid">data array</text>
+        <line x1="172" y1="35" x2="106" y2="58" marker-end="url(#arr)"/>
+        <line x1="188" y1="35" x2="212" y2="58" marker-end="url(#arr)"/>
+        <path d="M30 35 V130 H72" marker-end="url(#arr)"/>
+        <line x1="90" y1="96" x2="90" y2="112" marker-end="url(#arr)"/>
+        <circle cx="90" cy="130" r="13" class="fi-paper"/>
+        <text x="90" y="135" class="tx-mid">=</text>
+        <line x1="103" y1="130" x2="214" y2="130" class="st-muted dash"/>
+        <text x="152" y="123" class="tx-sm tx-mid halo">hit?</text>
+        <line x1="220" y1="96" x2="220" y2="146" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="230" y="146" class="tx-sm">data</text>
+        <text x="20" y="170" class="tx-hand">wrong read: drop it</text>
+        <text x="20" y="196" class="tx-sm tx-bold">one step: both arrays at once</text>
+      </svg>
+      <p class="fig-label">Read hit</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 204" role="img" aria-label="A write hit: step 1 reads the tag array and compares the stored tag with the address tag; only after a match does step 2 write the store's data F2 into the data array">
+        <rect x="20" y="12" width="120" height="22" class="fw-s3 st-s3"/>
+        <rect x="140" y="12" width="80" height="22" class="fi-paper"/>
+        <rect x="220" y="12" width="60" height="22" class="fi-soft"/>
+        <text x="80" y="27" class="tx-mono tx-sm tx-mid">tag</text>
+        <text x="180" y="27" class="tx-mono tx-sm tx-mid">index</text>
+        <text x="250" y="27" class="tx-mono tx-sm tx-mid">offset</text>
+        <rect x="40" y="62" width="100" height="34" class="fi-paper sw-2"/>
+        <rect x="170" y="62" width="100" height="34" class="fi-paper sw-2"/>
+        <text x="90" y="83" class="tx-sm tx-mid">tag array</text>
+        <text x="220" y="83" class="tx-sm tx-mid">data array</text>
+        <line x1="172" y1="35" x2="106" y2="58" marker-end="url(#arr)"/>
+        <circle cx="139" cy="46" r="8" class="fi-paper"/>
+        <text x="139" y="50" class="tx-sm tx-mid">1</text>
+        <path d="M30 35 V130 H72" marker-end="url(#arr)"/>
+        <line x1="90" y1="96" x2="90" y2="112" marker-end="url(#arr)"/>
+        <circle cx="90" cy="130" r="13" class="fi-paper"/>
+        <text x="90" y="135" class="tx-mid">=</text>
+        <line x1="103" y1="130" x2="242" y2="130" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="165" y="123" class="tx-sm tx-mid halo">write if hit</text>
+        <rect x="232" y="150" width="48" height="22" class="fw-s1 st-s1"/>
+        <text x="256" y="165" class="tx-mono tx-sm tx-mid">F2</text>
+        <line x1="256" y1="150" x2="252" y2="100" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <circle cx="266" cy="114" r="8" class="fi-paper"/>
+        <text x="266" y="118" class="tx-sm tx-mid">2</text>
+        <text x="20" y="170" class="tx-hand">no undo for writes</text>
+        <text x="20" y="196" class="tx-sm tx-bold">two steps: compare, then write</text>
+      </svg>
+      <p class="fig-label">Write hit</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Why a write hit is slower than a read hit. Left: a read indexes both arrays at once and uses the data only if the tags match; a wrong read is simply dropped. Right: a write may change the data array only after the comparison says "hit" (step 2 after step 1); written earlier, F2 could overwrite a word of another block.</figcaption>
+  </figure>
+
+  <p>Now a burst of stores, in the shape of the notes' Example 22, which splits a write into three one-cycle steps: address decode, tag check, data write. In the papers' mnemonics (the 2026 paper writes registers without the dollar sign; older papers write <code>$F2</code>):</p>
+
+<pre><code>SD   F2, 0(R1)
+SD   F4, 8(R1)
+SD   F6, 16(R1)
+SD   F8, 24(R1)
+SD   F10, 32(R1)</code></pre>
+
+  <p>Without pipelining, the cache finishes one store before it starts the next: 3 cycles each, 15 for the five, "one write every three cycles" (p. 366). With <mark class="key">pipelined writes</mark> a new store enters every cycle. While one store checks its tag, the store before it writes its data and the store after it decodes its address. The five stores need 7 cycles. In general, N stores through a k-stage write path take kN cycles without pipelining and k + N − 1 with it.</p>
+
+  <figure class="tbl-fig" id="l28-tbl-ex22">
+    <figcaption>Example 22 with five stores and pipelined writes: D address decode, T tag check, W data write. A new store enters every cycle, each store still takes 3 cycles, and the five need 7 cycles instead of 15.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Store</th><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th><th>C6</th><th>C7</th></tr></thead>
+        <tbody>
+          <tr><td><code>SD F2, 0(R1)</code></td><td>D</td><td>T</td><td>W</td><td></td><td></td><td></td><td></td></tr>
+          <tr><td><code>SD F4, 8(R1)</code></td><td></td><td>D</td><td>T</td><td>W</td><td></td><td></td><td></td></tr>
+          <tr><td><code>SD F6, 16(R1)</code></td><td></td><td></td><td>D</td><td>T</td><td>W</td><td></td><td></td></tr>
+          <tr><td><code>SD F8, 24(R1)</code></td><td></td><td></td><td></td><td>D</td><td>T</td><td>W</td><td></td></tr>
+          <tr><td><code>SD F10, 32(R1)</code></td><td></td><td></td><td></td><td></td><td>D</td><td>T</td><td>W</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Notice what did not change: each store still spends 3 cycles from decode to data write, "latency still 3, but overlapped" (p. 366). Pipelining raises the throughput, one write per cycle instead of one every three, which is what store-heavy code on a superscalar core needs. It does not make a single write faster. The notes' "reduced average hit time" means exactly this: the processor no longer waits for each write to finish before it issues the next.</p>
+
+  <p>A real cache adds a detail that the notes leave out (Hennessy &amp; Patterson, 2nd edition, describe it on the Alpha 21064). Loads need the data array too, so after its tag check a store's data waits in a small <mark class="key">delayed-write buffer</mark> and enters the array in a later cycle in which the data array is idle, such as the tag check of the next store, which needs only the tag array. The ticker below writes it in the first idle cycle. The buffer creates the hazard the notes name, "reads don't bypass pending writes to the same address" (p. 366). A load must compare its address with the buffer and, on a match, take the data from there. That check is the first of the three costs the notes list; the others are more complex control and the area and power of the buffers and pipeline registers.</p>
+
+  <div class="widget" id="l28-w-writes">
+    <h3 class="widget-title">The write ticker: five accesses, cycle by cycle</h3>
+    <p class="widget-intro">Rows are five cache hits in program order, columns the clock cycles. Blue cells are the steps: D address decode, T tag check, W data write for a store; D, then R (tag and data read together) for a load. Orange dashed cells are a store's data waiting in the delayed-write buffer; a magenta arrow is a value forwarded from that buffer to a load; a red ring is a load that read a stale value. Step through the cycles, or press Play.</p>
+    <ol class="tasks">
+      <li>Example 22, writes not pipelined. Predict how many cycles the five stores take, then step to the end. Switch on pipelined writes, start over and predict again.
+        <details class="answer"><summary>What you should see</summary>
+          <p>15 cycles, one store every 3. Pipelined: 7 cycles, a new store every cycle, yet each store still spends 3 cycles from D to W. The insight of the widget: pipelining the writes raises the throughput, not the speed of one write.</p></details>
+      </li>
+      <li>Choose "stores and loads", pipelined. In which cycle does the data of <code>SD F2, 0(R1)</code> reach the array, and why not earlier?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Cycle 5. In cycles 3 and 4 the two loads read the data array, so F2 waits in the buffer and goes in during the tag check of <code>SD F8, 8(R1)</code>. That store spent 5 cycles from D to W instead of 3, yet the whole stream needs 7 cycles, against 12 without pipelining.</p></details>
+      </li>
+      <li>Switch off "loads look into the buffer" and run the stream again. Which loads now get a wrong value?
+        <details class="answer"><summary>What you should see</summary>
+          <p><code>LD F4, 0(R1)</code> in cycle 3 and <code>LD F10, 8(R1)</code> in cycle 6: each reads the array while the store to its own word still waits in the buffer, and gets the old value. <code>LD F6, 8(R1)</code> in cycle 4 is right, because no store to 8(R1) is pending yet. That is the hazard of p. 366.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l28-w-writes', function (root, ui) {
+    var STREAMS = {
+      ex22: [{ op: 'SD', reg: 'F2', off: 0 }, { op: 'SD', reg: 'F4', off: 8 }, { op: 'SD', reg: 'F6', off: 16 }, { op: 'SD', reg: 'F8', off: 24 }, { op: 'SD', reg: 'F10', off: 32 }],
+      mix: [{ op: 'SD', reg: 'F2', off: 0 }, { op: 'LD', reg: 'F4', off: 0 }, { op: 'LD', reg: 'F6', off: 8 }, { op: 'SD', reg: 'F8', off: 8 }, { op: 'LD', reg: 'F10', off: 8 }]
+    };
+    var NC = 15, X0 = 168, CW = 26, Y0 = 34, RH = 32;
+    function txt(a) { return a.op + ' ' + a.reg + ', ' + a.off + '(R1)'; }
+    /* serial: one access at a time, a store D T W (3 cycles), a load D R (2 cycles).
+       pipelined: one access enters D per cycle; a store's data waits in the delayed-write buffer
+       until the first cycle after its T in which no load reads the data array (R). */
+    function schedule(stream, pipe) {
+      var acc = [], t = 1, busy = {};
+      if (!pipe) {
+        stream.forEach(function (a) {
+          if (a.op === 'SD') { acc.push({ a: a, D: t, T: t + 1, W: t + 2 }); t += 3; }
+          else { acc.push({ a: a, D: t, R: t + 1 }); t += 2; }
+        });
+      } else {
+        stream.forEach(function (a, i) {
+          if (a.op === 'SD') acc.push({ a: a, D: i + 1, T: i + 2 });
+          else { acc.push({ a: a, D: i + 1, R: i + 2 }); busy[i + 2] = true; }
+        });
+        acc.forEach(function (x) { if (x.T) { var c = x.T + 1; while (busy[c]) c++; x.W = c; } });
+      }
+      var last = 0;
+      acc.forEach(function (x) { last = Math.max(last, x.W || 0, x.R || 0); });
+      acc.forEach(function (x) {
+        if (!x.R) return;
+        x.pend = null; x.prev = null;
+        acc.forEach(function (s) {
+          if (!s.T || s.a.off !== x.a.off) return;
+          if (s.T < x.R && s.W > x.R) x.pend = s;
+          if (s.W < x.R && (!x.prev || s.W > x.prev.W)) x.prev = s;
+        });
+      });
+      return { acc: acc, last: last };
+    }
+    var svgEl = ui.svg(560, 206, { label: 'A grid of five cache accesses by fifteen clock cycles: each cell shows the step an access performs in that cycle; waiting cells show store data held in the delayed-write buffer; the highlighted column is the current cycle' });
+    ui.legend([
+      { label: 'a step: D decode, T tag check, W data write, R tag and data read', color: 's1', mark: 'square' },
+      { label: 'store data waiting in the buffer', color: 's2', mark: 'area' },
+      { label: 'value forwarded from the buffer', color: 's5', mark: 'line' },
+      { label: 'stale value read', color: 'bad', mark: 'ring' },
+      { label: 'the cycle shown', color: 'key', mark: 'area' }
+    ]);
+    var which = ui.select('access stream', [{ value: 'ex22', label: 'Example 22: five stores' }, { value: 'mix', label: 'stores and loads to the same words' }], null, 'ex22');
+    var pipe = ui.toggle('pipelined writes (delayed-write buffer)', false);
+    var check = ui.toggle('loads look into the buffer', true);
+    var caps = [];
+    for (var i = 0; i <= NC; i++) caps.push(i === 0 ? 'Before cycle 1: nothing has started.' : 'Cycle ' + i + '.');
+    var stp = ui.stepper({ steps: caps, play: 800 });
+    var roTot = ui.readout('cycles for the stream'), roDone = ui.readout('stores written into the array'),
+        roBuf = ui.readout('delayed-write buffer'), roLd = ui.readout('last load got');
+    var note = ui.note('');
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function cx(c) { return X0 + (c - 1) * CW; }
+    function draw(sch, t, chk) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      if (t >= 1) S('rect', { x: cx(t), y: Y0 - 6, width: CW, height: 5 * RH + 6, 'class': 'fw-key st-none' });
+      for (var c = 1; c <= NC; c++) {
+        S('text', { x: cx(c) + CW / 2, y: 22, 'class': 'tx-sm tx-mid tx-muted', text: String(c) });
+        for (var g = 0; g < 5; g++) S('rect', { x: cx(c) + 2, y: Y0 + g * RH + 3, width: CW - 4, height: 24, rx: 3, 'class': 'st-grid sw-1' });
+      }
+      sch.acc.forEach(function (x, r) {
+        var y = Y0 + r * RH;
+        S('text', { x: 154, y: y + 20, 'class': 'tx-mono tx-sm tx-end', text: txt(x.a) });
+        function cell(c, letter, cls) {
+          if (c > t) return;
+          S('rect', { x: cx(c) + 2, y: y + 3, width: CW - 4, height: 24, rx: 3, 'class': cls });
+          if (letter) S('text', { x: cx(c) + CW / 2, y: y + 20, 'class': 'tx-mono tx-sm tx-mid', text: letter });
+        }
+        cell(x.D, 'D', 'fw-s1 st-s1');
+        if (x.T) {
+          cell(x.T, 'T', 'fw-s1 st-s1');
+          for (var w = x.T + 1; w < x.W; w++) cell(w, '', 'fw-s2 st-s2 dash');
+          cell(x.W, 'W', 'fw-s1 st-s1');
+        } else {
+          cell(x.R, 'R', 'fw-s1 st-s1');
+          if (x.R <= t && x.pend) {
+            var X = cx(x.R) + CW / 2;
+            if (chk) {
+              var sr = sch.acc.indexOf(x.pend);
+              S('line', { x1: X, y1: Y0 + sr * RH + 13, x2: X, y2: y + 2, 'class': 'st-s5 sw-2', 'marker-end': 'url(#arr-s5)' });
+            } else S('circle', { cx: X, cy: y + 15, r: 15, 'class': 'st-bad sw-2' });
+          }
+        }
+      });
+    }
+    function narrate(sch, t, on, chk) {
+      if (t === 0) return 'Predict how many cycles the five accesses need, then press Next or Play.';
+      if (t > sch.last) return 'All five accesses were finished in cycle ' + sch.last + '.';
+      var parts = [];
+      sch.acc.forEach(function (x) {
+        var n = '<code>' + txt(x.a) + '</code>';
+        if (x.D === t) parts.push(n + ' decodes its address');
+        if (x.T === t) parts.push(n + ' checks its tag');
+        if (x.T && x.T < t && x.W > t) parts.push(n + ' waits in the buffer, because a load is reading the data array');
+        if (x.W === t) parts.push(n + ' writes its data into the array' + (on && x.W > x.T + 1 ? ', later than it could' : ''));
+        if (x.R === t) {
+          var s = n + ' reads tag and data';
+          if (x.pend) s += chk ? ' and takes ' + x.pend.a.reg + ' from the buffer, same address' : ', but the store to its word is still in the buffer: it reads a stale value';
+          parts.push(s);
+        }
+      });
+      return 'Cycle ' + t + ': ' + parts.join('; ') + '.';
+    }
+    ui.onChange(function () {
+      var on = pipe.value, chk = check.value, sch = schedule(STREAMS[which.value], on), t = stp.index;
+      draw(sch, t, chk);
+      var stores = sch.acc.filter(function (x) { return x.T; });
+      roTot.set(t >= sch.last ? sch.last + ' cycles' : 'not finished yet');
+      roDone.set(stores.filter(function (x) { return x.W <= t; }).length + ' of ' + stores.length);
+      if (!on) roBuf.set('not used');
+      else {
+        var p = null;
+        stores.forEach(function (x) { if (x.T <= t && x.W > t) p = x; });
+        roBuf.set(p ? p.a.reg + ' for ' + p.a.off + '(R1), waiting' : 'empty');
+      }
+      var L = null;
+      sch.acc.forEach(function (x) { if (x.R && x.R <= t) L = x; });
+      if (!L) roLd.set(sch.acc.some(function (x) { return x.R; }) ? 'no load yet' : 'no loads in this stream');
+      else if (L.pend && chk) roLd.set(L.a.reg + ' = ' + L.pend.a.reg + ', from the buffer', 'good');
+      else if (L.pend) roLd.set(L.a.reg + ' = ' + (L.prev ? L.prev.a.reg : 'the old word') + ', stale', 'bad');
+      else roLd.set(L.a.reg + ' = ' + (L.prev ? L.prev.a.reg : 'the old word') + ', from the array');
+      note.set(narrate(sch, t, on, chk));
+    });
+  });
+  </script>
+
+  <p>Pipelining is not limited to writes. Hennessy &amp; Patterson's 5th edition counts <mark class="key">pipelined cache access</mark> among its advanced optimisations: the whole L1 access is spread over several stages so that the clock can run fast. An instruction-cache access took 1 cycle on the Intel Pentium, 2 on the Pentium Pro to Pentium III, and 4 on the Pentium 4 and the Core i7. It is the "add a stage" choice of Fig. 1: a faster clock and more bandwidth, paid with a longer load-use latency and a costlier mispredicted branch.</p>
+
+  <p class="memo"><mark class="key">Pipelined writes overlap the data write of one store with the tag check of the next: one write per cycle, the same latency per write, and every load must look into the delayed-write buffer.</mark></p>
+</section>
+
+<section id="l28-subblocks">
+  <h2>Small sub-blocks: write first, check later</h2>
+
+  <p>The fourth hit-time technique of the notes (p. 367) attacks the same two-step write from the other side: instead of overlapping the steps, it makes the early write harmless. Take a write-through cache (<a href="l23.html">lesson 23</a>) whose 32-byte blocks hold four 8-byte words, and give every word its own valid bit, the key ingredient: each word is now a <mark class="key">sub-block</mark>. In Fig. 4 the line holds block A, all four words valid. The store <code>SD F2, 8(R1)</code> writes word 1 of block B, which maps to the same line.</p>
+
+  <p>The cache does not wait for the comparison. In the same cycle in which it compares the tags, it writes F2 into word 1 and B's tag into the tag field. Then it looks at the outcome:</p>
+
+  <figure class="tbl-fig" id="l28-tbl-cases">
+    <figcaption>The store has already written F2 and the tag of B. What the tag check decides afterwards.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Case</th><th>Tag check</th><th>Valid bit of word 1</th><th>The early write was</th><th>Then the cache</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>match: the line holds B</td><td class="num">1</td><td>an ordinary write hit</td><td>does nothing more</td></tr>
+          <tr><td class="num">2</td><td>match: the line holds B</td><td class="num">0</td><td>right: a word of B not yet valid</td><td>sets the valid bit of word 1</td></tr>
+          <tr class="is-key"><td class="num">3</td><td>mismatch: the line held A</td><td>—</td><td>a word of block A, which memory already holds</td><td>keeps tag B, word 1 valid, the other three invalid</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <figure class="fig fig--pair fig--plain" id="l28-fig-subblock">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 204" role="img" aria-label="Before: the line holds block A with all four words valid; the store SD F2, 8(R1) to block B writes F2 into word 1 and B into the tag field at once, while the tag comparison is still running">
+        <text x="20" y="22" class="tx-mono">SD F2, 8(R1)</text>
+        <text x="128" y="22" class="tx-sm">block B, word 1</text>
+        <line x1="44" y1="32" x2="44" y2="68" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+        <text x="54" y="54" class="tx-mono tx-sm halo">B</text>
+        <line x1="152" y1="32" x2="152" y2="68" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="162" y="54" class="tx-mono tx-sm halo">F2</text>
+        <rect x="20" y="74" width="48" height="28" class="fw-s3 st-s3"/>
+        <rect x="76" y="74" width="48" height="28" class="fi-paper"/>
+        <rect x="128" y="74" width="48" height="28" class="fi-paper"/>
+        <rect x="180" y="74" width="48" height="28" class="fi-paper"/>
+        <rect x="232" y="74" width="48" height="28" class="fi-paper"/>
+        <text x="44" y="93" class="tx-mono tx-mid">A</text>
+        <text x="100" y="93" class="tx-mono tx-sm tx-mid">A0</text>
+        <text x="152" y="93" class="tx-mono tx-sm tx-mid">A1</text>
+        <text x="204" y="93" class="tx-mono tx-sm tx-mid">A2</text>
+        <text x="256" y="93" class="tx-mono tx-sm tx-mid">A3</text>
+        <rect x="76" y="106" width="48" height="18" class="fi-paper"/>
+        <rect x="128" y="106" width="48" height="18" class="fi-paper"/>
+        <rect x="180" y="106" width="48" height="18" class="fi-paper"/>
+        <rect x="232" y="106" width="48" height="18" class="fi-paper"/>
+        <text x="44" y="119" class="tx-sm tx-mid tx-muted">valid</text>
+        <text x="100" y="119" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="152" y="119" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="204" y="119" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="256" y="119" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="44" y="142" class="tx-sm tx-mid tx-muted">tag</text>
+        <text x="100" y="142" class="tx-sm tx-mid tx-muted">w0</text>
+        <text x="152" y="142" class="tx-sm tx-mid tx-muted">w1</text>
+        <text x="204" y="142" class="tx-sm tx-mid tx-muted">w2</text>
+        <text x="256" y="142" class="tx-sm tx-mid tx-muted">w3</text>
+        <text x="20" y="190" class="tx-hand">tags not compared yet</text>
+      </svg>
+      <p class="fig-label">Before: the store writes at once</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 204" role="img" aria-label="After: the tags differed, so the line now holds block B with only word 1, F2, valid; block A was not lost because a write-through cache has already written its words to memory, and F2 goes to memory too">
+        <text x="20" y="22" class="tx-sm">tags differ, A ≠ B: case 3</text>
+        <rect x="20" y="74" width="48" height="28" class="fw-s3 st-s3"/>
+        <rect x="76" y="74" width="48" height="28" class="fi-soft"/>
+        <rect x="128" y="74" width="48" height="28" class="fw-s1 st-s1"/>
+        <rect x="180" y="74" width="48" height="28" class="fi-soft"/>
+        <rect x="232" y="74" width="48" height="28" class="fi-soft"/>
+        <text x="44" y="93" class="tx-mono tx-mid">B</text>
+        <text x="100" y="93" class="tx-mono tx-sm tx-mid tx-muted">—</text>
+        <text x="152" y="93" class="tx-mono tx-sm tx-mid">F2</text>
+        <text x="204" y="93" class="tx-mono tx-sm tx-mid tx-muted">—</text>
+        <text x="256" y="93" class="tx-mono tx-sm tx-mid tx-muted">—</text>
+        <rect x="76" y="106" width="48" height="18" class="fi-paper"/>
+        <rect x="128" y="106" width="48" height="18" class="fi-paper"/>
+        <rect x="180" y="106" width="48" height="18" class="fi-paper"/>
+        <rect x="232" y="106" width="48" height="18" class="fi-paper"/>
+        <text x="44" y="119" class="tx-sm tx-mid tx-muted">valid</text>
+        <text x="100" y="119" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="152" y="119" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="204" y="119" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="256" y="119" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="44" y="142" class="tx-sm tx-mid tx-muted">tag</text>
+        <text x="100" y="142" class="tx-sm tx-mid tx-muted">w0</text>
+        <text x="152" y="142" class="tx-sm tx-mid tx-muted">w1</text>
+        <text x="204" y="142" class="tx-sm tx-mid tx-muted">w2</text>
+        <text x="256" y="142" class="tx-sm tx-mid tx-muted">w3</text>
+        <text x="20" y="168" class="tx-sm">F2 also goes to memory (write-through)</text>
+        <text x="20" y="196" class="tx-hand">A is safe in memory</text>
+      </svg>
+      <p class="fig-label">After: case 3, repaired</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> Case 3 in a write-through cache with one valid bit per 8-byte word. Before: the line holds block A; the store writes the tag B and F2 into word 1 at once, while the tags are still being compared. After: the tags differed, so the line now holds block B with only word 1 valid. Nothing was lost: every earlier store to block A went to memory as well, so memory holds A's current words.</figcaption>
+  </figure>
+
+  <p>Every outcome is either right or repaired at once, so a store never waits for the tag check, and a write hit costs no more than a read hit. As a bonus, a write miss fetches nothing. Two conditions make it work. The sub-block must be one word, so that a one-word store fills it completely and its valid bit can be set with nothing fetched. And the cache must be write-through: case 3 overwrites a word of block A, which is harmless only because memory already holds A's current data. The price is a valid bit per word, and after case 3 the line holds a single valid word of B: a later read of B's other words misses, the notes' "spatial locality underused" (p. 367). This is the mechanism in Hennessy &amp; Patterson (2nd edition); the notes explain the technique differently, and two of their sentences need the red pen.</p>
+
+  <aside class="redpen" data-page="367">
+    <p class="claim">"If the cache block size is large (e.g., 64B), updating the entire block for a single small write is wasteful and increases hit time."</p>
+    <p class="fix">A store does not update the entire block: with or without sub-blocks it writes only its own bytes, and a write-through cache sends only those bytes to memory. What the sub-blocks change is when the store may write: with a valid bit per word, before the tag check is over.</p>
+    <p class="because">Count the bytes of <code>SD F2, 8(R1)</code> in a 64-byte line: 8 bytes enter the data array either way, selected by the block offset, and in write-through 8 bytes go to memory (one word write per store, the table of lesson 23). The time a write hit loses is the tag check that must come first (Fig. 3), and that is the step small sub-blocks remove.</p>
+  </aside>
+
+  <aside class="redpen" data-page="367">
+    <p class="claim">"Less common in write-back caches since writes accumulate in cache and only dirty blocks are written back, so the benefit is smaller."</p>
+    <p class="fix">In a write-back cache the technique is not just less useful, it is unsafe: the early write of case 3 can destroy a dirty block whose only up-to-date copy is in the cache.</p>
+    <p class="because">Replay case 3 with write-back: block A is dirty, its word 1 was changed by an earlier store and never written to memory. The store to block B overwrites that word before the comparison says "miss". In write-through, memory would still hold A's word; here A's new value is gone.</p>
+  </aside>
+
+  <p>The hardware is that of sub-block placement (p. 345, <a href="l26.html">lesson 26</a>), one valid bit per sub-block under one tag, put to another use: there to fetch less on a miss (miss penalty), here to write without waiting (hit time). And it is the twin of pipelined writes. Both attack the same rule, "check the tag before you write": one overlaps the two steps, the other makes the early write safe.</p>
+
+  <p class="memo"><mark class="key">With a valid bit per word, a write-through cache can write first and check the tag later: a hit was right, a missing valid bit is set, a mismatch is repaired because memory still holds the old block.</mark></p>
+</section>
+
+<section id="l28-score">
+  <h2>Nineteen rows, three terms: the scorecard of the chapter</h2>
+
+  <p>The notes close the chapter with three lists, one per term of AMAT, each technique with the page where it starts (pp. 368–369), and with Table 29 (p. 370). Before you look at either, test your memory: the lists are the skeleton of any open question on cache optimisations.</p>
+
+  <p>From memory: the eight techniques the notes file under "Reducing Miss Rate", with their pages.</p>
+  <details class="answer"><summary>Check yourself</summary>
+    <p>Increase cache size (p. 323), increase block size (p. 324), increase associativity (p. 326), victim cache (p. 328), pseudo-associativity / way prediction (p. 330), hardware prefetching (p. 335), software prefetching (p. 338), compiler optimizations (p. 340).</p>
+  </details>
+  <p>The six under "Reducing Miss Penalty".</p>
+  <details class="answer"><summary>Check yourself</summary>
+    <p>Read priority over write (p. 342), sub-block placement (p. 345), early restart and critical word first (p. 346), non-blocking caches (p. 348), second-level and multi-level caches (p. 350), merging write buffers (p. 353).</p>
+  </details>
+  <p>The four under "Reducing Hit Time".</p>
+  <details class="answer"><summary>Check yourself</summary>
+    <p>Small and simple L1 (p. 356), virtually indexed, physically tagged caches, VIPT (p. 357), pipelined writes (p. 366), small sub-blocks for write-through caches (p. 367).</p>
+  </details>
+
+  <p>The lists hold 18 entries. Table 29 has 19 rows, because early restart and critical word first get one each. The scorecard widget below has 20 cards: it also splits the row "Pseudo-Associativity / Way Prediction", since, as lesson 25 showed, way prediction lowers the hit time and pseudo-associativity the miss rate.</p>
+
+  <figure class="tbl-fig wide" id="l28-tbl-29">
+    <figcaption>Table 29 of the notes (p. 370), as printed. The letters a–f mark the cells discussed below the table.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Technique</th><th>Miss Rate</th><th>Miss Penalty</th><th>Hit Time</th><th>Complexity</th></tr></thead>
+        <tbody>
+          <tr><td>Increase Cache Size</td><td>↓ (fewer capacity)</td><td>–</td><td>↑ (slower)</td><td>↑ (larger arrays)</td></tr>
+          <tr><td>Increase Block Size</td><td>↓ (spatial locality)</td><td>↑ (bigger transfer)</td><td>↑ <sup>a</sup></td><td>Moderate</td></tr>
+          <tr><td>Increase Associativity</td><td>↓ (conflict misses)</td><td>–</td><td>↑ (tag checks)</td><td>↑</td></tr>
+          <tr><td>Victim Cache</td><td>↓ (conflict misses)</td><td>↓ (slightly) <sup>b</sup></td><td>=</td><td>Low–Moderate</td></tr>
+          <tr><td>Pseudo-Associativity / Way Prediction <sup>c</sup></td><td>↓ (like 2-way)</td><td>–</td><td>= (fast if predicted)</td><td>Moderate</td></tr>
+          <tr><td>HW Prefetching</td><td>↓ (compulsory/capacity)</td><td>–</td><td>=</td><td>↑ (stream buffers)</td></tr>
+          <tr><td>SW Prefetching</td><td>↓ (predictable patterns)</td><td>–</td><td>↑ (extra instr.) <sup>d</sup></td><td>Moderate (compiler)</td></tr>
+          <tr><td>Compiler Optimizations</td><td>↓ (better locality)</td><td>–</td><td>=</td><td>↑ (compiler effort)</td></tr>
+          <tr><td>Read Priority over Write</td><td>–</td><td>↓ (fewer stalls)</td><td>=</td><td>Low</td></tr>
+          <tr><td>Sub-block Placement</td><td>–</td><td>↓ (partial fetch)</td><td>=</td><td>↑ (valid bits)</td></tr>
+          <tr><td>Early Restart</td><td>–</td><td>↓ (resume earlier)</td><td>=</td><td>Low</td></tr>
+          <tr><td>Critical Word First</td><td>–</td><td>↓ (critical word first)</td><td>=</td><td>Moderate</td></tr>
+          <tr><td>Non-blocking Caches</td><td>–</td><td>↓↓ (overlap misses)</td><td>=</td><td>↑↑ (MSHRs)</td></tr>
+          <tr><td>Second-Level / Multi-Level</td><td>↓ (fewer L1 misses to DRAM) <sup>e</sup></td><td>↓↓↓</td><td>↑ (extra level) <sup>f</sup></td><td>↑↑</td></tr>
+          <tr><td>Merging Write Buffers</td><td>–</td><td>↓ (less traffic)</td><td>=</td><td>Moderate</td></tr>
+          <tr><td>Small &amp; Simple L1</td><td>↑ (slightly more misses)</td><td>–</td><td>↓↓↓ (fast hits)</td><td>Low</td></tr>
+          <tr><td>VIPT Caches</td><td>–</td><td>–</td><td>↓ (parallel TLB/cache)</td><td>↑ (alias handling)</td></tr>
+          <tr><td>Pipelined Writes</td><td>–</td><td>–</td><td>↓ (higher throughput)</td><td>↑</td></tr>
+          <tr><td>Small Sub-blocks (Write-through)</td><td>–</td><td>–</td><td>↓ (less write work)</td><td>↑</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Most rows say what lessons 25 and 26 said. Six cells need a second look:</p>
+  <ul>
+    <li><b>a</b>, block size, hit time ↑: there is no hit-time effect (red pen below).</li>
+    <li><b>b</b>, victim cache, miss penalty ↓ (slightly): a valid second reading. Seen from the L1 alone a victim-cache hit is a short miss; seen from the L1 and its buffer it is no miss at all.</li>
+    <li><b>c</b>, one row, two techniques: the ↓ under miss rate is pseudo-associativity's; way prediction removes no miss, it shortens the hit.</li>
+    <li><b>d</b>, software prefetching, hit time ↑ (extra instr.): the extra instructions raise the instruction count IC of <a href="l03.html">lesson 3</a>, not the time of a hit.</li>
+    <li><b>e</b>, second level, miss rate ↓: the L1 misses as often as before; what falls is the global miss rate of <a href="l24.html">lesson 24</a>.</li>
+    <li><b>f</b>, second level, hit time ↑ (extra level): the L1 hit is untouched; the L2 lookup is paid by L1 misses, inside the L1 miss penalty.</li>
+  </ul>
+
+  <aside class="redpen" data-page="370">
+    <p class="claim">"Increase Block Size | ↓ (spatial locality) | ↑ (bigger transfer) | ↑ | Moderate"</p>
+    <p class="fix">The third cell, under Hit Time, should read "–": a larger block leaves the hit time where it was. Its two costs are the ones lesson 25 measured: a larger miss penalty and, past the best size, a higher miss rate.</p>
+    <p class="because">Check it on a 32 KB direct-mapped cache with 32-bit addresses. With 32-byte blocks: 5 offset bits, 10 index bits, a 17-bit tag. With 64-byte blocks: 6 offset bits, 9 index bits, the same 17-bit tag. Same array, same single comparison, one index bit less to decode. Hennessy &amp; Patterson's summary tables give the block size no hit-time effect, and neither do the knob tables of lessons 24 and 25.</p>
+  </aside>
+
+  <p>The scorecard below keys all twenty cards with these corrections and the prices found in lessons 25 and 26, and a pattern appears: only six cards push a second term the wrong way. A bigger cache, more ways and pseudo-associativity lengthen the hit, bigger blocks raise the miss penalty, sub-block placement and the small L1 add misses. The other fourteen pay in hardware, bandwidth or complexity.</p>
+
+  <h3>The textbook's version adds bandwidth and power</h3>
+
+  <p>Background, not in the notes. The 5th edition of Hennessy &amp; Patterson sums up its advanced optimisations in a table (Fig. 2.11) that adds two columns to the three terms: bandwidth and power. Small and simple caches score on hit time and power; way prediction on hit time; pipelined cache access and multibanked caches (split into banks that serve independent accesses in parallel) on bandwidth, the first at the price of a longer hit; non-blocking caches on bandwidth and miss penalty; critical word first and the merging write buffer on miss penalty; compiler techniques on miss rate; prefetching on miss penalty and miss rate. A quiz that follows the book may therefore count prefetching as a miss-penalty technique too.</p>
+
+  <div class="widget" id="l28-w-score">
+    <h3 class="widget-title">The scorecard: twenty cards, three terms</h3>
+    <p class="widget-intro">Twenty cards, one per technique of Table 29, with way prediction and pseudo-associativity on separate cards. In "sort the cards", step to a card (or click its row), choose the term it lowers and the term it raises, and check: the row fills in with the corrected key, ↓ for the term it lowers and ↑ for the term it raises, in brackets a second reading that is also accepted. In "exam quiz" the same key writes multiple-answer questions in the form of the January 2026 paper.</p>
+    <ol class="tasks">
+      <li>Sort cards 1, 2, 3 and 17 (bigger cache, bigger blocks, more ways, small and simple L1) before you check any of them. Which of the four raises a term other than the hit time? Then check all four.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Bigger blocks: they raise the miss penalty (and, past the best size, the miss rate), not the hit time, whatever Table 29's ↑ says. The other three trade the miss rate against the hit time: the first two lower the miss rate and lengthen the hit, the small L1 does the opposite.</p></details>
+      </li>
+      <li>Card 15, the second-level cache. Predict its row before you check, then compare it with Table 29's row.
+        <details class="answer"><summary>What you should see</summary>
+          <p>↓ under miss penalty only. The L1 misses as often as before; Table 29's ↓ under miss rate is the global miss rate, and its ↑ under hit time is the L2 lookup that L1 misses pay, inside the miss penalty.</p></details>
+      </li>
+      <li>Switch to "exam quiz". The first question asks which improvements reduce the hit time; press "New question" for the second, which asks which ones increase it. Answer both before checking.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Every option is settled by the same two questions: what does the technique change (how many misses, what a miss costs, what every access costs), and what does it pay for that? The insight of the widget: one key answers every "which techniques reduce …?" quiz, and its second column answers the "increase" ones.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l28-w-score', function (root, ui) {
+    var TERM = { MR: 'miss rate', MP: 'miss penalty', HT: 'hit time' };
+    var CARDS = [
+      { s: 'Bigger cache', p: 323, red: 'MR', worse: 'HT', how: 'fewer capacity misses', cost: 'a longer hit: longer wires, a bigger decoder',
+        t29: '↓ (fewer capacity) · – · ↑ (slower) · ↑ (larger arrays)', ex: 'Increasing the cache size' },
+      { s: 'Bigger blocks', p: 324, red: 'MR', worse: 'MP', altW: ['MR'], how: 'fewer compulsory misses (spatial locality)', cost: 'more bytes to move on every miss',
+        t29: '↓ (spatial locality) · ↑ (bigger transfer) · ↑ · Moderate', ex: 'Increasing the block size',
+        whyNot: { 'raise HT': 'it lowers the miss rate and raises the miss penalty; the hit path stays the same, whatever Table 29 prints' },
+        note: 'Past the best size the miss rate rises again (fewer blocks), so ↑ miss rate is accepted too. Table 29 also writes ↑ under hit time: the red pen of this section removes it.' },
+      { s: 'More ways', p: 326, red: 'MR', worse: 'HT', how: 'fewer conflict misses', cost: 'a longer hit: the way-select multiplexer waits for the tag comparisons',
+        t29: '↓ (conflict misses) · – · ↑ (tag checks) · ↑', ex: 'Increasing the associativity' },
+      { s: 'Victim cache', p: 328, red: 'MR', alt: ['MP'], worse: 'none', how: 'blocks evicted by conflicts are caught in a small fully associative buffer', cost: 'a few entries, comparators and swap logic',
+        t29: '↓ (conflict misses) · ↓ (slightly) · = · Low–Moderate', ex: 'Adding a victim cache',
+        note: 'Counted at the cache plus its buffer, fewer misses; counted at the L1 alone, a victim-cache hit is a short miss. Both columns are accepted (lesson 25).' },
+      { s: 'Way prediction', p: 330, red: 'HT', worse: 'none', how: 'a hit reads only the predicted way and sends the data at once, as a direct-mapped cache does', cost: 'a small table; one more cycle on a wrong guess',
+        t29: 'one row with pseudo-associativity: ↓ (like 2-way) · – · = (fast if predicted) · Moderate', ex: 'Way prediction',
+        note: 'It changes how a hit is found, not what the cache holds: it removes no miss (lesson 25).' },
+      { s: 'Pseudo-associativity', p: 333, red: 'MR', worse: 'HT', how: 'a direct-mapped cache gets a second line per block, so two colliding blocks can both stay', cost: 'a slow second hit, one cycle more',
+        t29: 'one row with way prediction: ↓ (like 2-way) · – · = (fast if predicted) · Moderate', ex: 'Pseudo-associativity' },
+      { s: 'HW prefetching', p: 335, red: 'MR', worse: 'none', how: 'blocks are fetched into a stream buffer before they are asked for', cost: 'memory bandwidth and the stream buffers',
+        t29: '↓ (compulsory/capacity) · – · = · ↑ (stream buffers)', ex: 'Hardware prefetching with stream buffers' },
+      { s: 'SW prefetching', p: 338, red: 'MR', worse: 'none', how: 'the compiler places prefetch instructions ahead of the loads', cost: 'extra instructions (a larger IC) and bandwidth',
+        t29: '↓ (predictable patterns) · – · ↑ (extra instr.) · Moderate (compiler)', ex: 'Compiler-controlled (software) prefetching',
+        note: 'Table 29 writes ↑ (extra instr.) under hit time: the prefetches add instructions, which raises the instruction count, not the time of a hit.' },
+      { s: 'Compiler optimisations', p: 340, red: 'MR', worse: 'none', how: 'loops and data are reordered for locality', cost: 'compiler work only',
+        t29: '↓ (better locality) · – · = · ↑ (compiler effort)', ex: 'Compiler optimizations (loop interchange, blocking, merging arrays)' },
+      { s: 'Read priority over writes', p: 342, red: 'MP', worse: 'none', how: 'a read miss no longer waits behind buffered writes or a dirty write-back', cost: 'address checks on the write buffer',
+        t29: '– · ↓ (fewer stalls) · = · Low', ex: 'Giving priority to read misses over writes' },
+      { s: 'Sub-block placement', p: 345, red: 'MP', worse: 'MR', altW: ['none'], how: 'only the requested sub-block is fetched', cost: 'valid bits; neighbouring words now miss later',
+        t29: '– · ↓ (partial fetch) · = · ↑ (valid bits)', ex: 'Sub-block placement',
+        note: 'Lesson 26 counts the slightly higher miss rate as its price; Table 29 marks no ↑, so "none of the three" is accepted too.' },
+      { s: 'Early restart', p: 346, red: 'MP', worse: 'none', how: 'the processor resumes as soon as its word arrives', cost: 'a little control logic',
+        t29: '– · ↓ (resume earlier) · = · Low', ex: 'Early restart' },
+      { s: 'Critical word first', p: 346, red: 'MP', worse: 'none', how: 'the requested word is fetched first and the block wraps around', cost: 'wrap-around fetch in the memory',
+        t29: '– · ↓ (critical word first) · = · Moderate', ex: 'Critical word first' },
+      { s: 'Non-blocking cache', p: 348, red: 'MP', worse: 'none', how: 'hits and further misses go on while a miss is serviced', cost: 'MSHRs and complex control',
+        t29: '– · ↓↓ (overlap misses) · = · ↑↑ (MSHRs)', ex: 'Non-blocking caches (hit under miss, miss under miss)' },
+      { s: 'Second-level cache', p: 350, red: 'MP', worse: 'none', how: 'most L1 misses are served by the L2 instead of main memory', cost: 'the L2 lookup on every L1 miss, area and power',
+        t29: '↓ (fewer L1 misses to DRAM) · ↓↓↓ · ↑ (extra level) · ↑↑', ex: 'Combining a small and fast L1 with a larger and slower L2',
+        whyNot: { 'lower MR': 'it lowers the miss penalty: the L1 misses as often as before, only the global miss rate falls',
+                  'raise HT': 'it lowers the miss penalty; the L2 lookup is paid by L1 misses, not by the L1 hit' },
+        note: 'The L1 misses exactly as often as before: Table 29\'s ↓ under miss rate is the global miss rate, and the L2 lookup belongs to the L1 miss penalty, not to the L1 hit.' },
+      { s: 'Merging write buffer', p: 353, red: 'MP', worse: 'none', how: 'stores to one block become one transaction, so reads wait less for the bus', cost: 'byte masks and matching logic',
+        t29: '– · ↓ (less traffic) · = · Moderate', ex: 'Merging write buffer' },
+      { s: 'Small and simple L1', p: 356, red: 'HT', worse: 'MR', how: 'short wires, few comparators, no way-select multiplexer', cost: 'more misses',
+        t29: '↑ (slightly more misses) · – · ↓↓↓ (fast hits) · Low', ex: 'Small and simple first-level caches' },
+      { s: 'VIPT: no translation before indexing', p: 357, red: 'HT', worse: 'none', how: 'the cache is indexed while the TLB translates', cost: 'cache size / associativity limited to the page size',
+        t29: '– · – · ↓ (parallel TLB/cache) · ↑ (alias handling)', ex: 'Avoiding address translation during indexing of the cache' },
+      { s: 'Pipelined writes', p: 366, red: 'HT', worse: 'none', how: 'the data write of one store overlaps the tag check of the next', cost: 'a delayed-write buffer that every load must check',
+        t29: '– · – · ↓ (higher throughput) · ↑', ex: 'Pipelined writes' },
+      { s: 'Small sub-blocks (write-through)', p: 367, red: 'HT', worse: 'none', how: 'a store writes its word without waiting for the tag check', cost: 'a valid bit per word; write-through only',
+        t29: '– · – · ↓ (less write work) · ↑', ex: 'Small sub-blocks for write-through caches' }
+    ];
+    /* the exam quiz: question k asks "reduce" or "increase" for one term; cards that can be argued both ways for a kind are left out of it
+       (under miss penalty the victim cache, and prefetching, which H&P's Fig. 2.11 scores on miss penalty as well as miss rate) */
+    var KINDS = [{ dir: 'lower', t: 'HT' }, { dir: 'raise', t: 'HT' }, { dir: 'lower', t: 'MP' }, { dir: 'lower', t: 'MR' }, { dir: 'raise', t: 'MR' }, { dir: 'raise', t: 'MP' }];
+    var SKIP = { 'lower MP': ['Victim cache', 'HW prefetching', 'SW prefetching'], 'raise MR': ['Bigger blocks', 'Sub-block placement'], 'raise HT': ['Pseudo-associativity', 'SW prefetching'] };
+    function isRight(c, k) { return k.dir === 'lower' ? c.red === k.t : c.worse === k.t; }
+    function makeQuestion(q) {
+      var kind = KINDS[q % KINDS.length], key = kind.dir + ' ' + kind.t, rng = Course.rng(2800 + q);
+      var pool = CARDS.filter(function (c) { return (SKIP[key] || []).indexOf(c.s) < 0; });
+      var yes = rng.shuffle(pool.filter(function (c) { return isRight(c, kind); }));
+      var no = rng.shuffle(pool.filter(function (c) { return !isRight(c, kind); }));
+      var nYes = Math.min(yes.length, rng.int(1, 3));
+      var opts = rng.shuffle(yes.slice(0, nYes).concat(no.slice(0, 5 - nYes)));
+      return { kind: kind, opts: opts.map(function (c) { return { c: c, ok: isRight(c, kind) }; }), graded: false, ticks: null };
+    }
+    function reason(c, k) {
+      if (!isRight(c, k) && c.whyNot && c.whyNot[k.dir + ' ' + k.t]) return c.whyNot[k.dir + ' ' + k.t] + '.';
+      var ok = isRight(c, k), lowers = 'it lowers the ' + TERM[c.red], raises = c.worse === 'none' ? '' : ' and raises the ' + TERM[c.worse];
+      if (k.dir === 'lower') return ok ? c.how + '.' : lowers + raises + '.';
+      return ok ? 'its price is ' + c.cost + '.' : lowers + (c.worse === 'none' ? '; its price is ' + c.cost : raises) + '.';
+    }
+
+    var ans = CARDS.map(function () { return null; }), draft = CARDS.map(function () { return { red: '', worse: '' }; });
+    var msg = '', qmsg = '', qn = 0, Q = makeQuestion(0), qRight = 0, qDone = 0;
+
+    /* stage: the board (a table) and the quiz block */
+    var board = Course.el('div', { 'class': 'l28-board' });
+    board.appendChild(Course.el('p', { 'class': 'l28-legend', html: '<b>MR</b> miss rate · <b>MP</b> miss penalty · <b>HT</b> hit time — ↓ the term it lowers, ↑ the term it raises; in brackets a second reading, also accepted. The highlighted row is the current card.' }));
+    var wrap = Course.el('div', { 'class': 'scroll-x' }), tbody = Course.el('tbody'), rowsEl = [];
+    var head = Course.el('thead', null, [Course.el('tr', null, [Course.el('th', { text: 'Technique' }), Course.el('th', { 'class': 'l28-m', text: 'MR' }),
+      Course.el('th', { 'class': 'l28-m', text: 'MP' }), Course.el('th', { 'class': 'l28-m', text: 'HT' }), Course.el('th', { text: 'you' })])]);
+    CARDS.forEach(function (c, i) {
+      var tr = Course.el('tr', { tabindex: '0' });
+      var cells = [0, 1, 2].map(function () { return Course.el('td', { 'class': 'l28-m' }); });
+      var st = Course.el('td', { 'class': 'l28-st' });
+      tr.appendChild(Course.el('td', { html: (i + 1) + '. ' + c.s + ' <span class="l28-pg">p. ' + c.p + '</span>' }));
+      cells.forEach(function (x) { tr.appendChild(x); });
+      tr.appendChild(st);
+      tr.addEventListener('click', function () { if (stp.index !== i) stp.go(i); });
+      tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (stp.index !== i) stp.go(i); } });
+      tbody.appendChild(tr);
+      rowsEl.push({ tr: tr, cells: cells, st: st });
+    });
+    wrap.appendChild(Course.el('table', { 'class': 'tbl l28-tbl' }, [head, tbody]));
+    board.appendChild(wrap);
+    var quiz = Course.el('div', { 'class': 'l28-quiz', lang: 'en' });
+    ui.stage.appendChild(board);
+    ui.stage.appendChild(quiz);
+
+    /* controls */
+    var mode = ui.select('mode', [{ value: 'sort', label: 'sort the cards' }, { value: 'quiz', label: 'exam quiz' }], null, 'sort');
+    var stp = ui.stepper({
+      steps: CARDS.map(function (c, i) { return 'Card ' + (i + 1) + ': <b>' + c.s + '</b> (p. ' + c.p + ')'; }),
+      onStep: function (i) { selR.value = draft[i].red; selW.value = draft[i].worse; }
+    });
+    var selR = ui.select('it lowers', [{ value: '', label: 'choose…' }, { value: 'MR', label: 'the miss rate' }, { value: 'MP', label: 'the miss penalty' }, { value: 'HT', label: 'the hit time' }], null, '');
+    var selW = ui.select('it raises', [{ value: '', label: 'choose…' }, { value: 'MR', label: 'the miss rate' }, { value: 'MP', label: 'the miss penalty' }, { value: 'HT', label: 'the hit time' }, { value: 'none', label: 'none of the three' }], null, '');
+    var bCheck = ui.button('Check this card', function () {
+      var i = stp.index, c = CARDS[i], r = selR.value, w = selW.value;
+      if (!r || !w) { msg = 'Choose both: the term this technique lowers, and the term it raises (or "none of the three").'; return; }
+      var okR = r === c.red || (c.alt || []).indexOf(r) >= 0, okW = w === c.worse || (c.altW || []).indexOf(w) >= 0;
+      ans[i] = { red: r, worse: w, st: okR && okW ? 'right' : okR || okW ? 'half' : 'wrong' };
+      msg = feedback(i);
+    }, { kind: 'primary', icon: 'check' });
+    ui.button('Show the key', function () {
+      CARDS.forEach(function (c, i) { if (!ans[i]) ans[i] = { st: 'key' }; });
+      msg = '';
+    }, { kind: 'ghost' });
+    ui.button('Clear', function () {
+      ans = CARDS.map(function () { return null; });
+      draft = CARDS.map(function () { return { red: '', worse: '' }; });
+      selR.value = ''; selW.value = ''; msg = '';
+    }, { kind: 'ghost', icon: 'refresh' });
+    var tg = [1, 2, 3, 4, 5].map(function (k) { return ui.toggle('Answer ' + k, false); });
+    var bGrade = ui.button('Check the answers', function () {
+      if (Q.graded) return;
+      Q.ticks = tg.map(function (t) { return t.value; });
+      Q.graded = true;
+      var all = Q.opts.every(function (o, j) { return o.ok === Q.ticks[j]; });
+      qDone++; if (all) qRight++;
+      qmsg = all ? 'All five verdicts are right.' : 'Read the marked answers: each says what the technique really changes.';
+    }, { kind: 'primary', icon: 'check' });
+    ui.button('New question', function () {
+      qn++; Q = makeQuestion(qn); qmsg = '';
+      tg.forEach(function (t) { t.value = false; });
+    }, { icon: 'next' });
+    var roCards = ui.readout('cards right'), roQuiz = ui.readout('exam questions right');
+    var note = ui.note('');
+
+    function feedback(i) {
+      var c = CARDS[i], a = ans[i];
+      var key = 'Key: it lowers the ' + TERM[c.red] + (c.alt ? ' (or, read from the L1 alone, the ' + TERM[c.alt[0]] + ')' : '') +
+        '; it raises ' + (c.worse === 'none' ? 'none of the three' : 'the ' + TERM[c.worse]) + '. Its price: ' + c.cost + '.';
+      var head = a.st === 'right' ? 'Right. ' : a.st === 'half' ? 'Half right. ' : a.st === 'wrong' ? 'Not this time. ' : '';
+      var mine = a.st === 'half' || a.st === 'wrong' ? 'You chose: lowers the ' + TERM[a.red] + ', raises ' + (a.worse === 'none' ? 'none of the three' : 'the ' + TERM[a.worse]) + '. ' : '';
+      return '<b>' + c.s + '</b> (p. ' + c.p + '). ' + head + mine + 'How it works: ' + c.how + '. ' + key + ' Table 29 prints: ' + c.t29 + '.' + (c.note ? ' ' + c.note : '');
+    }
+    function mark(i, t) {
+      var c = CARDS[i], a = ans[i], d = draft[i];
+      if (a) {
+        if (c.red === t) return '↓';
+        if ((c.alt || []).indexOf(t) >= 0) return '(↓)';
+        if (c.worse === t) return '↑';
+        if ((c.altW || []).indexOf(t) >= 0) return '(↑)';
+        return '';
+      }
+      if (i !== stp.index) return '';
+      var s = d.red === t ? '↓?' : '';
+      if (d.worse === t) s = s ? s + ' ↑?' : '↑?';
+      return s;
+    }
+    function renderBoard() {
+      CARDS.forEach(function (c, i) {
+        var R = rowsEl[i], a = ans[i];
+        R.tr.className = i === stp.index ? 'is-key' : '';
+        ['MR', 'MP', 'HT'].forEach(function (t, j) { R.cells[j].textContent = mark(i, t); });
+        R.st.textContent = a ? a.st : '';
+        R.st.className = 'l28-st' + (a && a.st === 'right' ? ' l28-ok' : a && a.st === 'wrong' ? ' l28-no' : '');
+      });
+    }
+    function renderQuiz() {
+      var k = Q.kind, stem = k.dir === 'lower'
+        ? 'Which of the following cache improvements are effective in reducing the ' + TERM[k.t] + '?'
+        : 'Which of the following cache optimizations increase the ' + TERM[k.t] + ' as a side effect?';
+      quiz.textContent = '';
+      quiz.appendChild(Course.el('p', { html: '<b>Question ' + (qn + 1) + ' (MULTIPLE ANSWERS).</b> ' + stem + ' Tick the switches below, then check.' }));
+      var ol = Course.el('ol');
+      Q.opts.forEach(function (o, j) {
+        var li = Course.el('li', { html: '<b>Answer ' + (j + 1) + ':</b> ' + o.c.ex });
+        if (Q.graded) {
+          var tk = Q.ticks[j];
+          li.className = tk && o.ok ? 'l28-ok' : tk !== o.ok ? 'l28-no' : '';
+          var verdict = o.ok ? (tk ? 'Right' : 'Missed') : (tk ? 'Wrong' : 'Rightly left out');
+          li.appendChild(Course.el('span', { 'class': 'l28-why', text: verdict + ': ' + reason(o.c, k) }));
+        }
+        ol.appendChild(li);
+      });
+      quiz.appendChild(ol);
+    }
+    function show(el, on) { var w = el.closest('.ctl'); if (w) w.hidden = !on; }
+    var stepCtl = root.querySelector('.ctl-stepper');
+
+    ui.onChange(function () {
+      var q = mode.value === 'quiz', i = stp.index;
+      draft[i] = { red: selR.value, worse: selW.value };
+      board.hidden = q; quiz.hidden = !q;
+      if (stepCtl) stepCtl.hidden = q;
+      show(selR.el, !q); show(selW.el, !q);
+      bCheck.el.parentNode.hidden = q;
+      tg.forEach(function (t) { show(t.el, q); });
+      bGrade.el.parentNode.hidden = !q;
+      roCards.el.hidden = q; roQuiz.el.hidden = !q;
+      renderBoard();
+      renderQuiz();
+      var done = ans.filter(function (a) { return a && a.st !== 'key'; });
+      roCards.set(done.filter(function (a) { return a.st === 'right'; }).length + ' of ' + done.length + ' checked');
+      roQuiz.set(qRight + ' of ' + qDone);
+      if (q) note.set(qmsg || 'Exam form: several answers may be correct. Decide each one by what the technique changes and what it costs.');
+      else if (ans[i]) note.set(feedback(i));
+      else note.set(msg.indexOf('Choose both') === 0 ? msg : 'Choose the two terms for card ' + (i + 1) + ', then press "Check this card". Back and Next move between the cards.');
+    });
+  });
+  </script>
+
+  <h3>Back to the two L1 designs</h3>
+
+  <p>The cache that Example 18 does not mention is the L2. With the L2 of Example 16 behind it, an L1 miss costs 20 cycles and the small, simple L1 wins, 1.80 cycles per access against 2.50. Without it every miss costs 100 cycles and the 32 KB 8-way L1 wins, 4.5 against 5.0. Generations of small L1 caches rest on the large, fast levels behind them. The notes' "use L2 and L3 caches to absorb most misses from L1" (p. 356) is not a detail of the design; it is its condition.</p>
+
+  <p class="memo"><mark class="key">Sort any technique by what it changes (how many misses, what one miss costs, what every access costs), then name its price: the term it pushes the wrong way, if any, or the hardware it adds.</mark></p>
+</section>
+
+<section id="l28-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <p>The questions follow the forms of the papers: an open question with eight sub-points as in June 2026, an exercise answered with every intermediate number, and quizzes with multiple answers, a single number and a true/false. The model answers are computed here; there are no official solutions.</p>
+
+  <div class="exam" data-kind="open" data-points="8" id="l28-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used to improve the performance of a cache, and say which term of the average memory access time each one reduces: 1. Small and simple first-level caches; 2. Way prediction; 3. Avoiding address translation during indexing of the cache; 4. Pipelined writes; 5. Small sub-blocks for write-through caches; 6. Victim cache; 7. Giving priority to read misses over writes; 8. Second-level caches.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <ol>
+          <li>Hit time. The L1 is accessed on every cycle, so its access time bounds the clock period or adds pipeline stages. A small array has short wires, a simple index decoder and a small tag array; low associativity needs few comparators and, when direct-mapped, no way-select multiplexer, so the data can be sent on while the tag is compared. Benefit: minimum hit time and lower energy per access. Cost: a higher miss rate, worth it only if (MR_small − MR_big) × MP &lt; HT_big − HT_small, i.e. when a fast L2 keeps the miss penalty small.</li>
+          <li>Hit time. A small table remembers, for each set, the way that hit last; only that way is read and its data is sent at once, as in a direct-mapped cache, while one tag comparison confirms the hit. A wrong guess costs an extra cycle to check the other ways, and the table is updated. Benefit: the hit time and energy of a direct-mapped cache with the miss rate of a set-associative one. It does not reduce the miss rate.</li>
+          <li>Hit time. The cache is indexed with bits of the virtual address that lie in the page offset, identical in the physical address, while the TLB translates in parallel; the physical tag is compared at the end (virtually indexed, physically tagged). Benefit: the TLB leaves the critical path of every hit. Constraint: index and block-offset bits must fit in the page offset, so cache size / associativity ≤ page size (for example 32 KB, 8-way, with 4 KB pages).</li>
+          <li>Hit time. A write hit is slower than a read hit, because the tag must be checked before the data array is written: a wrong read can be discarded, a wrong write cannot. The write is split into stages (address decode, tag check, data write) and a new write enters every cycle; the data write of one store overlaps the tag check of the next, the data waiting in a delayed-write buffer. Benefit: one write per cycle instead of one every k cycles; the latency of a write does not change. Loads must check the buffer for a pending write to the same address.</li>
+          <li>Hit time. Each one-word sub-block has its own valid bit, so the cache writes the word and the tag in parallel with the tag check. Match: the write was right (set the word's valid bit if needed). Mismatch: the overwritten word belonged to another block that memory already holds (write-through), so the line keeps the new tag with only this word valid. Benefit: writes never wait for the tag check, and a write miss fetches nothing. Usable only with write-through: with write-back a dirty block could be destroyed.</li>
+          <li>Miss rate. A small fully associative buffer (4–16 entries) between the cache and the next level keeps the blocks recently evicted; on a miss it is searched, and a hit there swaps the block back into the cache. It removes many conflict misses of a direct-mapped cache without changing its hit time. Seen from the L1 alone, a victim-cache hit is a cheap miss.</li>
+          <li>Miss penalty. A read miss stalls the processor, a buffered write does not; so read misses are served before the writes waiting in the write buffer, after checking the buffer for the same address (otherwise a RAW hazard through memory). In a write-back cache a dirty victim is moved to the write buffer and written after the new block has been fetched. Benefit: the read-miss penalty no longer includes pending writes.</li>
+          <li>Miss penalty. An L2, larger and slower than the L1 but much faster than main memory, serves most L1 misses: AMAT = L1 Hit Time + L1 Miss Rate × (L2 Hit Time + L2 Miss Rate × L2 Miss Penalty), with the local L2 miss rate. The L1 miss rate is unchanged; the L1 miss penalty falls, and the global miss rate (L1 Miss Rate × L2 Miss Rate) is the fraction of accesses that reaches memory. It also makes a small, fast L1 affordable.</li>
+        </ol>
+      </div>
+      <div class="exam-note"><p>Eight sub-points in the form of June 2026, about five lines each. A complete sub-point names the mechanism, the term of AMAT and the cost. Two traps: putting "avoiding address translation" under the miss penalty (the January 2026 quiz of lesson 26), and crediting an L2 with a lower L1 miss rate. For sub-point 4, start with why a write hit is slow; for sub-point 5, with the three cases.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l28-exam-amat">
+    <div class="exam-q" lang="en">
+      <p>Let us consider two designs for the first-level cache of a processor. Design S: 16 KB direct-mapped cache with Hit Time = 1 clock cycle and Miss Rate = 6%. Design B: 64 KB 4-way set associative cache with Hit Time = 2 clock cycles and Miss Rate = 3%. Both are backed by the same L2 cache with Hit Time L2 = 10 clock cycles, Miss Rate L2 (local) = 20% and Miss Penalty L2 = 100 clock cycles.</p>
+      <p>1. How much is the miss penalty of L1? 2. How much is the AMAT of each design? 3. For which L1 miss penalty would the two designs have the same AMAT? 4. How much would the AMAT of each design be without the L2, if the L1 misses were served by main memory in 100 clock cycles? Which design would you choose in each case?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>1. Miss Penalty L1 = Hit Time L2 + Miss Rate L2 × Miss Penalty L2, in clock cycles:</p>
+        \[ MP_{L1} = 10 + 0.20 \times 100 = 30 \]
+        <p>2. AMAT = Hit Time + Miss Rate × Miss Penalty, in clock cycles:</p>
+        \[ \text{AMAT}_S = 1 + 0.06 \times 30 = 2.8 \]
+        \[ \text{AMAT}_B = 2 + 0.03 \times 30 = 2.9 \]
+        <p>Design S is faster by 0.1 clock cycles per access.</p>
+        <p>3. Equal AMAT when the extra misses of S cost exactly the cycle it saves on every hit:</p>
+        \[ 1 + 0.06\, MP = 2 + 0.03\, MP \]
+        \[ MP = \frac{2 - 1}{0.06 - 0.03} = 33.3 \]
+        <p>S is faster for an L1 miss penalty below about 33 clock cycles.</p>
+        <p>4. Without the L2 the miss penalty is 100 clock cycles:</p>
+        \[ \text{AMAT}_S = 1 + 0.06 \times 100 = 7.0 \]
+        \[ \text{AMAT}_B = 2 + 0.03 \times 100 = 5.0 \]
+        <p>With the L2 choose S (2.8 against 2.9); without it choose B (5.0 against 7.0).</p>
+      </div>
+      <div class="exam-note"><p>Work in this order: first the L1 miss penalty, from the two-level formula of the example A4 sheet, then the two AMATs. The trap is to use 100 cycles as the L1 miss penalty in part 2. Note how close 30 is to the break-even 33.3: a slightly slower L2 would flip the choice.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="13" data-tol="0.5" data-unit="clock cycles" id="l28-exam-pipe">
+    <div class="exam-q" lang="en">
+      <p>The write hits of a cache go through a write path of four one-cycle stages (address decode, tag check, data array update, write buffer update). With pipelined writes, how many clock cycles do 10 back-to-back store hits need, from the first decode to the last stage of the tenth store?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ k + N - 1 = 4 + 10 - 1 = 13 \]
+        <p>Without pipelining \(kN\) = 40 clock cycles. The throughput becomes one store per cycle instead of one every 4; each store still takes 4 cycles.</p>
+      </div>
+      <div class="exam-note"><p>The pipeline fill counts once: the first store needs all four cycles, each of the other nine finishes one cycle later. The same arithmetic as N instructions in a k-stage pipeline (lesson 3).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l28-exam-ht">
+    <div class="exam-q" lang="en"><p>(MULTIPLE ANSWERS) Which of the following cache improvements are effective in reducing the hit time?</p></div>
+    <ul class="options" lang="en">
+      <li>Answer 1: Adopting higher associativity to reduce conflict misses <span class="fb">It lowers the miss rate and lengthens the hit: the way-select multiplexer waits for more comparisons.</span></li>
+      <li data-correct>Answer 2: Avoiding address translation during indexing of the cache <span class="fb">Right: the cache is indexed while the TLB translates, so translation leaves the path of every hit (lesson 27).</span></li>
+      <li data-correct>Answer 3: Small and simple first-level caches <span class="fb">Right: short wires, few comparators, no way-select multiplexer.</span></li>
+      <li>Answer 4: Critical word first <span class="fb">It shortens the miss penalty: the requested word arrives first.</span></li>
+      <li data-correct>Answer 5: Pipelined writes <span class="fb">Right: a write hit no longer holds the cache for its tag check and its data write in a row.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 2, 3 and 5. Answer 1 reduces the miss rate (and increases the hit time); Answer 4 reduces the miss penalty.</p></div>
+      <div class="exam-note"><p>The options mix the hit-time list of the notes (p. 369) with one miss-rate and one miss-penalty technique, the way the January 2026 quiz built its wrong answers. Sort each option by the term it changes and the answer follows.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l28-exam-up">
+    <div class="exam-q" lang="en"><p>(MULTIPLE ANSWERS) Which of the following changes increase the hit time of a first-level cache?</p></div>
+    <ul class="options" lang="en">
+      <li>Answer 1: Increasing the block size, keeping the cache size <span class="fb">No: at a fixed cache size the tag, the comparisons and the data array stay the same; the price of larger blocks is the miss penalty.</span></li>
+      <li data-correct>Answer 2: Increasing the associativity <span class="fb">Right: more tags to compare, and the way-select multiplexer waits for them.</span></li>
+      <li data-correct>Answer 3: Increasing the cache size <span class="fb">Right: a bigger array has longer wires and a bigger decoder.</span></li>
+      <li>Answer 4: Adding a victim cache <span class="fb">No: it is searched only after a miss, so the hit path does not change.</span></li>
+      <li>Answer 5: Adding a second-level cache <span class="fb">No: the L1 hit is untouched; the L2 lookup is part of the L1 miss penalty.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 2 and 3. A larger block raises the miss penalty, a victim cache and an L2 act only after an L1 miss.</p></div>
+      <div class="exam-note"><p>Answers 1 and 5 are the cells a and f of Table 29 that this lesson corrects. If the paper asks you to motivate, give one line per option: the term it really changes.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l28-exam-tf">
+    <div class="exam-q" lang="en"><p>(True/False) Pipelining the cache writes reduces the latency of each individual write.</p></div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Each write still goes through all its stages; only the next write no longer waits for it.</span></li>
+      <li data-correct>False <span class="fb">Right: pipelining raises the number of writes per cycle, not the speed of one write.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. With pipelined writes a new write can start every cycle, so the throughput rises (to one write per cycle in Example 22 of the notes), but each write still needs its address decode, tag check and data write: "latency still 3, but overlapped". Its data may even wait longer in the delayed-write buffer when loads are using the data array.</p></div>
+      <div class="exam-note"><p>Motivate a true/false with the mechanism: throughput against latency, the same distinction as for an instruction pipeline.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l28-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">Your L1 data cache needs 1.25 ns, every other stage 1 ns, and you keep the 1 GHz clock. What does the slow cache cost you?</p>
+    <ul class="options">
+      <li>Nothing: the frequency is unchanged <span class="fb">The access no longer fits in one cycle; it takes two, and the extra cycle shows up somewhere.</span></li>
+      <li data-correct>One more pipeline stage for the access: an instruction that needs a loaded value waits longer for it <span class="fb">The clock is safe, but CPI grows: the load-use pair stalls twice instead of once. (Split the instruction cache the same way and every mispredicted branch would cost a cycle more too.)</span></li>
+      <li>A higher miss rate <span class="fb">The cache holds the same blocks; only the time of an access changed.</span></li>
+      <li>A clock of 800 MHz <span class="fb">That is the other choice, stretching the cycle to 1.25 ns; you kept 1 GHz.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A small L1 hits in 1 cycle and misses 6 % of its accesses; a bigger one hits in 2 cycles and misses 2 %. Below which miss penalty is the small one faster?</p>
+    <ul class="options">
+      <li data-correct>25 cycles <span class="fb">(2 − 1) / (0.06 − 0.02) = 1 / 0.04 = 25: below it, the 4 % of extra misses cost less than the cycle saved on every hit.</span></li>
+      <li>50 cycles <span class="fb">That divides by the big cache's miss rate alone; what counts is the difference of the two miss rates.</span></li>
+      <li>16.7 cycles <span class="fb">That divides by the small cache's miss rate alone.</span></li>
+      <li>At any miss penalty: the hit time matters more <span class="fb">At 100 cycles the small cache needs 1 + 6 = 7 cycles per access, the big one 2 + 2 = 4.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why may a read hit use the data array before the tag comparison is over, while a write may not write it?</p>
+    <ul class="options">
+      <li data-correct>A wrong read is simply thrown away; a wrong write would overwrite a word of another block <span class="fb">The asymmetry of Fig. 3: a read has no side effect, a write does.</span></li>
+      <li>Writes are rarer than reads, so they can afford to be slower <span class="fb">Often true, but it does not explain why the order of the two steps is forced.</span></li>
+      <li>The tag array is busy during a write <span class="fb">The tag array is read in both cases; the question is when the data array may change.</span></li>
+      <li>A write-through cache must write memory first <span class="fb">The memory write goes through the write buffer; it is the update of the cache line that must wait for the comparison.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">With pipelined writes, <code>SD F2, 0(R1)</code> is followed at once by <code>LD F4, 0(R1)</code>, and F2 still waits in the delayed-write buffer when the load reads. What must the cache do so that the load gets the right value without waiting?</p>
+    <ul class="options">
+      <li data-correct>Compare the load's address with the buffer and take F2 from it <span class="fb">The hazard of p. 366: a read must not bypass a pending write to the same address.</span></li>
+      <li>Read the data array, as for any hit <span class="fb">The array still holds the old word: the load would get a stale value, as in the third task of the ticker.</span></li>
+      <li>Send the load to main memory <span class="fb">Memory holds an older value at best; the newest one is in the buffer.</span></li>
+      <li>Stall the load until F2 is in the array <span class="fb">The value would be right, but the load waits, and the question asks for no waiting; taking F2 from the buffer gives it at once.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Small sub-blocks in a write-through cache, one valid bit per word. A store finds a different tag in its line (case 3). Which statements are true?</p>
+    <ul class="options">
+      <li data-correct>The word written early belonged to another block, and memory already holds that block <span class="fb">Write-through: every earlier store to that block went to memory as well.</span></li>
+      <li data-correct>The line keeps the new tag, and only the written word is valid <span class="fb">The other valid bits are cleared: those words are not the new block's.</span></li>
+      <li>The rest of the new block must be fetched before the store completes <span class="fb">Nothing is fetched: the store filled its whole one-word sub-block. Later reads of the other words will miss.</span></li>
+      <li data-correct>The store did not wait for the tag comparison <span class="fb">That is the point: data and tag were written alongside it.</span></li>
+      <li>The same trick would be safe in a write-back cache <span class="fb">No: the old block might be dirty, and the early write would destroy its only up-to-date copy.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which entries of the corrected scorecard are right?</p>
+    <ul class="options">
+      <li>A larger block raises the hit time <span class="fb">No: same tag, same comparison, same array at a fixed size; the price is the miss penalty.</span></li>
+      <li data-correct>An L2 leaves the L1 miss rate unchanged <span class="fb">It lowers the L1 miss penalty and the global miss rate.</span></li>
+      <li>Way prediction lowers the miss rate <span class="fb">It only speeds up finding a hit; the cache holds the same blocks.</span></li>
+      <li data-correct>Seen from the L1 alone, a victim-cache hit is a cheaper miss <span class="fb">Hence the second reading in Table 29: miss penalty ↓ (slightly).</span></li>
+      <li data-correct>Avoiding address translation during indexing lowers the hit time, not the miss penalty <span class="fb">The trap of the January 2026 quiz (lesson 26).</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l28-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Every access pays the hit time and the L1 is used on every cycle, so a slower L1 either stretches the clock period (lower \(f_{CLK}\)) or adds a pipeline stage (higher CPI: more load-use stalls for the data cache, a larger branch penalty for the instruction cache); a delay counted in cycles never lowers the frequency.</li>
+    <li>Small and simple means short wires, a simple decoder, few comparators and no way-select multiplexer, so a direct-mapped cache can send the data while it compares the tag; it also saves energy. It pays only while the extra misses, times the miss penalty, cost less than the hit time saved, which is why a fast L2 keeps the L1 small.</li>
+    <li>A write hit is slower than a read hit because the tag must be checked before the data array is written. Pipelined writes overlap the data write of one store with the tag check of the next: one write per cycle, the same latency, and loads must look into the delayed-write buffer.</li>
+    <li>Small sub-blocks (a valid bit per word) let a write-through cache write first and check later: a hit was right, a missing valid bit is set, a mismatch is repaired because memory holds the old block. With write-back the trick would destroy dirty data.</li>
+    <li>Every technique of the chapter lowers one term of AMAT. A few, such as a bigger cache, bigger blocks, more ways and a small L1, push another term up; the rest pay in hardware, bandwidth or complexity. In the corrected Table 29, larger blocks do not raise the hit time, an L2 lowers the L1 miss penalty and the global miss rate but not the L1 miss rate, and way prediction lowers the hit time, not the miss rate.</li>
+  </ul>
+  <aside class="cheat" id="l28-cheat">
+    <dl>
+      <dt>AMAT</dt><dd>Hit Time + Miss Rate × Miss Penalty; every access pays the hit time, a miss pays both</dd>
+      <dt>Small L1 against big L1 (same MP)</dt><dd>small wins iff \((MR_s - MR_b)\,MP \lt HT_b - HT_s\)</dd>
+      <dt>Break-even miss penalty</dt><dd>\(MP^{*} = \frac{HT_b - HT_s}{MR_s - MR_b}\); the small L1 wins below it</dd>
+      <dt>Break-even miss rate</dt><dd>\(MR_s^{*} = MR_b + \frac{HT_b - HT_s}{MP}\)</dd>
+      <dt>L1 too slow for one cycle</dt><dd>stretch \(T_{CLK}\) (\(f_{CLK}\) down, every instruction slower) or add a stage (\(f_{CLK}\) kept, CPI up: load-use stalls; for the I-cache also a larger branch penalty)</dd>
+      <dt>N writes, k-stage write path</dt><dd>kN cycles unpipelined; k + N − 1 pipelined; latency k either way</dd>
+      <dt>Read hit against write hit</dt><dd>read: tag and data in parallel, drop on mismatch; write: tag check first, then write</dd>
+      <dt>Pipelined-write hazard</dt><dd>a load checks the delayed-write buffer; on an address match it takes the data from there</dd>
+      <dt>Small sub-blocks, write-through</dt><dd>write word + tag at once; match: done (set valid); mismatch: new tag, only this word valid; never with write-back</dd>
+      <dt>Sorting rule</dt><dd>how many misses → miss rate; what one miss costs → miss penalty; what every access costs → hit time</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l28-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=dNnhmnIQjVA" target="_blank" rel="noopener">Pipelined Caches</a>
+      <span class="res-by">Milos Prvulovic, Georgia Tech HPCA (Udacity)</span><span class="res-dur">a few minutes</span>
+      <p class="res-why">Watch it at the end of section 3: a drawn example of a cache access spread over pipeline stages, the "add a stage" choice of Fig. 1.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://minds.wisc.edu/items/decd9235-3622-488f-945d-9bace74015ba" target="_blank" rel="noopener">Evaluating Associativity in CPU Caches</a>
+      <span class="res-by">Mark D. Hill and Alan Jay Smith, IEEE Transactions on Computers, 1989</span><span class="res-dur">19 pages</span>
+      <p class="res-why">Real measurements of the trade-off that the balance widget plays with invented numbers: above a certain size, a direct-mapped cache can have a lower effective access time than a set-associative one despite its higher miss ratio.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://ftp.mirrorservice.org/sites/www.bitsavers.org/pdf/dec/tech_reports/WRL-91-12.pdf" target="_blank" rel="noopener">Cache Write Policies and Performance</a>
+      <span class="res-by">Norman P. Jouppi, DEC WRL Research Report 91/12, 1991</span><span class="res-dur">48 pages</span>
+      <p class="res-why">For sections 3 and 4: write-through against write-back, and whether a write miss should fetch its block or not, measured. Read it with the three cases of the sub-block table in mind.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=0G5gi6kooig" target="_blank" rel="noopener">Advanced Caches (Lecture 24, Digital Design and Computer Architecture, Spring 2021)</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span>
+      <p class="res-why">A full-length lecture on advanced cache design: watch it after this lesson to review the cache optimisations of lessons 25 to 28 in one sitting.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>The memory module ends here: every technique makes misses rarer or cheaper, or hits faster. When a miss cannot be avoided, the core can still put the wait to use: let it run another thread meanwhile.</p>
+</aside>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SIMD today: packed extensions, GPUs, tensor cores and NPUs · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l32">
+
+<header class="lesson-head">
+  <h1>SIMD today: packed extensions, GPUs, tensor cores and NPUs</h1>
+  <p class="lede">After this lesson you will explain Table 30 row by row, describe a GPU's streaming multiprocessor as a multithreaded vector processor with a memory of its own, and say what a tensor core multiplies and what a TPU keeps stationary.</p>
+</header>
+
+<div class="hook" data-label="A puzzle">
+  <p>In 2015 Google started running a chip of its own design in its datacenters. It held 65,536 multipliers and none of the machinery this course has built since lesson 4: no caches, no branch prediction, no out-of-order execution, no multithreading. Its control logic took under 2 % of the die. On neural-network inference it was 15 to 30 times faster than the CPUs and GPUs of its day, and 30 to 80 times better in operations per watt.</p>
+  <p>How can a machine get faster by throwing away the hardware you spent a semester learning? Keep the question; the last section answers it. The way there runs through three machines you use every day — the SIMD unit of your laptop's CPU, the GPU, and the tensor cores inside the GPU — and each of them is Cray's vector idea of lessons 30–31, rebuilt for a different world.</p>
+</div>
+
+<section id="l32-packed">
+  <h2>Packed SIMD: the vector length written into the opcode</h2>
+
+  <p>Start with the loop of the exam's strip-mining quiz, <code>for (i=0; i&lt;260; i++) Y[i] = X[i] + Y[i];</code> (<a href="l21.html#l21-exam-strip">lesson 21</a> takes its wrong options apart), and compile it not for VMIPS but for the CPU in your laptop.</p>
+
+  <p>From the mid-1990s the general-purpose CPUs (x86, ARM, PowerPC) added <mark class="key">SIMD instruction sets</mark> (p. 414): Intel MMX (1996), then SSE, AVX and AVX-512; ARM NEON. A register of 128, 256 or 512 bits is treated as a short row of numbers packed side by side, and one instruction applies the same operation to all of them: 4 doubles in a 256-bit AVX register, 8 in a 512-bit AVX-512 register. The notes call these "SIMD ISA extensions", Hennessy &amp; Patterson "multimedia SIMD extensions"; this lesson says <mark class="key">packed SIMD</mark>.</p>
+
+  <p>For AVX, 260 = 65 × 4: the compiler emits a loop of 65 trips, one 4-wide add each. For AVX-512, 260 = 32 × 8 + 4: 32 trips of the 8-wide loop, and then four elements that no 8-wide add can take. They need a second loop, the scalar <mark class="key">remainder loop</mark>:</p>
+
+<pre><code>// AVX-512: 8 doubles in every add
+// main loop, 32 trips:
+for (i = 0; i + 8 &lt;= n; i += 8)
+  Y[i:i+8] = X[i:i+8] + Y[i:i+8];
+// remainder loop, 4 scalar trips:
+for (; i &lt; n; i++)
+  Y[i] = X[i] + Y[i];</code></pre>
+
+  <aside class="margin-note">The VMIPS code of Hennessy &amp; Patterson runs the short strip first; the notes and lesson 31 put it last, as min(n - i, MVL) does. Same five strips.</aside>
+
+  <p>On a vector machine the same loop is the strip-mined loop of <a href="l31.html">lesson 31</a>. With MVL = 64, 260 = 4 × 64 + 4: five strips, each the same four vector instructions with VLR set to the strip's length, and no second loop:</p>
+
+<pre><code>// vector ISA: the length is in VLR
+// strips: VLR = 64, 64, 64, 64, 4
+for (i = 0; i &lt; n; i += VLR) {
+  VLR = min(n - i, MVL);
+  // L.V, L.V, ADDVV.D, S.V:
+  Y[i:i+VLR] = X[i:i+VLR]
+             + Y[i:i+VLR];
+}</code></pre>
+
+  <p>The difference fits in one sentence, and Table 30 of the notes compares the two machines row by row: in packed SIMD the vector length is part of the opcode, in a vector ISA it is the content of a register.</p>
+
+  <figure class="tbl-fig" id="l32-tbl-t30">
+    <figcaption>Table 30 of the notes (p. 414), row by row. The memory-access cell is corrected (red pen below); the other cells say what the notes say.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Aspect</th><th>True vector machines (Cray, VMIPS)</th><th>SIMD ISA extensions (SSE/AVX)</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Vector length</th><td>arbitrary, controlled by VLR, up to MVL</td><td>fixed by the register width (e.g. 4, 8, 16 elements)</td></tr>
+          <tr><th scope="row">Scalability</th><td>the same code runs efficiently if MVL grows (e.g. 64 → 128 elements)</td><td>code must be recompiled or rewritten when the width changes (SSE 128-bit vs AVX 256-bit)</td></tr>
+          <tr><th scope="row">Memory access</th><td>rich modes: unit stride, non-unit stride (LVWS), gather/scatter</td><td>mostly contiguous aligned loads/stores; gather only from AVX2, scatter only from AVX-512, both slower</td></tr>
+          <tr><th scope="row">Masking / predication</th><td>vector mask registers</td><td>only with the k-mask registers of AVX-512; older SIMD had no clean predication</td></tr>
+          <tr><th scope="row">Instruction count</th><td>one vector instruction covers VL operations, whatever the MVL</td><td>one instruction covers only what fits in the register; long vectors need many</td></tr>
+          <tr><th scope="row">Loop handling</th><td>strip mining + VLR: the same loop handles any size</td><td>leftovers need a scalar remainder loop or a separate vector clean-up</td></tr>
+          <tr><th scope="row">Philosophy</th><td>an architecturally first-class vector model</td><td>a scalar ISA "extended" with packed data operations</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Three rows — vector length, instruction count, loop handling — are one fact seen three times. The register width fixes the length, so one instruction covers only what fits in the register, and whatever does not fit at the end goes to the remainder loop. For a loop of \(n\) elements on a width of \(W\):</p>
+
+  <div class="formula">
+    \[ I = \lfloor n/W \rfloor + (n \bmod W) \]
+    <dl class="legend">
+      <dt>\(I\)</dt><dd>add instructions executed for the loop</dd>
+      <dt>\(\lfloor n/W \rfloor\)</dt><dd>trips of the SIMD loop, one \(W\)-wide add each</dd>
+      <dt>\(n \bmod W\)</dt><dd>leftovers, one scalar add each in the remainder loop</dd>
+    </dl>
+  </div>
+
+  <p>A vector instruction covers VLR elements whatever MVL is, and the last strip simply sets a shorter VLR: \(\lceil n/\mathrm{MVL} \rceil\) instructions per operation, no second loop.</p>
+
+  <p>The width in the opcode also freezes the binary. A program compiled for AVX keeps issuing 4-wide adds on a core with 512-bit hardware: half the lanes stay idle until someone recompiles it. A program compiled for AVX-512 does not run at all on a core without AVX-512. A vector binary runs on any number of lanes — the transparent scaling of lesson 31 — and gets longer strips when MVL grows, provided its loop takes MVL from the hardware instead of writing 64 into the code.</p>
+
+  <details class="why">
+    <summary>Why can't a wider core simply widen an SSE instruction?</summary>
+    <p>Because the width is part of what the instruction means — the register names say it: <code>xmm</code> is 128 bits, <code>ymm</code> 256, <code>zmm</code> 512 — and the program relies on exactly that many doubles per register. In a VLR machine the width lives in a register, so the same <code>ADDVV.D</code> fills whatever MVL the hardware has.</p>
+  </details>
+
+  <div class="widget" id="l32-w-width">
+    <h3 class="widget-title">One loop, two kinds of binary</h3>
+    <p class="widget-intro">The loop <code>Y[i] = X[i] + Y[i]</code> for \(n\) elements, add instructions only: one column per clock cycle, one row per lane. Above, a packed-SIMD binary (one SIMD add per cycle; the leftovers run as scalar adds on one lane). Below, one vector binary that sets VLR to min(remaining, MVL) for each strip; an <code>ADDVV.D</code> with VLR = \(v\) on \(L\) lanes takes \(\lceil v/L \rceil\) cycles. The older core has 256-bit SIMD and a vector unit with MVL 64 on 4 lanes, the newer one 512-bit SIMD, MVL 128 and 8 lanes. Switching the core recompiles nothing; only the packed-binary menu does.</p>
+    <ol class="tasks">
+      <li>Older core, AVX binary. Predict the cycles of both machines at n = 64, then at n = 63.
+        <details class="answer"><summary>What you should see</summary>
+          <p>At n = 64 both take 16 cycles: sixteen 4-wide adds, and one <code>ADDVV.D</code> that needs 64 / 4 cycles on 4 lanes. At n = 63 the packed loop runs 15 SIMD adds and a remainder loop of 3 scalar adds: 18 cycles. The vector machine sets VLR = 63 and needs ⌈63 / 4⌉ = 16. One element fewer, two cycles more.</p></details>
+      </li>
+      <li>Keep n = 63 and switch to the newer core, still with the AVX binary. Predict the packed count before you look.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Still 18: every add in the binary says "4 doubles", so 4 of the 8 lanes idle and lanes busy drops to 44 %. The vector binary, untouched, falls to 8 cycles: MVL 128 gives one strip, 8 lanes give ⌈63 / 8⌉ = 8. That is the scalability row of Table 30.</p></details>
+      </li>
+      <li>Now pick the AVX-512 binary on the newer core. Predict n = 30, then n = 7.
+        <details class="answer"><summary>What you should see</summary>
+          <p>At n = 30: 3 SIMD adds + 6 scalar adds = 9 cycles, no better than the AVX binary's 7 + 2 = 9, because the remainder grew with the width. At n = 7: seven scalar adds and not a single SIMD instruction — the loop is shorter than one register. A wider register sends more of a short or ragged loop to the remainder loop, up to \(W - 1\) elements. Try this binary on the older core as well: it does not run.</p></details>
+      </li>
+      <li>Choose the masked tail. What do n = 30 and n = 7 cost now, and which machine does it imitate?
+        <details class="answer"><summary>What you should see</summary>
+          <p>4 cycles and 1 cycle. The k-mask registers of AVX-512 let one masked add take all the leftovers, which is what VLR does on a vector machine. Masks reached packed SIMD only with AVX-512, the last extension in the notes' list — the masking row of Table 30.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-width', function (root, ui) {
+    var S = Course.svg;
+    var BIN = [
+      { value: 'avx', label: 'AVX: 4 doubles per add (256-bit)', W: 4, masked: false, title: 'AVX binary, 4 doubles per add' },
+      { value: 'avx512', label: 'AVX-512: 8 doubles per add (512-bit)', W: 8, masked: false, title: 'AVX-512 binary, 8 doubles per add' },
+      { value: 'avx512m', label: 'AVX-512 with a masked tail (k-mask)', W: 8, masked: true, title: 'AVX-512 binary, masked tail' }
+    ];
+    var HW = [
+      { value: 'old', label: 'older core: 4 lanes, MVL 64', H: 4, MVL: 64 },
+      { value: 'new', label: 'newer core: 8 lanes, MVL 128', H: 8, MVL: 128 }
+    ];
+    var nS = ui.slider({ label: 'loop length n', min: 1, max: 260, step: 1, value: 30 });
+    [7, 30, 63, 64, 260].forEach(function (v) {
+      ui.button('n = ' + v, function () { nS.set(v, true); }, { kind: 'ghost' });
+    });
+    var bin = ui.select('packed-SIMD binary', BIN.map(function (b) { return { value: b.value, label: b.label }; }), null, 'avx');
+    var hw = ui.select('hardware under both binaries', HW.map(function (h) { return { value: h.value, label: h.label }; }), null, 'old');
+    var roP = ui.readout('packed SIMD'), roV = ui.readout('vector + VLR');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'lane busy: SIMD or vector add', color: 's1', mark: 'square' },
+      { label: 'lane busy: scalar remainder add', color: 's2', mark: 'square' },
+      { label: 'lane idle', color: 'line', mark: 'square' }
+    ]);
+    var svg = ui.svg(560, 330, { label: 'Two lane-by-cycle grids for the same loop: above, the add instructions of the packed-SIMD binary (full columns for SIMD adds, single cells for scalar remainder adds, empty cells for idle lanes); below, the strips of the vector binary, each one ADDVV.D' });
+    var layer = S('g', {}, svg);
+
+    function find(list, v) { for (var i = 0; i < list.length; i++) if (list[i].value === v) return list[i]; return list[0]; }
+    function packed(n, b, h) {
+      if (b.W > h.H) return null;                       // 512-bit instructions on a 256-bit core
+      var main = Math.floor(n / b.W), r = n % b.W, cols = [], i;
+      for (i = 0; i < main; i++) cols.push({ k: 'simd', busy: b.W });
+      if (r > 0) {
+        if (b.masked) cols.push({ k: 'simd', busy: r });
+        else for (i = 0; i < r; i++) cols.push({ k: 'scalar', busy: 1 });
+      }
+      return { main: main, r: r, cols: cols };
+    }
+    function vector(n, h) {
+      var strips = [], cols = [], starts = [], left = n;
+      while (left > 0) { var v = Math.min(left, h.MVL); strips.push(v); left -= v; }
+      strips.forEach(function (v) {
+        starts.push(cols.length);
+        for (var q = 0; q < Math.ceil(v / h.H); q++) cols.push({ k: 'simd', busy: Math.min(h.H, v - q * h.H) });
+      });
+      return { strips: strips, cols: cols, starts: starts };
+    }
+    function txt(x, y, cls, s) { return S('text', { x: x, y: y, 'class': cls, text: s }, layer); }
+    function drawGrid(cols, H, Y, X0, cw) {
+      var rh = 96 / H, gap = cw >= 8 ? 2 : 1;
+      cols.forEach(function (c, ci) {
+        for (var l = 0; l < H; l++) {
+          var cls = l < c.busy ? (c.k === 'scalar' ? 'fw-s2 st-s2 sw-1' : 'fw-s1 st-s1 sw-1') : 'fi-soft st-line sw-1';
+          S('rect', { x: X0 + ci * cw + gap / 2, y: Y + l * rh + 1, width: Math.max(1, cw - gap), height: rh - 2, 'class': cls }, layer);
+        }
+      });
+      txt(X0 - 8, Y + rh / 2 + 4, 'tx-sm tx-end', 'lane 0');
+      txt(X0 - 8, Y + (H - 1) * rh + rh / 2 + 4, 'tx-sm tx-end', 'lane ' + (H - 1));
+    }
+    function sep(x, Y) { S('line', { x1: x, y1: Y - 5, x2: x, y2: Y + 101, 'class': 'sw-2 dash' }, layer); }
+
+    ui.onChange(function () {
+      var n = Math.round(nS.value), b = find(BIN, bin.value), h = find(HW, hw.value);
+      var p = packed(n, b, h), v = vector(n, h);
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      var X0 = 70, YA = 30, YB = 180;
+      var maxC = Math.max(16, v.cols.length, p ? p.cols.length : 0), cw = Math.min(18, 478 / maxC);
+      txt(8, 18, 'tx-bold', 'Packed SIMD · ' + b.title);
+      txt(8, 168, 'tx-bold', 'Vector ISA · one strip-mined binary for any core');
+      if (p) {
+        drawGrid(p.cols, h.H, YA, X0, cw);
+        if (p.main > 0 && p.cols.length > p.main) sep(X0 + p.main * cw, YA);
+      } else {
+        txt(309, 72, 'tx-mid', 'No 512-bit SIMD unit in this core:');
+        txt(309, 96, 'tx-mid', 'it stops on an illegal-instruction fault.');
+      }
+      drawGrid(v.cols, h.H, YB, X0, cw);
+      for (var s = 1; s < v.starts.length; s++) sep(X0 + v.starts[s] * cw, YB);
+      for (var t = 0; t <= maxC; t += 8) {
+        S('line', { x1: X0 + t * cw, y1: 284, x2: X0 + t * cw, y2: 290, 'class': 'st-muted' }, layer);
+        txt(X0 + t * cw, 304, 'tx-sm tx-mid tx-muted', String(t));
+      }
+      txt(552, 322, 'tx-sm tx-end tx-muted', 'clock cycles →');
+
+      var pct = function (cycles) { return Math.round(100 * n / (cycles * h.H)) + ' % lanes busy'; };
+      if (!p) roP.set('does not run on this core');
+      else roP.set(p.main + ' SIMD' + (p.r ? (b.masked ? ' + 1 masked' : ' + ' + p.r + ' scalar') : '') + ' = ' + p.cols.length + ' instr. · ' + p.cols.length + ' cycles · ' + pct(p.cols.length));
+      roV.set(v.strips.length + ' × ADDVV.D (VLR = ' + v.strips.join(', ') + ') · ' + v.cols.length + ' cycles · ' + pct(v.cols.length));
+
+      var msg = [];
+      if (!p) msg.push('An AVX-512 binary is made of 512-bit instructions, and this core cannot decode them. The vector binary runs on both cores.');
+      else {
+        if (b.W < h.H) msg.push('Every add of this binary says "4 doubles": on 8 lanes, 4 stay idle until the program is recompiled for AVX-512. The vector binary was not touched — its lanes and its MVL come from the hardware.');
+        if (p.main === 0 && p.r > 0 && !b.masked) msg.push('The loop is shorter than one register: not a single SIMD instruction runs.');
+        else if (p.r > 0 && !b.masked) msg.push(n + ' = ' + p.main + ' × ' + b.W + ' + ' + p.r + ': the leftovers go to the scalar remainder loop, one lane busy per add.');
+        if (p.r > 0 && b.masked) msg.push('The ' + p.r + ' leftovers take one masked add: the k-mask registers of AVX-512 do the job of VLR.');
+        if (p.r === 0) msg.push(n + ' is a multiple of ' + b.W + ': no leftovers this time.');
+      }
+      msg.push('Vector side: ' + v.strips.length + (v.strips.length > 1 ? ' strips, each' : ' strip,') + ' one ADDVV.D of ⌈VLR / ' + h.H + '⌉ cycles.');
+      note.set(msg.join(' '));
+    });
+  });
+  </script>
+
+  <p>The two rows left, memory access and masking, are about what packed SIMD lacked at birth. It loaded only contiguous, aligned blocks. Strided access, gather/scatter and per-element masks — all in vector ISAs since the Cray era — arrived generations later, if at all: gather with AVX2 (strided loads only as gathers), scatter and the k-mask registers with AVX-512. The notes misdate gather:</p>
+
+  <aside class="redpen" data-page="414">
+    <p class="claim">"Limited: mostly contiguous aligned loads/stores; gather/scatter only in AVX-512 (slower)."</p>
+    <p class="fix">Gather came before AVX-512: AVX2 (2013) has gather instructions. Only scatter waited for AVX-512.</p>
+    <p class="because">Look both up in the Intel Intrinsics Guide (in the resources): <code>_mm256_i32gather_pd</code> is listed under AVX2, <code>_mm512_i32scatter_pd</code> under AVX-512. The point of the row stands: both came late, and each gathered element is still a separate memory access, slower than a contiguous load.</p>
+  </aside>
+
+  <div class="pitfall">
+    <p>"AVX-512 is a vector processor." It is packed SIMD: a fixed 512-bit width in the opcode and no vector-length register. It borrowed masks and gather/scatter from vector machines, not the length register: a masked add can take the leftovers, but the compiler must build that mask for the tail, and a wider register still means new opcodes and a recompiled binary.</p>
+  </div>
+
+  <h3>What packed SIMD buys, and what it costs</h3>
+
+  <p>Why did the CPU makers take this road anyway? The notes list three gains (p. 415): compatibility with scalar CPUs — "no need for separate vector hardware, just extra datapaths in the same ALU pipeline"; widespread adoption, so compilers and libraries target it; and a good fit for multimedia and data-parallel kernels: audio, video, ML inner loops. Hennessy &amp; Patterson add the hardware side: short vectors add little state to save on a context switch, they are fed by the caches instead of the banked memory a vector unit needs, and a 32- or 64-byte access touches at most two pages, where one 64-element vector load can touch many.</p>
+
+  <p>The notes' list of losses (p. 415) mirrors the other column of Table 30: no performance portability to wider registers, compilers that must generate remainder loops, clumsy strided and sparse access. The fourth bullet carries the wrong label:</p>
+
+  <aside class="redpen" data-page="415">
+    <p class="claim">"Fewer instructions: vector ISAs had elegant rich semantics; SIMD extensions are “bolt-ons” with awkward encodings."</p>
+    <p class="fix">Like the three bullets above it, this one names a weakness of packed SIMD, and the weakness is the opposite: more instructions — more opcodes in the instruction set, and more instructions executed for a long vector.</p>
+    <p class="because">The notes' own Table 30, one page earlier, says so: "multiple instructions needed for longer vectors". And with the width in the opcode every new width needs new encodings: adding packed doubles is <code>ADDPD</code> on 128-bit SSE2 registers, <code>VADDPD</code> on 256-bit AVX registers and again <code>VADDPD</code>, newly encoded, on 512-bit AVX-512 registers, where VMIPS has one <code>ADDVV.D</code> for every vector length. The sentence after the label describes this bloat; only the label is wrong.</p>
+  </aside>
+
+  <div class="story" data-year="2016–2021">
+    <p>ARM announced its Scalable Vector Extension (SVE) in 2016, and RISC-V ratified its "V" vector extension in 2021. Both are vector ISAs in Cray's sense: the length is not in the opcode, and they have mask registers and gather/scatter. A RISC-V loop opens every strip with <code>vsetvli</code>: it asks for the number of elements still to do and gets back how many this hardware will take, at most its maximum vector length; SVE gets the same effect with a mask that switches off the lanes past the end. One binary runs on every implementation, from 128-bit to 2048-bit registers. After twenty years in the opcode, the vector length moved back out of it.</p>
+  </div>
+
+  <p class="memo"><mark class="key">Packed SIMD writes the vector length into the opcode; a vector ISA keeps it in a register (VLR). Remainder loops and recompilation for every new width both follow from that one choice.</mark></p>
+</section>
+
+<section id="l32-gpu">
+  <h2>A GPU is a vector processor that juggles threads</h2>
+
+  <div class="pitfall">
+    <p>"The notes skip GPUs, so they are not examined." Chapter 9 of the notes is one paragraph and a QR code to another course's notes (p. 416). But the professor's exam-topic list names "Intro to GP-GPUs; Intro to Tensor Cores" and "Intro to Neural Processing Units", and the June 2025 paper asked a true/false on the GPU programming model. From here to the end of the lesson the content is background from Hennessy &amp; Patterson (ch. 4 and ch. 7) and the vendors' documents — not in the notes, and not quoted from the slides, which are not available.</p>
+  </div>
+
+  <p>Here is DAXPY, Y = a·X + Y, written for an NVIDIA GPU in CUDA. There is no loop and no vector instruction: you write the body for one element and launch as many copies of it as there are elements.</p>
+
+<pre><code>__global__
+void daxpy(int n, double a,
+           double *x, double *y)
+{
+  // which element am I?
+  int i = blockIdx.x * blockDim.x
+          + threadIdx.x;
+  if (i &lt; n)   // the tail idles
+    y[i] = a * x[i] + y[i];
+}
+// host: n threads, 256 per block
+daxpy&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;
+     (n, a, d_x, d_y);</code></pre>
+
+  <p>Each copy is a CUDA <mark class="key">thread</mark> with its own index <code>i</code> and its own registers. The launch line creates a grid of blocks of 256 threads, and the hardware cuts every block into groups of 32 consecutive threads, the <mark class="key">warps</mark>. A warp is the real unit of execution: one instruction is fetched for it, and its 32 threads execute that instruction in lockstep on the SM's SIMD lanes, each on its own registers. In the words of lessons 30–31, a warp instruction is a vector instruction with VL = 32: on 16 lanes it takes 32 / 16 = 2 cycles. NVIDIA calls the style <abbr title="single instruction, multiple threads">SIMT</abbr>: you program threads, the machine runs vectors.</p>
+
+  <p>The hardware that runs the warps is NVIDIA's <mark class="key">streaming multiprocessor</mark> (SM); Hennessy &amp; Patterson call it a multithreaded SIMD processor. Figure 30 of the notes (p. 392) draws it next to a vector processor, and the widget turns one into the other.</p>
+
+  <aside class="margin-note">Since Volta (2017) NVIDIA keeps a PC per thread, but a warp still issues one instruction at a time for its active lanes. For the exam: "within each warp it's pure SIMD" (p. 393).</aside>
+
+  <div class="widget" id="l32-w-morph">
+    <h3 class="widget-title">From a vector processor to a GPU, three boxes at a time</h3>
+    <p class="widget-intro">Figure 30 of the notes as one picture. The slider swaps, one at a time, the parts in which the GPU's SIMD processor differs from the vector processor; neutral boxes are the same in both machines.</p>
+    <ol class="tasks">
+      <li>Before you move the slider: if a GPU hides latency with many threads instead of long vectors, which parts of the vector processor must change? Then slide to step 3 and count what changed.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Three parts, and only three. The front end: one PC and a control processor become one PC per warp, a warp scheduler and a dispatch unit. The registers: a 16-element slice of each vector register becomes 1024 registers private to the threads of the lane. The memory path gains an address coalescing unit. The instruction cache, the single instruction register, the masked functional units in their lanes, the load/store unit and the memory interface stay: the SIMD spine is the same.</p></details>
+      </li>
+      <li>Step 1 has many PCs but still one instruction register. Predict how many warps execute an instruction in a given cycle.
+        <details class="answer"><summary>What you should see</summary>
+          <p>One. The scheduler picks one ready warp at a time, and its instruction goes to all the lanes — on four lanes a 32-thread instruction passes through them in 8 cycles, like a vector instruction of length 32. SIMD inside the warp, fine-grained multithreading across warps (<a href="l29.html">lesson 29</a>). Real SMs have several schedulers, each with its own dispatch path and its own lanes; Figure 30 draws one.</p></details>
+      </li>
+      <li>Step 2: why does the GPU need 1024 registers in every lane, when the vector processor keeps a 16-element slice of each vector register there? Read the "memory latency hidden by" readout at step 1, then at step 2.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Because a switch must cost nothing. The registers of every resident warp stay in the register file, so the scheduler can issue from another warp in the next cycle without saving or restoring anything. At step 1 the readout asks where the waiting warps' registers would live; step 2 answers. The vector processor needs the registers of one instruction stream only: it hides latency with long vectors and chaining.</p></details>
+      </li>
+      <li>Step 3: the 32 threads of a warp execute <code>y[i] = a * x[i] + y[i]</code> with 32 consecutive <code>i</code>. What does the coalescing unit receive, and what does it send to memory? What told VMIPS the same thing?
+        <details class="answer"><summary>What you should see</summary>
+          <p>It receives 32 separate addresses, one per thread, finds that they are consecutive, and sends a few wide memory transactions instead of 32 narrow ones. On VMIPS the instruction says it: <code>L.V</code> is a unit-stride load by definition. The GPU discovers at run time what the vector ISA states in the opcode — and a column access defeats it, as a bad stride defeats the memory banks.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-morph', function (root, ui) {
+    var S = Course.svg;
+    var STEP = ['vector processor', 'a PC per warp', 'private registers', 'GPU SIMD processor'];
+    var MACH = ['vector processor (left of Fig. 30)', 'halfway: many PCs', 'halfway: + private registers', 'GPU SIMD processor = an SM (right of Fig. 30)'];
+    var PCS = ['one PC (+ a control processor)', 'one PC per warp; a scheduler picks', 'one PC per warp; a scheduler picks', 'one PC per warp; a scheduler picks'];
+    var REGS = ['16 elements of each vector register', '16 elements of each vector register', '1024, private to its threads', '1024, private to its threads'];
+    var LAT = ['long vectors: pipelining, chaining', 'switching warps — but whose registers?', 'switching warps; registers stay put', 'switching warps; registers stay put'];
+    var STRIDE = ['the instruction itself (L.V)', 'the instruction itself (L.V)', 'the instruction itself (L.V)', 'the coalescing unit, at run time'];
+    var NOTES = [
+      'The left half of Figure 30 (p. 392): one PC, a control processor for the scalar work, one instruction register driving four masked lanes. Element i of every vector register lives in lane i mod 4. The coloured parts are the ones that will change.',
+      'Change 1, the front end: one PC per warp, and a warp scheduler (H&amp;P: SIMD thread scheduler) that picks the ready warp whose next instruction goes into the single instruction register. The control processor is gone: scalar work runs inside the threads.',
+      'Change 2, the registers: each lane gets 1024 registers that belong to the threads running on it. The registers of every resident warp stay in place, so switching warps saves and restores nothing.',
+      'Change 3, the memory path: each thread computes its own address, and the address coalescing unit merges the addresses of a warp into as few memory transactions as it can. This is the right half of Figure 30: a GPU SIMD processor, NVIDIA’s streaming multiprocessor.'
+    ];
+    var st = ui.slider({ label: 'morph step', min: 0, max: 3, step: 1, value: 0,
+      format: function (v) { return Math.round(v) + ': ' + STEP[Math.round(v)]; } });
+    var roM = ui.readout('machine'), roPC = ui.readout('instruction streams'), roR = ui.readout('registers in each lane'),
+        roL = ui.readout('memory latency hidden by'), roA = ui.readout('unit stride known from');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'vector processor only', color: 's4', mark: 'square' },
+      { label: 'GPU only', color: 's5', mark: 'square' }
+    ]);
+    var svg = ui.svg(560, 470, { label: 'Figure 30 of the notes redrawn as one diagram: an instruction cache and a single instruction register drive four lanes, each a functional unit with a mask above a column of registers, over a load/store unit and the memory interface. The slider swaps the single PC and control processor of the vector processor, its vector-register slices and its plain load/store path for the many PCs and warp scheduler, the 1024 private registers per lane and the address coalescing unit of the GPU.' });
+    function R(x, y, w, h, cls, par) { return S('rect', { x: x, y: y, width: w, height: h, rx: 4, 'class': cls }, par || svg); }
+    function T(x, y, cls, s, par) { return S('text', { x: x, y: y, 'class': cls, text: s }, par || svg); }
+    function L(x1, y1, x2, y2, cls, arrow, par) {
+      var a = { x1: x1, y1: y1, x2: x2, y2: y2 };
+      if (cls) a['class'] = cls;
+      if (arrow) a['marker-end'] = 'url(#' + arrow + ')';
+      return S('line', a, par || svg);
+    }
+    function show(el, on) { if (on) el.removeAttribute('display'); else el.setAttribute('display', 'none'); }
+
+    /* the spine both machines share */
+    R(100, 30, 130, 56, 'fi-paper sw-2'); T(165, 54, 'tx-mid', 'Instruction'); T(165, 74, 'tx-mid', 'cache');
+    R(140, 112, 410, 32, 'fi-paper sw-2'); T(345, 133, 'tx-mid', 'Instruction register');
+    var regRect = [], regTxt = [];
+    for (var i = 0; i < 4; i++) {
+      var cx = 187.5 + 105 * i, cells = [];
+      L(cx, 144, cx, 157, null, 'arr');
+      R(cx - 47.5, 160, 95, 50, 'fi-paper sw-2');
+      T(cx, 182, 'tx-mid', 'FU'); T(cx, 201, 'tx-mid tx-sm', '+ mask');
+      L(cx, 210, cx, 222);
+      regRect.push(R(cx - 37.5, 222, 75, 112, 'fw-s4 st-s4 sw-2'));
+      for (var q = 1; q < 4; q++) L(cx - 37.5, 222 + 28 * q, cx + 37.5, 222 + 28 * q, 'st-muted sw-1');
+      for (var r = 0; r < 4; r++) cells.push(T(cx, 241 + 28 * r, 'tx-mid tx-mono', ''));
+      regTxt.push(cells);
+      L(cx, 334, cx, 348);
+    }
+    var regLabel = T(128, 278, 'tx-mid tx-sm', 'Vector registers');
+    regLabel.setAttribute('transform', 'rotate(-90 128 278)');
+    R(140, 350, 410, 32, 'fi-paper sw-2'); var lsuTxt = T(345, 371, 'tx-mid', 'Vector load/store unit');
+    L(345, 382, 345, 429, null, 'arr');
+    var coal = S('g', {}, svg);
+    R(140, 392, 410, 30, 'fi-paper', coal); R(140, 392, 410, 30, 'fw-s5 st-s5 sw-2', coal);
+    T(345, 412, 'tx-mid', 'Address coalescing unit', coal);
+    R(240, 432, 210, 30, 'fi-paper sw-2'); T(345, 452, 'tx-mid', 'Memory interface');
+
+    /* front end of the vector processor: one PC and a control processor */
+    var vfe = S('g', {}, svg);
+    R(16, 44, 56, 34, 'fw-s4 st-s4 sw-2', vfe); T(44, 66, 'tx-mid', 'PC', vfe);
+    L(72, 61, 97, 61, null, 'arr', vfe);
+    L(165, 86, 165, 109, null, 'arr', vfe);                 /* the fetched instruction goes straight to the instruction register */
+    R(10, 156, 108, 60, 'fw-s4 st-s4 sw-2', vfe); T(64, 181, 'tx-mid', 'Control', vfe); T(64, 201, 'tx-mid', 'processor', vfe);
+    S('polyline', { points: '64,156 64,128 137,128', 'marker-end': 'url(#arr)' }, vfe);
+    S('polyline', { points: '64,216 64,366 137,366', 'marker-end': 'url(#arr)' }, vfe);
+
+    /* front end of the GPU: a PC per warp, a warp scheduler and a dispatch unit */
+    var gfe = S('g', {}, svg);
+    for (var j = 0; j < 4; j++) { R(20, 28 + 20 * j, 50, 18, 'fw-s5 st-s5 sw-2', gfe); T(45, 42 + 20 * j, 'tx-mid tx-sm', 'PC', gfe); }
+    L(70, 58, 97, 58, null, 'arr', gfe);
+    T(10, 126, 'tx-sm', 'a PC per warp', gfe);
+    L(230, 41, 259, 41, null, 'arr', gfe);                  /* as in Figure 30: cache, then scheduler and dispatch unit */
+    R(262, 26, 160, 30, 'fw-s5 st-s5 sw-2', gfe); T(342, 46, 'tx-mid', 'Warp scheduler', gfe);
+    L(342, 56, 342, 68, null, 'arr', gfe);
+    R(262, 70, 160, 26, 'fw-s5 st-s5 sw-2', gfe); T(342, 88, 'tx-mid tx-sm', 'Dispatch unit', gfe);
+    L(342, 96, 342, 109, null, 'arr', gfe);
+
+    var VEC = [['0', '4', '⋮', '60'], ['1', '5', '⋮', '61'], ['2', '6', '⋮', '62'], ['3', '7', '⋮', '63']];
+    var GPU = ['r0', 'r1', '⋮', 'r1023'];
+    ui.onChange(function () {
+      var k = Math.round(st.value);
+      show(vfe, k === 0); show(gfe, k >= 1); show(coal, k >= 3);
+      for (var i = 0; i < 4; i++) {
+        regRect[i].setAttribute('class', k >= 2 ? 'fw-s5 st-s5 sw-2' : 'fw-s4 st-s4 sw-2');
+        for (var r = 0; r < 4; r++) regTxt[i][r].textContent = k >= 2 ? GPU[r] : VEC[i][r];
+      }
+      regLabel.textContent = k >= 2 ? 'Registers' : 'Vector registers';
+      lsuTxt.textContent = k >= 3 ? 'SIMD load/store unit' : 'Vector load/store unit';
+      roM.set(MACH[k]); roPC.set(PCS[k]); roR.set(REGS[k]); roL.set(LAT[k]); roA.set(STRIDE[k]);
+      note.set(NOTES[k]);
+    });
+  });
+  </script>
+
+  <h3>The tail and the if: masks instead of VLR</h3>
+
+  <p>A GPU has no vector-length register. The kernel's <code>if (i &lt; n)</code> does its job: in the last block, the threads with <code>i ≥ n</code> are switched off by the hardware's per-thread mask and their lanes idle — the masked tail of the first widget. The same mechanism handles any <code>if</code>. When the threads of a warp disagree, the warp runs both paths, each under the mask of its own threads: the vector mask register of lesson 31, set by the hardware. This is <mark class="key">branch divergence</mark>, and it costs what masking costs. A warp split 8 against 24 across an if-else issues both bodies with part of its lanes idle; a warp whose 32 threads take 32 different paths runs at 1/32 of its speed.</p>
+
+  <h3>Memory: coalescing finds the stride at run time</h3>
+
+  <p>VMIPS knows the access pattern from the instruction: <code>L.V</code> means unit stride. A GPU receives 32 independent addresses, one per thread. The <mark class="key">address coalescing unit</mark> compares them and merges them into as few wide transactions as it can: 32 threads reading 32 consecutive doubles cost a couple of transactions, 32 threads walking down a column of a row-major matrix cost 32. It is the bad-stride story of lesson 31 again. The cure is a traversal order or a data layout in which consecutive threads touch consecutive words; padding the rows, the cure for bank conflicts, does not merge a column's addresses.</p>
+
+  <h3>Latency: switch warps instead of waiting</h3>
+
+  <p>A load that misses goes to DRAM and takes hundreds of cycles (<a href="l22.html#l22-wall">the memory wall</a> of lesson 22). A vector machine pays that latency once per 64-element vector and streams behind it. A GPU has short vectors, 32 elements, and no out-of-order engine. Instead, every SM keeps dozens of warps resident, and its warp scheduler picks, every cycle, one whose operands are ready — the fine-grained multithreading of lesson 29. The switch costs nothing because the registers of every resident warp are already in the register file: that is what the 1024 registers per lane of Figure 30 are for.</p>
+
+  <figure class="fig fig--pair" id="l32-fig-warps">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="One warp over 12 cycles: it issues in cycles 0 and 1, waits six cycles for DRAM, issues in cycles 8 and 9 and waits again; the issue slot is used in 4 of the 12 cycles">
+        <text x="40" y="18" class="tx-sm tx-end tx-muted">cycle</text>
+        <text x="62" y="18" class="tx-sm tx-mid tx-muted">0</text>
+        <text x="142" y="18" class="tx-sm tx-mid tx-muted">4</text>
+        <text x="222" y="18" class="tx-sm tx-mid tx-muted">8</text>
+        <text x="44" y="46" class="tx-sm tx-end tx-mono">W0</text>
+        <rect x="52" y="30" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="92" y="30" width="120" height="24" class="fw-s2 st-s2 dash"/>
+        <rect x="212" y="30" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="252" y="30" width="40" height="24" class="fw-s2 st-s2 dash"/>
+        <text x="152" y="46" class="tx-sm tx-mid">waiting for DRAM</text>
+        <text x="152" y="112" class="tx-hand tx-mid">lanes idle</text>
+        <text x="44" y="169" class="tx-sm tx-end">issue</text>
+        <rect x="53" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="73" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="93" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="113" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="133" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="153" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="173" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="193" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="213" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="233" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="253" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <rect x="273" y="156" width="18" height="18" class="fi-soft st-none"/>
+        <text x="172" y="194" class="tx-sm tx-mid">4 busy cycles out of 12</text>
+      </svg>
+      <p class="fig-label">Before: one warp</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Four warps over 12 cycles: each issues two instructions and then waits six cycles for DRAM, but the scheduler always finds a ready warp, so the issue slot is used in all 12 cycles">
+        <text x="40" y="18" class="tx-sm tx-end tx-muted">cycle</text>
+        <text x="62" y="18" class="tx-sm tx-mid tx-muted">0</text>
+        <text x="142" y="18" class="tx-sm tx-mid tx-muted">4</text>
+        <text x="222" y="18" class="tx-sm tx-mid tx-muted">8</text>
+        <text x="44" y="46" class="tx-sm tx-end tx-mono">W0</text>
+        <rect x="52" y="30" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="92" y="30" width="120" height="24" class="fw-s2 st-s2 dash"/>
+        <rect x="212" y="30" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="252" y="30" width="40" height="24" class="fw-s2 st-s2 dash"/>
+        <text x="152" y="46" class="tx-sm tx-mid">waiting</text>
+        <text x="44" y="76" class="tx-sm tx-end tx-mono">W1</text>
+        <rect x="92" y="60" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="132" y="60" width="120" height="24" class="fw-s2 st-s2 dash"/>
+        <rect x="252" y="60" width="40" height="24" class="fw-s1 st-s1"/>
+        <text x="44" y="106" class="tx-sm tx-end tx-mono">W2</text>
+        <rect x="132" y="90" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="172" y="90" width="120" height="24" class="fw-s2 st-s2 dash"/>
+        <text x="44" y="136" class="tx-sm tx-end tx-mono">W3</text>
+        <rect x="172" y="120" width="40" height="24" class="fw-s1 st-s1"/>
+        <rect x="212" y="120" width="80" height="24" class="fw-s2 st-s2 dash"/>
+        <text x="44" y="169" class="tx-sm tx-end">issue</text>
+        <rect x="53" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="73" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="93" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="113" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="133" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="153" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="173" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="193" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="213" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="233" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="253" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <rect x="273" y="156" width="18" height="18" class="fw-s1 st-s1"/>
+        <text x="172" y="194" class="tx-sm tx-mid">12 busy cycles out of 12</text>
+      </svg>
+      <p class="fig-label">After: four warps</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Hiding a DRAM access by switching warps, as a schematic: each warp issues two instructions (blue) and then waits six cycles for its load (orange); a real DRAM access takes hundreds of cycles. Left: alone, the warp keeps the lanes busy 2 cycles in every 8. Right: with four warps the scheduler always finds a ready one, and every cycle issues an instruction.</figcaption>
+  </figure>
+
+  <p>How many warps are enough? Each warp offers a run of \(r\) instructions before its next stall, and the other warps must fill the \(t_{wait}\) cycles of its wait:</p>
+
+  <div class="formula">
+    \[ N_{warps} \approx 1 + \frac{t_{wait}}{r} \]
+    <dl class="legend">
+      <dt>\(t_{wait}\)</dt><dd>cycles a warp waits for memory after its run</dd>
+      <dt>\(r\)</dt><dd>instructions a warp issues between two stalls</dd>
+    </dl>
+  </div>
+
+  <p>In Fig. 1, 1 + 6/2 = 4 warps are exactly enough. With runs of 10 instructions and a 400-cycle DRAM access you need 41. That is why an SM is built to hold dozens of warps at once, and why a single GPU thread is slow while the GPU is fast.</p>
+
+  <figure class="tbl-fig" id="l32-tbl-terms">
+    <figcaption>The GPU vocabulary mapped onto the vector vocabulary of lessons 30–31, after Hennessy &amp; Patterson (ch. 4).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>NVIDIA / CUDA term</th><th>vector-machine equivalent</th><th>what it is</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">CUDA thread</th><td>one element, one iteration of the loop</td><td>has its own registers; runs in one lane</td></tr>
+          <tr><th scope="row">warp (32 threads)</th><td>a vector instruction stream with VL = 32 (H&amp;P: a thread of SIMD instructions)</td><td>the unit the scheduler issues</td></tr>
+          <tr><th scope="row">thread block</th><td>one strip of a strip-mined loop</td><td>runs on one SM; its threads share memory and can wait at a barrier (<code>__syncthreads()</code>); blocks are independent, so a kernel scales with the number of SMs</td></tr>
+          <tr><th scope="row">grid</th><td>the whole vectorisable loop</td><td>everything one kernel launch computes</td></tr>
+          <tr><th scope="row">streaming multiprocessor (SM)</th><td>a multithreaded vector processor (H&amp;P: multithreaded SIMD processor)</td><td>lanes, register file, warp schedulers</td></tr>
+          <tr><th scope="row">warp scheduler</th><td>vector issue logic + multithreading</td><td>picks a ready warp every cycle</td></tr>
+          <tr><th scope="row">lane ("CUDA core")</th><td>vector lane</td><td>executes one element</td></tr>
+          <tr><th scope="row">global (device) memory</th><td>main memory</td><td>the GPU's own off-chip DRAM</td></tr>
+          <tr><th scope="row">shared memory</th><td>no VMIPS counterpart: a memory managed by software</td><td>an on-chip scratchpad per SM, banked like vector memory</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">A streaming multiprocessor is a multithreaded SIMD processor: a warp is one vector instruction stream of length 32 with per-lane registers; masks replace the VLR, coalescing replaces the strided load, and switching warps replaces long vectors as the way to hide memory latency.</mark></p>
+</section>
+
+<section id="l32-host">
+  <h2>Host and device: two memories, explicit copies</h2>
+
+  <p>The kernel is half of a CUDA program. The other half runs on the CPU, the <mark class="key">host</mark>, and its main job is moving data, because the GPU, the <mark class="key">device</mark>, has its own DRAM (GDDR or HBM) on its own board, linked to the host by PCIe or NVLink. DAXPY on the host side:</p>
+
+<pre><code>size_t bytes = n * sizeof(double);
+double *d_x, *d_y;
+// 1. reserve device memory
+cudaMalloc(&amp;d_x, bytes);
+cudaMalloc(&amp;d_y, bytes);
+// 2. copy the inputs in
+cudaMemcpy(d_x, x, bytes,
+           cudaMemcpyHostToDevice);
+cudaMemcpy(d_y, y, bytes,
+           cudaMemcpyHostToDevice);
+// 3. run the kernel on the device
+daxpy&lt;&lt;&lt;(n + 255) / 256, 256&gt;&gt;&gt;
+     (n, a, d_x, d_y);
+// 4. copy the result out
+cudaMemcpy(y, d_y, bytes,
+           cudaMemcpyDeviceToHost);</code></pre>
+
+  <figure class="fig fig--plain" id="l32-fig-host">
+    <svg class="dia" viewBox="0 0 560 268" role="img" aria-label="The host, a CPU with its main memory holding x and y, and the device, a GPU with its own device memory holding d_x and d_y. Numbered steps: 1, the space is reserved in device memory; 2, cudaMemcpy copies the inputs over the PCIe or NVLink link; 3, the kernel launched by the CPU runs on the GPU and reads and writes device memory; 4, cudaMemcpy copies the result back to main memory.">
+      <rect x="20" y="32" width="180" height="200" rx="8" class="st-muted dash"/>
+      <rect x="360" y="32" width="180" height="200" rx="8" class="st-muted dash"/>
+      <text x="110" y="22" class="tx-mid tx-bold">host</text>
+      <text x="450" y="22" class="tx-mid tx-bold">device</text>
+      <line x1="182" y1="70" x2="376" y2="70" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="182" y1="166" x2="368" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="370" y1="202" x2="184" y2="202" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="440" y1="94" x2="440" y2="148" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="460" y1="150" x2="460" y2="96" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="40" y="48" width="140" height="44" rx="4" class="fi-paper sw-2"/>
+      <text x="110" y="76" class="tx-mid">CPU</text>
+      <rect x="380" y="48" width="140" height="44" rx="4" class="fi-paper sw-2"/>
+      <text x="450" y="76" class="tx-mid">GPU (SMs)</text>
+      <rect x="40" y="150" width="140" height="66" rx="4" class="fi-paper sw-2"/>
+      <text x="110" y="177" class="tx-mid">main memory</text>
+      <text x="110" y="202" class="tx-mid tx-mono">x, y</text>
+      <rect x="372" y="150" width="156" height="66" rx="4" class="fi-paper sw-2"/>
+      <text x="450" y="177" class="tx-mid">device memory</text>
+      <text x="462" y="202" class="tx-mid tx-mono">d_x, d_y</text>
+      <circle cx="392" cy="198" r="8" class="fi-paper"/>
+      <text x="392" y="202" class="tx-mid tx-sm">1</text>
+      <circle cx="214" cy="166" r="8" class="fi-paper"/>
+      <text x="214" y="170" class="tx-mid tx-sm">2</text>
+      <text x="290" y="156" class="tx-mid tx-mono tx-sm halo">cudaMemcpy</text>
+      <circle cx="214" cy="70" r="8" class="fi-paper"/>
+      <text x="214" y="74" class="tx-mid tx-sm">3</text>
+      <text x="290" y="60" class="tx-mid tx-mono tx-sm halo">daxpy&lt;&lt;&lt;…&gt;&gt;&gt;</text>
+      <circle cx="346" cy="202" r="8" class="fi-paper"/>
+      <text x="346" y="206" class="tx-mid tx-sm">4</text>
+      <text x="290" y="228" class="tx-mid tx-mono tx-sm">cudaMemcpy</text>
+      <text x="472" y="118" class="tx-sm">reads,</text>
+      <text x="472" y="138" class="tx-sm">writes</text>
+      <text x="280" y="118" class="tx-mid tx-hand">two memories</text>
+      <text x="290" y="254" class="tx-mid tx-sm tx-muted">link: PCIe or NVLink</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The two memories of the GP-GPU programming model. The host reserves space in device memory (1), copies the inputs over the link (2), launches the kernel, whose threads read and write device memory (3), and copies the result back (4). Requests are orange, data blue.</figcaption>
+  </figure>
+
+  <p>The pointers <code>d_x</code> and <code>d_y</code> hold addresses in the device's memory. In the basic model the host reaches that memory only through <code>cudaMemcpy</code>, and the kernel cannot see <code>x</code> and <code>y</code> in host memory. That is the quiz of the June 2025 paper (Quizzes, Question 3, p. 11): "In the GP-GPU programming model, the CPU (host) and GPU (device) have separate memory address spaces." True. Later CUDA versions added unified memory, which migrates pages between the two memories automatically, but it is a convenience laid on top: the basic model, and the hardware, keep two memories, and every byte crosses the link.</p>
+
+  <p>The split has a price: the copies cost time, and the GPU's own bandwidth serves only data that is already on the device, so a kernel must do enough work per byte copied to pay for the trip.</p>
+
+  <p class="memo"><mark class="key">In the GP-GPU programming model the host and the device have separate memory address spaces: the program allocates device memory, copies the data in, launches the kernel and copies the results back.</mark></p>
+</section>
+
+<section id="l32-tensor">
+  <h2>Tensor cores: make the operand a matrix</h2>
+
+  <p>Multiply two 4 × 4 matrices and add a third: D = A × B + C. Each entry of D is a row of A times a column of B plus one entry of C — four multiply-adds, <abbr title="fused multiply-add: a × b + c in one operation">FMAs</abbr>. Sixteen entries make 64 FMAs.</p>
+
+  <figure class="fig fig--plain" id="l32-fig-tensor">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="Four 4 by 4 grids, D = A times B plus C. Row 1 of A, column 2 of B and entry (1,2) of C are highlighted; together they produce entry (1,2) of D with four multiply-adds. A and B are FP16, C and D FP16 or FP32.">
+      <text x="72" y="50" class="tx-mid tx-bold tx-lg">A</text>
+      <text x="208" y="50" class="tx-mid tx-bold tx-lg">B</text>
+      <text x="344" y="50" class="tx-mid tx-bold tx-lg">C</text>
+      <text x="480" y="50" class="tx-mid tx-bold tx-lg">D</text>
+      <g class="sw-1">
+        <rect x="24" y="64" width="96" height="96" class="fi-paper"/>
+        <rect x="24" y="88" width="96" height="24" class="fw-key"/>
+        <path d="M48 64V160M72 64V160M96 64V160M24 88H120M24 112H120M24 136H120" class="st-muted"/>
+        <rect x="160" y="64" width="96" height="96" class="fi-paper"/>
+        <rect x="208" y="64" width="24" height="96" class="fw-key"/>
+        <path d="M184 64V160M208 64V160M232 64V160M160 88H256M160 112H256M160 136H256" class="st-muted"/>
+        <rect x="296" y="64" width="96" height="96" class="fi-paper"/>
+        <rect x="344" y="88" width="24" height="24" class="fw-key"/>
+        <path d="M320 64V160M344 64V160M368 64V160M296 88H392M296 112H392M296 136H392" class="st-muted"/>
+        <rect x="432" y="64" width="96" height="96" class="fi-paper"/>
+        <rect x="480" y="88" width="24" height="24" class="fw-s1 st-s1 sw-2"/>
+        <path d="M456 64V160M480 64V160M504 64V160M432 88H528M432 112H528M432 136H528" class="st-muted"/>
+      </g>
+      <text x="140" y="118" class="tx-mid tx-lg">×</text>
+      <text x="276" y="118" class="tx-mid tx-lg">+</text>
+      <text x="412" y="118" class="tx-mid tx-lg">=</text>
+      <text x="72" y="182" class="tx-mid tx-sm tx-muted">FP16</text>
+      <text x="208" y="182" class="tx-mid tx-sm tx-muted">FP16</text>
+      <text x="344" y="182" class="tx-mid tx-sm tx-muted">FP16 or FP32</text>
+      <text x="480" y="182" class="tx-mid tx-sm tx-muted">FP16 or FP32</text>
+      <text x="280" y="214" class="tx-mid">D entry = row of A · column of B + C entry</text>
+      <text x="280" y="240" class="tx-mid">16 entries × 4 FMAs = 64 FMAs, each input used 4 times</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> What a Volta tensor core computes as one operation. The highlighted row of A meets the highlighted column of B: \(d_{12} = \sum_k a_{1k} b_{k2} + c_{12}\), four multiply-adds. Every element of A takes part in 4 of these dot products (its row meets 4 columns), and so does every element of B.</figcaption>
+  </figure>
+
+  <p>On ordinary lanes those 64 FMAs are 64 lane operations, each reading its own <em>a</em> and <em>b</em> from the register file: 128 operand reads. A <mark class="key">tensor core</mark>, a functional unit NVIDIA added to every SM with the Volta generation (2017), takes the three 4 × 4 matrices and returns D as one operation: 64 FMAs per clock, A and B in FP16, C and D in FP16 or FP32. It reads the 32 values of A and B once and uses each of them 4 times inside the unit. A Tesla V100 has 8 tensor cores per SM, 640 in all, for up to 125 tensor TFLOPS (NVIDIA's figure). Software sees a warp-level instruction: the 32 threads of a warp hold 16 × 16 tiles of the matrices in their registers and issue the multiply together.</p>
+
+  <p>Why does it pay? For three reasons you have met before. One operation of the unit does 64 FMAs: the vector idea, in two dimensions. Each value read is used 4 times, so the register-file traffic per FMA drops by four. And FP16 halves the bytes per operand. The accumulation stays in FP32 because a product of two FP16 numbers loses little, while a sum of thousands of them would lose precision or overflow: accumulate wide, store narrow.</p>
+
+  <p>The cost is that a tensor core does nothing for work that is not a matrix product. DAXPY gains nothing, and a model from Hennessy &amp; Patterson shows why.</p>
+
+  <h3>The roofline: when is a faster unit useless?</h3>
+
+  <p>The <mark class="key">roofline model</mark> (H&amp;P, ch. 4) caps the flop rate a kernel can reach by two ceilings: the peak of the arithmetic units, and the memory bandwidth times the kernel's <mark class="key">arithmetic intensity</mark> — the flops it performs per byte it moves from DRAM:</p>
+
+  <div class="formula">
+    \[ P_{att} = \min(P_{peak},\ BW \times AI) \]
+    <dl class="legend">
+      <dt>\(P_{peak}\)</dt><dd>peak flop/s of the arithmetic units (the flat roof)</dd>
+      <dt>\(BW\)</dt><dd>DRAM bandwidth in bytes/s (the slope)</dd>
+      <dt>\(AI\)</dt><dd>arithmetic intensity: flops per byte moved from DRAM</dd>
+    </dl>
+  </div>
+
+  <p>DAXPY does 2 flops per element, a multiply and an add, and moves 24 bytes: <code>X[i]</code> and <code>Y[i]</code> loaded, <code>Y[i]</code> stored, 8 bytes each. A product of two \(n \times n\) matrices does \(2n^3\) flops on \(3n^2\) doubles, read and written once each:</p>
+
+  <div class="formula">
+    \[ AI_{DAXPY} = \frac{2}{3 \times 8} = \frac{1}{12} \]
+    \[ AI_{n \times n} = \frac{2n^3}{3n^2 \times 8} = \frac{n}{12} \]
+  </div>
+
+  <p>DAXPY stays at 1/12 flop per byte whatever \(n\) is; the matrix product grows with \(n\), to 85 for \(n = 1024\) (four times more in FP16, the tensor cores' format). The slope meets a roof at its ridge point. A kernel left of the ridge, like DAXPY, is memory-bound and cannot use a higher roof; only a kernel to its right, like the large matrix product, can.</p>
+
+  <figure class="fig fig--plain" id="l32-fig-roof">
+    <svg class="dia" viewBox="0 0 560 312" role="img" aria-label="Roofline on log scales: attainable flop per second against arithmetic intensity. A sloped line, bandwidth times intensity, meets a flat vector-unit roof and, higher, a tensor-core roof. DAXPY at 1/12 flop per byte sits on the slope far below both roofs; a 1024 by 1024 matrix product at 85 flops per byte reaches the vector-unit roof and, with tensor cores, the higher one.">
+      <line x1="60" y1="262" x2="530" y2="262" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="60" y1="262" x2="60" y2="36" class="st-muted" marker-end="url(#arr-muted)"/>
+      <path d="M70 262v6M150 262v6M230 262v6M310 262v6M390 262v6M470 262v6" class="st-muted"/>
+      <text x="70" y="284" class="tx-sm tx-mid">1/16</text>
+      <text x="150" y="284" class="tx-sm tx-mid">1/4</text>
+      <text x="230" y="284" class="tx-sm tx-mid">1</text>
+      <text x="310" y="284" class="tx-sm tx-mid">4</text>
+      <text x="390" y="284" class="tx-sm tx-mid">16</text>
+      <text x="470" y="284" class="tx-sm tx-mid">64</text>
+      <text x="295" y="306" class="tx-sm tx-mid tx-muted">flops per byte moved from DRAM (log scale)</text>
+      <text x="66" y="26" class="tx-sm tx-muted">attainable flop/s (log scale)</text>
+      <line x1="70" y1="250" x2="390" y2="114" class="sw-2"/>
+      <line x1="270" y1="165" x2="520" y2="165" class="st-s4 sw-3"/>
+      <line x1="390" y1="114" x2="520" y2="114" class="st-s5 sw-3"/>
+      <text x="282" y="140" class="tx-sm tx-end">bandwidth × intensity</text>
+      <text x="330" y="153" class="tx-sm">vector-unit peak</text>
+      <text x="400" y="102" class="tx-sm">tensor-core peak</text>
+      <line x1="486.6" y1="158" x2="486.6" y2="124" class="sw-2" marker-end="url(#arr)"/>
+      <circle cx="486.6" cy="165" r="6" class="fi-paper sw-2"/>
+      <circle cx="486.6" cy="114" r="6" class="fi-paper sw-2"/>
+      <text x="476" y="188" class="tx-sm tx-end">matmul, n = 1024: AI 85</text>
+      <circle cx="86.6" cy="242.9" r="6" class="fi-paper sw-2"/>
+      <text x="110" y="251" class="tx-sm">DAXPY: AI 1/12</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> The roofline, on log scales with schematic heights. A kernel can go no faster than the bandwidth times its arithmetic intensity (the slope) nor faster than the arithmetic units (the roofs). DAXPY, at 1/12 flop per byte, sits on the slope far below both roofs; the 1024 × 1024 matrix product, at 85, is under the roof, and only it is lifted by the tensor cores.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">A tensor core turns the operand from a vector into a matrix tile: 64 FMAs per operation, each input used 4 times, in reduced precision. It raises the compute roof, so only kernels of high arithmetic intensity — matrix products — gain.</mark></p>
+</section>
+
+<section id="l32-npu">
+  <h2>NPUs: the whole chip becomes the matrix unit</h2>
+
+  <p>A <mark class="key">neural processing unit</mark> (NPU) is a domain-specific accelerator for neural networks: a large array of low-precision multiply-accumulate units (MACs) fed from on-chip memory, with none of the general-purpose machinery around it. The reference design is Google's first TPU (Jouppi et al., ISCA 2017): a 256 × 256 array of 8-bit MACs at 700 MHz, 28 MiB of on-chip memory managed by software, and about a dozen CISC-style instructions (<code>Read_Weights</code>, <code>MatrixMultiply</code>, <code>Activate</code> …) sent by the host over PCIe. Each MAC counts as two operations, so the peak is 92 TOPS, tera-operations per second:</p>
+
+  <div class="formula">
+    \[ 2 \times 65\,536 \times 700\ \text{MHz} \]
+    \[ \approx 92 \times 10^{12}\ \text{op/s} \]
+  </div>
+
+  <p>The array is <mark class="key">systolic</mark>: data moves between neighbouring cells in lockstep, pumped like a heartbeat, so every value fetched from memory is used again and again on its way across. The TPU's dataflow is <mark class="key">weight-stationary</mark>: the weights are loaded into the cells and stay there; the activations enter from the left, each row one cycle after the row above, and move right; the partial sums move down and leave at the bottom into the accumulators. The widget runs it on a 3 × 3 array.</p>
+
+  <div class="widget" id="l32-w-systolic">
+    <h3 class="widget-title">Pump a 3 × 3 weight-stationary array</h3>
+    <p class="widget-intro">The cells hold the weights \(W = \begin{pmatrix} 1 &amp; 2 &amp; 0 \\ 0 &amp; 1 &amp; 3 \\ 2 &amp; 0 &amp; 1 \end{pmatrix}\). Three input vectors \(x_0 = (1, 2, 3)\), \(x_1 = (2, 0, 1)\), \(x_2 = (1, 1, 1)\) stream through, and each output is \(y_b = x_b W\): \(y_b[j] = \sum_k x_b[k]\, W[k][j]\). Each "Next" is one clock cycle.</p>
+    <ol class="tasks">
+      <li>Before pressing Next: which cell works in cycle 0, and in which cycle does the first finished output leave the bottom of the array?
+        <details class="answer"><summary>What you should see</summary>
+          <p>In cycle 0 only the top-left cell works: 0 + 1 × 1 = 1. The first output, y₀[0] = 1·1 + 2·0 + 3·2 = 7, leaves the bottom of column 0 in cycle 2, after one multiply-accumulate in each of the three rows.</p></details>
+      </li>
+      <li>Go to cycle 3 and count the busy cells. Why not 9? How many would work in each cycle in the middle of a stream of 100 inputs?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Seven. The work moves as a diagonal wavefront, and at the start and at the end of a stream some cells have nothing to do — fill and drain, as in a vector pipeline. With 100 inputs all 9 cells would be busy in every cycle of the middle part.</p></details>
+      </li>
+      <li>At the last step, compare the two counters. In the TPU's 256 × 256 array, how many multiply-accumulates does one activation read feed?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Here 9 reads feed 27 MACs: each activation is used once in each of the 3 columns, and each weight serves all 3 inputs. In the TPU one activation read feeds 256 MACs, and a weight, loaded once, serves every input of the batch. Operands never go back to a register file between operations: that reuse is where the energy is saved.</p></details>
+      </li>
+      <li>How many cycles does a stream of B inputs take on this 3 × 3 array?
+        <details class="answer"><summary>What you should see</summary>
+          <p>B + 4, here 7: the last input enters row 0 in cycle B − 1 and still has 2 rows and 2 columns to cross. For a K × N array it is B + K + N − 2: a fill-and-drain cost of K + N − 2 cycles paid once per stream, like the start-up of a vector instruction.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-systolic', function (root, ui) {
+    var S = Course.svg;
+    var W = [[1, 2, 0], [0, 1, 3], [2, 0, 1]], X = [[1, 2, 3], [2, 0, 1], [1, 1, 1]];
+    var B = 3, K = 3, N = 3, NC = B + K + N - 2, SUB = ['₀', '₁', '₂'];
+    /* cell (k, j) does the MAC of input b in cycle b + k + j; the partial sum of y_b[j] moves down column j */
+    var log = [], ps = {}, Y = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], t, k, j, b;
+    for (t = 0; t < NC; t++) {
+      var m = [];
+      for (k = 0; k < K; k++) for (j = 0; j < N; j++) {
+        b = t - k - j;
+        if (b < 0 || b >= B) continue;
+        var before = k === 0 ? 0 : ps[b + ',' + j], after = before + X[b][k] * W[k][j];
+        ps[b + ',' + j] = after;
+        if (k === K - 1) Y[b][j] = after;
+        m.push({ k: k, j: j, b: b, x: X[b][k], after: after });
+      }
+      log.push(m);
+    }
+    function cap(t) {
+      if (t === 0) return 'Cycle 0: x₀[0] = 1 enters the top-left cell, which adds 1 × 1 to 0 and passes the partial sum 1 down. One cell busy.';
+      var m = log[t], outs = m.filter(function (q) { return q.k === K - 1; });
+      var s = 'Cycle ' + t + ': ' + m.length + (m.length === 1 ? ' multiply-accumulate' : ' multiply-accumulates') + ' on the diagonal';
+      if (outs.length) s += '; leaving the bottom row: ' + outs.map(function (q) { return 'y' + SUB[q.b] + '[' + q.j + '] = ' + q.after; }).join(', ');
+      return s + '.';
+    }
+    var caps = ['Before cycle 0: the weights are loaded into the nine cells and stay there. The inputs wait on the left, each row one cycle behind the row above, so that every partial sum meets the right activation.'];
+    for (t = 0; t < NC; t++) caps.push(cap(t));
+    caps.push('Done after ' + NC + ' cycles: 27 multiply-accumulates. Every activation was read once and used in 3 cells; every weight was used by 3 inputs. Y = X · W is in the accumulators.');
+    var stepper = ui.stepper({ steps: caps, play: 1300 });
+    var roC = ui.readout('clock cycle'), roM = ui.readout('MACs in this cycle', { digits: 0 }),
+        roT = ui.readout('MACs so far'), roR = ui.readout('activations read from memory');
+    ui.legend([
+      { label: 'cell doing a multiply-accumulate', color: 's1', mark: 'square' },
+      { label: 'activation waiting to enter', color: 's1', mark: 'ring' }
+    ]);
+    var svg = ui.svg(560, 420, { label: 'A 3 by 3 weight-stationary systolic array: weights fixed in the cells, activations entering from the left in a skewed queue, partial sums moving down, outputs collected at the bottom; each step is one clock cycle' });
+    function R(x, y, w, h, cls, par) { return S('rect', { x: x, y: y, width: w, height: h, rx: 4, 'class': cls }, par || svg); }
+    function tx(x, y, cls, s, par) { return S('text', { x: x, y: y, 'class': cls, text: s }, par || svg); }
+    function show(el, on) { if (on) el.removeAttribute('display'); else el.setAttribute('display', 'none'); }
+
+    tx(130, 30, 'tx-sm tx-mid', 'inputs, skewed');
+    tx(395, 28, 'tx-hand tx-mid', 'weights stay put');
+    var cell = [], cellX = [], psG = [], psT = [];
+    for (k = 0; k < K; k++) {
+      cell.push([]); cellX.push([]); psG.push([]); psT.push([]);
+      for (j = 0; j < N; j++) {
+        var x = 230 + 110 * j, y = 44 + 96 * k;
+        cell[k].push(R(x, y, 84, 60, 'fi-paper sw-2'));
+        tx(x + 42, y + 24, 'tx-mid tx-mono', 'w = ' + W[k][j]);
+        cellX[k].push(tx(x + 42, y + 48, 'tx-mid tx-mono', ''));
+        var g = S('g', {}, svg);
+        R(x + 20, y + 66, 44, 22, 'fw-ink', g);
+        psT[k].push(tx(x + 42, y + 82, 'tx-mid tx-mono', '', g));
+        psG[k].push(g);
+      }
+    }
+    var qLayer = S('g', {}, svg);
+    var outT = [];
+    for (b = 0; b < B; b++) {
+      tx(222, 352 + 26 * b, 'tx-end tx-mono', 'y' + SUB[b] + ' =');
+      var row = [];
+      for (j = 0; j < N; j++) row.push(tx(272 + 110 * j, 352 + 26 * b, 'tx-mid tx-mono', ''));
+      outT.push(row);
+    }
+    tx(110, 380, 'tx-sm tx-mid', 'accumulators');
+
+    ui.onChange(function () {
+      var t = stepper.index - 1, active = t >= 0 && t < NC ? log[t] : [], k, j, b;
+      for (k = 0; k < K; k++) for (j = 0; j < N; j++) {
+        cell[k][j].setAttribute('class', 'fi-paper sw-2');
+        cellX[k][j].textContent = '';
+        show(psG[k][j], false);
+      }
+      active.forEach(function (q) {
+        cell[q.k][q.j].setAttribute('class', 'fw-s1 st-s1 sw-2');
+        cellX[q.k][q.j].textContent = 'x = ' + q.x;
+        psT[q.k][q.j].textContent = '↓ ' + q.after;
+        show(psG[q.k][q.j], true);
+      });
+      while (qLayer.firstChild) qLayer.removeChild(qLayer.firstChild);
+      for (b = 0; b < B; b++) {
+        var pts = [];                          // the elements of x_b still waiting: one diagonal per input vector
+        for (k = 0; k < K; k++) {
+          var d = b + k - t;                   // cycles until x_b[k] enters row k
+          if (d >= 1) pts.push([210 - 34 * (d - 1), 44 + 96 * k + 30, k]);
+        }
+        if (pts.length > 1) S('polyline', { points: pts.map(function (p) { return p[0] + ',' + p[1]; }).join(' '), 'class': 'st-muted dash sw-1' }, qLayer);
+        pts.forEach(function (p) {
+          S('circle', { cx: p[0], cy: p[1], r: 14, 'class': 'fi-paper st-s1 sw-2' }, qLayer);
+          tx(p[0], p[1] + 5, 'tx-mid tx-mono', String(X[b][p[2]]), qLayer);
+        });
+        if (pts.length) tx(pts[0][0], pts[0][1] - 20, 'tx-mid tx-sm tx-muted', 'x' + SUB[b], qLayer);
+      }
+      for (b = 0; b < B; b++) for (j = 0; j < N; j++) outT[b][j].textContent = b + K - 1 + j <= t ? String(Y[b][j]) : '·';
+      var done = 0, reads = 0;
+      for (var u = 0; u <= Math.min(t, NC - 1); u++) done += log[u].length;
+      for (k = 0; k < K; k++) for (b = 0; b < B; b++) if (b + k <= t) reads++;
+      roC.set(t < 0 ? 'none yet: weights loaded' : t >= NC ? 'done after ' + NC + ' cycles' : String(t));
+      roM.set(active.length);
+      roT.set(done + ' of ' + (B * K * N));
+      roR.set(reads + ' of ' + (B * K));
+    });
+  });
+  </script>
+
+  <p>The systolic array is to a matrix what the vector pipeline of lesson 30 is to a vector: the latency of the wavefront is paid once, then results stream out, one per column per cycle.</p>
+
+  <h3>Hennessy &amp; Patterson's five guidelines</h3>
+
+  <p>Hennessy &amp; Patterson (6th ed., ch. 7) distil such designs into five guidelines for domain-specific architectures. The TPU follows each of them:</p>
+
+  <ol>
+    <li><b>Dedicated memories to minimise data movement</b> — a 24 MiB unified buffer for activations and 4 MiB of accumulators, both managed by software; no caches.</li>
+    <li><b>Spend the resources saved on advanced microarchitecture on more arithmetic units or bigger memories</b> — 65,536 MACs, and control logic under 2 % of the die.</li>
+    <li><b>The easiest form of parallelism that matches the domain</b> — SIMD in two dimensions, a systolic array; no MIMD.</li>
+    <li><b>Reduce data size and type to the simplest the domain needs</b> — 8-bit integers. Quantising Google's Inception network shrank it from 91 MB to 23 MB.</li>
+    <li><b>A domain-specific programming language</b> — models written in TensorFlow, compiled for the TPU.</li>
+  </ol>
+
+  <p>The NPUs of phones and laptops (Apple's Neural Engine, Qualcomm's Hexagon, the NPU blocks of recent Intel and AMD chips) apply the same recipe at a few watts: 8-bit or FP16 MAC arrays and large local SRAM.</p>
+
+  <h3>Back to the puzzle</h3>
+
+  <p>The TPU of the hook beat the CPUs and GPUs of its day without caches, branch prediction, out-of-order execution or multithreading. That machinery exists for programs that hide their future: branches whose direction is unknown until they execute, loads whose latency depends on a cache, independent instructions that the hardware must discover inside a window of a few hundred (<a href="l08.html#l08-limits">lesson 8</a>). A neural-network layer announces everything in advance — a matrix product of known size, a fixed dataflow, no data-dependent branches. Hardware that rediscovers what the program already states wastes silicon and energy; the TPU spends them on multipliers and on-chip memory instead. It is the choice Cray made in lesson 30, taken as far as it goes.</p>
+
+  <p>Every machine of this lesson is a step on the same road. Packed SIMD writes the parallelism into the opcode, a GPU into thousands of threads, a tensor core into a matrix tile, and an NPU into the whole chip.</p>
+
+  <p class="memo"><mark class="key">An NPU is the vector idea pushed to two dimensions and to one domain: a systolic array that reuses every operand hundreds of times, fed from software-managed on-chip memory, in low precision, with none of the hardware that discovers parallelism at run time.</mark></p>
+</section>
+
+<section id="l32-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l32-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used by data-parallel architectures:</p>
+      <ol>
+        <li>SIMD ISA extensions (e.g. SSE/AVX)</li>
+        <li>Vector length register (VLR) with strip mining</li>
+        <li>Vector mask registers</li>
+        <li>Multithreaded SIMD execution in GP-GPUs (warps)</li>
+        <li>Separate host and device memories in the GP-GPU programming model</li>
+        <li>Address coalescing in GP-GPUs</li>
+        <li>Tensor cores</li>
+        <li>Systolic arrays in Neural Processing Units</li>
+      </ol>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <ol>
+          <li><p>A scalar ISA extended with instructions that apply one operation to the elements packed in a wide register (128, 256 or 512 bits: 2, 4 or 8 doubles). Benefits: several data operations per fetched and decoded instruction; cheap to add as extra datapaths in the existing pipeline; little extra state, fed by the caches; available in every CPU, so compilers and libraries use it for media and ML kernels. Limits: the width is fixed in the opcode, so a wider register needs new instructions and recompiled code, leftovers need a scalar remainder loop, and strided/sparse access and masks came late (gather with AVX2, scatter and masks with AVX-512).</p></li>
+          <li><p>VLR holds the number of elements, 0 ≤ VLR ≤ MVL, that every vector instruction processes; MVL is the hardware length of a vector register. Strip mining (a compiler transformation) splits a loop of n iterations into ⌈n/MVL⌉ strips: full strips with VLR = MVL and one strip of n mod MVL. Benefits: one loop handles any n with no remainder loop, nothing beyond the arrays is touched, and the same binary uses more lanes or a longer MVL if the loop takes its strip length from the hardware (ARM SVE, RISC-V V).</p></li>
+          <li><p>A mask register holds one bit per element; a vector compare sets it, and the following vector instructions update only the elements whose bit is 1, leaving the others unchanged (predication). Benefits: loops with if statements stay vectorised, with no branch per element, and masked elements raise no exceptions. Cost: masked elements still use their slot, so an if-else executes both bodies. GPUs do the same per thread (branch divergence).</p></li>
+          <li><p>A GP-GPU streaming multiprocessor is a multithreaded SIMD processor. Threads are grouped into warps of 32; one instruction is fetched per warp and executed in lockstep on the SIMD lanes for all 32 threads, each thread with private registers (SIMT). Many warps are resident; every cycle the warp scheduler issues from a ready one, and since all their registers stay in a large register file, switching costs nothing. Benefits: DRAM latency of hundreds of cycles is hidden by the other warps instead of by caches or out-of-order logic; the programmer writes sequential code for one element; the same kernel scales over any number of SMs.</p></li>
+          <li><p>The CPU (host) and the GPU (device) have separate memory address spaces, physically two DRAMs linked by PCIe/NVLink. The host allocates device memory (cudaMalloc), copies the inputs (cudaMemcpy), launches the kernel and copies the results back. Benefit: the device memory (GDDR/HBM) is built for bandwidth and serves the kernel at full speed. Cost: every transfer crosses the link, so a kernel must do enough work per byte copied; unified memory only automates the migration.</p></li>
+          <li><p>Each thread of a warp computes its own address; the coalescing unit merges the 32 addresses of a warp's load or store into as few wide memory transactions as possible. Consecutive threads touching consecutive words cost one or two transactions — the run-time equivalent of a unit-stride L.V — while column or scattered accesses cost up to 32. Benefit: memory bandwidth is used efficiently without the program stating the stride; it rewards unit-stride data layouts.</p></li>
+          <li><p>A tensor core is a functional unit in each SM that computes D = A × B + C on small matrices as one operation (Volta: 4 × 4, A and B in FP16, accumulation in FP16 or FP32, 64 FMAs per clock), used through a warp-level matrix instruction. Benefits: one instruction for 64 FMAs; each input reused 4 times inside the unit, so less register traffic per flop; reduced precision halves data movement — up to 125 TFLOPS on a V100. Only matrix-shaped, high-intensity work (dense linear algebra, deep learning) gains.</p></li>
+          <li><p>A systolic array is a grid of multiply-accumulate cells in which data moves between neighbours in lockstep, so each operand fetched from memory is used by a whole row or column. In the TPU (256 × 256 8-bit MACs, weight-stationary) the weights stay in the cells, activations flow right and partial sums flow down into accumulators: one activation read feeds 256 MACs. Benefits: very high throughput (92 TOPS) at low energy per operation, simple control, software-managed on-chip memory instead of caches. Limits: only dense matrix work, and a fill/drain latency per stream.</p></li>
+        </ol>
+      </div>
+      <div class="exam-note"><p>The June 2026 paper asked exactly this form for superscalar techniques: eight sub-points, five lines each. For every point write the mechanism (what the hardware or the compiler does), the benefit, and one cost. Points 2–3 are the notes' own material (lesson 31); points 4–8 are the background of this lesson, which the topic list ("Intro to GP-GPUs; Intro to Tensor Cores", "Intro to Neural Processing Units") makes examinable but the notes do not cover.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l32-exam-compare">
+    <div class="exam-q" lang="en">
+      <p>Compare a vector processor (VMIPS-like) and the streaming multiprocessor of a GP-GPU. For each one describe: the main concepts; how the length of a loop is handled; how a conditional statement inside the loop is handled; how memory latency is hidden; the main benefits; the main drawbacks.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th></th><th>Vector processor (VMIPS)</th><th>GP-GPU streaming multiprocessor</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Main concepts</th><td>SIMD with one PC; vector registers of MVL = 64 elements; deeply pipelined vector FUs in lanes with chaining; one vector load/store unit; a scalar control processor. One instruction = a whole vector.</td><td>Multithreaded SIMD: threads grouped in warps of 32; one instruction per warp, executed in lockstep for its 32 threads, each with private registers (SIMT); dozens of resident warps, a warp scheduler issues from a ready one each cycle; a host CPU and a separate device memory.</td></tr>
+              <tr><th scope="row">Loop length</th><td>VLR (≤ MVL) and strip mining: ⌈n/MVL⌉ strips.</td><td>A grid of n threads in blocks; the tail is masked off by <code>if (i &lt; n)</code>; no VLR.</td></tr>
+              <tr><th scope="row">Conditionals</th><td>A vector compare sets the mask register; the instructions execute under the mask.</td><td>Branch divergence: the warp executes both paths, each under a per-thread mask.</td></tr>
+              <tr><th scope="row">Memory latency</th><td>Paid once per vector, then one element per cycle from interleaved banks; strided and gather/scatter loads; little or no data cache.</td><td>Hidden by switching among resident warps, whose registers stay in the register file; coalescing merges a warp's accesses; small caches save bandwidth.</td></tr>
+              <tr><th scope="row">Benefits</th><td>Few instructions (DAXPY: 6 instead of 578), no loop overhead, deep pipelines without hazards, energy-efficient, scales with lanes under the same code.</td><td>Very high throughput on massively parallel work; latency hiding without out-of-order logic; sequential code for one thread; scales with the number of SMs.</td></tr>
+              <tr><th scope="row">Drawbacks</th><td>Only vectorisable loops; needs a high-bandwidth memory; masked elements still cost cycles; bank conflicts with bad strides.</td><td>Divergence and uncoalesced accesses waste lanes; host–device copies; one thread is slow; needs thousands of threads to fill the machine.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="exam-note"><p>The forms of July 2024 (fine-grained vs simultaneous multithreading) and June 2025 (a dual-core chip) were tables with blank lines: one precise line per cell, naming the mechanism and not only the term. The loop-length, conditional and latency rows are the mapping of this lesson — VLR against a masked tail, mask register against divergence, latency amortised by long vectors against latency hidden by warps.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l32-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>In the GP-GPU programming model, the CPU (host) and GPU (device) have separate memory address spaces. (True/False)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">The host allocates device memory, copies the data in with cudaMemcpy, launches the kernel and copies the results back: two memories, two address spaces.</span></li>
+      <li>False <span class="fb">Unified memory only migrates pages between the two memories automatically; the basic model and the hardware keep two separate memories.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True. The device has its own DRAM; pointers to device memory are valid only on the device, and data moves explicitly (cudaMalloc, cudaMemcpy host to device, kernel launch, cudaMemcpy device to host).</p></div>
+      <div class="exam-note"><p>Question 3 of the quizzes of 10 June 2025, word for word — the only GPU question of the three papers. The wrong answer usually comes from unified memory, which automates the copies but does not merge the memories.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l32-exam-avx">
+    <div class="exam-q" lang="en">
+      <p>Let's consider the loop <code>for (i=0; i&lt;260; i++) Y[i] = X[i] + Y[i];</code> compiled for a processor with the AVX-512 SIMD extension (512-bit registers, 64-bit elements), without masked instructions: the leftover elements are handled by a scalar remainder loop. How many SIMD add instructions and how many scalar add instructions are executed? (SINGLE ANSWER)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Answer 1: 32 SIMD adds and 4 scalar adds <span class="fb">8 doubles per register: 260 = 32 × 8 + 4.</span></li>
+      <li>Answer 2: 33 SIMD adds and 0 scalar adds <span class="fb">That needs a masked last add, which the question excludes.</span></li>
+      <li>Answer 3: 65 SIMD adds and 0 scalar adds <span class="fb">That is AVX, with 4 doubles per 256-bit register: 260 = 65 × 4.</span></li>
+      <li>Answer 4: 5 SIMD adds and 0 scalar adds <span class="fb">That is the number of strips on VMIPS with MVL = 64, a vector machine, not packed SIMD.</span></li>
+      <li>Answer 5: 8 SIMD adds and 4 scalar adds <span class="fb">8 is the width of the register, not the number of trips of the loop.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 1. A 512-bit register holds 8 doubles, and 260 = 32 × 8 + 4: the SIMD loop runs 32 times, and the 4 leftover elements go to the scalar remainder loop. With the k-mask registers of AVX-512 the 4 leftovers would take one masked add (33 instructions); on a vector machine the loop is strip-mined with VLR instead (5 strips with MVL = 64).</p></div>
+      <div class="exam-note"><p>The same loop as the strip-mining quiz of the papers, on a different machine. The distractors are the counts of the neighbouring machines — 65 for AVX, 33 for the masked version, 5 for the VMIPS strips — in the style the papers build their options.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l32-exam-sm">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about the streaming multiprocessor of a GP-GPU are true? (MULTIPLE ANSWERS)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>A warp executes one instruction for its 32 threads in lockstep, each thread with its own registers. <span class="fb">SIMT: a warp instruction is a vector instruction of length 32 with per-lane registers.</span></li>
+      <li data-correct>The latency of a DRAM access is hidden mainly by switching to another ready warp. <span class="fb">Fine-grained multithreading at no switch cost: the registers of all resident warps stay in the register file.</span></li>
+      <li>The tail of a loop is handled with a vector length register, as in VMIPS. <span class="fb">There is no VLR: the threads with i ≥ n are masked off by the if of the kernel.</span></li>
+      <li data-correct>When the threads of a warp take different paths of an if, both paths are executed, each under a mask. <span class="fb">Branch divergence: the vector mask of lesson 31, managed per thread by the hardware.</span></li>
+      <li>A tensor core performs one fused multiply-add per lane per clock. <span class="fb">A tensor core computes D = A × B + C on 4 × 4 matrices: 64 FMAs per clock as one operation.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 2 and 4. A warp is one instruction stream for 32 threads with private registers; latency is hidden by switching warps; divergent paths run one after the other under masks. A GPU has no VLR (the tail is masked), and a tensor core is a matrix unit, not a wider FMA.</p></div>
+      <div class="exam-note"><p>The two false options are the traps: carrying the VLR over from the vector machine, and imagining the tensor core as a faster ordinary lane.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l32-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A program compiled for SSE2 (two doubles per add, 128-bit registers) runs on a core with AVX-512 hardware. What happens?</p>
+    <ul class="options">
+      <li data-correct>It runs, but every add uses 2 of the 8 lanes <span class="fb">The width is part of each instruction; the wider hardware cannot widen it, so the program needs recompiling to use the lanes.</span></li>
+      <li>It runs on all 8 lanes automatically <span class="fb">That is what a VLR binary does on a vector machine; a packed-SIMD instruction keeps the width of its opcode.</span></li>
+      <li>It does not run <span class="fb">Old instructions remain supported; it is the newer binary on the older core that does not run.</span></li>
+      <li>It runs, but needs a remainder loop it did not have before <span class="fb">The remainder depends on the width the program was compiled for, which has not changed.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these did vector ISAs (Cray, VMIPS) have from the start, while packed SIMD got them late or never?</p>
+    <ul class="options">
+      <li data-correct>A length register that the same binary reads on any hardware <span class="fb">VLR; SSE and AVX never had one. RISC-V V brought it back, and ARM SVE gets the same effect with masks.</span></li>
+      <li data-correct>Per-element mask registers <span class="fb">Packed SIMD got clean predication only with the k-mask registers of AVX-512.</span></li>
+      <li data-correct>Indexed loads and stores (gather/scatter) <span class="fb">Gather arrived with AVX2, scatter with AVX-512.</span></li>
+      <li>A separate opcode for every register width <span class="fb">That is the packed-SIMD way, and the reason for its bloat; a vector ISA has one ADDVV.D for every length.</span></li>
+      <li>A scalar remainder loop for the leftovers <span class="fb">The other way round: packed SIMD needs it, strip mining with VLR does not.</span></li>
+    </ul>
+    <p class="q-fb">Hennessy &amp; Patterson list exactly these three omissions of multimedia SIMD. AVX2 and AVX-512 added indexed access and masks; a length kept out of the opcode came back only with RISC-V V and ARM SVE.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A warp of 32 threads reaches an if-else. 8 threads take the then-body, 24 the else-body; each body is 10 instructions. How many warp instructions are issued for the two bodies, and what fraction of the lane slots does useful work?</p>
+    <ul class="options">
+      <li>10 instructions, 100 % <span class="fb">Only if all 32 threads took the same path; here both paths must run.</span></li>
+      <li data-correct>20 instructions, 50 % <span class="fb">Both bodies run, each under a mask: 8 × 10 + 24 × 10 = 320 useful lane slots out of 20 × 32 = 640.</span></li>
+      <li>20 instructions, 25 % <span class="fb">The else-body keeps 24 lanes busy, not 8.</span></li>
+      <li>40 instructions, 50 % <span class="fb">Each body is issued once, under its mask — not once per group of threads.</span></li>
+    </ul>
+    <p class="q-fb">With two bodies of equal length the efficiency is 50 % however the threads split, as long as both paths are taken.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">The 32 threads of a warp read the first column of a row-major matrix of doubles with 32 columns: thread t loads M[t][0]. What does the coalescing unit produce?</p>
+    <ul class="options">
+      <li>One wide transaction <span class="fb">The addresses are 32 × 8 = 256 bytes apart: no single transaction covers them.</span></li>
+      <li>Two 128-byte transactions <span class="fb">That is the case of a row: 32 consecutive doubles.</span></li>
+      <li data-correct>32 separate transactions <span class="fb">Each address falls in a different memory segment — the column access is the bad stride of lesson 31.</span></li>
+      <li>8 transactions, one per memory bank <span class="fb">Coalescing groups addresses into segments; with a 256-byte stride no two share one.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A tensor core computes D = A × B + C on 4 × 4 matrices. How many of its 64 multiplications use the element a₀₀?</p>
+    <ul class="options">
+      <li>1 <span class="fb">That is the ordinary FMA on a lane, where every operand is read for one use.</span></li>
+      <li data-correct>4 <span class="fb">a₀₀ meets b₀₀, b₀₁, b₀₂ and b₀₃: it takes part in d₀₀, d₀₁, d₀₂ and d₀₃.</span></li>
+      <li>16 <span class="fb">16 is the number of entries of D; a₀₀ appears only in row 0 of D.</span></li>
+      <li>64 <span class="fb">64 is the total number of multiplications.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">You move DAXPY to a GPU that has tensor cores. How much faster does DAXPY get thanks to the tensor cores?</p>
+    <ul class="options">
+      <li>About 8 times, the extra compute of the tensor cores <span class="fb">DAXPY sits on the bandwidth slope of the roofline; a higher compute roof does not reach it.</span></li>
+      <li data-correct>Not at all <span class="fb">At 1/12 flop per byte DAXPY is memory-bound, and it is not a matrix product: tensor cores raise the compute roof only for kernels of high intensity.</span></li>
+      <li>About 2 times, thanks to FP16 <span class="fb">The tensor cores do not run DAXPY at all; it is a vector operation, not a matrix multiply-accumulate.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the TPU's 256 × 256 weight-stationary array, one activation value is read once from the unified buffer. How many multiply-accumulates use it?</p>
+    <ul class="options">
+      <li>1 <span class="fb">That is a MAC unit reading its operands from a register file, the design the systolic array avoids.</span></li>
+      <li data-correct>256 <span class="fb">The activation travels along its row and meets the 256 weights of that row, one MAC per cell.</span></li>
+      <li>512 <span class="fb">It crosses one row of 256 cells, not a row and a column.</span></li>
+      <li>65,536 <span class="fb">That is the number of cells; each activation crosses only its own row.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l32-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>Packed SIMD (MMX, SSE, AVX, AVX-512, NEON) writes the vector length into the opcode: a loop of n elements on width W needs ⌊n/W⌋ SIMD instructions plus a remainder loop of n mod W, and a wider register needs new instructions and a recompiled binary.</li>
+    <li>A vector ISA keeps the length in VLR: one strip-mined loop handles any n and uses more lanes or a longer MVL without recompiling; RISC-V V and ARM SVE brought the length-agnostic model back.</li>
+    <li>Packed SIMD won in CPUs because it is cheap — extra datapaths in the existing pipeline, little state, data from the caches — and got gather (AVX2), scatter and masks (AVX-512) late; its drawback is more instructions, not fewer.</li>
+    <li>A GP-GPU's streaming multiprocessor is a multithreaded SIMD processor: a warp is one instruction for 32 threads, each with private registers; masks replace VLR, coalescing replaces the strided load, and switching among dozens of warps hides DRAM latency.</li>
+    <li>Host and device have separate memory address spaces: data is copied in and out explicitly — the true/false of June 2025 is True.</li>
+    <li>A tensor core computes D = A × B + C on small tiles (Volta: 4 × 4, FP16 in, FP32 accumulation, 64 FMAs per clock); reuse and narrow data raise the compute roof, which only high-intensity kernels such as matrix products can reach — DAXPY, at 1/12 flop per byte, gains nothing.</li>
+    <li>An NPU such as the TPU (a 256 × 256 weight-stationary systolic array of 8-bit MACs, 92 TOPS, 28 MiB on-chip) follows H&amp;P's guidelines: dedicated memories, more arithmetic, the simplest parallelism, small data types, a domain-specific language.</li>
+  </ul>
+
+  <aside class="cheat" id="l32-cheat">
+    <dl>
+      <dt>Packed-SIMD loop</dt><dd>\(\lfloor n/W \rfloor\) SIMD adds \(+\ (n \bmod W)\) scalar adds; \(W\) = elements per register</dd>
+      <dt>Vector loop</dt><dd>\(\lceil n/\mathrm{MVL} \rceil\) strips; one instruction takes \(\lceil \mathrm{VL}/L \rceil\) cycles on \(L\) lanes</dd>
+      <dt>GP-GPU warp</dt><dd>32 threads = one SIMD instruction (VL = 32), each thread with private registers; host and device: separate address spaces</dd>
+      <dt>Warps to hide latency</dt><dd>\(N_{warps} \approx 1 + t_{wait}/r\); \(t_{wait}\) = wait in cycles, \(r\) = instructions between stalls</dd>
+      <dt>Tensor core (Volta)</dt><dd>\(D = A \times B + C\), 4 × 4, FP16 in, FP16/FP32 out, 64 FMAs per clock</dd>
+      <dt>Roofline</dt><dd>\(P_{att} = \min(P_{peak},\ BW \times AI)\); \(AI\) = flops per DRAM byte</dd>
+      <dt>Intensities</dt><dd>DAXPY: \(2/24 = 1/12\); \(n \times n\) matrix product (FP64): \(n/12\)</dd>
+      <dt>TPU v1 peak</dt><dd>\(2 \times 65\,536 \times 700\) MHz \(\approx\) 92 TOPS (256 × 256 8-bit MACs)</dd>
+      <dt>Systolic stream</dt><dd>\(B\) inputs through a \(K \times N\) array: \(B + K + N - 2\) cycles</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l32-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=UFD8K-lprbQ" target="_blank" rel="noopener">Digital Design and Comp. Arch. — Lecture 20: GPU Architectures</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span>
+      <p class="res-why">The bridge from vector machines to CUDA drawn step by step: SIMD hardware under a SIMT programming model, warps scheduled as fine-grained multithreading to hide memory latency, divergence handled with masks.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html" target="_blank" rel="noopener">Intel Intrinsics Guide</a>
+      <span class="res-by">Intel</span>
+      <p class="res-why">Next to Table 30: look up _mm256_add_pd and _mm512_add_pd (one operation, two widths, two encodings), then _mm256_i32gather_pd (AVX2) and _mm512_i32scatter_pd (AVX-512) — the dates of the first red pen.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://developer.nvidia.com/blog/programming-tensor-cores-cuda-9" target="_blank" rel="noopener">Programming Tensor Cores in CUDA 9</a>
+      <span class="res-by">NVIDIA Technical Blog, 2017</span>
+      <p class="res-why">The source of the tensor-core numbers: the 4 × 4 × 4 cube figure, 64 mixed-precision FMAs per clock, 8 per SM, and the warp-level 16 × 16 × 16 fragments.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://cloud.google.com/blog/products/ai-machine-learning/an-in-depth-look-at-googles-first-tensor-processing-unit-tpu" target="_blank" rel="noopener">An in-depth look at Google's first Tensor Processing Unit (TPU)</a>
+      <span class="res-by">Kaz Sato, Cliff Young (Google)</span>
+      <p class="res-why">The systolic array animated, the 8-bit quantisation (91 MB to 23 MB), the dozen CISC instructions, and the list of what the chip left out — the hook of this lesson.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://arxiv.org/abs/1704.04760" target="_blank" rel="noopener">In-Datacenter Performance Analysis of a Tensor Processing Unit</a>
+      <span class="res-by">Jouppi et al., ISCA 2017</span>
+      <p class="res-why">The primary source: 65,536 MACs, 92 TOPS, 28 MiB on chip, "15X – 30X faster" and "30X – 80X" better per watt — and a roofline analysis of six production workloads.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Every machine in this lesson widens what one instruction applies to. The next lesson takes the other column of Flynn's table — many processors, each with its own instruction stream — and starts with the wire they all share.</p>
+</aside>
+
+</main>
+</body>
+</html>

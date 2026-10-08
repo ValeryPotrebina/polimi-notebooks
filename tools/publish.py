@@ -13,6 +13,9 @@ scratch pages _*.html). While copying it
   - strips HTML comments (notes to the builder) and the header comment of assets/syllabus.js (local paths),
   - adds <meta name="robots" content="noindex, nofollow"> to every page (search engines are asked not to list the site),
   - adds a link back to the list of notebooks at the start of the hub's eyebrow line,
+  - adds the credit of the notebook's source under the hub's lede, when site.json has one ("credits" -> slug -> "hub";
+    "source", "url", "license" also go on the card of the list and into the README),
+  - turns links to pages that are not published yet into plain text (a bridge button to one is left out),
   - checks that every relative link and file reference of the exported pages resolves.
 Then it rebuilds index.html (the list of notebooks), notebooks.json and README.md from the exported notebooks.
 
@@ -131,6 +134,15 @@ def add_backlink(text, lang):
     return new
 
 
+def add_credit(text, hub_html):
+    """the source a notebook is built on, right under the hub's lede (site.json, "credits" -> slug -> "hub")"""
+    m = re.search(r'<p class="hub-lede">.*?</p>', text, re.S)
+    if not m:
+        print("   ! the hub has no <p class=\"hub-lede\">: the credit line was not added")
+        return text
+    return text[:m.end()] + f'\n      <p class="hub-credit">{hub_html}</p>' + text[m.end():]
+
+
 def strip_js_header(text):
     m = re.match(r"\s*/\*.*?\*/\s*", text, re.S)
     return text[m.end():] if m else text
@@ -144,6 +156,30 @@ def page_lang(text):
 def hub_lede(text):
     m = re.search(r'<p class="hub-lede">(.*?)</p>', text, re.S)
     return html.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip() if m else ""
+
+
+LOCAL_LINK_RE = re.compile(r'<a\b([^>]*?)\bhref="([^"#?]+\.html)(?:[#?][^"]*)?"([^>]*)>(.*?)</a>', re.S | re.I)
+
+
+def drop_dead_links(text, page):
+    """Links to pages that are not published (a lesson or a companion page still marked ready: false) keep their words
+    and lose the link; a bridge button to such a page is left out. Script and style blocks are not touched."""
+    dropped = []
+
+    def repl(m):
+        href = m.group(2)
+        if re.match(r"^(?:[a-z][a-z0-9+.-]*:|//)", href, re.I):
+            return m.group(0)
+        target = (page.parent / href).resolve()
+        if target.exists() or target == (REPO / "index.html").resolve():
+            return m.group(0)
+        dropped.append(href)
+        return "" if "bridge-link" in (m.group(1) + m.group(3)) else m.group(4)
+
+    parts = SCRIPT_OR_STYLE.split(text)
+    for i in range(0, len(parts), 2):
+        parts[i] = LOCAL_LINK_RE.sub(repl, parts[i])
+    return "".join(parts), dropped
 
 
 TAG_REF_RE = re.compile(r"""<[a-zA-Z][^<>]*?\b(?:src|href)\s*=\s*["']([^"'#?]*)""", re.I)
@@ -178,7 +214,7 @@ def check_refs(out_dir, rel_files):
     return problems
 
 
-def export(slug, site):
+def export(slug, site, credit=None):
     site = Path(site).resolve()
     syl = read_syllabus(site)
     files = publishable_files(site, syl)
@@ -194,11 +230,20 @@ def export(slug, site):
             text = add_noindex(strip_html_comments(src.read_text(encoding="utf-8")))
             if rel == "index.html":
                 text = add_backlink(text, lang)
+                if credit and credit.get("hub"):
+                    text = add_credit(text, credit["hub"])
             dst.write_text(text, encoding="utf-8", newline="\n")
         elif rel == "assets/syllabus.js":
             dst.write_text(strip_js_header(src.read_text(encoding="utf-8")), encoding="utf-8", newline="\n")
         else:
             shutil.copyfile(src, dst)
+    for rel in files:
+        if rel.endswith(".html"):
+            page = out_dir / rel
+            text, dropped = drop_dead_links(page.read_text(encoding="utf-8"), page)
+            if dropped:
+                page.write_text(text, encoding="utf-8", newline="\n")
+                print(f"   link(s) to unpublished pages turned into text in {rel}: {', '.join(sorted(set(dropped)))}")
     problems = check_refs(out_dir, files)
     for p in problems[:20]:
         print("   ! unresolved reference " + p)
@@ -219,6 +264,7 @@ def export(slug, site):
         "minutes": sum(int(le.get("minutes") or 0) for le in lessons),
         "extras": [x.get("title", x.get("id")) for x in syl.get("extras", []) if is_ready(x, site)],
         "updated": datetime.date.today().isoformat(),
+        "credit": {k: credit[k] for k in ("source", "url", "license") if k in credit} if credit else None,
     }
 
 
@@ -233,6 +279,9 @@ def card(nb):
     e = html.escape
     lang_name = LANG_NAMES.get(nb["lang"].split("-")[0], nb["lang"])
     extras = "".join(f"<li>{e(x)}</li>" for x in nb["extras"])
+    cr = nb.get("credit")
+    credit = (f'\n        <p class="nb-credit" lang="en">Based on <a href="{e(cr["url"])}">{e(cr["source"])}</a>'
+              f'{" · " + e(cr["license"]) + " License" if cr.get("license") else ""}</p>') if cr and cr.get("url") else ""
     return f"""
     <article class="nb" lang="{e(nb['lang'])}">
       <p class="nb-count"><b>{nb['lessons']}</b> lessons</p>
@@ -243,7 +292,7 @@ def card(nb):
         <ul class="nb-meta" lang="en">
           <li>{nb['modules']} modules</li><li>{hours(nb['minutes'])}</li><li>{e(lang_name)}</li><li>updated {e(nb['updated'])}</li>
         </ul>
-        {f'<ul class="nb-extras" lang="en">{extras}</ul>' if extras else ''}
+        {f'<ul class="nb-extras" lang="en">{extras}</ul>' if extras else ''}{credit}
         <p class="nb-open" lang="en"><a href="{e(nb['slug'])}/">Open the notebook</a></p>
       </div>
     </article>"""
@@ -314,6 +363,8 @@ h1 span {{ background: linear-gradient(transparent 58%, var(--key-bg) 58%, var(-
 .nb-meta, .nb-extras {{ list-style: none; margin: 0.3rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem 1rem;
   font: 500 0.82rem/1.4 var(--f-display); color: var(--ink-3); font-variant-numeric: tabular-nums; }}
 .nb-extras li {{ border: 1px solid var(--line); border-radius: 999px; padding: 0.1rem 0.65rem; background: var(--paper-2); color: var(--ink-2); }}
+.nb-credit {{ margin: 0.2rem 0 0; font: 400 0.82rem/1.45 var(--f-display); color: var(--ink-3); }}
+.nb-credit a {{ color: inherit; text-underline-offset: 0.18em; }}
 .nb-open {{ margin: 0.6rem 0 0; font: 650 0.95rem/1.3 var(--f-display); }}
 .nb-open a {{ color: var(--accent); text-underline-offset: 0.2em; }}
 a:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }}
@@ -352,6 +403,14 @@ def readme(cfg, notebooks):
     rows = "\n".join(
         f"| [{nb['title']}]({base}{nb['slug']}/) | {nb['subtitle']} | {nb['lessons']} | "
         f"{LANG_NAMES.get(nb['lang'].split('-')[0], nb['lang'])} | {nb['updated']} |" for nb in notebooks)
+    credited = [nb for nb in notebooks if nb.get("credit") and nb["credit"].get("url")]
+    credits_md = ""
+    if credited:
+        lines = "\n".join(
+            f"- **{nb['title']}** is based on [{nb['credit']['source']}]({nb['credit']['url']})"
+            f"{', ' + nb['credit']['license'] + ' License' if nb['credit'].get('license') else ''}." for nb in credited)
+        credits_md = (f"\n## Sources and credits\n\n{lines}\n\nThe license texts of these sources are in "
+                      f"[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).\n")
     return f"""# {cfg['title']}
 
 {cfg['intro']}
@@ -363,7 +422,7 @@ def readme(cfg, notebooks):
 {rows}
 
 {cfg['disclaimer']}
-
+{credits_md}
 ## How the site is made
 
 Each folder (`{notebooks[0]['slug'] if notebooks else 'slug'}/`, ...) is a static notebook: plain HTML, CSS and JavaScript, with
@@ -420,8 +479,9 @@ def main(argv):
     if not sources:
         die("no notebook registered yet: python tools/publish.py add <slug> <site_dir>")
     meta = {nb["slug"]: nb for nb in load_json(REPO / "notebooks.json", [])}
+    credits = load_json(SITE_CFG, {}).get("credits", {})
     for slug in targets:
-        meta[slug] = export(slug, sources[slug])
+        meta[slug] = export(slug, sources[slug], credits.get(slug))
     rebuild_index([meta[s] for s in meta if (REPO / s).is_dir()])
 
 

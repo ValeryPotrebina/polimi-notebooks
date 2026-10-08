@@ -1,0 +1,1057 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Branches that talk to each other · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l06">
+
+<header class="lesson-head">
+  <h1>Branches that talk to each other: correlating and two-level predictors</h1>
+  <p class="lede">After this lesson you will fill the prediction table of a (1,1) or (2,2) correlating predictor cycle by cycle, say which predictor can learn a loop exit and why, and explain what gshare's XOR buys.</p>
+</header>
+
+<div class="hook" data-label="A warm-up puzzle">
+  <p>Two branches, one after the other, test the same variable <code>d</code>, which alternates 2, 0, 2, 0. Give each branch its own one-bit history entry, as lesson 5 did, and watch: <strong>0 of 8</strong> predictions right. A coin would do better.</p>
+  <p>Now add one bit of information — not about this branch, but the outcome of <em>the branch executed just before</em>. After two warm-up misses it never misses again: 8 of 8 on every later pass. Where did that information come from, if the branch's own history was worthless?</p>
+</div>
+
+<section id="l06-problem">
+  <h2>Two branches, one variable: where the per-branch table goes blind</h2>
+
+  <p>Recall from <a href="l05.html">lesson 5</a>: a branch history table (BHT) is indexed by the low-order PC bits, has no tags, and holds a tiny state machine per entry — one bit or two (Strongly/Weakly Taken, Weakly/Strongly Not Taken) — whose state is the prediction; the branch target buffer (BTB) is the tagged cache that supplies <em>where</em> to fetch when the prediction says Taken.</p>
+
+  <p>Every BHT entry looks at one thing, that branch's own past. The notes open §2.6.4 (p. 65) with the simplest case where that is not enough:</p>
+
+<pre><code>if (x &gt; 0)   // Branch A
+   ...
+if (x &gt; 0)   // Branch B
+   ...</code></pre>
+
+  <p>Branch B behaves like Branch A because both test the same condition, and "a normal predictor doesn't know this. It treats A and B independently" (p. 65). Hennessy and Patterson sharpen the example with a variable that changes between the tests — in RISC-V in the book, here in the papers' mnemonics, with <code>d</code> in <code>R1</code> and <code>R0</code> as the zero register:</p>
+
+<pre><code>      BNE   R1, R0, L1      ; b1: taken if d != 0
+      ADDUI R1, R0, 1       ;     d = 1
+L1:   SUBI  R3, R1, 1       ;     R3 = d - 1
+      BNE   R3, R0, L2      ; b2: taken if d != 1
+      ...
+L2:</code></pre>
+
+  <p>Three cases. <code>d = 0</code>: b1 not taken, <code>d</code> becomes 1, b2 not taken. <code>d = 1</code>: b1 taken, b2 not taken. <code>d = 2</code>: both taken. So <mark class="key">if b1 is not taken, b2 is certainly not taken</mark> — a correlation no per-branch counter can see. Let <code>d</code> alternate 2, 0, 2, 0 and give each branch a 1-bit entry initialised Not Taken; the prediction is the bit before the branch, the bit after is the outcome.</p>
+
+  <figure class="tbl-fig" id="l06-tbl-1bit">
+    <figcaption>Table 1. A 1-bit entry per branch on <code>d = 2, 0, 2, 0</code>: every prediction is one step behind.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>d</th><th>b1 prediction</th><th>b1 outcome</th><th>b1 bit after</th><th>b2 prediction</th><th>b2 outcome</th><th>b2 bit after</th></tr></thead>
+        <tbody>
+          <tr><td class="num">2</td><td>NT</td><td>T</td><td>T</td><td>NT</td><td>T</td><td>T</td></tr>
+          <tr><td class="num">0</td><td>T</td><td>NT</td><td>NT</td><td>T</td><td>NT</td><td>NT</td></tr>
+          <tr><td class="num">2</td><td>NT</td><td>T</td><td>T</td><td>NT</td><td>T</td><td>T</td></tr>
+          <tr><td class="num">0</td><td>T</td><td>NT</td><td>NT</td><td>T</td><td>NT</td><td>NT</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Eight predictions, eight misses: the bit always holds the <em>previous</em> outcome and the pattern flips every time. What decides b2 is not what b2 did last time but what b1 did a moment ago.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l06-fig-context">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="A per-branch table: the PC selects one entry for b1 and one for b2, and each entry holds only that branch's last outcome">
+        <rect x="14" y="88" width="56" height="24" rx="4" class="fi-paper"/>
+        <text x="42" y="105" class="tx-mid tx-mono tx-sm">PC</text>
+        <text x="14" y="134" class="tx-sm tx-muted">k low-order bits</text>
+        <line x1="74" y1="100" x2="112" y2="100" marker-end="url(#arr)"/>
+        <rect x="120" y="50" width="150" height="24" class="fw-s3 st-s3"/>
+        <text x="195" y="67" class="tx-mid tx-mono tx-sm">BHT: last outcome</text>
+        <rect x="120" y="74" width="150" height="24" class="fi-paper"/>
+        <rect x="120" y="98" width="150" height="24" class="fi-paper"/>
+        <text x="132" y="91" class="tx-mono tx-sm">b1</text>
+        <text x="258" y="91" class="tx-end tx-mono">NT</text>
+        <text x="132" y="115" class="tx-mono tx-sm">b2</text>
+        <text x="258" y="115" class="tx-end tx-mono">NT</text>
+        <text x="40" y="170" class="tx-hand">one bit, no context</text>
+      </svg>
+      <p class="fig-label">Before: one entry per branch</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="A (1,1) correlating predictor: the last outcome, kept in a one-bit global history register, selects one of two tables and the PC selects the row">
+        <text x="14" y="26" class="tx-sm tx-muted">last outcome (GHR)</text>
+        <rect x="14" y="32" width="28" height="24" class="fi-paper"/>
+        <text x="28" y="49" class="tx-mid tx-mono">1</text>
+        <polyline points="42,44 243,44 243,66" class="hl"/>
+        <polyline points="42,44 243,44 243,66" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+        <rect x="14" y="110" width="56" height="24" rx="4" class="fi-paper"/>
+        <text x="42" y="127" class="tx-mid tx-mono tx-sm">PC</text>
+        <line x1="74" y1="122" x2="98" y2="122" marker-end="url(#arr)"/>
+        <rect x="104" y="72" width="86" height="24" class="fw-s3 st-s3"/>
+        <text x="147" y="89" class="tx-mid tx-mono tx-sm">GHR = 0</text>
+        <rect x="104" y="96" width="86" height="24" class="fi-paper"/>
+        <rect x="104" y="120" width="86" height="24" class="fi-paper"/>
+        <text x="112" y="113" class="tx-mono tx-sm">b1</text><text x="182" y="113" class="tx-end tx-mono tx-sm">T</text>
+        <text x="112" y="137" class="tx-mono tx-sm">b2</text><text x="182" y="137" class="tx-end tx-mono tx-sm">NT</text>
+        <rect x="200" y="72" width="86" height="24" class="fw-s3 st-s3"/>
+        <text x="243" y="89" class="tx-mid tx-mono tx-sm">GHR = 1</text>
+        <rect x="200" y="96" width="86" height="24" class="fi-paper"/>
+        <rect x="200" y="120" width="86" height="24" class="fi-paper"/>
+        <text x="208" y="113" class="tx-mono tx-sm">b1</text><text x="278" y="113" class="tx-end tx-mono tx-sm">NT</text>
+        <text x="208" y="137" class="tx-mono tx-sm">b2</text><text x="278" y="137" class="tx-end tx-mono tx-sm">T</text>
+        <text x="40" y="180" class="tx-hand">one entry per context</text>
+      </svg>
+      <p class="fig-label">After: one entry per (branch, last outcome)</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Same two branches, same PC bits. On the right the outcome of the previous branch chooses between two tables, so b2 after a taken b1 and b2 after a not-taken b1 are two different entries that can hold two different answers. The entries shown are the trained ones of Table 2.</figcaption>
+  </figure>
+
+  <p>The right panel is the notes' <mark class="key">(1,1) correlating predictor</mark> (p. 67): a 1-bit <mark class="key">global history</mark> stores the last branch outcome and selects one of two 1-bit tables (T1 if the last branch was taken, T2 if not); the low-order PC bits index the selected table. Each branch now has two entries, written below as "if last NT / if last T", all initialised NT; the history starts at NT.</p>
+
+  <figure class="tbl-fig" id="l06-tbl-11">
+    <figcaption>Table 2. The (1,1) predictor on the same stream: the two cold entries miss, then nothing does.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>d</th><th>GH before b1</th><th>b1 entries</th><th>b1 pred.</th><th>b1 outcome</th><th>GH before b2</th><th>b2 entries</th><th>b2 pred.</th><th>b2 outcome</th></tr></thead>
+        <tbody>
+          <tr><td class="num">2</td><td>NT</td><td>NT / NT</td><td>NT <b>(miss)</b></td><td>T</td><td>T</td><td>NT / NT</td><td>NT <b>(miss)</b></td><td>T</td></tr>
+          <tr><td class="num">0</td><td>T</td><td>T / NT</td><td>NT</td><td>NT</td><td>NT</td><td>NT / T</td><td>NT</td><td>NT</td></tr>
+          <tr><td class="num">2</td><td>NT</td><td>T / NT</td><td>T</td><td>T</td><td>T</td><td>NT / T</td><td>T</td><td>T</td></tr>
+          <tr><td class="num">0</td><td>T</td><td>T / NT</td><td>NT</td><td>NT</td><td>NT</td><td>NT / T</td><td>NT</td><td>NT</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two misses, both on cold entries, then a perfect record. The column "GH before b1" is b2's previous outcome, which encodes the previous value of <code>d</code>: b1 is predicted from the last b2, b2 from the current b1 — the two branches predict each other.</p>
+
+  <div class="def">
+    <p><dfn>Correlating predictor</dfn> (also <dfn>two-level predictor</dfn>) — a dynamic predictor that selects the counter by the branch address <em>and</em> the recent history of branch outcomes, one counter per (branch, context). The notes' key idea (p. 65): "use global branch history (outcomes of previous branches) to improve prediction for the current branch".</p>
+  </div>
+
+  <aside class="redpen" data-page="67">
+    <p class="claim">"T1 says: “Try to predict as Taken”."</p>
+    <p class="fix">the page never says how T1 was initialised: it starts T2 cold (A is mispredicted because its entry holds Not Taken) and then lets T1 answer Taken for B from an entry nothing has written. With the same cold start for both tables B is mispredicted too on this first pass; the correlation pays from the second pass on.</p>
+    <p class="because">Nothing is written into T1 before B, so its entry can only hold its initial value. Table 2, recomputed from cold tables: the first two predictions miss, every later one hits — the learning the notes' example assumes instead of showing.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">A per-branch counter answers "what did this branch do last time?"; a correlating predictor answers "what did this branch do last time it was in this situation?"</mark></p>
+</section>
+
+<section id="l06-mn">
+  <h2>The (m, n) predictor: a history register that picks the table</h2>
+
+  <p>Generalise the right panel of Fig. 1 and you get the notes' general case (p. 65): in an <mark class="key">(m, n) correlating predictor</mark> the outcomes of the last <em>m</em> branches select one of \(2^m\) prediction tables of <em>n</em>-bit entries. The four steps, in the order the hardware takes them:</p>
+
+  <ol>
+    <li><strong>Track the last m branches</strong>: their outcomes, in program order, whichever branches they were, are shifted into an <em>m</em>-bit <mark class="key">Global History Register</mark> (GHR), Taken = 1, Not Taken = 0.</li>
+    <li><strong>Select a table</strong>: the GHR value picks one of the \(2^m\) tables.</li>
+    <li><strong>Index it</strong> with <em>k</em> low-order bits of the branch PC.</li>
+    <li><strong>Predict with the n-bit entry</strong> — the last outcome (n = 1) or the four-state machine of lesson 5 (n = 2); after the branch resolves, update the entry and shift the outcome into the GHR.</li>
+  </ol>
+
+  <details class="why">
+    <summary>Why a real core shifts the predicted outcome in, not the resolved one</summary>
+    <p>Background, not in the notes: the next branch is fetched long before this one resolves, so a GHR updated only at resolution would lag by the pipeline depth and the next prediction would read a stale history. Real cores shift the <em>predicted</em> outcome in at fetch and repair the register on a misprediction. The notes (p. 71) and the exam tables update at resolution: keep that convention on paper.</p>
+  </details>
+
+  <figure class="fig fig--plain" id="l06-fig-mn">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="An (m,n) predictor with m = 2: the global history register selects one of four tables through a multiplexer, the k low-order bits of the PC select the row, and the selected n-bit entry is the prediction">
+      <text x="380" y="28" class="tx-mid tx-sm tx-muted">2ᵐ = 4 tables, one per history value</text>
+      <rect x="230" y="40" width="70" height="24" class="fw-s3 st-s3"/>
+      <rect x="310" y="40" width="70" height="24" class="fw-s3 st-s3"/>
+      <rect x="390" y="40" width="70" height="24" class="fw-s3 st-s3"/>
+      <rect x="470" y="40" width="70" height="24" class="fw-s3 st-s3"/>
+      <text x="265" y="57" class="tx-mid tx-mono tx-sm">00</text>
+      <text x="345" y="57" class="tx-mid tx-mono tx-sm">01</text>
+      <text x="425" y="57" class="tx-mid tx-mono tx-sm">10</text>
+      <text x="505" y="57" class="tx-mid tx-mono tx-sm">11</text>
+      <rect x="230" y="64" width="70" height="106" class="fi-paper"/>
+      <rect x="310" y="64" width="70" height="106" class="fi-paper"/>
+      <rect x="390" y="64" width="70" height="106" class="fi-paper"/>
+      <rect x="470" y="64" width="70" height="106" class="fi-paper"/>
+      <line x1="230" y1="86" x2="300" y2="86" class="st-muted"/><line x1="230" y1="108" x2="300" y2="108" class="st-muted"/><line x1="230" y1="130" x2="300" y2="130" class="st-muted"/><line x1="230" y1="152" x2="300" y2="152" class="st-muted"/>
+      <line x1="310" y1="86" x2="380" y2="86" class="st-muted"/><line x1="310" y1="108" x2="380" y2="108" class="st-muted"/><line x1="310" y1="130" x2="380" y2="130" class="st-muted"/><line x1="310" y1="152" x2="380" y2="152" class="st-muted"/>
+      <line x1="390" y1="86" x2="460" y2="86" class="st-muted"/><line x1="390" y1="108" x2="460" y2="108" class="st-muted"/><line x1="390" y1="130" x2="460" y2="130" class="st-muted"/><line x1="390" y1="152" x2="460" y2="152" class="st-muted"/>
+      <line x1="470" y1="86" x2="540" y2="86" class="st-muted"/><line x1="470" y1="108" x2="540" y2="108" class="st-muted"/><line x1="470" y1="130" x2="540" y2="130" class="st-muted"/><line x1="470" y1="152" x2="540" y2="152" class="st-muted"/>
+      <line x1="226" y1="119" x2="544" y2="119" class="hl"/>
+      <text x="548" y="190" class="tx-end tx-sm tx-muted">2ᵏ rows</text>
+      <text x="20" y="99" class="tx-sm tx-muted">PC of the branch</text>
+      <rect x="20" y="107" width="70" height="24" class="fi-soft"/>
+      <rect x="90" y="107" width="60" height="24" class="fi-paper"/>
+      <rect x="150" y="107" width="30" height="24" class="fi-soft"/>
+      <text x="55" y="124" class="tx-mid tx-sm">upper</text>
+      <text x="120" y="124" class="tx-mid tx-mono tx-sm">k bits</text>
+      <text x="165" y="124" class="tx-mid tx-mono tx-sm">00</text>
+      <text x="20" y="152" class="tx-sm tx-muted">k low-order bits</text>
+      <line x1="184" y1="119" x2="226" y2="119" marker-end="url(#arr)"/>
+      <text x="20" y="195" class="tx-sm tx-muted">GHR, m = 2 bits</text>
+      <rect x="20" y="203" width="26" height="26" class="fi-paper"/>
+      <rect x="46" y="203" width="26" height="26" class="fi-paper"/>
+      <text x="33" y="221" class="tx-mid tx-mono">1</text>
+      <text x="59" y="221" class="tx-mid tx-mono">0</text>
+      <text x="20" y="252" class="tx-sm tx-muted">older · newest</text>
+      <line x1="265" y1="170" x2="265" y2="200" class="st-muted"/>
+      <line x1="345" y1="170" x2="345" y2="200" class="st-muted"/>
+      <line x1="425" y1="170" x2="425" y2="200" class="st-s3 sw-2"/>
+      <line x1="505" y1="170" x2="505" y2="200" class="st-muted"/>
+      <polygon points="240,200 540,200 500,232 280,232" class="fi-paper sw-2"/>
+      <text x="390" y="221" class="tx-mid tx-sm">mux</text>
+      <line x1="76" y1="216" x2="256" y2="216" class="hl"/>
+      <line x1="76" y1="216" x2="256" y2="216" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="390" y1="232" x2="390" y2="256" marker-end="url(#arr)"/>
+      <text x="390" y="282" class="tx-mid tx-sm">n-bit prediction</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The (2, n) predictor of the notes' Figure 19 (p. 70), redrawn: the PC's k low-order bits pick the same row in all four tables at once, the GHR picks which table's entry is used. The entry is an n-bit counter. The notes' Figure 18 (p. 68) is the same drawing with two tables and a multiplexer driven by the "Last Branch Result".</figcaption>
+  </figure>
+
+  <p>In memory (p. 66): \(2^m\) tables of \(2^k\) entries of n bits. The plain 2-bit BHT of lesson 5 is the <strong>(0, 2)</strong> predictor of this family — no history bits, one table. And the tables, selected by the GHR and indexed by the PC, are one table of \(2^{m+k}\) entries indexed by the <mark class="key">concatenation</mark> of the GHR and the PC bits.</p>
+
+  <div class="formula">
+    \[ \text{tables} = 2^m \]
+    \[ \text{entries per table} = 2^k \]
+    \[ \text{storage} = 2^m \cdot n \cdot 2^k \text{ bits} \]
+    \[ \text{index} = \text{GHR} \,\Vert\, \text{PC}[k] \]
+    <dl class="legend">
+      <dt>\(m\)</dt><dd>global history bits (outcomes of the last m branches)</dd>
+      <dt>\(n\)</dt><dd>bits per entry: 1 (last outcome) or 2 (the four states)</dd>
+      <dt>\(k\)</dt><dd>low-order PC bits used to index a table</dd>
+      <dt>\(\Vert\)</dt><dd>concatenation: GHR as the upper m bits, the k PC bits as the lower ones — an index of m + k bits</dd>
+    </dl>
+  </div>
+
+  <aside class="margin-note">Memory check: the (2,2) of the notes' Table 6 uses k = 4 PC bits: 4 tables of 16 entries, 2 bits each, 128 bits in all. Its 4-bit PC plus 2-bit GHR giving a 6-bit index is that one example, not a rule: an index has k + m bits.</aside>
+
+  <h3>The shift convention, and the (2,2) walkthrough done right</h3>
+
+  <p>An exercise is only as right as its shift convention. The notes' (p. 69), for m = 2: <code>00</code> both Not Taken; <code>01</code> last Taken, penultimate Not Taken; <code>10</code> last Not Taken, penultimate Taken; <code>11</code> both Taken — shift left, newest outcome on the right. The opposite convention exists elsewhere, so state yours at the top of an exercise.</p>
+
+  <div class="formula">
+    \[ \text{GHR} \leftarrow \big( (\text{GHR} \ll 1) \,|\, o \big) \bmod 2^m \]
+    <dl class="legend">
+      <dt>\(o\)</dt><dd>the outcome just resolved: 1 for Taken, 0 for Not Taken</dd>
+      <dt>\(\ll 1\)</dt><dd>shift left by one bit; the oldest bit falls out on the left</dd>
+    </dl>
+  </div>
+
+  <p>Now the notes' (2,2) example (pp. 69–70): branches A, B and C in program order, outcomes Taken, Not Taken, Taken; four tables of 2-bit counters, one per GHR value; GHR starting at <code>00</code>. Each branch is predicted from the table the GHR selects at that moment, the entry is updated, the outcome shifted in — Table 3. For C the notes assume Weakly Taken in table <code>10</code>: Taken is predicted and is right; the entry moves to Strongly Taken, the GHR becomes <code>01</code> again.</p>
+
+  <figure class="tbl-fig" id="l06-tbl-22">
+    <figcaption>Table 3. The (2,2) walkthrough of the notes' p. 70, recomputed with "newest outcome on the right".</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Cycle</th><th>Branch</th><th>GHR before</th><th>Table used (predict and update)</th><th>Outcome</th><th>GHR after</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>A</td><td><code>00</code></td><td>BHT[<code>00</code>]</td><td>T</td><td><code>01</code></td></tr>
+          <tr><td class="num">2</td><td>B</td><td><code>01</code></td><td>BHT[<code>01</code>]</td><td>NT</td><td><code>10</code></td></tr>
+          <tr><td class="num">3</td><td>C</td><td><code>10</code></td><td>BHT[<code>10</code>]</td><td>T</td><td><code>01</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="69">
+    <p class="claim">"Predicts Branch 3 using its 2-bit counter in BHT[00]."</p>
+    <p class="fix">With the GHR at <code>00</code> the first prediction is for Branch 1 (A), from BHT[<code>00</code>]. Branch 3 (C) is predicted in cycle 3, when the GHR holds <code>10</code>, from BHT[<code>10</code>] — as the notes' own table on p. 70 says. The page also calls the branches 1, 2, 3 in the code and A, B, C in the updates: use one naming.</p>
+    <p class="because">Shift it yourself: <code>00</code>, Taken gives <code>01</code>, Not Taken gives <code>10</code>; an entry is read from the table the GHR selects at that moment, and at cycle 0 that is Branch 1's moment.</p>
+  </aside>
+
+  <p>Each (branch, context) pair has its own counter, which converges where a single counter would flip-flop; and because the history also holds the branch's <em>own</em> previous outcomes, b1 was fixed in Table 2 although it comes first. Pan, So and Rahmeh, who published the scheme in 1992, priced it at "up to 11% additional accuracy at the extra hardware cost of one shift register".</p>
+
+  <h3>Same budget, two designs</h3>
+
+  <p>History bits are not free: tables multiply as \(2^m\), each context must be trained, and distant outcomes are mostly noise. The honest comparison is at equal storage, as Hennessy and Patterson make it on SPEC89.</p>
+
+  <ol class="steps" id="l06-steps-budget">
+    <li><p>A (2,2) predictor with 1024 entries per table: \(2^m \cdot n \cdot 2^k = 4 \cdot 2 \cdot 1024\).</p> \[ \text{storage} = 8192 \text{ bits} = 1 \text{ KB} \]</li>
+    <li><p>A plain 2-bit BHT — the (0,2) predictor — with the same 8192 bits holds 8192 / 2 entries.</p> \[ \text{entries} = 4096 \]</li>
+    <li><p>Their SPEC89 measurement (background from the textbook): the (2,2) with 1024 entries per table mispredicts less than the 4096-entry 2-bit BHT, and even than one with <em>unlimited</em> entries (<code>eqntott</code>: about 6 % against 18 %). Unlimited entries remove aliasing, not the lack of context.</p></li>
+    <li><p>The address of an entry in the single-table view: GHR = <code>10</code>, PC bits = <code>1011</code>, k = 4.</p> \[ \text{index} = 10\,\Vert\,1011 = 101011_2 = 43 \]</li>
+  </ol>
+
+</section>
+
+<section id="l06-twolevel">
+  <h2>Two levels: a history register and a pattern table — global or local</h2>
+
+  <p>Yeh and Patt gave the family its general shape in 1991; the notes present it as <mark class="key">two-level adaptive branch prediction</mark> (p. 71): a <em>history-tracking</em> component and a <em>pattern-based prediction</em> component, with the exam vocabulary of both:</p>
+
+  <ul>
+    <li>A <mark class="key">Branch History Register</mark> (BHR): a shift register of the most recent outcomes — "k-bit" in the notes' letter; this lesson writes h for the history length and keeps k for the PC bits. <strong>Global</strong> — one register for all branches, the GHR above — or <strong>local</strong>, "separate register for each branch": in hardware, a table of history registers indexed by the PC.</li>
+    <li>A <mark class="key">Pattern History Table</mark> (PHT): a table of 2-bit saturating counters, indexed with the content of the BHR.</li>
+  </ul>
+
+  <p>The process (p. 71): index the PHT with the BHR, read the counter, predict Taken if it is in a Taken state; afterwards update the counter and shift the outcome in. The (m, n) predictor is one member — global history, table by history, row by PC; the variants differ only in <em>whose</em> history (global or local) and <em>how the PHT is indexed</em> (history alone, history ‖ PC, history ⊕ PC).</p>
+
+  <aside class="margin-note">Two vocabularies for one machine: the notes and H&amp;P say BHT and GHR, Yeh and Patt say PHT and BHR. The official papers say BHT; the notes' January 2026 solution uses GHR and PHT in one answer. Know both.</aside>
+
+  <figure class="fig fig--pair fig--plain" id="l06-fig-history">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Global history: every branch shifts its outcome into the same register, and that register indexes the pattern history table">
+        <rect x="14" y="30" width="60" height="22" rx="4" class="fi-paper"/>
+        <rect x="14" y="70" width="60" height="22" rx="4" class="fi-paper"/>
+        <rect x="14" y="110" width="60" height="22" rx="4" class="fi-paper"/>
+        <text x="44" y="45" class="tx-mid tx-mono tx-sm">b1</text>
+        <text x="44" y="85" class="tx-mid tx-mono tx-sm">b2</text>
+        <text x="44" y="125" class="tx-mid tx-mono tx-sm">b3</text>
+        <line x1="78" y1="41" x2="116" y2="80" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="78" y1="81" x2="116" y2="85" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="78" y1="121" x2="116" y2="90" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="170" y="62" class="tx-mid tx-sm tx-muted">one BHR for all</text>
+        <rect x="120" y="72" width="100" height="26" class="fi-paper"/>
+        <text x="170" y="90" class="tx-mid tx-mono">1 0 1 1</text>
+        <line x1="222" y1="85" x2="248" y2="85" marker-end="url(#arr)"/>
+        <text x="272" y="20" class="tx-mid tx-sm tx-muted">PHT</text>
+        <rect x="252" y="30" width="40" height="120" class="fi-paper"/>
+        <line x1="252" y1="50" x2="292" y2="50" class="st-muted"/><line x1="252" y1="70" x2="292" y2="70" class="st-muted"/><line x1="252" y1="110" x2="292" y2="110" class="st-muted"/><line x1="252" y1="130" x2="292" y2="130" class="st-muted"/>
+        <rect x="252" y="90" width="40" height="20" class="fw-s3 st-s3"/>
+        <text x="272" y="105" class="tx-mid tx-mono tx-sm">WT</text>
+        <text x="14" y="180" class="tx-hand">shared history</text>
+      </svg>
+      <p class="fig-label">Global: one register, all branches</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Local history: the PC selects the branch's own history register in a table, and that history indexes the pattern history table">
+        <rect x="14" y="80" width="56" height="24" rx="4" class="fi-paper"/>
+        <text x="42" y="97" class="tx-mid tx-mono tx-sm">PC</text>
+        <line x1="74" y1="92" x2="96" y2="92" marker-end="url(#arr)"/>
+        <rect x="100" y="36" width="100" height="22" class="fw-s3 st-s3"/>
+        <text x="150" y="51" class="tx-mid tx-mono tx-sm">BHR per branch</text>
+        <rect x="100" y="58" width="100" height="22" class="fi-paper"/>
+        <rect x="100" y="80" width="100" height="22" class="fw-key"/>
+        <rect x="100" y="80" width="100" height="22" class="st-ink"/>
+        <rect x="100" y="102" width="100" height="22" class="fi-paper"/>
+        <text x="106" y="73" class="tx-mono tx-sm">b1</text><text x="194" y="73" class="tx-end tx-mono tx-sm">1101</text>
+        <text x="106" y="95" class="tx-mono tx-sm">b2</text><text x="194" y="95" class="tx-end tx-mono tx-sm">0111</text>
+        <text x="106" y="117" class="tx-mono tx-sm">b3</text><text x="194" y="117" class="tx-end tx-mono tx-sm">1111</text>
+        <line x1="204" y1="91" x2="248" y2="91" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+        <text x="272" y="20" class="tx-mid tx-sm tx-muted">PHT</text>
+        <rect x="252" y="30" width="40" height="120" class="fi-paper"/>
+        <line x1="252" y1="50" x2="292" y2="50" class="st-muted"/><line x1="252" y1="70" x2="292" y2="70" class="st-muted"/><line x1="252" y1="110" x2="292" y2="110" class="st-muted"/><line x1="252" y1="130" x2="292" y2="130" class="st-muted"/>
+        <rect x="252" y="90" width="40" height="20" class="fw-s3 st-s3"/>
+        <text x="272" y="105" class="tx-mid tx-mono tx-sm">ST</text>
+        <text x="14" y="180" class="tx-hand">own history</text>
+      </svg>
+      <p class="fig-label">Local: one register per branch</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Two first levels for the same second level. Global history sees what the other branches just did; local history sees only this branch's own last h outcomes, so it is never diluted by the rest of the loop body.</figcaption>
+  </figure>
+
+  <h3>What local history buys: the loop exit</h3>
+
+  <p>The loop of the June 2025 paper, whose 2-bit table lesson 5 filled in, runs five iterations: the <code>BNE</code> goes <code>T T T T NT</code>, and again on the next execution.</p>
+
+<pre><code>LOOP: LD    F0, 0(R1)
+      FADD  F2, F0, F0
+      SD    F2, 0(R1)
+      ADDUI R1, R1, 4
+      BNE   R1, R2, LOOP      ; R1 = 0, R2 = 20: T T T T NT</code></pre>
+
+  <p>A 2-bit counter mispredicts the exit every time: it holds a bias, and no counter can express "after four taken comes a not-taken". Yet the exit comes at the same place in every pass. A local history of 4 bits makes it visible: before the fifth iteration the branch's own history is <code>1111</code>, before the first <code>1110</code>, and each context gets its own counter. The smallest example that fits in a table: a 3-iteration loop, pattern <code>T T NT</code>, 2 bits of local history (older, newer), counters initialised Weakly Taken:</p>
+
+  <figure class="tbl-fig" id="l06-tbl-local">
+    <figcaption>Table 4. A two-level predictor with 2 bits of local history on the pattern <code>T T NT</code>, four times over (recomputed). History before step 1: T,T.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>step</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th><th>11</th><th>12</th></tr></thead>
+        <tbody>
+          <tr><th>history</th><td>T,T</td><td>T,T</td><td>T,T</td><td>T,NT</td><td>NT,T</td><td>T,T</td><td>T,NT</td><td>NT,T</td><td>T,T</td><td>T,NT</td><td>NT,T</td><td>T,T</td></tr>
+          <tr><th>its counter</th><td>WT</td><td>ST</td><td>ST</td><td>WT</td><td>WT</td><td>WT</td><td>ST</td><td>ST</td><td>WNT</td><td>ST</td><td>ST</td><td>SNT</td></tr>
+          <tr><th>prediction</th><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>T</td><td>NT</td><td>T</td><td>T</td><td>NT</td></tr>
+          <tr><th>outcome</th><td>T</td><td>T</td><td>NT</td><td>T</td><td>T</td><td>NT</td><td>T</td><td>T</td><td>NT</td><td>T</td><td>T</td><td>NT</td></tr>
+          <tr class="is-key"><th>result</th><td>hit</td><td>hit</td><td><b>miss</b></td><td>hit</td><td>hit</td><td><b>miss</b></td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td><td>hit</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two warm-up misses while the counter of context "T,T" is dragged from Weakly Taken to Weakly Not Taken, then nothing: three contexts, three converged counters, the pattern memorised. A plain 2-bit counter on the same stream, started Strongly Taken, misses every third execution for ever — 4 of 12. The rule:</p>
+
+  <div class="formula">
+    \[ h \ge N - 1 \]
+    <dl class="legend">
+      <dt>\(h\)</dt><dd>bits of local history</dd>
+      <dt>\(N\)</dt><dd>iterations of the loop (the branch is taken N − 1 times, then not taken)</dd>
+    </dl>
+  </div>
+
+  <p>With h ≥ N − 1 every position in the pattern has its own history, so after warm-up the exit is predicted like the others. A global register can do the same only if the loop body holds no other branch; otherwise their outcomes dilute the pattern — the reason tournament designs such as the Alpha 21264 of 1998 keep both kinds. Yeh and Patt's 1991 figure: "97 percent accuracy on nine of the ten SPEC benchmarks, compared to less than 93 percent for other schemes".</p>
+
+  <p>Time to race them. The arena feeds one stream to eight predictors, from the two static rules and the BHTs of lesson 5 to the (1,1), the (2,2), gshare and a local two-level predictor with h history bits. Counters start Strongly Not Taken (the June 2025 initialisation), 1-bit entries Not Taken, histories at 0; a toggle switches the 2-bit entries from the saturating counter (pp. 69, 71) to the four-state figure of p. 59.</p>
+
+  <div class="widget" id="l06-w-arena">
+    <h3 class="widget-title">Predictor arena: one stream, eight predictors</h3>
+    <p class="widget-intro">Top: the outcome of each step (a filled square is Taken) and, for every predictor, a green square for a correct prediction and an orange one for a misprediction, with the running count on the right. Bottom: the four tables of the (2,2) predictor (rows b1, b2), the entry it uses at this step, and its history register. "One step" advances the stream; the stream, its length and the history length are set with the controls.</p>
+    <ol class="tasks">
+      <li>Keep the H&amp;P stream and, before pressing anything, predict the score of the 1-bit row and of the (1,1) row over 12 steps. Then run to the end.
+        <details class="answer"><summary>What you should see</summary>
+          <p>1-bit: 12 misses of 12 — every square orange, as in Table 1. (1,1): 2 misses, the first two steps, then green for ever. Always Taken and always Not Taken sit at 6 of 12: on this stream the per-branch learner is worse than not learning at all, and one bit of context fixes it completely. This is the insight the widget is built for.</p></details>
+      </li>
+      <li>Same stream. Why does the (2,2) row take two passes (4 misses) to become perfect where the (1,1) took one? Predict, then step through the first six steps and watch the counters in the bottom picture.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The (2,2) entries are 2-bit counters starting Strongly Not Taken: the first Taken moves the entry only to Weakly Not Taken, which still predicts Not Taken; the second pass moves it to Weakly Taken. Hysteresis costs one extra miss per context. Switch "counters start Weakly Taken" on and the (2,2) matches the (1,1).</p></details>
+      </li>
+      <li>Switch to the loop stream (N = 5, 3 passes). Which of always Taken, 1-bit and 2-bit has the fewest misses, and how many does each have? Predict, then run.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Always Taken: 3 misses (one exit per pass). 2-bit: 5 (two warm-up misses from Strongly Not Taken, then one per exit). 1-bit: 6 (the exit <em>and</em> the re-entry of every pass). The simplest learning predictor is the worst of the three on a loop, and no counter removes the exit miss.</p></details>
+      </li>
+      <li>Still on the loop: set h = 4 and passes = 6. Which rows become perfect, and from which pass? Then try N = 8 with h = 4.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The local row (and gshare, since the loop body has no other branch) reaches zero misses from the fourth pass on: each of the five contexts needs two Taken pushes from Strongly Not Taken. With N = 8 the exit needs 7 history bits and h = 4 is not enough: the context <code>1111</code> occurs both before a Taken and before the exit, so the exit keeps being mispredicted.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l06-w-arena', function (root, ui) {
+    var SN = ['SNT', 'WNT', 'WT', 'ST'];
+    var cur = 0, i;
+    var rng = Course.rng(6), RAND = [];
+    for (i = 0; i < 48; i++) RAND.push(rng.random() < 0.7);
+
+    var preset = ui.select('branch stream', [
+      { value: 'altd', label: 'H&P: b1 and b2 test d = 2, 0, 2, 0 …' },
+      { value: 'loop', label: 'the loop branch of the June 2025 paper: N − 1 taken, then not taken' },
+      { value: 'rand', label: 'b1 and b2 with random outcomes, taken with probability 0.7' }
+    ], function () { cur = 0; }, 'altd');
+    var N = ui.slider({ label: 'loop length N (loop stream)', min: 2, max: 8, step: 1, value: 5, onInput: function () { cur = 0; } });
+    var passes = ui.slider({ label: 'passes through the pattern', min: 1, max: 6, step: 1, value: 3 });
+    var H = ui.slider({ label: 'history bits h (gshare and local)', min: 1, max: 4, step: 1, value: 2 });
+    var initWT = ui.toggle('counters start Weakly Taken (otherwise Strongly Not Taken)', false);
+    var hpFSM = ui.toggle('2-bit entries follow the four-state figure of the notes (p. 59) instead of the saturating counter', false);
+    var player = ui.player({ ms: 700, label: 'Run', stepLabel: 'One step',
+      onTick: function () { var S = stream(); cur = Math.min(cur + 1, S.length); if (cur >= S.length) player.stop(); },
+      onReset: function () { cur = 0; } });
+    ui.button('Back one step', function () { cur = Math.max(0, cur - 1); }, { kind: 'ghost', icon: 'back' });
+    var roStep = ui.readout('step'), roGHR = ui.readout('GHR of the (2,2)'), roBest = ui.readout('fewest misses so far');
+    var svgA = ui.svg(560, 250, { label: 'Hit-and-miss record of eight predictors on the same branch stream' });
+    var svgB = ui.svg(560, 212, { label: 'The four tables of the (2,2) predictor, the entry in use and the global history register' });
+    var note = ui.note('');
+    ui.legend([
+      { label: 'outcome Taken (empty cell: Not Taken)', color: 'ink', mark: 'square' },
+      { label: 'correct prediction', color: 'good', mark: 'square' },
+      { label: 'misprediction', color: 's2', mark: 'square' },
+      { label: 'current step / entry used now', color: 'key', mark: 'area' },
+      { label: 'table selected by the GHR', color: 's3', mark: 'line' }
+    ]);
+
+    function stream() {
+      var S = [], p, j, P = passes.value, n = N.value;
+      if (preset.value === 'altd') { for (p = 0; p < P; p++) S.push({ b: 0, t: true }, { b: 1, t: true }, { b: 0, t: false }, { b: 1, t: false }); }
+      else if (preset.value === 'loop') { for (p = 0; p < P; p++) for (j = 1; j <= n; j++) S.push({ b: 0, t: j < n }); }
+      else { for (j = 0; j < 8 * P; j++) S.push({ b: j % 2, t: RAND[j] }); }
+      return S;
+    }
+    function step2(c, t) {
+      if (hpFSM.value) { if (t) return c === 0 ? 1 : 3; return c === 3 ? 2 : 0; }
+      return t ? Math.min(3, c + 1) : Math.max(0, c - 1);
+    }
+    function makeAll() {
+      var h = H.value, mask = (1 << h) - 1, c0 = initWT.value ? 2 : 0, PC = [5, 6], j;
+      var bit = [false, false], cnt = [c0, c0], g1 = 0, t11 = [[false, false], [false, false]], g2 = 0;
+      var t22 = [[c0, c0], [c0, c0], [c0, c0], [c0, c0]], gg = 0, pht = [], lh = [0, 0], lp = [[], []];
+      for (j = 0; j < (1 << h); j++) { pht.push(c0); lp[0].push(c0); lp[1].push(c0); }
+      var list = [
+        { name: 'always NT', predict: function () { return false; }, update: function () {} },
+        { name: 'always T', predict: function () { return true; }, update: function () {} },
+        { name: '1-bit', predict: function (b) { return bit[b]; }, update: function (b, t) { bit[b] = t; } },
+        { name: '2-bit', predict: function (b) { return cnt[b] >= 2; }, update: function (b, t) { cnt[b] = step2(cnt[b], t); } },
+        { name: '(1,1)', predict: function (b) { return t11[g1][b]; }, update: function (b, t) { t11[g1][b] = t; g1 = t ? 1 : 0; } },
+        { name: '(2,2)', predict: function (b) { return t22[g2][b] >= 2; }, update: function (b, t) { t22[g2][b] = step2(t22[g2][b], t); g2 = ((g2 << 1) | (t ? 1 : 0)) & 3; } },
+        { name: 'gshare h=' + h, predict: function (b) { return pht[(PC[b] ^ gg) & mask] >= 2; },
+          update: function (b, t) { var k = (PC[b] ^ gg) & mask; pht[k] = step2(pht[k], t); gg = ((gg << 1) | (t ? 1 : 0)) & mask; } },
+        { name: 'local h=' + h, predict: function (b) { return lp[b][lh[b]] >= 2; },
+          update: function (b, t) { lp[b][lh[b]] = step2(lp[b][lh[b]], t); lh[b] = ((lh[b] << 1) | (t ? 1 : 0)) & mask; } }
+      ];
+      return { list: list, g: function () { return g2; }, tab: t22 };
+    }
+    function simulate(S, upto) {
+      var P = makeAll(), rows = P.list.map(function (p) { return { name: p.name, res: [], miss: 0 }; }), last = null, k;
+      for (k = 0; k < upto; k++) {
+        var s = S[k], gBefore = P.g(), cBefore = P.tab[gBefore][s.b];
+        P.list.forEach(function (p, r) { var ok = p.predict(s.b) === s.t; rows[r].res.push(ok); if (!ok) rows[r].miss++; p.update(s.b, s.t); });
+        if (k === upto - 1) last = { i: k, b: s.b, t: s.t, gBefore: gBefore, cBefore: cBefore, cAfter: P.tab[gBefore][s.b], gAfter: P.g() };
+      }
+      return { rows: rows, g: P.g(), tab: P.tab, last: last };
+    }
+    function clear(s) { while (s.firstChild) s.removeChild(s.firstChild); }
+    function txt(s, x, y, str, cls) { return Course.svg('text', { x: x, y: y, 'class': cls, text: str }, s); }
+    function bits2(g) { return ('0' + g.toString(2)).slice(-2); }
+
+    function drawA(S, R) {
+      clear(svgA);
+      var n = S.length, x0 = 118, x1 = 500, cw = (x1 - x0) / n, y0 = 36, rh = 22, side = Math.min(cw - 2, 14), r, k;
+      var every = Math.max(1, Math.ceil(28 / cw));
+      if (cur > 0) Course.svg('rect', { x: x0 + (cur - 1) * cw, y: y0 - 4, width: cw, height: rh * 9 + 2, 'class': 'fw-key' }, svgA);
+      for (k = 0; k < n; k++) if ((k + 1) % every === 0 || every === 1) txt(svgA, x0 + (k + 0.5) * cw, 24, String(k + 1), 'tx-mid tx-sm tx-muted');
+      txt(svgA, 110, y0 + 15, 'outcome', 'tx-end tx-sm');
+      for (k = 0; k < n; k++) {
+        var cx = x0 + (k + 0.5) * cw;
+        if (S[k].t) Course.svg('rect', { x: cx - side / 2, y: y0 + 11 - side / 2, width: side, height: side, 'class': 'fi-ink' }, svgA);
+        else Course.svg('rect', { x: cx - side / 2, y: y0 + 11 - side / 2, width: side, height: side, 'class': 'st-muted' }, svgA);
+      }
+      for (r = 0; r < R.rows.length; r++) {
+        var y = y0 + rh * (r + 1), row = R.rows[r];
+        txt(svgA, 110, y + 15, row.name, 'tx-end tx-sm');
+        for (k = 0; k < row.res.length; k++) {
+          var cx2 = x0 + (k + 0.5) * cw;
+          Course.svg('rect', { x: cx2 - side / 2, y: y + 11 - side / 2, width: side, height: side, 'class': row.res[k] ? 'fw-good st-good' : 'fi-s2 st-s2' }, svgA);
+        }
+        txt(svgA, 508, y + 15, row.miss + '/' + row.res.length, 'tx-mono tx-sm');
+      }
+    }
+    function drawB(S, R) {
+      clear(svgB);
+      var g = R.g, last = R.last, k, two = preset.value !== 'loop';
+      txt(svgB, 20, 30, 'GHR', 'tx-sm tx-muted');
+      Course.svg('rect', { x: 20, y: 40, width: 26, height: 26, 'class': 'fi-paper' }, svgB);
+      Course.svg('rect', { x: 46, y: 40, width: 26, height: 26, 'class': 'fi-paper' }, svgB);
+      txt(svgB, 33, 58, String((g >> 1) & 1), 'tx-mid tx-mono');
+      txt(svgB, 59, 58, String(g & 1), 'tx-mid tx-mono');
+      txt(svgB, 59, 90, 'old → new', 'tx-mid tx-sm tx-muted');
+      for (k = 0; k < 4; k++) {
+        var x = 150 + k * 100, sel = (k === g);
+        Course.svg('rect', { x: x, y: 74, width: 90, height: 24, 'class': 'fw-s3 st-s3' + (sel ? ' sw-3' : '') }, svgB);
+        txt(svgB, x + 45, 91, 'GHR ' + bits2(k), 'tx-mid tx-mono tx-sm');
+        Course.svg('rect', { x: x, y: 98, width: 90, height: 24, 'class': 'fi-paper' }, svgB);
+        Course.svg('rect', { x: x, y: 122, width: 90, height: 24, 'class': 'fi-paper' }, svgB);
+        if (last && last.gBefore === k) Course.svg('rect', { x: x, y: 98 + 24 * last.b, width: 90, height: 24, 'class': 'fw-key' }, svgB);
+        txt(svgB, x + 8, 115, 'b1', 'tx-mono tx-sm');
+        txt(svgB, x + 82, 115, SN[R.tab[k][0]], 'tx-end tx-mono tx-sm');
+        txt(svgB, x + 8, 139, 'b2', 'tx-mono tx-sm');
+        txt(svgB, x + 82, 139, two ? SN[R.tab[k][1]] : '—', 'tx-end tx-mono tx-sm');
+      }
+      var xs = 150 + g * 100 + 45, route = '72,53 ' + xs + ',53 ' + xs + ',70';
+      Course.svg('polyline', { points: route, 'class': 'hl' }, svgB);
+      Course.svg('polyline', { points: route, 'class': 'st-s3 sw-2', 'marker-end': 'url(#arr-s3)' }, svgB);
+      txt(svgB, 150, 170, 'GHR → table of the next prediction · PC → row', 'tx-sm tx-muted');
+      txt(svgB, 150, 200, 'newest bit on the right', 'tx-hand');
+    }
+
+    ui.onChange(function () {
+      var S = stream();
+      if (cur > S.length) cur = S.length;
+      var R = simulate(S, cur), L = R.last;
+      drawA(S, R); drawB(S, R);
+      roStep.set(cur + ' of ' + S.length);
+      roGHR.set(bits2(R.g));
+      if (cur === 0) { roBest.set('—'); }
+      else {
+        var best = R.rows.reduce(function (a, b) { return b.miss < a.miss ? b : a; }, R.rows[0]);
+        var names = R.rows.filter(function (r) { return r.miss === best.miss; }).map(function (r) { return r.name; }).join(', ');
+        roBest.set(names + ': ' + best.miss);
+      }
+      if (!L) { note.set('Nothing has run yet. The GHR starts at 00; every 2-bit entry starts ' + (initWT.value ? 'Weakly Taken' : 'Strongly Not Taken') + ', every 1-bit entry Not Taken. Press "One step".'); return; }
+      var bname = 'b' + (L.b + 1), pred = R.tab && (L.cBefore >= 2) ? 'Taken' : 'Not Taken', out = L.t ? 'Taken' : 'Not Taken';
+      note.set('Step ' + (L.i + 1) + ', ' + bname + ': the (2,2) reads table ' + bits2(L.gBefore) + ', entry ' + bname + ' = ' + SN[L.cBefore] + ', predicts ' + pred + '. Outcome ' + out + ': ' + ((L.cBefore >= 2) === L.t ? 'correct' : 'misprediction') + '. Entry → ' + SN[L.cAfter] + '; GHR ' + bits2(L.gBefore) + ' → ' + bits2(L.gAfter) + ' (shift left, insert ' + (L.t ? '1' : '0') + ').');
+    });
+  });
+  </script>
+</section>
+
+<section id="l06-gshare">
+  <h2>gshare and aliasing: let every branch reach every entry</h2>
+
+  <p>Two named members of the family (p. 72). The <mark class="key">Global Adaptive predictor</mark> (GA) indexes the PHT with the global history alone: one BHR shared by all branches captures their correlation. <mark class="key">gshare</mark> (the name is McFarling's, 1993) is, in the notes' words, "designed to improve the indexing of the PHT and reduce aliasing (i.e., different branches mapping to the same PHT entry)": the index is the <strong>XOR</strong> of the BHR with the low-order PC bits of the branch. The notes' Table 7:</p>
+
+  <figure class="tbl-fig" id="l06-tbl-ga">
+    <figcaption>Table 5. Global Adaptive and gshare (the notes' Table 7, p. 72).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Predictor</th><th>History used</th><th>Indexing to PHT</th><th>Benefit</th></tr></thead>
+        <tbody>
+          <tr><td>Global Adaptive (GA)</td><td>global BHR</td><td>BHR value directly indexes the PHT</td><td>simple, effective for globally correlated branches</td></tr>
+          <tr><td>gshare</td><td>global BHR + PC</td><td>BHR XOR PC bits index the PHT</td><td>reduces aliasing, captures global + local context</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="formula">
+    \[ \text{index} = \text{BHR} \oplus \text{PC}[h \text{ bits}] \]
+    <dl class="legend">
+      <dt>\(\oplus\)</dt><dd>bitwise exclusive OR</dd>
+      <dt>\(h\)</dt><dd>width of the history, of the PC slice and of the index: the PHT has \(2^h\) entries</dd>
+    </dl>
+  </div>
+
+  <p>By hand, h = 4: PC bits <code>1011</code> under history <code>0110</code> give <code>1011 ⊕ 0110 = 1101</code>, entry 13 of 16; a second branch with PC bits <code>0101</code> under the same history lands on <code>0011</code>, entry 3 — separated.</p>
+
+  <p>Why XOR rather than concatenation, when both fit h index bits? Concatenation must <em>split</em> them, m for the history and h − m for the PC: each branch reaches only \(2^m\) entries, its own partition, and branches whose low h − m PC bits agree collide in <em>every</em> context. With XOR all h PC bits and all h history bits take part: a branch reaches all \(2^h\) entries as the history varies, and under the same history two branches never share one. XOR is still many-to-one (\(2^{2h}\) pairs onto \(2^h\) entries), so aliasing is reduced, not removed.</p>
+
+  <div class="pitfall">
+    <p>"The PHT is local in the sense that it provides per-entry adaptation via 2-bit counters" (p. 72). In two-level vocabulary <em>local</em> means per-branch history (p. 71); a PHT indexed by global history is not local in any sense, and gshare's "global and local view" (p. 72) means only that the branch's identity is mixed in.</p>
+  </div>
+
+  <div class="widget" id="l06-w-mixer">
+    <h3 class="widget-title">Index mixer: concatenation against XOR on the same 16 entries</h3>
+    <p class="widget-intro">A loop body holds up to six branches, A to F, with PC bits <code>0100</code>, <code>0110</code>, <code>1000</code>, <code>1010</code>, <code>1100</code>, <code>1110</code>; the program passes through a few distinct global histories, and every branch is seen under each of them. The left column maps each (branch, history) pair onto a 16-entry PHT by concatenating m history bits with 4 − m PC bits; the right column by XOR of 4 history bits with the 4 PC bits. A violet entry serves one branch, an orange one is shared by different branches — interference. The yellow frame follows one traced branch under the first history.</p>
+    <ol class="tasks">
+      <li>With 4 branches, m = 2 and 2 histories: how many entries on each side are shared by different branches? Predict, then look.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Concatenation: 4 shared entries — all 8 predictions sit in an entry that another branch also uses, because A and C have the same low two PC bits (<code>00</code>), and so do B and D (<code>10</code>). gshare: none. This is the insight: under one and the same history, XOR puts different branches on different entries; concatenation cannot, once it has given bits to the history.</p></details>
+      </li>
+      <li>Keep everything and move m from 0 to 4. What does concatenation gain and lose at each end?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At m = 0 nothing is shared — but no history is used at all, so no correlation can be learnt. At m = 4 all four history bits are used — but every branch maps to the same entry under the same history (2 entries, 4 branches each). Concatenation trades context for identity; gshare keeps both: 4 history bits and distinct entries.</p></details>
+      </li>
+      <li>Set 6 branches and 4 histories. Does gshare still have zero shared entries? Why not?
+        <details class="answer"><summary>What you should see</summary>
+          <p>No: 8 shared entries (12 colliding pairs) against 6 on the left (18 pairs). Two branches collide in gshare when the XOR of their PCs equals the XOR of two histories, which happens across <em>different</em> contexts once there are enough of them. XOR reduces aliasing; it does not eliminate it.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l06-w-mixer', function (root, ui) {
+    var PCS = [4, 6, 8, 10, 12, 14], CTX = [15, 14, 11, 5], NAMES = 'ABCDEF';
+    var B = ui.slider({ label: 'branches in the loop body', min: 2, max: 6, step: 1, value: 4 });
+    var M = ui.slider({ label: 'history bits m in the concatenation (PC bits = 4 − m)', min: 0, max: 4, step: 1, value: 2 });
+    var C = ui.slider({ label: 'distinct global histories seen', min: 1, max: 4, step: 1, value: 2 });
+    var TR = ui.slider({ label: 'traced branch', min: 1, max: 6, step: 1, value: 1, format: function (v) { return NAMES[Math.min(6, Math.max(1, Math.round(v))) - 1]; } });
+    var roShared = ui.readout('entries shared by different branches'), roExposed = ui.readout('predictions in a shared entry'), roReach = ui.readout('entries one branch can reach'), roHist = ui.readout('history bits in the index');
+    var svg = ui.svg(560, 400, { label: 'Sixteen pattern history table entries under concatenation and under gshare, with the branches mapped onto each entry' });
+    var note = ui.note('');
+    ui.legend([
+      { label: 'entry used by one branch', color: 's3', mark: 'area' },
+      { label: 'entry shared by different branches', color: 's2', mark: 'area' },
+      { label: 'the traced branch under the first history', color: 'ink', mark: 'hl' }
+    ]);
+    function bits(v, n) { var s = v.toString(2); while (s.length < n) s = '0' + s; return n > 0 ? s : ''; }
+    function model() {
+      var b = B.value, m = M.value, c = C.value, cat = [], xr = [], j, k;
+      for (j = 0; j < 16; j++) { cat.push([]); xr.push([]); }
+      for (j = 0; j < b; j++) for (k = 0; k < c; k++) {
+        var g = CTX[k], pc = PCS[j];
+        var i1 = (((g & ((1 << m) - 1)) << (4 - m)) | (pc & ((1 << (4 - m)) - 1))) & 15;
+        var i2 = (pc ^ g) & 15;
+        cat[i1].push(j); xr[i2].push(j);
+      }
+      return { cat: cat, xr: xr, b: b, m: m, c: c };
+    }
+    function stats(map) {
+      var shared = 0, exposed = 0, pairs = 0;
+      map.forEach(function (list) { var set = {}, n; list.forEach(function (j) { set[j] = 1; }); n = Object.keys(set).length; if (n > 1) { shared++; exposed += list.length; pairs += n * (n - 1) / 2; } });
+      return { shared: shared, exposed: exposed, pairs: pairs };
+    }
+    function clear(s) { while (s.firstChild) s.removeChild(s.firstChild); }
+    function txt(x, y, str, cls) { return Course.svg('text', { x: x, y: y, 'class': cls, text: str }, svg); }
+    function column(x, map, title, formula, traced) {
+      var j;
+      txt(x + 85, 26, title, 'tx-mid tx-sm');
+      txt(x + 85, 48, formula, 'tx-mid tx-mono tx-sm');
+      for (j = 0; j < 16; j++) {
+        var y = 60 + j * 20, set = {}, names = [], k;
+        map[j].forEach(function (b) { set[b] = 1; });
+        for (k = 0; k < 6; k++) if (set[k]) names.push(NAMES[k]);
+        var cls = names.length === 0 ? 'fi-paper' : (names.length === 1 ? 'fw-s3 st-s3' : 'fw-s2 st-s2');
+        txt(x - 6, y + 15, bits(j, 4), 'tx-end tx-mono tx-sm tx-muted');
+        Course.svg('rect', { x: x, y: y, width: 170, height: 20, 'class': cls }, svg);
+        if (names.length) txt(x + 8, y + 15, names.join(' '), 'tx-mono tx-sm');
+        if (j === traced) Course.svg('rect', { x: x, y: y, width: 170, height: 20, 'class': 'hl' }, svg);
+      }
+    }
+    ui.onChange(function () {
+      var R = model(), sc = stats(R.cat), sx = stats(R.xr), total = R.b * R.c;
+      var t = Math.min(TR.value, R.b) - 1, g = CTX[0], pc = PCS[t];
+      var i1 = (((g & ((1 << R.m) - 1)) << (4 - R.m)) | (pc & ((1 << (4 - R.m)) - 1))) & 15, i2 = (pc ^ g) & 15;
+      clear(svg);
+      column(60, R.cat, 'Before: concatenation', 'hist[' + R.m + '] ‖ PC[' + (4 - R.m) + ']', i1);
+      column(330, R.xr, 'After: gshare', 'PC ⊕ hist (4 bits each)', i2);
+      roShared.set(sc.shared + ' vs ' + sx.shared);
+      roExposed.set(sc.exposed + ' of ' + total + ' vs ' + sx.exposed + ' of ' + total);
+      roReach.set((1 << R.m) + ' vs 16');
+      roHist.set(R.m + ' vs 4');
+      note.set('Branch ' + NAMES[t] + ' (PC bits ' + bits(pc, 4) + ') under history ' + bits(g, 4) + ': concatenation ' + (R.m ? bits(g & ((1 << R.m) - 1), R.m) : '') + (R.m && R.m < 4 ? ' ‖ ' : '') + (R.m < 4 ? bits(pc & ((1 << (4 - R.m)) - 1), 4 - R.m) : '') + ' = ' + bits(i1, 4) + ' (entry ' + i1 + '); gshare ' + bits(pc, 4) + ' ⊕ ' + bits(g, 4) + ' = ' + bits(i2, 4) + ' (entry ' + i2 + '). Colliding pairs of branches: ' + sc.pairs + ' vs ' + sx.pairs + '.');
+    });
+  });
+  </script>
+
+  <h3>Aliasing done right: harmless with tags, harmful without</h3>
+
+  <p>The notes end with a deepening on <mark class="key">aliasing</mark> (pp. 72–73): "two or more distinct entities become indistinguishable to the hardware or software". The idea is right, two of its three examples are wrong, and the difference is the point: an index collision happens in every structure indexed by a few address bits, and what it <em>costs</em> depends on whether there is a tag.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l06-fig-alias">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="A tagged structure: the index selects a row, the stored tag is compared with the address tag, and a mismatch is a miss — never wrong data">
+        <rect x="14" y="24" width="90" height="22" class="fw-s3 st-s3"/>
+        <rect x="104" y="24" width="60" height="22" class="fi-paper"/>
+        <rect x="164" y="24" width="30" height="22" class="fi-soft"/>
+        <text x="59" y="40" class="tx-mid tx-sm">tag</text>
+        <text x="134" y="40" class="tx-mid tx-sm">index</text>
+        <text x="179" y="40" class="tx-mid tx-mono tx-sm">00</text>
+        <line x1="134" y1="48" x2="134" y2="84" marker-end="url(#arr)"/>
+        <polyline points="59,22 59,10 250,10 250,82" class="st-s3" marker-end="url(#arr-s3)"/>
+        <rect x="14" y="90" width="90" height="22" class="fw-s3 st-s3"/>
+        <rect x="104" y="90" width="110" height="22" class="fi-paper"/>
+        <text x="59" y="106" class="tx-mid tx-sm">stored tag</text>
+        <text x="159" y="106" class="tx-mid tx-sm">target / data</text>
+        <polyline points="59,114 59,128 250,128 250,120" class="st-s3" marker-end="url(#arr-s3)"/>
+        <circle cx="250" cy="101" r="14" class="fi-paper sw-2"/>
+        <text x="250" y="106" class="tx-mid tx-bold">=</text>
+        <text x="14" y="150" class="tx-sm">tags differ: a miss,</text>
+        <text x="14" y="170" class="tx-sm">never the wrong data</text>
+      </svg>
+      <p class="fig-label">Cache or BTB: index + tag</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="An untagged structure: the index selects a row and whatever counter is there is used, so another branch's counter gives a wrong prediction">
+        <rect x="14" y="24" width="90" height="22" class="fi-soft"/>
+        <rect x="104" y="24" width="60" height="22" class="fi-paper"/>
+        <rect x="164" y="24" width="30" height="22" class="fi-soft"/>
+        <text x="59" y="40" class="tx-mid tx-sm">unused</text>
+        <text x="134" y="40" class="tx-mid tx-sm">index</text>
+        <text x="179" y="40" class="tx-mid tx-mono tx-sm">00</text>
+        <line x1="134" y1="48" x2="134" y2="84" marker-end="url(#arr)"/>
+        <rect x="14" y="90" width="90" height="22" class="st-muted dash"/>
+        <text x="59" y="106" class="tx-mid tx-sm tx-muted">no tag</text>
+        <line x1="20" y1="94" x2="98" y2="108" class="st-bad sw-2"/>
+        <line x1="20" y1="108" x2="98" y2="94" class="st-bad sw-2"/>
+        <rect x="104" y="90" width="110" height="22" class="fi-paper"/>
+        <text x="159" y="106" class="tx-mid tx-mono tx-sm">counter: WT</text>
+        <text x="14" y="150" class="tx-sm">another branch's counter:</text>
+        <text x="14" y="170" class="tx-sm">wrong guess, right program</text>
+        <text x="100" y="196" class="tx-hand">no tag, no check</text>
+      </svg>
+      <p class="fig-label">BHT or PHT: index only</p>
+    </div>
+    <figcaption><b>Fig. 4.</b> The same index collision in two structures. With a tag the hardware notices and misses (a conflict miss, a BTB miss); without one it uses the other branch's state and mispredicts — and the misprediction is caught when the branch resolves, so the program stays correct and only accuracy is lost.</figcaption>
+  </figure>
+
+  <p>Branch-predictor aliasing is the untagged case: "different branches map to the same entry in a branch predictor table (e.g., BHT, PHT)" and pollute each other's prediction (p. 73) — harmless for correctness, since a prediction is a guess the pipeline checks, costly for accuracy. Caches and BTBs carry a tag because their payload must never be wrong. Two red pens on the notes' other examples:</p>
+
+  <aside class="redpen" data-page="73">
+    <p class="claim">"Map to the same cache line. They alias in the cache, leading to potential false hits and data corruption."</p>
+    <p class="fix">In a physically tagged cache two addresses with the same index and different tags cause a <em>conflict miss</em>: the tag comparison fails and one block evicts the other — never a false hit, never corrupted data. False hits and stale copies are a problem of virtually addressed caches (homonyms and synonyms), a different mechanism, in <a href="l27.html">lesson 27</a>.</p>
+    <p class="because">Example 6's addresses differ in bit 28, a tag bit in any cache indexed with the low bits, and the tag is compared on every access (Fig. 4, left). Where a collision really does damage is the untagged BHT — the notes' own third example.</p>
+  </aside>
+
+  <aside class="redpen" data-page="73">
+    <p class="claim">"Register Aliasing: occurs when different architectural registers map to the same physical register in the hardware, leading to false dependencies."</p>
+    <p class="fix">Inverted. A name dependence — WAR or WAW — arises when the <em>same</em> architectural register is reused for unrelated values; renaming maps each new write of that register to a <em>different</em> physical register, so the values stop colliding. Two architectural registers never share a physical register: that would be a correctness bug.</p>
+    <p class="because"><code>FADD F6, F2, F4</code> then <code>LD F2, 0(R1)</code>: the WAR hazard is on the one name F2, read by the first and written by the second; Tomasulo's reservation-station tags give the load's F2 a new name and the hazard disappears (lesson 11).</p>
+  </aside>
+
+  <h3>The warm-up puzzle, resolved</h3>
+
+  <p>Where did the information come from, if b2's own history was worthless? From b1, a few instructions earlier — and, for b1, from the previous b2: the global history register carries the last outcome, and in that program the last outcome <em>is</em> the value of <code>d</code>. A per-branch counter cannot see other branches; a correlating predictor sees them through one shift register — its whole advantage, and with the tables each context must train, its whole cost.</p>
+</section>
+
+<section id="l06-habits">
+  <h2>What the papers ask: counting accesses, initialisation and size</h2>
+
+  <p>Three exam habits, all in the May 2025 midterm (notes pp. 538–541; quiz texts are the paper's, solutions the note author's, recomputed here).</p>
+
+  <h3>Habit 1: count the executions of the branch, not the iterations</h3>
+
+  <p>Quiz 5 gives a top-tested loop and a 1-entry 1-bit BHT initialised Taken, and asks how many BHT accesses and mispredictions, "assuming only the branch instruction accesses the BHT":</p>
+
+<pre><code>      ADDI R1, R0, 0
+      ADDI R2, R0, 100
+LOOP: BEQ  R1, R2, DONE
+      ADD  R5, R5, R4
+      ADDI R1, R1, 1
+      J    LOOP
+DONE:</code></pre>
+
+  <p>The <code>BEQ</code> executes for R1 = 0, 1, …, 100 — the exit test is the 101st execution; the unconditional <code>J</code> does not touch the BHT. Outcomes: Not Taken 100 times, then Taken.</p>
+
+  <figure class="tbl-fig" id="l06-tbl-q5">
+    <figcaption>Table 6. The 1-bit entry on the midterm's top-tested loop: 101 accesses, 2 mispredictions.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>access</th><th>R1</th><th>prediction</th><th>outcome</th><th>result</th><th>bit after</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td class="num">0</td><td>T (initial)</td><td>NT</td><td><b>miss</b></td><td>NT</td></tr>
+          <tr><td>2 to 100</td><td>1 to 99</td><td>NT</td><td>NT</td><td>99 hits</td><td>NT</td></tr>
+          <tr><td class="num">101</td><td class="num">100</td><td>NT</td><td>T</td><td><b>miss</b></td><td>T</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Two mispredictions — one artificial (initialisation), one real (exit) — in 101 accesses; the bottom-tested loop of June 2025 executes its <code>BNE</code> five times for five iterations. The rule: branch at the bottom, N executions; test at the top, N + 1.</p>
+
+  <h3>Habit 2: initialisation and size both change the count</h3>
+
+  <p>Quiz 4 — "the number of mispredictions depends on the initialization and the size of the Branch History Table", true or false, motivate: true, for two reasons the motivation must name. Initialisation sets the start-up misses: a 2-bit entry started Strongly Not Taken misses twice before predicting a loop branch Taken (the 60 % of June 2025), started Strongly Taken it misses none. Size sets aliasing: no tags, so a small table lets unrelated branches overwrite each other's state (Fig. 4, right).</p>
+
+  <div class="tip">
+    <p>Any predictor table: state before each execution, prediction from it, outcome, hit or miss, update, shift — and the misprediction rate divides by the executions, warm-up included; the "state left in the BHT" is the state after the last update, one transition past the last row.</p>
+  </div>
+
+  <h3>Habit 3: from accuracy to CPI</h3>
+
+  <p>Quiz 6, third statement: "The introduction of dynamic branch predictors improves the CPI metric." True, by the formula the notes give on p. 541 — copy it onto your A4 sheet, since the course's example sheet has no branch formula at all.</p>
+
+  <div class="formula">
+    \[ \text{CPI} = \text{CPI}_{\text{ideal}} + f_b \,(1 - a)\, P \]
+    <dl class="legend">
+      <dt>\(f_b\)</dt><dd>branch frequency: fraction of executed instructions that are branches</dd>
+      <dt>\(a\)</dt><dd>prediction accuracy; \(1 - a\) is the misprediction rate</dd>
+      <dt>\(P\)</dt><dd>misprediction penalty in cycles: 1 in the course pipeline, where the branch is resolved in ID; 7 at least and about 11 on average on the Alpha 21264, around 20 on the deepest pipelines</dd>
+    </dl>
+  </div>
+
+  <p>A better predictor changes only \(a\); the penalty belongs to the pipeline — and that is why the percentage points matter: at \(f_b = 0.2\) the step from 90 % to 97 % accuracy is worth 0.014 CPI with \(P = 1\) and 0.28 with \(P = 20\).</p>
+
+  <h3>The bridge to speculation</h3>
+
+  <p>The June 2026 open question pairs "dynamic branch prediction" with "speculative execution". A prediction is only useful if the processor acts on it before the branch resolves — fetching, issuing, even executing the instructions after it. They must not touch registers or memory until the branch is known: their results wait in the <strong>reorder buffer</strong>; on a misprediction every entry younger than the branch is flushed, nothing architectural is undone, the PC is set right and fetch resumes. Lessons 5 and 6 decide how often that happens; <a href="l17.html">lesson 17</a> builds the buffer.</p>
+</section>
+
+<section id="l06-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="1" id="l06-exam-open">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts of the correlating branch prediction technique and its benefits with respect to a standard Branch History Table.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A standard BHT predicts each branch from its own past only. A correlating (two-level) predictor also uses the outcomes of the branches executed just before it: an m-bit Global History Register, a shift register holding the last m outcomes (1 = Taken), selects one of 2^m tables of n-bit entries (1-bit, or the 2-bit states Strongly/Weakly Taken, Weakly/Strongly Not Taken), and the k low-order bits of the branch PC select the entry inside the selected table. Equivalently the GHR concatenated with the PC bits forms one index of m + k bits into a single table; gshare XORs the history with the PC bits instead, to spread the branches over the whole table and reduce aliasing. After the branch resolves, the entry is updated and the outcome is shifted into the GHR. The benefit: each (branch, recent context) pair has its own counter, so a branch whose outcome depends on previous branches — or on its own recent pattern, such as a loop exit — is predicted correctly after warm-up, where a per-branch counter flip-flops; H&amp;P show a (2,2) predictor of 8 Kbit mispredicting less than a 2-bit BHT with unlimited entries. The cost is one shift register, 2^m × n × 2^k bits of tables, a longer warm-up (every context must be trained) and aliasing in the pattern table.</p>
+      </div>
+      <div class="exam-note"><p>The wording is the fourth sub-point of Q2 of the January 2026 paper in the notes (p. 498); in the June 2026 format the same material sits inside the sub-point "dynamic branch prediction and speculative execution" of the 8-point question — about five lines either way. The examiner looks for the three mechanisms (history register, table selection, PC indexing), the update rule, the "separate counter per context" argument and one concrete benefit. Naming gshare's XOR earns the aliasing point; the January 2026 solution in the notes mentions "concatenating or XORing", so both words belong in the answer.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l06-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Consider the code <code>BNE R1, R0, L1; ADDUI R1, R0, 1; L1: SUBI R3, R1, 1; BNE R3, R0, L2</code>, where the first branch (b1) is taken if d = R1 is not 0 and the second (b2) is taken if d is not 1. The code is executed with d = 2, 0, 2, 0. (a) Fill the prediction table for a 1-bit predictor per branch, both entries initialised Not Taken. (b) Fill it for a (1,1) correlating predictor whose entries (one per branch and per value of the 1-bit global history) are initialised Not Taken, with the global history initialised Not Taken. (c) Count the mispredictions of each and explain the difference.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) 1-bit per branch (prediction = bit before, bit after = outcome):</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>d</th><th>b1 pred.</th><th>b1 outcome</th><th>b2 pred.</th><th>b2 outcome</th></tr></thead>
+            <tbody>
+              <tr><td>2</td><td>NT (miss)</td><td>T</td><td>NT (miss)</td><td>T</td></tr>
+              <tr><td>0</td><td>T (miss)</td><td>NT</td><td>T (miss)</td><td>NT</td></tr>
+              <tr><td>2</td><td>NT (miss)</td><td>T</td><td>NT (miss)</td><td>T</td></tr>
+              <tr><td>0</td><td>T (miss)</td><td>NT</td><td>T (miss)</td><td>NT</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>(b) (1,1) predictor, entries written "if last NT / if last T":</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>d</th><th>GH before b1</th><th>b1 entries</th><th>b1 pred.</th><th>b1 outcome</th><th>GH before b2</th><th>b2 entries</th><th>b2 pred.</th><th>b2 outcome</th></tr></thead>
+            <tbody>
+              <tr><td>2</td><td>NT</td><td>NT/NT</td><td>NT (miss)</td><td>T</td><td>T</td><td>NT/NT</td><td>NT (miss)</td><td>T</td></tr>
+              <tr><td>0</td><td>T</td><td>T/NT</td><td>NT</td><td>NT</td><td>NT</td><td>NT/T</td><td>NT</td><td>NT</td></tr>
+              <tr><td>2</td><td>NT</td><td>T/NT</td><td>T</td><td>T</td><td>T</td><td>NT/T</td><td>T</td><td>T</td></tr>
+              <tr><td>0</td><td>T</td><td>T/NT</td><td>NT</td><td>NT</td><td>NT</td><td>NT/T</td><td>NT</td><td>NT</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>(c) 8 of 8 mispredicted against 2 of 8. The 1-bit entry always holds the previous outcome, and the outcomes alternate, so it is always one step behind. In the (1,1) predictor the global history bit selects a different entry for "after a taken branch" and "after a not-taken branch": in this code b1 not taken implies b2 not taken and b1 taken implies b2 taken, so each context converges after one miss; b1 is predicted from the previous b2, whose outcome encodes the previous value of d. Only the two cold entries miss.</p>
+      </div>
+      <div class="exam-note"><p>Marks go to the correct shift of the history (it holds the <em>last</em> outcome, whichever branch produced it), to the two cold-entry misses being the only ones, and to the explanation in (c). A frequent slip: predicting b2 from b2's own previous outcome instead of from the entry the history selects.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="8192" data-tol="1" data-unit="bits" id="l06-exam-bits">
+    <div class="exam-q" lang="en">
+      <p>A (2,2) correlating predictor has 1024 entries per table. How many bits of prediction storage does it use?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ 2^m \cdot n \cdot 2^k = 4 \cdot 2 \cdot 1024 = 8192 \text{ bits} \]
+        <p>that is 1 KB; a plain 2-bit BHT with the same budget would have 4096 entries.</p>
+      </div>
+      <div class="exam-note"><p>The m history bits multiply the tables, they do not add bits to an entry: 2^m tables, each of 2^k entries of n bits.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l06-exam-q5">
+    <div class="exam-q" lang="en">
+      <p>Consider the following assembly code executed by a processor with a 1-entry 1-bit Branch History Table initialised as Taken: <code>ADDI R1, R0, 0; ADDI R2, R0, 100; LOOP: BEQ R1, R2, DONE; ADD R5, R5, R4; ADDI R1, R1, 1; J LOOP; DONE:</code>. Assuming only the branch instruction accesses the BHT, how many accesses to the Branch History Table and how many mispredictions? (Single answer)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Answer 1: 101 accesses, 2 mispredictions <span class="fb">The BEQ runs for R1 = 0 to 100: 101 executions; the initial Taken misses on the first (Not Taken), the exit misses on the last (Taken).</span></li>
+      <li>Answer 2: 100 accesses, 1 misprediction <span class="fb">100 counts the iterations, not the executions of the branch: the exit test is the 101st, and the initialisation costs a miss of its own.</span></li>
+      <li>Answer 3: 99 accesses, 1 misprediction <span class="fb">The branch is executed for R1 = 0 as well as for R1 = 100; neither can be dropped.</span></li>
+      <li>Answer 4: 201 accesses, 2 mispredictions <span class="fb">The unconditional J does not access the BHT by assumption; only the BEQ does.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 1. Executions of BEQ: R1 = 0, 1, …, 100 → 101 accesses. Predict Taken at R1 = 0: outcome Not Taken, miss, bit → NT. R1 = 1 … 99: predict NT, outcome NT, 99 hits. R1 = 100: predict NT, outcome Taken, miss. Two mispredictions.</p></div>
+      <div class="exam-note"><p>The midterm's quiz, recomputed. The two misses are the two changes of direction the 1-bit entry sees — one artificial (initialisation), one real (exit).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l06-exam-q4">
+    <div class="exam-q" lang="en">
+      <p>During the execution of a program, the number of mispredictions depends on the initialization and the size of the Branch History Table (BHT). True or False? Motivate your answer.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">Initialisation sets the start-up misses; size sets how many branches share an untagged entry (aliasing).</span></li>
+      <li>False <span class="fb">Both matter: a loop branch started Strongly Not Taken misses twice before predicting Taken, and a small untagged table lets unrelated branches overwrite each other's state.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>True. (1) Initialisation: the initial state of the entries decides whether the first executions of each branch are predicted right — a 2-bit entry initialised Strongly Not Taken mispredicts the first two taken executions of a loop branch, initialised Strongly Taken it mispredicts none; these start-up misses count in the misprediction rate. (2) Size: the BHT is indexed by the low-order PC bits without tags, so with a small table different branches map to the same entry (aliasing) and interfere, each spoiling the other's state; a larger table reduces the collisions.</p></div>
+      <div class="exam-note"><p>Two separate reasons, each with its mechanism, is what the extra "motivate" point pays for. Adding that the counter type (1 bit or 2) and the program's patterns also matter does not hurt.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l06-exam-loop">
+    <div class="exam-q" lang="en">
+      <p>A loop of 10 iterations, whose body contains no other branch, is executed many times. Which predictor can reach 100 % accuracy on its loop branch after warm-up, exit included? (Single answer)</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>A 2-bit BHT with 4096 entries <span class="fb">A counter holds a bias, not a pattern: it mispredicts the exit every time, 90 % at best.</span></li>
+      <li>A 2-bit BHT with unlimited entries <span class="fb">Unlimited entries remove aliasing only; the exit is not an aliasing problem.</span></li>
+      <li data-correct>A two-level predictor with at least 9 bits of local history <span class="fb">With h ≥ N − 1 = 9 every position in the pattern T×9 NT has its own history and its own counter; after warm-up all ten executions are predicted.</span></li>
+      <li>Always Taken <span class="fb">Right nine times in ten, wrong at every exit: 90 %.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 3. The exit is predictable because it comes at a fixed position; only a history long enough to distinguish "nine taken in a row" from the earlier positions can represent it, which is what a local (or, with no other branch in the body, global) history of at least 9 bits does. Counters of any size and static rules cannot.</p></div>
+      <div class="exam-note"><p>The examiner is checking the difference between <em>bias</em> (what a counter stores) and <em>pattern</em> (what a history register stores).</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l06-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">In Table 2 the (1,1) predictor also fixes b1, although b1 comes first and nothing precedes it in the code. Why?</p>
+    <ul class="options">
+      <li>Because b1's own last outcome is in its entry <span class="fb">That is the 1-bit scheme of Table 1, which missed all eight; the entry alone is always one step behind.</span></li>
+      <li data-correct>Because the global history holds the previous b2, whose outcome encodes the previous value of d <span class="fb">The GHR records the last branch executed, whichever it was: before b1 that is b2, and b2's outcome tells which way d was last time, which is the opposite of this time.</span></li>
+      <li>Because the (1,1) predictor has twice the entries, so there is no aliasing <span class="fb">There are only two branches; aliasing plays no role. The extra bit is context, not capacity.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">With the notes' convention, after the outcomes Not Taken then Taken (in this order) a 2-bit GHR holds…</p>
+    <ul class="options">
+      <li><code>10</code> <span class="fb">That would be "last Not Taken, penultimate Taken": the reverse order.</span></li>
+      <li data-correct><code>01</code> <span class="fb">Shift left and insert the newest outcome on the right: 0 after Not Taken, then 1 after Taken gives 01 — "last Taken, penultimate Not Taken" (p. 69).</span></li>
+      <li><code>11</code> <span class="fb">Both bits 1 would mean both outcomes Taken.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A loop of 6 iterations is executed many times. Which predictors can learn its exit after warm-up? Select all that apply.</p>
+    <ul class="options">
+      <li>A 2-bit BHT, however large <span class="fb">A counter cannot represent "after five taken comes a not-taken"; it mispredicts the exit every pass.</span></li>
+      <li data-correct>A two-level predictor with 5 bits of local history <span class="fb">h = 5 ≥ N − 1: each position of T T T T T NT gets its own counter.</span></li>
+      <li>A (2,2) correlating predictor, the loop body containing no other branch <span class="fb">Only 2 bits of history: the contexts before iterations 3, 4, 5 and 6 are all "11" and share one counter, which cannot be right for both T and NT.</span></li>
+      <li data-correct>A gshare predictor with 8 bits of history, the loop body containing no other branch <span class="fb">With no other branch the global history is the loop branch's own, and 8 bits are more than the 5 needed.</span></li>
+      <li>Always Taken <span class="fb">Static rules do not learn; the exit is missed every pass.</span></li>
+    </ul>
+    <p class="q-fb">The question behind the question: bias (a counter) against pattern (a history). Only enough history bits capture a pattern, and global history only counts as "this branch's" when nothing else in the body dilutes it.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">gshare XORs the history with the PC bits instead of concatenating them. What does that buy, with the same index width?</p>
+    <ul class="options">
+      <li>It removes aliasing completely <span class="fb">XOR is still many-to-one: 2^2h (PC, history) pairs land on 2^h entries. The mixer's third task shows collisions returning with more contexts.</span></li>
+      <li data-correct>Every branch can reach every entry, and under the same history two different branches never share one <span class="fb">Concatenation confines a branch to the 2^m entries of its partition and makes branches with equal low PC bits collide in every context; XOR uses all h bits of both.</span></li>
+      <li>It uses local history instead of global history <span class="fb">gshare's history is global; mixing in the PC gives the branch's identity, not its own history.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Two branches share an entry of an untagged BHT; two addresses share a set of a tagged cache. In which case can the program compute a wrong result?</p>
+    <ul class="options">
+      <li>In the BHT case <span class="fb">The polluted entry gives a wrong prediction, which the pipeline detects when the branch resolves; only cycles are lost.</span></li>
+      <li>In the cache case <span class="fb">The tag comparison fails and the access is a miss: the right data is fetched from memory. That is a conflict miss, not corruption.</span></li>
+      <li data-correct>In neither <span class="fb">A guess is checked at resolution, and a tag is checked on every access. Aliasing costs accuracy in the first structure and a miss in the second — never correctness.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In the arena the (2,2) predictor needs two passes of the H&amp;P stream to become perfect, where the (1,1) needs one. What is the reason?</p>
+    <ul class="options">
+      <li>The (2,2) has four tables to fill instead of two <span class="fb">More tables do mean more contexts, but each context of this stream is met once per pass; the number of tables does not add passes.</span></li>
+      <li data-correct>Its entries are 2-bit counters starting Strongly Not Taken, which need two Taken outcomes before they predict Taken <span class="fb">Hysteresis: the first Taken moves an entry to Weakly Not Taken, which still predicts Not Taken; the second pass moves it to Weakly Taken. With counters started Weakly Taken the (2,2) matches the (1,1).</span></li>
+      <li>Its history register is updated one cycle late <span class="fb">The widget updates every history register at resolution, in the same way for all predictors.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Inside a loop body, a branch is taken exactly when the branch three instructions earlier was taken. Which kind of history can see that?</p>
+    <ul class="options">
+      <li data-correct>Global history <span class="fb">The GHR holds the outcomes of the last branches executed, whichever they were — the earlier branch is in it.</span></li>
+      <li>Local history <span class="fb">A local register holds only this branch's own outcomes; the other branch never appears in it.</span></li>
+      <li>Neither: it needs a bigger 2-bit table <span class="fb">Table size removes aliasing; it does not add context.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l06-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>A per-branch counter answers "what did this branch do last time?"; it is blind to other branches and to patterns, so two branches testing an alternating variable give 0 of 8 right, and a loop exit is missed every pass.</li>
+    <li>A correlating, or two-level, predictor keeps a separate counter for each (branch, recent context): an m-bit Global History Register selects one of \(2^m\) tables of n-bit entries, the k low-order PC bits select the row — equivalently one table indexed by GHR ‖ PC bits, with \(2^m \cdot n \cdot 2^k\) bits in all; the plain 2-bit BHT is the (0,2) member.</li>
+    <li>The history register shifts left and takes the newest outcome on the right (notes: 01 = last Taken, penultimate Not Taken); every exam table must state its convention and keep the "state before, prediction, outcome, update, shift" order.</li>
+    <li>History can be global (one register, sees other branches, gets diluted by them) or local (one register per branch, selected by the PC); a local history of h ≥ N − 1 bits makes an N-iteration loop exit perfectly predictable after warm-up, which no counter can do.</li>
+    <li>gshare indexes the PHT with history ⊕ PC bits: every branch reaches every entry and two branches never collide under the same history, so aliasing drops — it does not vanish, and the warm-up per context remains.</li>
+    <li>Aliasing is an index collision; with a tag (cache, BTB) it costs a miss and never correctness, without a tag (BHT, PHT) it costs a wrong prediction that the pipeline catches — so size and initialisation both change the misprediction count.</li>
+    <li>Count executions of the branch, not iterations: a top-tested loop of N iterations accesses the BHT N + 1 times; the predictor changes \(a\) in \(\text{CPI} = \text{CPI}_{\text{ideal}} + f_b (1 - a) P\), never \(P\).</li>
+  </ul>
+  <aside class="cheat" id="l06-cheat">
+    <dl>
+      <dt>(m, n) predictor</dt><dd>\(2^m\) tables (m history bits) × \(2^k\) entries (k PC bits) × n bits; storage \(2^m \cdot n \cdot 2^k\) bits; the plain 2-bit BHT is (0, 2)</dd>
+      <dt>Single-table index</dt><dd>\(\text{GHR} \,\Vert\, \text{PC}[k]\): m + k bits, GHR on top</dd>
+      <dt>GHR update</dt><dd>shift left, insert 1 (Taken) or 0 (Not Taken) on the right, keep m bits — notes: 01 = last T, penultimate NT</dd>
+      <dt>gshare index</dt><dd>\(\text{BHR} \oplus \text{PC}[h]\), h bits each, \(2^h\) entries</dd>
+      <dt>Local two-level size</dt><dd>\(2^k h + 2^{h+1}\) bits: \(2^k\) histories of h bits plus one PHT of \(2^h\) 2-bit counters</dd>
+      <dt>Loop exit learnable</dt><dd>local history \(h \ge N - 1\) (N iterations, N − 1 taken then not taken)</dd>
+      <dt>Misses per loop pass, steady state</dt><dd>1-bit: 2 (exit + re-entry) · 2-bit and always Taken: 1 (exit) · two-level with h ≥ N − 1: 0</dd>
+      <dt>Branch executions</dt><dd>bottom-tested loop: N · top-tested loop: N + 1 (the exit test)</dd>
+      <dt>CPI with branches</dt><dd>\(\text{CPI}_{\text{ideal}} + f_b (1 - a) P\): branch frequency × misprediction rate × penalty</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l06-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=XvJDif_YIgY" target="_blank" rel="noopener">2 Bit History Predictor</a>
+      <span class="res-by">Georgia Tech HPCA (Udacity), Milos Prvulovic</span><span class="res-dur">3 min</span>
+      <p class="res-why">A whiteboard clip of the local two-level idea: a per-branch history selecting a counter. Watch it after Table 4, before the arena.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://danluu.com/branch-prediction/" target="_blank" rel="noopener">Branch prediction</a>
+      <span class="res-by">Dan Luu</span><span class="res-dur">≈ 25 min</span>
+      <p class="res-why">The whole ladder from static rules to two-level global and local, gshare, agree and hybrid predictors, with an illustrative accuracy-to-CPI table. Read it to place this lesson's predictors on the map.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://staff.fnwi.uva.nl/s.polstra/psa2017/p76-pan.pdf" target="_blank" rel="noopener">Improving the Accuracy of Dynamic Branch Prediction Using Branch Correlation</a>
+      <span class="res-by">Pan, So and Rahmeh, ASPLOS 1992</span><span class="res-dur">9 pages</span>
+      <p class="res-why">The origin of the (m, n) predictor and of the if–if correlation example; the "up to 11 % at the cost of one shift register" sentence is on its first page.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.utexas.edu/~lin/cs378/reading1.pdf" target="_blank" rel="noopener">Two-Level Adaptive Training Branch Prediction</a>
+      <span class="res-by">Yeh and Patt, MICRO 1991</span><span class="res-dur">11 pages</span>
+      <p class="res-why">The paper behind the BHR / PHT vocabulary of the notes' §2.6.5 and the 97 % figure quoted above; skim the figures of the two levels.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.ece.lsu.edu/tca/mcf.pdf" target="_blank" rel="noopener">Combining Branch Predictors</a>
+      <span class="res-by">Scott McFarling, DEC WRL TN-36, 1993</span><span class="res-dur">29 pages</span>
+      <p class="res-why">Where gshare gets its name and its XOR, next to bimodal, local and the combined predictor with a chooser that the Alpha 21264 later built in silicon.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Lesson 5 told the fetch stage where to go, this lesson told it which way with far fewer mistakes. The next chapter leaves branches and looks at how instructions collide on data — the three hazard types the exam tables ask you to name — and at what happens when EX takes more than one cycle.</p>
+</aside>
+
+</main>
+</body>
+</html>

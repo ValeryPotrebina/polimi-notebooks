@@ -1,0 +1,1074 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Where does the memory live? UMA, NUMA, DSM, clusters and programming models · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+  /* page-local: the text field in which an address is typed (the toolkit has no text input); tokens only */
+  .l34-hex { width: 100%; min-height: 2.5rem; padding: 0.3rem 0.6rem; background: var(--paper); color: var(--ink); border: 1.5px solid var(--line-2); border-radius: var(--radius); font-family: var(--f-mono); font-size: var(--t-sm); }
+  .l34-hex:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l34">
+
+<header class="lesson-head">
+  <h1>Where does the memory live? UMA, NUMA, DSM, clusters and programming models</h1>
+  <p class="lede">After this lesson you will place any multiprocessor on two independent axes — shared or private address space, centralized or distributed memory — find the home node of an address, estimate what remote accesses cost, and match each machine with its programming model.</p>
+</header>
+
+<div class="hook" data-label="A picture quiz">
+  <p>One quiz of the paper of 8 January 2026, as the notes reproduce it (p. 505), is a picture and a question. The picture: columns N0 … N3; in each, a processor, its cache and a memory module stacked on top of each other, and every memory hanging on the same grey bar. Next to every memory module, in small print: "P0, P1, P2, P3". The question: "What type of multiprocessor architecture does the following picture represent?"</p>
+  <p>The four answers pair centralized or distributed memory with either a single logically shared address space or message passing. Every processor has a memory of its own, so the picture looks like four computers that must talk by messages. Look again at the small print. It decides the answer, and why it decides is what this lesson is about.</p>
+</div>
+
+<section id="l34-space">
+  <h2>Shared or private: what an address means</h2>
+
+  <p>Start with two instructions. Processors P0 and P1 both hold R1 = 0x2000. P0 executes <code>SD F2, 0(R1)</code> with F2 = 5; a moment later P1 executes <code>LD F4, 0(R1)</code>. Does P1 get the 5?</p>
+
+  <p>It depends on the <mark class="key">address space</mark>: "the set of memory addresses that a processor can use in its instructions" (p. 425). In a multiprocessor the question is whether all processors share one global address space or each has a private one of its own (Fig. 1).</p>
+
+  <figure class="fig fig--pair" id="l34-fig-spaces">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="Shared address space: P0 stores 5 at address 0x2000, and the load of P1 from 0x2000 reads the same cell of the one memory, so it gets 5">
+        <line x1="58" y1="82" x2="106" y2="158" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="194" y1="164" x2="240" y2="90" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="26" y="14" width="64" height="40" rx="3" class="fi-paper sw-2"/>
+        <text x="58" y="39" class="tx-mid tx-mono">P0</text>
+        <rect x="210" y="14" width="64" height="40" rx="3" class="fi-paper sw-2"/>
+        <text x="242" y="39" class="tx-mid tx-mono">P1</text>
+        <text x="58" y="74" class="tx-mid tx-mono tx-sm">SD F2, 0(R1)</text>
+        <text x="242" y="74" class="tx-mid tx-mono tx-sm">LD F4, 0(R1)</text>
+        <rect x="60" y="150" width="180" height="56" rx="3" class="fi-paper sw-2"/>
+        <rect x="76" y="164" width="148" height="26" class="fw-s1 st-s1"/>
+        <text x="150" y="182" class="tx-mid tx-mono tx-sm">0x2000: 5</text>
+        <text x="150" y="226" class="tx-mid tx-sm tx-muted">one memory</text>
+        <text x="150" y="126" class="tx-mid tx-hand">the same X</text>
+      </svg>
+      <p class="fig-label">Shared: one 0x2000 for everybody</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="Private address spaces: P0 stores 5 into the 0x2000 of its own memory, P1 loads the 0x2000 of its own memory and gets 0; the value reaches P1 only in a message sent by P0">
+        <line x1="94" y1="34" x2="204" y2="34" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="58" y1="82" x2="66" y2="158" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="234" y1="164" x2="242" y2="90" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="26" y="14" width="64" height="40" rx="3" class="fi-paper sw-2"/>
+        <text x="58" y="39" class="tx-mid tx-mono">P0</text>
+        <rect x="210" y="14" width="64" height="40" rx="3" class="fi-paper sw-2"/>
+        <text x="242" y="39" class="tx-mid tx-mono">P1</text>
+        <text x="150" y="24" class="tx-mid tx-sm halo">message</text>
+        <text x="58" y="74" class="tx-mid tx-mono tx-sm">SD F2, 0(R1)</text>
+        <text x="242" y="74" class="tx-mid tx-mono tx-sm">LD F4, 0(R1)</text>
+        <rect x="10" y="150" width="128" height="56" rx="3" class="fi-paper sw-2"/>
+        <rect x="22" y="164" width="104" height="26" class="fw-s1 st-s1"/>
+        <text x="74" y="182" class="tx-mid tx-mono tx-sm">0x2000: 5</text>
+        <rect x="162" y="150" width="128" height="56" rx="3" class="fi-paper sw-2"/>
+        <rect x="174" y="164" width="104" height="26" class="fi-paper"/>
+        <text x="226" y="182" class="tx-mid tx-mono tx-sm">0x2000: 0</text>
+        <text x="74" y="226" class="tx-mid tx-sm tx-muted">memory of P0</text>
+        <text x="226" y="226" class="tx-mid tx-sm tx-muted">memory of P1</text>
+        <text x="150" y="126" class="tx-mid tx-hand">two X</text>
+      </svg>
+      <p class="fig-label">Private: a 0x2000 in every memory</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Two processors, both with R1 = 0x2000. Left: one address space — the store of P0 writes the very cell that the load of P1 reads, so P1 gets 5. Right: private address spaces — the number 0x2000 names one cell in each memory; P1 reads its own 0 unless P0 sends the value in a message.</figcaption>
+  </figure>
+
+  <p>In a <mark class="key">shared address space</mark> all processors see one single logical memory: 0x2000 is the same location for everybody, and P1 reads the 5. Communication is implicit — a store by one processor, a load by another, no "send" — and a parallel program looks like a uniprocessor program with several threads (Pthreads, OpenMP): the <em>shared-memory model</em>.</p>
+
+  <p>With <mark class="key">private address spaces</mark> each processor has its own separate memory space: P0's 0x2000 is not P1's, and no load or store crosses from one processor to another. P1 reads its own 0x2000; to get P0's value it must receive a message that P0 sends explicitly, with <code>MPI_Send()</code> and <code>MPI_Recv()</code> in MPI: the <em>message-passing model</em> (p. 425).</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Shared address space: loads and stores">
+<pre><code>; P0, R1 = 0x2000
+SD  F2, 0(R1)
+; P1, R1 = 0x2000
+LD  F4, 0(R1)</code></pre>
+      <p>No call, no copy; a flag, a lock or a barrier makes P1 load only after the store.</p>
+    </div>
+    <div class="compare-col" data-label="Private address spaces: messages">
+<pre><code>; P0
+SD  F2, 0(R1)
+MPI_Send(X, dest=P1)
+; P1
+MPI_Recv(X, source=P0)
+LD  F4, 0(R1)</code></pre>
+      <p>Two calls and a copy into P1's own 0x2000; the receive waits for the message.</p>
+    </div>
+  </div>
+
+  <p>Each model buys what the other pays for (pp. 425–426). A shared address space is easy to program, copes with irregular communication, moves small items without message overhead, keeps the memory model that compilers already optimize for, and lets caches cut remote traffic automatically. It pays with hardware that is hard to build — a scalable, coherent shared memory — with locks and barriers, and with little control over where shared data sits. Private address spaces need simple hardware with no coherence protocol, make communication explicit, synchronize at every send/receive, give control over placement and isolate faults. They pay with a harder programming model, a fixed overhead on every small message, and the work of distributing the data by hand.</p>
+
+  <p class="memo"><mark class="key">Shared memory is easier for the programmer and harder for the hardware, which needs cache coherence; message passing is the other way round. Both can express any algorithm; they differ in latency, control and scalability (p. 426).</mark></p>
+
+  <div class="pitfall"><p>"With shared memory nothing needs synchronizing: the data is just there." The opposite: communication is implicit, so nothing tells P1 when P0's store has happened. A flag, a lock or a barrier must order them.</p></div>
+</section>
+
+<section id="l34-place">
+  <h2>Where the memory sits: UMA, NUMA and the multicore chip</h2>
+
+  <p>The address space is about names. The second question is about wires: where the memory is physically placed, and how the latency behaves (p. 427). Fig. 2 redraws the UMA and NUMA pictures of the notes (Figs. 34 and 36), which, the notes warn, "could happen on the exam". The second one did: with a directory added to every node, it is the figure of the directory question in all three official papers.</p>
+
+  <figure class="fig fig--pair" id="l34-fig-uma-numa">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="UMA: four processors with their caches reach one main memory through the interconnection network, all at the same distance">
+        <line x1="42" y1="44" x2="42" y2="56"/><line x1="114" y1="44" x2="114" y2="56"/><line x1="186" y1="44" x2="186" y2="56"/><line x1="258" y1="44" x2="258" y2="56"/>
+        <line x1="42" y1="76" x2="42" y2="112"/><line x1="114" y1="76" x2="114" y2="112"/><line x1="186" y1="76" x2="186" y2="112"/><line x1="258" y1="76" x2="258" y2="112"/>
+        <line x1="150" y1="132" x2="150" y2="160"/>
+        <rect x="9" y="8" width="66" height="78" rx="4" class="fi-none st-muted dash"/>
+        <rect x="81" y="8" width="66" height="78" rx="4" class="fi-none st-muted dash"/>
+        <rect x="153" y="8" width="66" height="78" rx="4" class="fi-none st-muted dash"/>
+        <rect x="225" y="8" width="66" height="78" rx="4" class="fi-none st-muted dash"/>
+        <rect x="14" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="42" y="35" class="tx-mid tx-mono">P0</text>
+        <rect x="86" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="114" y="35" class="tx-mid tx-mono">P1</text>
+        <rect x="158" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="186" y="35" class="tx-mid tx-mono">P2</text>
+        <rect x="230" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="258" y="35" class="tx-mid tx-mono">P3</text>
+        <rect x="22" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="42" y="70" class="tx-mid tx-mono tx-sm">C0</text>
+        <rect x="94" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="114" y="70" class="tx-mid tx-mono tx-sm">C1</text>
+        <rect x="166" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="186" y="70" class="tx-mid tx-mono tx-sm">C2</text>
+        <rect x="238" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="258" y="70" class="tx-mid tx-mono tx-sm">C3</text>
+        <rect x="8" y="112" width="284" height="20" rx="4" class="fi-soft"/>
+        <text x="150" y="126" class="tx-mid tx-sm">Interconnection Network</text>
+        <rect x="96" y="160" width="108" height="34" rx="3" class="fi-paper sw-2"/>
+        <text x="150" y="181" class="tx-mid tx-sm">Main Memory</text>
+        <text x="150" y="222" class="tx-mid tx-hand">same distance for all</text>
+      </svg>
+      <p class="fig-label">Before: UMA, one central memory</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="NUMA: every node has a processor, a cache and its own memory module; P0 reaches MM0 inside its node, but MM3 only through the interconnection network">
+        <line x1="42" y1="44" x2="42" y2="56" class="st-s1 sw-3"/><line x1="42" y1="76" x2="42" y2="88" class="st-s1 sw-3"/>
+        <line x1="114" y1="44" x2="114" y2="56"/><line x1="114" y1="76" x2="114" y2="88"/><line x1="114" y1="116" x2="114" y2="150"/>
+        <line x1="186" y1="44" x2="186" y2="56"/><line x1="186" y1="76" x2="186" y2="88"/><line x1="186" y1="116" x2="186" y2="150"/>
+        <line x1="258" y1="44" x2="258" y2="56"/><line x1="258" y1="76" x2="258" y2="88"/>
+        <line x1="42" y1="116" x2="42" y2="150" class="st-s2 sw-2 dash"/>
+        <polyline points="42,170 42,190 258,190 258,174" class="fi-none st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="258" y1="150" x2="258" y2="120" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <rect x="9" y="8" width="66" height="118" rx="4" class="fi-none st-muted dash"/>
+        <rect x="81" y="8" width="66" height="118" rx="4" class="fi-none st-muted dash"/>
+        <rect x="153" y="8" width="66" height="118" rx="4" class="fi-none st-muted dash"/>
+        <rect x="225" y="8" width="66" height="118" rx="4" class="fi-none st-muted dash"/>
+        <rect x="14" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="42" y="35" class="tx-mid tx-mono">P0</text>
+        <rect x="86" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="114" y="35" class="tx-mid tx-mono">P1</text>
+        <rect x="158" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="186" y="35" class="tx-mid tx-mono">P2</text>
+        <rect x="230" y="16" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="258" y="35" class="tx-mid tx-mono">P3</text>
+        <rect x="22" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="42" y="70" class="tx-mid tx-mono tx-sm">C0</text>
+        <rect x="94" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="114" y="70" class="tx-mid tx-mono tx-sm">C1</text>
+        <rect x="166" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="186" y="70" class="tx-mid tx-mono tx-sm">C2</text>
+        <rect x="238" y="56" width="40" height="20" rx="3" class="fi-paper"/><text x="258" y="70" class="tx-mid tx-mono tx-sm">C3</text>
+        <rect x="14" y="88" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="42" y="107" class="tx-mid tx-mono tx-sm">MM0</text>
+        <rect x="86" y="88" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="114" y="107" class="tx-mid tx-mono tx-sm">MM1</text>
+        <rect x="158" y="88" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="186" y="107" class="tx-mid tx-mono tx-sm">MM2</text>
+        <rect x="230" y="88" width="56" height="28" rx="3" class="fi-paper sw-2"/><text x="258" y="107" class="tx-mid tx-mono tx-sm">MM3</text>
+        <rect x="8" y="150" width="284" height="20" rx="4" class="fi-soft"/>
+        <text x="150" y="164" class="tx-mid tx-sm">Interconnection Network</text>
+        <text x="150" y="222" class="tx-mid tx-hand">MM3 is far</text>
+      </svg>
+      <p class="fig-label">After: NUMA, a memory in every node</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> The UMA and NUMA pictures of the notes (Figs. 34 and 36), redrawn with four processors. Before: one main memory behind the interconnection network, equally far from every processor. After: a memory module in every node. P0 reaches MM0 inside its own node (blue), MM3 only through the network (orange, dashed). Every processor can still address every module: the address space did not change, the distance did.</figcaption>
+  </figure>
+
+  <p>In a <mark class="key">UMA</mark> (Uniform Memory Access) machine all processors share one centralized physical memory "with the same access latency and bandwidth, regardless of which processor initiates the access" (p. 427); such machines are also called Symmetric Multiprocessors (SMPs) or Centralized Shared-Memory Multiprocessors. Each processor has private caches, sometimes a shared L3, and a snooping protocol keeps them coherent.</p>
+
+  <p>Uniform latency makes UMA simple: nobody asks whether data is local or remote, and sequential code ports naturally (p. 428). The price is scalability. Every miss of every processor goes to the same memory through the same interconnect, so demand grows with the processors while supply does not. The result is <mark class="key">contention</mark>: "two or more processors (or components) try to use the same resource at the same time", and some must wait (p. 432, footnote 12). Classic SMPs stop at about 32 processors (p. 428); <a href="l33.html">lesson 33</a> meets the same wall from the side of the bus, which saturates at about 36 (p. 420).</p>
+
+  <aside class="margin-note">Strictly, NUMA names the uneven latency, DSM the shared address space over distributed memory, cc-NUMA the coherent caches. The notes use the three as synonyms.</aside>
+
+  <p>The way out is to move the memory into the nodes. In a <mark class="key">NUMA</mark> (Non-Uniform Memory Access) machine each node is "Processor(s) + private caches + local memory module", a network (mesh, torus, crossbar) joins the nodes, and "the union of all local memories is one global shared address space" (p. 429). P0 reading MM0 stays inside its node; P0 reading MM3 crosses the network and waits longer.</p>
+
+  <p>NUMA buys scalability, to dozens or hundreds of nodes, and bandwidth, since every memory module adds its own. It costs programming effort, because performance now depends on where the data is placed, and hardware: a scalable network and, since snooping a whole network does not scale, a directory-based coherence protocol (p. 430).</p>
+
+  <h3>The multicore chip is a small SMP</h3>
+
+  <p>A multicore with a handful of cores is an SMP on one chip (p. 432) — the "single-chip dual-core shared-memory architecture" of the June 2025 paper's Question 2. Private L1 and L2 caches hold each core's working set and keep it off the shared resources; a larger, slower L3, shared by all cores, cuts the traffic to DRAM and is where shared data meets (Fig. 3, left). Each cache controller snoops the shared bus and invalidates or updates its copy when another core writes, which a few cores can afford (p. 432).</p>
+
+  <aside class="margin-note">The notes' "less than 8 cores (typical laptops, desktops)" ages fast. The model stays: one chip, one memory, symmetric cores.</aside>
+
+  <figure class="fig fig--pair" id="l34-fig-chip">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 244" role="img" aria-label="A small-scale multicore: four cores with private L1 and L2 caches on one on-chip bus, one shared L3 and one main memory">
+        <rect x="6" y="6" width="288" height="176" rx="6" class="fi-none st-muted dash"/>
+        <line x1="42" y1="42" x2="42" y2="50"/><line x1="114" y1="42" x2="114" y2="50"/><line x1="186" y1="42" x2="186" y2="50"/><line x1="258" y1="42" x2="258" y2="50"/>
+        <line x1="42" y1="68" x2="42" y2="74"/><line x1="114" y1="68" x2="114" y2="74"/><line x1="186" y1="68" x2="186" y2="74"/><line x1="258" y1="68" x2="258" y2="74"/>
+        <line x1="42" y1="92" x2="42" y2="110"/><line x1="114" y1="92" x2="114" y2="110"/><line x1="186" y1="92" x2="186" y2="110"/><line x1="258" y1="92" x2="258" y2="110"/>
+        <line x1="24" y1="110" x2="276" y2="110" class="st-ink sw-3"/>
+        <line x1="150" y1="110" x2="150" y2="126"/>
+        <line x1="150" y1="156" x2="150" y2="204"/>
+        <rect x="14" y="16" width="56" height="26" rx="3" class="fi-paper sw-2"/><text x="42" y="34" class="tx-mid tx-mono">P0</text>
+        <rect x="86" y="16" width="56" height="26" rx="3" class="fi-paper sw-2"/><text x="114" y="34" class="tx-mid tx-mono">P1</text>
+        <rect x="158" y="16" width="56" height="26" rx="3" class="fi-paper sw-2"/><text x="186" y="34" class="tx-mid tx-mono">P2</text>
+        <rect x="230" y="16" width="56" height="26" rx="3" class="fi-paper sw-2"/><text x="258" y="34" class="tx-mid tx-mono">P3</text>
+        <rect x="20" y="50" width="44" height="18" rx="2" class="fi-paper"/><text x="42" y="63" class="tx-mid tx-mono tx-sm">L1</text>
+        <rect x="92" y="50" width="44" height="18" rx="2" class="fi-paper"/><text x="114" y="63" class="tx-mid tx-mono tx-sm">L1</text>
+        <rect x="164" y="50" width="44" height="18" rx="2" class="fi-paper"/><text x="186" y="63" class="tx-mid tx-mono tx-sm">L1</text>
+        <rect x="236" y="50" width="44" height="18" rx="2" class="fi-paper"/><text x="258" y="63" class="tx-mid tx-mono tx-sm">L1</text>
+        <rect x="20" y="74" width="44" height="18" rx="2" class="fi-paper"/><text x="42" y="87" class="tx-mid tx-mono tx-sm">L2</text>
+        <rect x="92" y="74" width="44" height="18" rx="2" class="fi-paper"/><text x="114" y="87" class="tx-mid tx-mono tx-sm">L2</text>
+        <rect x="164" y="74" width="44" height="18" rx="2" class="fi-paper"/><text x="186" y="87" class="tx-mid tx-mono tx-sm">L2</text>
+        <rect x="236" y="74" width="44" height="18" rx="2" class="fi-paper"/><text x="258" y="87" class="tx-mid tx-mono tx-sm">L2</text>
+        <rect x="66" y="126" width="168" height="30" rx="3" class="fi-paper sw-2"/>
+        <text x="150" y="146" class="tx-mid tx-sm">shared L3</text>
+        <text x="286" y="174" class="tx-end tx-sm tx-muted">one chip</text>
+        <rect x="96" y="204" width="108" height="30" rx="3" class="fi-paper sw-2"/>
+        <text x="150" y="224" class="tx-mid tx-sm">main memory</text>
+      </svg>
+      <p class="fig-label">A handful of cores: one shared L3</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 244" role="img" aria-label="A larger multicore: eight tiles, each a core with one bank of the L3, joined by a mesh network-on-chip">
+        <rect x="6" y="6" width="288" height="190" rx="6" class="fi-none st-muted dash"/>
+        <line x1="42" y1="51" x2="258" y2="51" class="st-ink sw-2"/>
+        <line x1="42" y1="147" x2="258" y2="147" class="st-ink sw-2"/>
+        <line x1="42" y1="51" x2="42" y2="147" class="st-ink sw-2"/><line x1="114" y1="51" x2="114" y2="147" class="st-ink sw-2"/>
+        <line x1="186" y1="51" x2="186" y2="147" class="st-ink sw-2"/><line x1="258" y1="51" x2="258" y2="147" class="st-ink sw-2"/>
+        <line x1="150" y1="196" x2="150" y2="208"/>
+        <rect x="14" y="16" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="42" y="33" class="tx-mid tx-mono tx-sm">P0</text>
+        <rect x="86" y="16" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="114" y="33" class="tx-mid tx-mono tx-sm">P1</text>
+        <rect x="158" y="16" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="186" y="33" class="tx-mid tx-mono tx-sm">P2</text>
+        <rect x="230" y="16" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="258" y="33" class="tx-mid tx-mono tx-sm">P3</text>
+        <rect x="14" y="40" width="56" height="22" rx="2" class="fi-paper"/><text x="42" y="56" class="tx-mid tx-mono tx-sm">L3·0</text>
+        <rect x="86" y="40" width="56" height="22" rx="2" class="fi-paper"/><text x="114" y="56" class="tx-mid tx-mono tx-sm">L3·1</text>
+        <rect x="158" y="40" width="56" height="22" rx="2" class="fi-paper"/><text x="186" y="56" class="tx-mid tx-mono tx-sm">L3·2</text>
+        <rect x="230" y="40" width="56" height="22" rx="2" class="fi-paper"/><text x="258" y="56" class="tx-mid tx-mono tx-sm">L3·3</text>
+        <rect x="14" y="112" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="42" y="129" class="tx-mid tx-mono tx-sm">P4</text>
+        <rect x="86" y="112" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="114" y="129" class="tx-mid tx-mono tx-sm">P5</text>
+        <rect x="158" y="112" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="186" y="129" class="tx-mid tx-mono tx-sm">P6</text>
+        <rect x="230" y="112" width="56" height="24" rx="3" class="fi-paper sw-2"/><text x="258" y="129" class="tx-mid tx-mono tx-sm">P7</text>
+        <rect x="14" y="136" width="56" height="22" rx="2" class="fi-paper"/><text x="42" y="152" class="tx-mid tx-mono tx-sm">L3·4</text>
+        <rect x="86" y="136" width="56" height="22" rx="2" class="fi-paper"/><text x="114" y="152" class="tx-mid tx-mono tx-sm">L3·5</text>
+        <rect x="158" y="136" width="56" height="22" rx="2" class="fi-paper"/><text x="186" y="152" class="tx-mid tx-mono tx-sm">L3·6</text>
+        <rect x="230" y="136" width="56" height="22" rx="2" class="fi-paper"/><text x="258" y="152" class="tx-mid tx-mono tx-sm">L3·7</text>
+        <text x="150" y="182" class="tx-mid tx-sm">mesh network-on-chip</text>
+        <rect x="96" y="208" width="108" height="28" rx="3" class="fi-paper sw-2"/>
+        <text x="150" y="227" class="tx-mid tx-sm">main memory</text>
+      </svg>
+      <p class="fig-label">Many cores: L3 banks on a mesh</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Left: the centralized shared-memory multicore of H&amp;P (notes, Fig. 35) — private L1 and L2 per core, one shared L3, one memory. Right: with more cores, one L3 and one bus become the bottleneck; the L3 is split into banks spread over the chip, and cores and banks talk over a network-on-chip, so several requests are served at once.</figcaption>
+  </figure>
+
+  <p>Beyond about eight cores, one shared L3 and one memory controller become the bottleneck (p. 433). The L3 is cut into banks placed around the chip, which serve requests in parallel, and the bus becomes a <mark class="key">network-on-chip</mark> (NoC): a mesh, a ring or a crossbar.</p>
+
+  <div class="pitfall"><p>"More than 8 cores means NUMA." The memory decides, not the core count. A 16-core chip with one memory system is UMA; a server with two 8-core sockets, each with its own memory, is NUMA. Read the "8-32 cores" that p. 435 files under DSM as multi-socket machines.</p></div>
+</section>
+
+<section id="l34-dsm">
+  <h2>DSM: one address space over four memories</h2>
+
+  <p>The notes explain a DSM with a university library system (pp. 434–435). Every faculty (a node) has its own library (a memory module); all the libraries together form one global catalogue (the address space); a student (a processor) can request any book (an address). A book from the own faculty comes quickly, one from another faculty rides the campus shuttle (the interconnect) and takes longer, and a central catalogue (the directory) records who borrowed which copy, so that everybody reads the latest version.</p>
+
+  <p><mark class="key">Distributed Shared Memory</mark> (DSM) is that machine: physical memory distributed among the nodes, one global shared address space, any location addressable by any processor — "distributed physically, shared logically" (p. 434). It is also called Cache-Coherent NUMA (cc-NUMA).</p>
+
+  <p>How can one address space live in four memories? The notes partition it (p. 436): Node 0 owns 0x0000–0x0FFF, Node 1 0x1000–0x1FFF, Node 2 0x2000–0x2FFF, and so on, so with four nodes Node 3 owns 0x3000–0x3FFF. Each node's memory controller serves its own range, and the owner of an address can be read off its top bits (Fig. 4).</p>
+
+  <figure class="fig fig--plain" id="l34-fig-addr">
+    <svg class="dia" viewBox="0 0 560 176" role="img" aria-label="The 14-bit address 0x2200 split into a 2-bit node field, 10, which names node 2, and a 12-bit field, 0x200, the byte inside the memory of node 2">
+      <text x="60" y="18" class="tx-sm tx-muted">address 0x2200, 14 bits</text>
+      <text x="91" y="40" class="tx-mid tx-sm">node</text>
+      <text x="312" y="40" class="tx-mid tx-sm">byte inside the node’s memory</text>
+      <rect x="60" y="48" width="63" height="30" class="fw-s3 st-s3"/>
+      <rect x="123" y="48" width="377" height="30" class="fi-soft"/>
+      <text x="91" y="68" class="tx-mid tx-mono">10</text>
+      <text x="312" y="68" class="tx-mid tx-mono">0010 0000 0000</text>
+      <line x1="91" y1="80" x2="91" y2="104" marker-end="url(#arr)"/>
+      <line x1="312" y1="80" x2="312" y2="104" marker-end="url(#arr)"/>
+      <text x="91" y="126" class="tx-mid">home node N2</text>
+      <text x="312" y="126" class="tx-mid">byte 0x200 of MM2</text>
+      <text x="300" y="164" class="tx-mid tx-hand">top bits pick the node</text>
+    </svg>
+    <figcaption><b>Fig. 4.</b> Four nodes of 4 KiB make a global space of 16 KiB: 14-bit addresses. The top 2 bits name the node that owns the address, the low 12 bits the byte inside that node's memory. 0x2200 = 10 0010 0000 0000 lives in MM2, at offset 0x200. A field of the address picks the node, as the index field picks the set of a cache.</figcaption>
+  </figure>
+
+  <p>Now follow the notes' example, a processor in Node 0 that accesses 0x2200:</p>
+
+<pre><code>; on P0, R1 = 0x2200
+LD  F2, 0(R1)</code></pre>
+
+  <ol class="steps" id="l34-steps-route">
+    <li><p>P0 looks for 0x2200 in its cache C0 and misses. The request leaves the node and goes to the interconnect.</p></li>
+    <li><p>The interconnect routes it to Node 2, which owns 0x2000–0x2FFF: the top two bits of the address are 10.</p></li>
+    <li><p>Node 2's memory module MM2 reads the block at offset 0x200 and sends the data back across the network into C0; the load completes into F2.</p></li>
+    <li><p>Change R1 to 0x0200. The instruction is the same, but MM0 owns the address: the miss is served inside Node 0 and the network is never used. The program cannot tell the two cases apart; only the time differs.</p></li>
+  </ol>
+
+  <aside class="margin-note">In lesson 37 "remote node" narrows: a node that holds a cached copy of the block. Here a remote access is any access to another node's memory.</aside>
+
+  <p>The node whose memory holds an address is its <mark class="key">home node</mark>; the node whose processor issues the access is the <mark class="key">local node</mark> — here N2 and N0. The July 2024 paper asks it word for word, "What is the definition of home node?", about the NUMA picture of Fig. 2 with a directory D0 … D3 beside every memory, on an "Interconnection Network".</p>
+
+  <div class="def">
+    <p><dfn>Home node</dfn> — the node whose memory module holds an address, and the block that contains it; it is fixed by the physical address. In a directory protocol it also keeps the block's directory entry, so every request for the block goes through it. <dfn>Local node</dfn> — the node whose processor issues the request.</p>
+  </div>
+
+  <div class="story" data-year="1992">
+    <p>This vocabulary goes back to Stanford's DASH, "the first operational machine to include a scalable cache-coherence mechanism": up to 64 processors in clusters of four, joined by a directory. Its paper (Lenoski et al., IEEE Computer) calls home cluster "the cluster that contains the directory and physical memory for a given memory address".</p>
+  </div>
+
+  <div class="widget" id="l34-w-router">
+    <h3 class="widget-title">Where does an address live?</h3>
+    <p class="widget-intro">Four nodes as in the notes' example: Node 0 owns 0x0000–0x0FFF, Node 1 0x1000–0x1FFF, and so on. Type an address and choose the processor that loads it: the picture draws the miss to the home node and the data back. The slider places an array A of 4 KiB, 512 doubles, that a loop on the same processor reads from start to end. The model assumes 80 ns for a local miss and 240 ns for a remote one: round numbers, not measurements.</p>
+    <ol class="tasks">
+      <li>The widget starts with the notes' example: P0 accesses 0x2200. Before you look, say which node is home and how many times the access crosses the network. Then type 0x0200.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Home is N2: 0x2200 lies in 0x2000–0x2FFF. The request crosses the network to N2 and the data crosses it back, 240 ns. With 0x0200 the home is N0, P0's own node: MM0 serves the miss without the network, 80 ns. The instruction is the same; <b>the address alone decides where the data lives</b>.</p></details>
+      </li>
+      <li>Keep 0x2200 and let P2 issue the access instead. Predict the latency first.
+        <details class="answer"><summary>What you should see</summary>
+          <p>80 ns: the requester now sits in the home node, and the picture says "home = local". Local and remote are not properties of an address; they describe a processor and an address together.</p></details>
+      </li>
+      <li>Back to P0. A starts at 0x2000: predict the average miss latency of the loop. Then move A until the loop is as fast as it can be. Last, put A at 0x1800 and run the loop on P1.
+        <details class="answer"><summary>What you should see</summary>
+          <p>240 ns: all of A is homed in N2, so every miss is remote. With A at 0x0000 every miss is local, 80 ns, three times faster, and not one instruction changed. At 0x1800 A straddles N1 and N2: half of P1's misses are local, 0.5 × 80 + 0.5 × 240 = 160 ns. <b>One logically shared address space, physically distributed: data placement decides performance</b>, the NUMA limitation of p. 430.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l34-w-router', function (root, ui) {
+    var S = Course.svg, RANGE = 0x1000, TOP = 0x4000, ASIZE = 0x1000, T_LOC = 80, T_REM = 240;
+    var X0 = 40, W = 500;                                     /* the address strip: 0x0000 at x = 40, 0x4000 at x = 540 */
+    function hex(v) { var s = Math.round(v).toString(16).toUpperCase(); while (s.length < 4) s = '0' + s; return '0x' + s; }
+    function ax(a) { return X0 + a / TOP * W; }
+    function cx(k) { return X0 + (k + 0.5) * RANGE / TOP * W; }
+    function range(k) { return hex(k * RANGE) + '–' + hex(k * RANGE + RANGE - 1); }
+    function num(v) { return String(+v.toFixed(3)); }
+    function parse(s) {
+      var t = String(s == null ? '' : s).trim().replace(/^0x/i, '').replace(/h$/i, '').replace(/^0+(?=.)/, '');
+      if (!/^[0-9a-f]{1,4}$/i.test(t)) return null;
+      var v = parseInt(t, 16);
+      return v < TOP ? v : null;
+    }
+
+    var who = ui.select('access and loop run on', [0, 1, 2, 3].map(function (k) { return { value: String(k), label: 'P' + k }; }), null, '0');
+    var addrIn = Course.el('input', { type: 'text', id: 'l34-w-router-addr', 'class': 'l34-hex', value: '0x2200', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off', maxlength: '8' });
+    addrIn.addEventListener('input', function () { ui.changed(); });
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl' }, [
+      Course.el('label', { 'for': 'l34-w-router-addr' }, Course.el('span', { 'class': 'ctl-label', text: 'address of one access (hex)' })), addrIn]));
+    var base = ui.slider({ label: 'array A starts at', min: 0, max: 0x3000, step: 0x200, value: 0x2000, format: hex });
+    var roHome = ui.readout('home node'), roAcc = ui.readout('this access'),
+        roShare = ui.readout('A in the loop’s own node'), roAvg = ui.readout('average miss latency of the loop');
+    var note = ui.note('');
+    var svg = ui.svg(560, 334, { label: 'Four nodes N0 to N3, each with a processor, a cache and a memory module, above the interconnection network; the path of one access from the requesting processor to the home node of its address and back; below, the global address space from 0x0000 to 0x3FFF split into the four node ranges, with the typed address marked and the array A drawn where it lies' });
+    ui.legend([
+      { label: 'request: the miss travels to the home', color: 's2', mark: 'line' },
+      { label: 'data back to the cache', color: 's1', mark: 'line' },
+      { label: 'home node of the typed address', color: 's6', mark: 'dash' },
+      { label: 'part of A in the loop’s own node', color: 's1', mark: 'area' },
+      { label: 'part of A in other nodes', color: 's2', mark: 'area' },
+      { label: 'interconnection network', color: 'soft', mark: 'area' }
+    ]);
+
+    function state() {
+      var p = Course.clamp(+who.value || 0, 0, 3), a = parse(addrIn.value), b = base.value;
+      var on = [0, 1, 2, 3].map(function (k) { return Math.max(0, Math.min(b + ASIZE, (k + 1) * RANGE) - Math.max(b, k * RANGE)); });
+      var f = on[p] / ASIZE;
+      return { p: p, a: a, home: a === null ? null : Math.floor(a / RANGE), b: b, on: on, f: f, avg: f * T_LOC + (1 - f) * T_REM };
+    }
+    function poly(pts, cls, marker) {
+      S('polyline', { points: pts.map(function (q) { return q[0] + ',' + q[1]; }).join(' '), 'class': 'fi-none ' + cls, 'marker-end': marker }, svg);
+    }
+    function stepMark(x, y, n) {
+      S('circle', { cx: x, cy: y, r: 8, 'class': 'fi-paper' }, svg);
+      S('text', { x: x, y: y + 4, 'class': 'tx-mid tx-sm tx-bold', text: String(n) }, svg);
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var k, x;
+      for (k = 0; k < 4; k++) {
+        x = cx(k);
+        var isHome = st.home === k, isLoc = st.p === k;
+        if (isHome || isLoc) S('text', { x: x, y: 16, 'class': 'tx-mid tx-sm tx-bold', text: isHome && isLoc ? 'home = local' : isHome ? 'home' : 'local' }, svg);
+        S('line', { x1: x, y1: 84, x2: x, y2: 96 }, svg);
+        S('line', { x1: x, y1: 118, x2: x, y2: 130 }, svg);
+        S('line', { x1: x, y1: 158, x2: x, y2: 196 }, svg);
+        S('rect', { x: x - 56, y: 24, width: 112, height: 146, rx: 6, 'class': isHome ? 'fi-none st-s6 sw-3 dash' : 'fi-none st-muted dash' }, svg);
+        S('text', { x: x - 48, y: 42, 'class': 'tx-mono tx-sm', text: 'N' + k }, svg);
+        S('rect', { x: x - 32, y: 50, width: 64, height: 34, rx: 3, 'class': isLoc ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' }, svg);
+        S('text', { x: x, y: 72, 'class': 'tx-mid tx-mono', text: 'P' + k }, svg);
+        S('rect', { x: x - 22, y: 96, width: 44, height: 22, rx: 3, 'class': isLoc && st.home !== null ? 'fw-s2 st-s2' : 'fi-paper' }, svg);
+        S('text', { x: x, y: 111, 'class': 'tx-mid tx-mono tx-sm', text: 'C' + k }, svg);
+        S('rect', { x: x - 32, y: 130, width: 64, height: 28, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+        S('text', { x: x, y: 149, 'class': 'tx-mid tx-mono tx-sm', text: 'MM' + k }, svg);
+      }
+      S('rect', { x: 14, y: 196, width: 532, height: 20, rx: 4, 'class': 'fi-soft' }, svg);
+
+      if (st.home !== null) {
+        var xp = cx(st.p), xh = cx(st.home);
+        if (st.home === st.p) {
+          poly([[xp - 22, 104], [xp - 44, 104], [xp - 44, 138], [xp - 32, 138]], 'st-s2 sw-2', 'url(#arr-s2)');
+          poly([[xp + 32, 150], [xp + 44, 150], [xp + 44, 110], [xp + 22, 110]], 'st-s1 sw-2', 'url(#arr-s1)');
+          stepMark(xp - 44, 121, 1); stepMark(xp + 44, 130, 2);
+        } else {
+          var d = xh > xp ? 1 : -1;
+          poly([[xp + d * 22, 104], [xp + d * 42, 104], [xp + d * 42, 202], [xh - d * 42, 202], [xh - d * 42, 138], [xh - d * 32, 138]], 'st-s2 sw-2', 'url(#arr-s2)');
+          poly([[xh - d * 32, 150], [xh - d * 48, 150], [xh - d * 48, 210], [xp + d * 48, 210], [xp + d * 48, 112], [xp + d * 22, 112]], 'st-s1 sw-2', 'url(#arr-s1)');
+          stepMark(xp + d * 42, 178, 1); stepMark((xp + xh) / 2, 202, 2); stepMark(xh - d * 48, 178, 3);
+        }
+      }
+
+      for (k = 0; k < 4; k++) {
+        S('rect', { x: X0 + k * W / 4, y: 250, width: W / 4, height: 24, 'class': 'fi-paper' }, svg);
+        S('text', { x: cx(k), y: 267, 'class': 'tx-mid tx-mono tx-sm', text: 'N' + k }, svg);
+      }
+      for (k = 0; k < 4; k++) if (st.on[k] > 0) {
+        var lo = Math.max(st.b, k * RANGE);
+        S('rect', { x: ax(lo), y: 282, width: st.on[k] / TOP * W, height: 20, 'class': k === st.p ? 'fw-s1 st-s1' : 'fw-s2 st-s2 dash' }, svg);
+      }
+      S('text', { x: 30, y: 297, 'class': 'tx-end tx-mono tx-sm tx-bold', text: 'A' }, svg);
+      [0, 0x1000, 0x2000, 0x3000, 0x4000].forEach(function (v, i) {
+        S('line', { x1: ax(v), y1: 246, x2: ax(v), y2: 306, 'class': 'st-muted' }, svg);
+        S('text', { x: ax(v), y: 324, 'class': 'tx-mono tx-sm' + (i === 0 ? '' : i === 4 ? ' tx-end' : ' tx-mid'), text: i === 4 ? '0x3FFF' : hex(v) }, svg);
+      });
+      if (st.a !== null) {
+        var xa = ax(st.a);
+        S('line', { x1: xa, y1: 248, x2: xa, y2: 304, 'class': 'hl' }, svg);
+        S('line', { x1: xa, y1: 244, x2: xa, y2: 306, 'class': 'st-ink sw-2' }, svg);
+        S('text', { x: xa < 80 ? xa - 4 : xa > 500 ? xa + 4 : xa, y: 238, 'class': 'tx-mono tx-sm' + (xa < 80 ? '' : xa > 500 ? ' tx-end' : ' tx-mid'), text: hex(st.a) }, svg);
+      }
+    }
+
+    ui.onChange(function () {
+      var st = state(), acc, loop, el = st.on[st.p] / 8;
+      if (st.a === null) {
+        roHome.set('—'); roAcc.set('type an address from 0x0000 to 0x3FFF');
+        acc = 'This machine has addresses 0x0000 to 0x3FFF: type one of them, with or without 0x. ';
+      } else if (st.home === st.p) {
+        roHome.set('N' + st.home + ' (' + range(st.home) + ')'); roAcc.set('local · ' + T_LOC + ' ns');
+        acc = hex(st.a) + ' lies in ' + range(st.home) + ', the memory of P' + st.p + '’s own node: home and local coincide. The miss (1) is served by MM' + st.home + ' (2) without using the network: ' + T_LOC + ' ns. ';
+      } else {
+        roHome.set('N' + st.home + ' (' + range(st.home) + ')'); roAcc.set('remote · ' + T_REM + ' ns');
+        acc = 'P' + st.p + ' misses in C' + st.p + ' (1); ' + hex(st.a) + ' lies in ' + range(st.home) + ', so the network takes the request to N' + st.home + ' (2); MM' + st.home + ' sends the data back (3). A remote access: ' + T_REM + ' ns. ';
+      }
+      roShare.set(el + ' of 512 elements (' + Course.fmt(100 * st.f, 1) + '%)');
+      roAvg.set(Course.fmt(st.avg, 0) + ' ns');
+      loop = 'The loop on P' + st.p + ' reads A = ' + hex(st.b) + '–' + hex(st.b + ASIZE - 1) + ': ' + el + ' of its 512 doubles are homed in N' + st.p + ', so the average miss costs ' + num(st.f) + ' × 80 + ' + num(1 - st.f) + ' × 240 = ' + Course.fmt(st.avg, 0) + ' ns.';
+      note.set(acc + loop);
+      draw(st);
+    });
+  });
+  </script>
+
+  <p>The second half of the widget is the formula behind "performance depends on data placement" (p. 430). If a fraction \(f\) of a loop's misses find their block in the local memory:</p>
+
+  <div class="formula">
+    \[ t_{\text{avg}} = f \cdot t_{\text{local}} + (1 - f) \cdot t_{\text{remote}} \]
+    <dl class="legend">
+      <dt>\(f\)</dt><dd>fraction of the misses whose home is the local node</dd>
+      <dt>\(t_{\text{local}}\), \(t_{\text{remote}}\)</dt><dd>latency of one local and one remote access; the widget assumes 80 ns and 240 ns</dd>
+    </dl>
+  </div>
+
+  <p>With 70% local misses, 0.7 × 80 + 0.3 × 240 = 56 + 72 = 128 ns; with 95%, 76 + 12 = 88 ns. Placement alone makes the average 45% longer.</p>
+
+  <p>Why reach into another node's memory at all? Because parallel programs share data (p. 437): an array that Node 0 initializes and Node 1 processes in place, a lock in Node 3's memory that Node 0 must acquire, the border cells of a simulation grid spread over the nodes. "If no processor could access remote memory, it wouldn't be ‘shared memory’ anymore; it would be pure message passing." With private memories the programmer would orchestrate every transfer — <code>send(array, Node 1)</code> here, <code>receive(array, Node 0)</code> there — while in a DSM "a simple load/store suffices" (p. 437): easier to program, harder to build.</p>
+
+  <aside class="redpen" data-page="436">
+    <p class="claim">"In particular, what does it mean that the memory is shared physically but not logically?"</p>
+    <p class="fix">The other way round: in a DSM the memory is distributed physically and shared logically — several memory modules, one address space.</p>
+    <p class="because">The notes' own definition two pages earlier reads "distributed physically, shared logically" (p. 434), and the box itself answers its question with exactly that: one memory controller per node, one set of addresses for all. At the exam the order of the words is the answer: the January 2026 quiz (p. 505) wants "Distributed Memory; Single Logically Shared Address Space".</p>
+  </aside>
+
+  <p>Two pieces of hardware make it work. The interconnect moves cache lines between nodes and routes each request to the memory module that owns the block: a crossbar in small systems, a 2-D mesh, a torus or a fat tree in larger ones, a NoC inside a chip (p. 436). And since a DSM has no single bus to snoop, and broadcasting every write would not scale, a <mark class="key">directory</mark> records which caches hold a copy of each block. It is stored alongside each memory block, at its home, and only the caches it lists are notified (p. 435); <a href="l37.html">lessons 37</a> and <a href="l38.html">38</a> run it message by message.</p>
+
+  <details class="why">
+    <summary>Who decides which node's memory gets an array?</summary>
+    <p>The notes say only that "the system (hardware + OS) automatically decides" whether an address is local or remote (p. 434). Placement is a second decision. The hardware fixes which physical addresses each node owns; the operating system chooses the physical pages that a program's data receive — commonly with a first-touch policy, from the memory of the node whose processor touches the page first. (Background, not in the notes.)</p>
+  </details>
+
+  <p class="memo"><mark class="key">In a DSM the address decides the home node; local or remote is a relation between the processor and that address. The program is the same either way; only the latency changes.</mark></p>
+</section>
+
+<section id="l34-cluster">
+  <h2>Clusters: separate computers that talk by messages</h2>
+
+  <p>Now take four ordinary servers in a rack. Each has its own processors, often multicore, its own private memory, a local disk and its own instance of the operating system; Ethernet, InfiniBand or another high-speed fabric joins them. That is a <mark class="key">cluster</mark> (p. 438). There is no shared address space: P0's load of 0x2200 reads P0's own memory, whatever Node 2 keeps at that number.</p>
+
+  <p>Nodes communicate by explicit message passing: a process in Node A calls <code>send(message, Node B)</code>, a process in Node B calls <code>receive(message, Node A)</code> (p. 438). The receive waits until the message has arrived (Fig. 5), so every send/receive pair is a synchronization point, and the network latency is paid in full.</p>
+
+  <figure class="fig fig--plain" id="l34-fig-mpi">
+    <svg class="dia" viewBox="0 0 560 200" role="img" aria-label="Timeline of two processes: P0 computes until time 6 and sends a message; P1 computes until time 3, then waits in its receive until the message arrives at time 8, then both compute">
+      <text x="86" y="52" class="tx-end tx-mono">P0</text>
+      <text x="86" y="132" class="tx-end tx-mono">P1</text>
+      <rect x="100" y="34" width="177" height="26" class="fw-s1 st-s1"/>
+      <rect x="283" y="34" width="237" height="26" class="fw-s1 st-s1"/>
+      <rect x="277" y="30" width="6" height="34" class="fi-s1"/>
+      <text x="280" y="22" class="tx-mid tx-mono tx-sm">MPI_Send</text>
+      <rect x="100" y="114" width="90" height="26" class="fw-s1 st-s1"/>
+      <rect x="190" y="114" width="150" height="26" class="fw-s2 st-s2 dash"/>
+      <rect x="340" y="114" width="180" height="26" class="fw-s1 st-s1"/>
+      <text x="190" y="104" class="tx-mono tx-sm">MPI_Recv</text>
+      <text x="265" y="132" class="tx-mid tx-sm">waits</text>
+      <line x1="283" y1="62" x2="336" y2="111" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="330" y="84" class="tx-sm halo">message</text>
+      <line x1="100" y1="164" x2="528" y2="164" class="st-muted" marker-end="url(#arr-muted)"/>
+      <text x="86" y="168" class="tx-end tx-sm tx-muted">time</text>
+      <text x="100" y="184" class="tx-mid tx-sm tx-muted">0</text>
+      <text x="190" y="184" class="tx-mid tx-sm tx-muted">3</text>
+      <text x="280" y="184" class="tx-mid tx-sm tx-muted">6</text>
+      <text x="340" y="184" class="tx-mid tx-sm tx-muted">8</text>
+      <text x="520" y="184" class="tx-mid tx-sm tx-muted">14</text>
+    </svg>
+    <figcaption><b>Fig. 5.</b> Explicit communication between two processes of a cluster. P1 reaches its receive at time 3 and stops (orange) until the message of P0 arrives at time 8: every send/receive pair is a synchronization point, and the network latency, here from 6 to 8, is paid in full.</figcaption>
+  </figure>
+
+  <p>The software is <mark class="key">MPI</mark> (Message Passing Interface), the de facto standard of high-performance computing: not a language but a specification plus libraries, for C, C++ and Fortran and with Python bindings (p. 438). Processes that share no memory must exchange messages to cooperate; a standard interface makes their programs portable across machines and vendors.</p>
+
+  <p>Clusters win on scale and cost (pp. 438–439). They grow from a few nodes to tens of thousands, and memory grows linearly with them, since every node brings its own DRAM. They are built from off-the-shelf servers and network gear, cheaper than custom supercomputers, and they run scientific computing, data analytics and AI training at scale; they are the dominant architecture of cloud datacenters, where each server is one node. They also isolate faults: one node can fail without crashing the system, because nothing is shared with it.</p>
+
+  <p>The bill goes to the programmer (p. 439): the data must be partitioned explicitly and every transfer orchestrated — "who owns the data", "when to send it". The network latency is much larger than a local memory access, the bandwidth between nodes lower than to the local DRAM, and every send/receive pair costs coordination.</p>
+
+  <p class="memo"><mark class="key">A DSM and a cluster can be built from the same boxes. The difference is the address space: one address space and one operating system, reached by loads and stores, or one of each per node, reached by messages.</mark></p>
+</section>
+
+<section id="l34-models">
+  <h2>Three ways to program the machine</h2>
+
+  <p>A programming model is the same choice seen from the software: "the software-level abstraction that maps onto the underlying hardware organization" (p. 440). It fixes how processors communicate — through a common memory, by explicit messages, or by all running the same program on different pieces of data — and the primitives that express parallelism: threads, send/receive, barriers.</p>
+
+  <h3>Shared memory</h3>
+  <p>Threads communicate through shared variables — Thread 0 writes <code>x = 42</code>, Thread 1 later reads <code>x</code> — on any machine with one address space, UMA or NUMA (p. 440). Locks, semaphores, barriers and atomic operations prevent race conditions; the tools are OpenMP (pragmas for parallel loops), POSIX threads, Java or C# threads. It is the natural model for SMPs and multicores; coherence traffic, placement on NUMA and synchronization limit it at scale (p. 441).</p>
+
+  <h3>Message passing</h3>
+  <p>Process A calls <code>MPI_Send(data, dest=B)</code>, Process B calls <code>MPI_Recv(data, source=A)</code>; groups use collective operations — broadcast, scatter/gather, reduce, barriers (p. 441). The model scales to thousands of nodes with no coherence problem and explicit control of locality, at the price of complex programming, network overhead and waiting at the send/receive points (pp. 441–442).</p>
+
+  <h3>Data parallel: one program, many slices</h3>
+  <p>The third model starts from the data: the same operation on different elements of a large data set. All processors run the same program, each on its own portion — <mark class="key">SPMD</mark>, Single Program, Multiple Data (p. 442). The notes add two 1000-element vectors A and B on four processors: Proc 0 takes indices 0–249, Proc 1 250–499, Proc 2 500–749, Proc 3 750–999, each with the same loop.</p>
+
+<pre><code>/* on every processor p = 0 … 3 */
+for (i = 250*p; i &lt; 250*(p+1); i++)
+    C[i] = A[i] + B[i];
+barrier();</code></pre>
+
+  <p>Data-parallel programs move in <mark class="key">bulk-synchronous</mark> phases: local computation on local data, then global communication or a barrier, then the next phase — the BSP model formalized by Leslie Valiant (p. 442). The barrier is also the weak spot: a phase lasts as long as its slowest processor (Fig. 6).</p>
+
+  <figure class="fig fig--pair" id="l34-fig-bsp">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="Balanced step: four processors each add 250 elements and reach the barrier together at time 250">
+        <text x="58" y="41" class="tx-end tx-sm">Proc 0</text>
+        <text x="58" y="81" class="tx-end tx-sm">Proc 1</text>
+        <text x="58" y="121" class="tx-end tx-sm">Proc 2</text>
+        <text x="58" y="161" class="tx-end tx-sm">Proc 3</text>
+        <rect x="66" y="24" width="125" height="26" class="fw-s1 st-s1"/><text x="128" y="41" class="tx-mid tx-mono tx-sm">0–249</text>
+        <rect x="66" y="64" width="125" height="26" class="fw-s1 st-s1"/><text x="128" y="81" class="tx-mid tx-mono tx-sm">250–499</text>
+        <rect x="66" y="104" width="125" height="26" class="fw-s1 st-s1"/><text x="128" y="121" class="tx-mid tx-mono tx-sm">500–749</text>
+        <rect x="66" y="144" width="125" height="26" class="fw-s1 st-s1"/><text x="128" y="161" class="tx-mid tx-mono tx-sm">750–999</text>
+        <line x1="191" y1="14" x2="191" y2="178" class="st-ink sw-3"/>
+        <text x="191" y="198" class="tx-mid tx-sm">barrier at 250</text>
+      </svg>
+      <p class="fig-label">Balanced: the barrier at 250</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="Unbalanced step: three processors add 200 elements and then wait, the fourth adds 400, so the barrier comes at time 400">
+        <text x="58" y="41" class="tx-end tx-sm">Proc 0</text>
+        <text x="58" y="81" class="tx-end tx-sm">Proc 1</text>
+        <text x="58" y="121" class="tx-end tx-sm">Proc 2</text>
+        <text x="58" y="161" class="tx-end tx-sm">Proc 3</text>
+        <rect x="66" y="24" width="100" height="26" class="fw-s1 st-s1"/><text x="116" y="41" class="tx-mid tx-mono tx-sm">0–199</text>
+        <rect x="66" y="64" width="100" height="26" class="fw-s1 st-s1"/><text x="116" y="81" class="tx-mid tx-mono tx-sm">200–399</text>
+        <rect x="66" y="104" width="100" height="26" class="fw-s1 st-s1"/><text x="116" y="121" class="tx-mid tx-mono tx-sm">400–599</text>
+        <rect x="66" y="144" width="200" height="26" class="fw-s1 st-s1"/><text x="166" y="161" class="tx-mid tx-mono tx-sm">600–999</text>
+        <rect x="166" y="24" width="100" height="26" class="fw-s2 st-s2 dash"/><text x="216" y="41" class="tx-mid tx-sm">wait</text>
+        <rect x="166" y="64" width="100" height="26" class="fw-s2 st-s2 dash"/><text x="216" y="81" class="tx-mid tx-sm">wait</text>
+        <rect x="166" y="104" width="100" height="26" class="fw-s2 st-s2 dash"/><text x="216" y="121" class="tx-mid tx-sm">wait</text>
+        <line x1="266" y1="14" x2="266" y2="178" class="st-ink sw-3"/>
+        <text x="246" y="198" class="tx-mid tx-sm">barrier at 400</text>
+      </svg>
+      <p class="fig-label">One straggler: the barrier at 400</p>
+    </div>
+    <figcaption><b>Fig. 6.</b> One bulk-synchronous step of the addition of two 1000-element vectors on four processors, one time unit per element. Balanced (left), all four reach the barrier at 250. Suppose instead that Proc 3 holds 400 elements (right): the barrier comes at 400 and the other three wait 200 units each — 1000 units of work in 4 × 400 = 1600 processor-units of time, 62.5% efficiency.</figcaption>
+  </figure>
+
+  <p>Data parallelism runs on SIMD and vector machines, on GPUs where CUDA or OpenCL launch thousands of threads running the same kernel, on multicores with <code>#pragma omp parallel for</code>, and on MapReduce or Spark clusters (pp. 442–443). It is simple, scales when the data are large and split evenly, and keeps GPUs and vector units busy; it suffers from load imbalance and stragglers, and suits regular, array-like work, not trees or graphs (p. 443).</p>
+
+  <figure class="tbl-fig" id="l34-tbl-models">
+    <figcaption>The three programming models side by side (notes, pp. 440–443).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Model</th><th>Processors communicate by</th><th>Fits</th><th>Tools</th><th>Pays with</th></tr></thead>
+        <tbody>
+          <tr><td>Shared memory</td><td>loads and stores to shared variables; locks, barriers, atomics</td><td>UMA and NUMA machines, multicores</td><td>OpenMP, POSIX threads</td><td>coherence traffic, placement on NUMA, synchronization</td></tr>
+          <tr><td>Message passing</td><td>explicit send / receive; broadcast, scatter / gather, reduce</td><td>clusters</td><td>MPI</td><td>harder programming, network latency, waiting at send / receive</td></tr>
+          <tr><td>Data parallel (SPMD)</td><td>the same program on its own slice; a barrier between phases</td><td>vector units, GPUs, multicores, MapReduce / Spark clusters</td><td>CUDA, OpenCL, OpenMP, MPI</td><td>load imbalance, stragglers, regular data only</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>"SPMD is SIMD." No. In SPMD each processor has its own program counter and may take different branches: a programming style on MIMD hardware, as with MPI or OpenMP. SIMD is hardware running one instruction stream on many data elements in lock step (<a href="l30.html">lesson 30</a>).</p></div>
+</section>
+
+<section id="l34-axes">
+  <h2>Two axes, four machines</h2>
+
+  <p>Put the two questions side by side. The address-space model, shared or private, and the physical memory organization, centralized or distributed, are orthogonal: "choosing one does not force the other" (p. 431). All four combinations exist (p. 430).</p>
+
+  <figure class="tbl-fig" id="l34-tbl-axes">
+    <figcaption>The two axes and the four machines (notes, pp. 430–431).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Centralized memory</th><th>Distributed memory</th></tr></thead>
+        <tbody>
+          <tr><th>Shared address space</th><td>UMA: the classic SMP, a multicore chip</td><td>NUMA: DSM, cc-NUMA</td></tr>
+          <tr><th>Private address spaces</th><td>rare: MPI processes on one SMP box</td><td>clusters, large-scale MPI machines</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>The only unfamiliar cell is private and centralized: MPI processes on one SMP box, each in its own address space, exchanging copies through the one memory — "rare, but possible in small message-passing systems" (p. 430). The January 2026 quiz, though, gives a picture, not a name.</p>
+
+  <div class="widget" id="l34-w-axes">
+    <h3 class="widget-title">Sort the four machines</h3>
+    <p class="widget-intro">Four machines, drawn in the style of the exam picture. Choose a machine, decide its cell, then press the button of that cell. A right answer stays in the grid; a wrong one tells you which axis you misread and underlines the clues.</p>
+    <ol class="tasks">
+      <li>Machine 1 is the January 2026 picture of the hook. Before you press anything, count its memory modules — that gives the column — then read the small labels next to them — that gives the row. Then press your cell.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Shared · distributed, a DSM (cc-NUMA). One memory module in every node and no central memory: distributed. Every module answers to P0, P1, P2, P3, so loads and stores reach all of them: one logically shared address space. That is Answer 3 of the quiz.</p></details>
+      </li>
+      <li>Select Machine 3 and compare it, box by box, with Machine 1. What is different? Predict its cell before you press.
+        <details class="answer"><summary>What you should see</summary>
+          <p>The boxes are identical; only the labels and the network changed. Each memory answers to its own processor only, and data crosses the network as messages: private · distributed, a cluster — Answer 4 of the quiz. <b>"Shared memory" is about addresses, not about where the chips are.</b></p></details>
+      </li>
+      <li>Machines 2 and 4 each have a single memory. Predict both cells, then check.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Machine 2: one memory that every processor addresses — shared · centralized, the UMA SMP of Fig. 2. Machine 4: one physical memory cut into four private parts, one per process, which exchange messages — private · centralized, MPI processes on one box, the rare cell. Again a pair of hardware twins that differ only in the labels.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l34-w-axes', function (root, ui) {
+    var S = Course.svg;
+    var CELL = { 'shared|centralized': 'UMA / SMP', 'shared|distributed': 'DSM / cc-NUMA', 'private|centralized': 'MPI on one box', 'private|distributed': 'cluster' };
+    var M = [
+      { name: 'Machine 1 (the January 2026 picture)', draw: 'dist', own: false, bar: '', row: 'shared', col: 'distributed',
+        desc: 'Machine 1, the picture of the January 2026 quiz: nodes N0 … N3, each with a processor, a cache and a memory module; every module is labelled P0, P1, P2, P3.',
+        right: 'Right: shared · distributed, a DSM (cc-NUMA). Column: a memory module in every node and no central memory. Row: every module answers to P0, P1, P2, P3, so loads and stores reach all of them. This is Answer 3 of the quiz. Its hardware twin is Machine 3.' },
+      { name: 'Machine 2', draw: 'cent', own: false, bar: 'Interconnection Network', row: 'shared', col: 'centralized',
+        desc: 'Machine 2: processors P0 … P3 with their caches on an interconnection network, and one memory module below it, labelled P0, P1, P2, P3.',
+        right: 'Right: shared · centralized, UMA: the classic SMP of Fig. 2 (the notes’ Fig. 34). One memory, equally far from every processor and addressable by all. Its hardware twin is Machine 4.' },
+      { name: 'Machine 3', draw: 'dist', own: true, bar: 'messages: send / receive', row: 'private', col: 'distributed',
+        desc: 'Machine 3: nodes N0 … N3, each with a processor, a cache and a memory module; each module is labelled with its own processor only, and the network carries messages.',
+        right: 'Right: private · distributed, a cluster. The boxes are those of Machine 1; only the labels changed: each memory answers to its own processor, so data crosses the network as messages. A real cluster also runs one operating system per node.' },
+      { name: 'Machine 4', draw: 'cent', own: true, bar: 'messages: send / receive', row: 'private', col: 'centralized',
+        desc: 'Machine 4: processors P0 … P3 with their caches, and one physical memory below, cut into four parts, one per processor; the processors exchange messages.',
+        right: 'Right: private · centralized, MPI processes on one SMP box, each in its own address space: the rare cell of p. 430. The boxes are those of Machine 2; only the labels changed.' }
+    ];
+    var placed = [false, false, false, false], verdict = null;
+    var pick = ui.select('machine to classify', M.map(function (m, i) { return { value: String(i), label: m.name }; }), function () { verdict = null; }, '0');
+    function cur() { return Course.clamp(+pick.value || 0, 0, 3); }
+    function attempt(row, col) {
+      var i = cur(), m = M[i], ok = m.row === row && m.col === col;
+      verdict = { i: i, row: row, col: col, ok: ok };
+      if (ok) placed[i] = true;
+    }
+    ui.button('shared · centralized', function () { attempt('shared', 'centralized'); });
+    ui.button('shared · distributed', function () { attempt('shared', 'distributed'); });
+    ui.button('private · centralized', function () { attempt('private', 'centralized'); });
+    ui.button('private · distributed', function () { attempt('private', 'distributed'); });
+    ui.button('Empty the grid', function () { placed = [false, false, false, false]; verdict = null; }, { kind: 'ghost', icon: 'refresh' });
+    var roV = ui.readout('your cell'), roN = ui.readout('machines placed');
+    var note = ui.note('');
+    var svg = ui.svg(560, 430, { label: 'The machine to classify, drawn as in the exam: processors, caches, memory modules with the processors that can address them, and the interconnection network; below it the two-by-two grid of address space, shared or private, by physical memory, centralized or distributed, with the machines placed so far' });
+    ui.legend([
+      { label: 'placed in its cell', color: 'good', mark: 'line' },
+      { label: 'not this cell', color: 'bad', mark: 'cross' },
+      { label: 'the clues: memories and their labels', color: 'ink', mark: 'hl' }
+    ]);
+
+    function brace(x, y0, y1) {
+      var m = (y0 + y1) / 2;
+      S('path', { d: 'M' + x + ' ' + y0 + 'Q' + (x + 6) + ' ' + y0 + ' ' + (x + 6) + ' ' + (y0 + 6) + 'L' + (x + 6) + ' ' + (m - 3) + 'L' + (x + 11) + ' ' + m + 'L' + (x + 6) + ' ' + (m + 3) + 'L' + (x + 6) + ' ' + (y1 - 6) + 'Q' + (x + 6) + ' ' + y1 + ' ' + x + ' ' + y1, 'class': 'fi-none st-ink' }, svg);
+    }
+    function allLabels(x, y0, y1, hint) {
+      brace(x, y0, y1);
+      if (hint) { S('line', { x1: x + 14, y1: y0 + 14, x2: x + 84, y2: y0 + 14, 'class': 'hl' }, svg); S('line', { x1: x + 14, y1: y0 + 36, x2: x + 84, y2: y0 + 36, 'class': 'hl' }, svg); }
+      S('text', { x: x + 16, y: y0 + 10, 'class': 'tx-mono tx-sm', text: 'P0, P1,' }, svg);
+      S('text', { x: x + 16, y: y0 + 32, 'class': 'tx-mono tx-sm', text: 'P2, P3' }, svg);
+    }
+    function machine(m, hint) {
+      var xs = [120, 410], ids = [0, 3], k, x, i;
+      if (m.draw === 'dist') {
+        for (k = 0; k < 2; k++) {
+          x = xs[k]; i = ids[k];
+          S('line', { x1: x, y1: 68, x2: x, y2: 82 }, svg);
+          S('line', { x1: x, y1: 104, x2: x, y2: 118 }, svg);
+          S('line', { x1: x, y1: 146, x2: x, y2: 186 }, svg);
+          S('rect', { x: x - 44, y: 8, width: 88, height: 160, rx: 4, 'class': 'fi-none st-muted dash' }, svg);
+          S('text', { x: x, y: 26, 'class': 'tx-mid tx-mono tx-bold', text: 'N' + i }, svg);
+          S('rect', { x: x - 32, y: 36, width: 64, height: 32, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+          S('text', { x: x, y: 57, 'class': 'tx-mid tx-mono', text: 'P' + i }, svg);
+          S('rect', { x: x - 22, y: 82, width: 44, height: 22, rx: 3, 'class': 'fi-paper' }, svg);
+          S('text', { x: x, y: 97, 'class': 'tx-mid tx-mono tx-sm', text: 'C' + i }, svg);
+          if (hint) S('line', { x1: x - 30, y1: 151, x2: x + 30, y2: 151, 'class': 'hl' }, svg);
+          S('rect', { x: x - 32, y: 118, width: 64, height: 28, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+          S('text', { x: x, y: 137, 'class': 'tx-mid tx-mono tx-sm', text: 'MM' + i }, svg);
+          if (m.own) {
+            if (hint) S('line', { x1: x + 50, y1: 142, x2: x + 118, y2: 142, 'class': 'hl' }, svg);
+            S('text', { x: x + 52, y: 137, 'class': 'tx-mono tx-sm', text: 'P' + i + ' only' }, svg);
+          } else allLabels(x + 48, 118, 146, hint);
+        }
+        [26, 57, 97].forEach(function (y) { S('text', { x: 272, y: y, 'class': 'tx-mid', text: '…' }, svg); });
+        S('rect', { x: 40, y: 186, width: 480, height: 16, rx: 3, 'class': 'fi-soft' }, svg);
+      } else {
+        for (k = 0; k < 2; k++) {
+          x = xs[k]; i = ids[k];
+          S('line', { x1: x, y1: 52, x2: x, y2: 66 }, svg);
+          S('line', { x1: x, y1: 88, x2: x, y2: 130 }, svg);
+          S('rect', { x: x - 44, y: 8, width: 88, height: 104, rx: 4, 'class': 'fi-none st-muted dash' }, svg);
+          S('rect', { x: x - 32, y: 20, width: 64, height: 32, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+          S('text', { x: x, y: 41, 'class': 'tx-mid tx-mono', text: 'P' + i }, svg);
+          S('rect', { x: x - 22, y: 66, width: 44, height: 22, rx: 3, 'class': 'fi-paper' }, svg);
+          S('text', { x: x, y: 81, 'class': 'tx-mid tx-mono tx-sm', text: 'C' + i }, svg);
+        }
+        [41, 81].forEach(function (y) { S('text', { x: 272, y: y, 'class': 'tx-mid', text: '…' }, svg); });
+        S('rect', { x: 40, y: 130, width: 480, height: 16, rx: 3, 'class': 'fi-soft' }, svg);
+        S('line', { x1: 280, y1: 146, x2: 280, y2: 178 }, svg);
+        if (m.bar) S('text', { x: 40, y: 166, 'class': 'tx-sm tx-muted', text: m.bar }, svg);
+        if (m.own) {
+          if (hint) S('line', { x1: 202, y1: 213, x2: 358, y2: 213, 'class': 'hl' }, svg);
+          S('rect', { x: 200, y: 178, width: 160, height: 30, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+          [240, 280, 320].forEach(function (xx) { S('line', { x1: xx, y1: 178, x2: xx, y2: 208, 'class': 'st-muted' }, svg); });
+          [0, 1, 2, 3].forEach(function (j) { S('text', { x: 220 + 40 * j, y: 198, 'class': 'tx-mid tx-mono tx-sm', text: 'P' + j }, svg); });
+        } else {
+          if (hint) S('line', { x1: 234, y1: 213, x2: 326, y2: 213, 'class': 'hl' }, svg);
+          S('rect', { x: 232, y: 178, width: 96, height: 30, rx: 3, 'class': 'fi-paper sw-2' }, svg);
+          S('text', { x: 280, y: 198, 'class': 'tx-mid tx-mono tx-sm', text: 'MM' }, svg);
+          allLabels(334, 178, 208, hint);
+        }
+        return;
+      }
+      if (m.bar) S('text', { x: 280, y: 226, 'class': 'tx-mid tx-sm tx-muted', text: m.bar }, svg);
+    }
+    function grid() {
+      S('text', { x: 245, y: 262, 'class': 'tx-mid tx-sm tx-bold', text: 'centralized memory' }, svg);
+      S('text', { x: 445, y: 262, 'class': 'tx-mid tx-sm tx-bold', text: 'distributed memory' }, svg);
+      S('text', { x: 72, y: 300, 'class': 'tx-mid tx-sm tx-bold', text: 'shared' }, svg);
+      S('text', { x: 72, y: 320, 'class': 'tx-mid tx-sm', text: 'address space' }, svg);
+      S('text', { x: 72, y: 378, 'class': 'tx-mid tx-sm tx-bold', text: 'private' }, svg);
+      S('text', { x: 72, y: 398, 'class': 'tx-mid tx-sm', text: 'address spaces' }, svg);
+      ['shared', 'private'].forEach(function (row, r) {
+        ['centralized', 'distributed'].forEach(function (col, c) {
+          var x = 150 + 200 * c, y = 272 + 78 * r;
+          S('rect', { x: x, y: y, width: 190, height: 70, rx: 4, 'class': 'fi-paper' }, svg);
+          S('text', { x: x + 10, y: y + 22, 'class': 'tx-sm tx-bold', text: CELL[row + '|' + col] }, svg);
+          M.forEach(function (m, i) {
+            if (placed[i] && m.row === row && m.col === col) {
+              S('text', { x: x + 10, y: y + 54, 'class': 'tx-mono tx-sm', text: 'Machine ' + (i + 1) }, svg);
+              S('path', { d: 'M' + (x + 118) + ' ' + (y + 46) + 'l6 6l12 -14', 'class': 'fi-none st-good sw-3' }, svg);
+            }
+          });
+          if (verdict && !verdict.ok && verdict.row === row && verdict.col === col) {
+            var a = x + 168, b = y + 47;
+            S('path', { d: 'M' + (a - 7) + ' ' + (b - 7) + 'l14 14M' + (a + 7) + ' ' + (b - 7) + 'l-14 14', 'class': 'fi-none st-bad sw-3' }, svg);
+          }
+        });
+      });
+    }
+
+    ui.onChange(function () {
+      var m = M[cur()], n = placed.filter(Boolean).length, txt;
+      if (!verdict) {
+        roV.set('—');
+        txt = m.desc + ' Pick a cell: count the memory modules for the column, then read the labels next to them for the row.';
+      } else {
+        var vm = M[verdict.i], rowOk = vm.row === verdict.row, colOk = vm.col === verdict.col;
+        roV.set(verdict.row + ' · ' + verdict.col + (verdict.ok ? ': right' : ': not this one'), verdict.ok ? 'good' : 'bad');
+        if (verdict.ok) txt = vm.right;
+        else if (rowOk) txt = 'The row is right, the column is not. Count the memory modules: ' + (vm.col === 'centralized' ? 'one memory, shared by all the processors, so centralized.' : 'one in every node, so distributed.');
+        else if (colOk) txt = 'The column is right, the row is not. Read the labels next to the memory: ' + (vm.row === 'shared' ? 'every processor is listed, so every processor can address it: one shared address space.' : 'each memory part answers to one processor only: private address spaces.');
+        else txt = 'Both axes are off. Count the memory modules for the column, then read the labels next to them for the row.';
+      }
+      if (n === 4) txt += ' All four cells are filled: Machines 1 and 3 have the same boxes, and so do Machines 2 and 4. The boxes set the column; the labels set the row.';
+      roN.set(n + ' of 4', n === 4 ? 'good' : undefined);
+      note.set(txt);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      machine(m, verdict !== null);
+      grid();
+    });
+  });
+  </script>
+
+  <p>Back to the quiz of the hook. The column first: every node has its own memory module and there is no central one, so the memory is distributed, and Answers 1 and 2 are out. Then the row: every module is labelled "P0, P1, P2, P3", so every processor can load and store every module — a single logically shared address space. That rules out Answer 4, in which each processor reaches only its own memory and communicates by send/receive. The answer is 3: distributed memory, single logically shared address space, a DSM. Give each memory only its own processor's label, and the same drawing becomes a cluster: Answer 4.</p>
+
+  <p class="memo"><mark class="key">"Shared memory" is about addresses, not about where the chips are: the number of memory modules sets the column, the processors that can address them set the row.</mark></p>
+</section>
+
+<section id="l34-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <p>The questions follow the forms of the papers: the January 2026 picture quiz, an open question with eight sub-points as in June 2026, a shorter question in the style of the 2024 directory question, a computation, and quizzes with multiple answers and a true/false. The model answers are written here; there are no official solutions.</p>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l34-exam-picture">
+    <div class="exam-q" lang="en">
+      <p>(SINGLE ANSWER) What type of multiprocessor architecture does the following picture represent?</p>
+      <figure class="fig fig--plain" id="l34-fig-exam">
+        <svg class="dia" viewBox="0 0 560 214" role="img" aria-label="Nodes N0 to N3, each with a processor, a cache and a memory module; every memory module is labelled P0, P1, P2, P3; all modules hang on one interconnection bar">
+          <line x1="120" y1="68" x2="120" y2="82"/><line x1="120" y1="104" x2="120" y2="118"/><line x1="120" y1="146" x2="120" y2="186"/>
+          <line x1="410" y1="68" x2="410" y2="82"/><line x1="410" y1="104" x2="410" y2="118"/><line x1="410" y1="146" x2="410" y2="186"/>
+          <rect x="76" y="8" width="88" height="160" rx="4" class="fi-none st-muted dash"/>
+          <rect x="366" y="8" width="88" height="160" rx="4" class="fi-none st-muted dash"/>
+          <text x="120" y="26" class="tx-mid tx-mono tx-bold">N0</text>
+          <text x="410" y="26" class="tx-mid tx-mono tx-bold">N3</text>
+          <rect x="88" y="36" width="64" height="32" rx="3" class="fi-paper sw-2"/><text x="120" y="57" class="tx-mid tx-mono">P0</text>
+          <rect x="378" y="36" width="64" height="32" rx="3" class="fi-paper sw-2"/><text x="410" y="57" class="tx-mid tx-mono">P3</text>
+          <rect x="98" y="82" width="44" height="22" rx="3" class="fi-paper"/><text x="120" y="97" class="tx-mid tx-mono tx-sm">C0</text>
+          <rect x="388" y="82" width="44" height="22" rx="3" class="fi-paper"/><text x="410" y="97" class="tx-mid tx-mono tx-sm">C3</text>
+          <rect x="88" y="118" width="64" height="28" rx="3" class="fi-paper sw-2"/><text x="120" y="137" class="tx-mid tx-mono tx-sm">MM0</text>
+          <rect x="378" y="118" width="64" height="28" rx="3" class="fi-paper sw-2"/><text x="410" y="137" class="tx-mid tx-mono tx-sm">MM3</text>
+          <path d="M168 118Q174 118 174 124L174 129L179 132L174 135L174 140Q174 146 168 146" class="fi-none st-ink"/>
+          <path d="M458 118Q464 118 464 124L464 129L469 132L464 135L464 140Q464 146 458 146" class="fi-none st-ink"/>
+          <text x="184" y="128" class="tx-mono tx-sm">P0, P1,</text>
+          <text x="184" y="150" class="tx-mono tx-sm">P2, P3</text>
+          <text x="474" y="128" class="tx-mono tx-sm">P0, P1,</text>
+          <text x="474" y="150" class="tx-mono tx-sm">P2, P3</text>
+          <text x="272" y="26" class="tx-mid">…</text>
+          <text x="272" y="57" class="tx-mid">…</text>
+          <text x="272" y="97" class="tx-mid">…</text>
+          <rect x="40" y="186" width="480" height="16" rx="3" class="fi-soft"/>
+        </svg>
+        <figcaption>The picture of the quiz, redrawn: N0 … N3, each with a processor, a cache and a memory module; every memory module is labelled P0, P1, P2, P3.</figcaption>
+      </figure>
+    </div>
+    <ul class="options" lang="en">
+      <li>Answer 1: Centralized Memory; Single Logically Shared Address Space <span class="fb">There is no central memory: every node has its own module, MM0 … MM3.</span></li>
+      <li>Answer 2: Centralized Memory; Message Passing Architectures <span class="fb">Wrong on both axes: the memory is in the nodes, and the labels say that every processor addresses every module.</span></li>
+      <li data-correct>Answer 3: Distributed Memory; Single Logically Shared Address Space <span class="fb">One memory per node (distributed), each addressable by P0–P3 (one shared address space): a DSM, also called NUMA.</span></li>
+      <li>Answer 4: Distributed Memory; Message Passing Architectures <span class="fb">The memory is distributed, but with message passing each module would answer to its own processor only; here every module lists P0, P1, P2, P3.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 3. Each node contains its own processor, private cache and memory module, so the memory is physically distributed and there is no single central memory: Answers 1 and 2 are wrong. Each memory module is annotated with P0, P1, P2, P3: every processor can access every module with ordinary loads and stores, so the memories form a single logically shared address space and Answer 4 is wrong. This is a Distributed Shared Memory (DSM) architecture, also known as NUMA.</p></div>
+      <div class="exam-note"><p>This is the quiz of the 8 January 2026 paper as the notes reproduce it (p. 505), options verbatim; the notes' answer, 3, is correct. Read the picture in two moves: count the memories for the column, read the labels for the row. If the paper asks you to motivate, one sentence per axis is the whole answer.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="8" id="l34-exam-theory">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following organizations and models used in multiprocessors: 1. Shared address space; 2. Private address spaces (message passing); 3. Centralized shared-memory multiprocessors (UMA / SMP); 4. Distributed shared-memory multiprocessors (NUMA / DSM); 5. Home node of a block in a DSM; 6. Small-scale multicores; 7. Distributed-memory clusters; 8. Data-parallel (SPMD) programming model. (Five lines each.)</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>1.</b> All processors see one logical memory: an address names the same location for every processor, any processor can load or store any address, and communication is implicit (one processor stores, another loads). Programmed with threads (Pthreads, OpenMP). Benefits: easy to program, handles irregular and dynamic sharing, low latency for small items, caches reduce remote traffic automatically. Costs: complex hardware (cache coherence), synchronization with locks and barriers, little control of data placement.</p>
+        <p><b>2.</b> Each processor has its own address space: the same address names different locations on different processors, no load or store crosses processors, and data moves by explicit send/receive (MPI_Send / MPI_Recv). Benefits: simple hardware with no coherence protocol, the programmer sees when and how much data moves, every send/receive synchronizes, explicit placement, fault isolation. Costs: harder programming, high overhead for fine-grain sharing, data decomposed by hand.</p>
+        <p><b>3.</b> One centralized physical memory shared by all processors, with the same latency and bandwidth whichever processor accesses it (symmetric). Processors with private caches, possibly a shared L3, reach it through a bus or crossbar; coherence by snooping. Benefits: the simplest programming (no data placement), sequential code ports easily, a uniform view for the OS. Limit: the single memory and interconnect saturate under contention, about 32 processors in classic designs.</p>
+        <p><b>4.</b> Memory physically distributed: each node is processor(s) + caches + a local memory module, and the nodes are joined by a scalable interconnection network. The union of the local memories is one global address space, so programs still use loads and stores. The access time depends on whether the address is in the local module (fast) or in a remote node (slower). Benefits: scales to hundreds of cores, aggregate memory bandwidth grows with the nodes. Costs: performance depends on data placement; a scalable network and directory-based coherence are needed.</p>
+        <p><b>5.</b> The home node of a block is the node whose main memory holds it, fixed by the physical address (if every node owns 4 KiB, N2 owns 0x2000–0x2FFF and the block of 0x2200 is homed in N2). In a directory protocol it also keeps the block's directory entry (state and sharer bits), stored with the block in its memory, so every request for the block goes through it. The local node is the node that issues the request. Benefit: the data and its coherence information are found from the address alone, without broadcasts.</p>
+        <p><b>6.</b> A multicore chip with a few cores (up to about 8, sometimes 16) is an SMP on a chip: identical cores, uniform access to one main memory, one shared-memory machine for the OS. Private L1 and L2 caches per core hold the working sets and reduce contention; a shared L3 cuts DRAM traffic and is where shared data meets; coherence by snooping on the shared bus. Beyond about 8 cores the L3 is split into banks and the bus becomes a network-on-chip (mesh, ring, crossbar), so several requests are served in parallel.</p>
+        <p><b>7.</b> A set of independent computers, each with its own processors, private memory, local disk and OS instance, connected by a network (Ethernet, InfiniBand); no shared address space, communication by explicit message passing with MPI. Benefits: scales to tens of thousands of nodes, memory grows linearly with the nodes, commodity hardware is cheap, one node can fail without crashing the system. Costs: harder programming (partition the data, orchestrate the messages), network latency much higher and bandwidth lower than local DRAM, synchronization at every send/receive.</p>
+        <p><b>8.</b> All processors run the same program, each on its own portion of the data (Single Program, Multiple Data): adding two 1000-element vectors, Proc 0 takes indices 0–249, …, Proc 3 750–999. Execution proceeds in bulk-synchronous phases: local computation, global communication or a barrier, next phase (Valiant's BSP model). Benefits: one simple program, high scalability for large and evenly split data, efficient on GPUs and vector units. Costs: load imbalance and stragglers stall everyone at the barrier; it suits regular array computations, not trees or graphs.</p>
+      </div>
+      <div class="exam-note"><p>The form is the June 2026 question: eight sub-points, about five lines each. Give three things in each: what it is, one concrete detail (a number, an example, an API) and the benefit with its cost. Sub-points 3 and 4 are best written as a pair, uniform against non-uniform latency; sub-point 5 is the July 2024 question "What is the definition of home node?".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l34-exam-home">
+    <div class="exam-q" lang="en">
+      <p>Consider a distributed shared memory system with 4 nodes (N0, N1, N2, N3); each node has a processor Pi, a cache Ci and a main memory MMi, and the nodes are connected by an interconnection network. Each node owns 4 KiB of the physical addresses: N0 from 0x0000 to 0x0FFF, N1 from 0x1000 to 0x1FFF, N2 from 0x2000 to 0x2FFF, N3 from 0x3000 to 0x3FFF. Processor P0 executes <code>LD F2, 0(R1)</code> with R1 = 0x2200 and misses in C0; no other cache holds a copy of the block.</p>
+      <p>1. What is the definition of home node? Which node is the home node of this access? 2. Which node is the local node? 3. Describe the path of the request and of the data. 4. What changes, and what does not change, if R1 = 0x0200?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>1. The home node of a block is the node whose main memory holds the block; it is fixed by the physical address, and in a directory protocol it also keeps the block's directory entry, so every request for the block goes through it. 0x2200 lies in 0x2000–0x2FFF: the home node is N2.</p>
+        <p>2. The local node is the node whose processor issues the request: N0.</p>
+        <p>3. C0 misses; the request leaves N0 and the interconnection network routes it, by address, to N2; MM2 supplies the block (offset 0x200 in its range); the data travels back to N0, is written into C0, and the load completes into F2. It is a remote access: two network crossings and a longer latency than a local access.</p>
+        <p>4. With 0x0200 the home is N0 itself: home and local coincide, and the miss is served by MM0 without using the network, with the shorter local latency. The program does not change — the same instruction in the same address space; only the latency changes.</p>
+      </div>
+      <div class="exam-note"><p>Sub-question 1 is the July 2024 question word for word. In the directory exercises a third role appears, the remote node: a node that holds a cached copy of the block (lesson 37). Here no other cache holds a copy, so there is none; do not call N2 "remote" in that exercise vocabulary.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="1.25" data-tol="0.01" id="l34-exam-cpi">
+    <div class="exam-q" lang="en">
+      <p>Let us consider a distributed shared-memory multiprocessor with 4 nodes (N0, N1, N2, N3) and a clock frequency of 1 GHz. With all memory references hitting in the caches, the CPI is 1. 0.5% of the instructions miss in the cache, and the processor stalls until the miss is served: 80 ns when the home node of the block is the local node, 240 ns when it is another node. Case A: the data of the program are interleaved evenly over the four nodes. Case B: the operating system places the data so that 75% of the misses find their block in the local node. How much is the speed up of case B over case A in terms of CPI?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>With \(T_{CLK} = 1\) ns, a local miss costs 80 clock cycles and a remote miss 240. Case A: a quarter of the blocks are homed in the local node, so the average miss penalty and the CPI are</p>
+        \[ 0.25 \times 80 + 0.75 \times 240 = 200 \]
+        \[ CPI_A = 1 + 0.005 \times 200 = 2 \]
+        <p>Case B:</p>
+        \[ 0.75 \times 80 + 0.25 \times 240 = 120 \]
+        \[ CPI_B = 1 + 0.005 \times 120 = 1.6 \]
+        <p>Speed up in terms of CPI:</p>
+        \[ \frac{CPI_A}{CPI_B} = \frac{2}{1.6} = 1.25 \]
+        <p>The same program on the same machine runs 25% faster only because of where its data are placed.</p>
+      </div>
+      <div class="exam-note"><p>Not a past-paper exercise: it is the formula sheet's CPI with stalls (CPI = 1 + stall cycles per instruction) with the average miss latency of section 3 as the penalty, asked the way the 2025 performance exercise and the 2026 VLIW exercise ("How much is the speed up in terms of CPI?") ask. The two traps: 0.5% is 0.005, and with four nodes an even spread makes only a quarter of the misses local, not half. <a href="l33.html">Lesson 33</a> works Hennessy &amp; Patterson's version: 0.2% of the instructions make a remote reference of 400 cycles, and a CPI of 0.5 becomes 1.3.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l34-exam-dsm">
+    <div class="exam-q" lang="en">
+      <p>(MULTIPLE ANSWERS) Which of the following statements about a distributed shared-memory (DSM, cc-NUMA) multiprocessor are true?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Answer 1: Any processor can access any memory location with ordinary load and store instructions. <span class="fb">The single global address space: the hardware routes the access to the home node.</span></li>
+      <li>Answer 2: Processors on different nodes must exchange explicit messages (send/receive) to share data. <span class="fb">That is a cluster. In a DSM a load or a store suffices.</span></li>
+      <li data-correct>Answer 3: The access time depends on whether the address belongs to the local memory module or to a remote node. <span class="fb">Non-uniform memory access: local inside the node, remote across the network.</span></li>
+      <li>Answer 4: Each node runs its own instance of the operating system. <span class="fb">A DSM is one machine with one OS; an OS instance per node is the mark of a cluster.</span></li>
+      <li data-correct>Answer 5: Cache coherence is typically maintained by a directory stored alongside each memory block. <span class="fb">Snooping a network does not scale; the directory notifies only the caches that hold a copy (p. 435).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 3 and 5. A DSM has physically distributed memory, a single logically shared address space reached by loads and stores, non-uniform latency, and directory-based coherence. Answers 2 and 4 describe a distributed-memory cluster.</p></div>
+      <div class="exam-note"><p>A multiple-answer quiz as in June 2026. The two wrong options are the cluster's features; sort each option by asking "load/store or send/receive?".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l34-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>(True/False) In a distributed-memory cluster programmed with MPI, a process can read a variable of a process running on another node with an ordinary load instruction.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Each node has its own private address space; the memory of another node is out of reach of loads and stores.</span></li>
+      <li data-correct>False <span class="fb">Right: the variable must be requested and sent as a message (MPI_Send / MPI_Recv).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. In a cluster every node has its own private memory and address space, and the memory of one node cannot be accessed directly by another node via loads and stores; data moves only through explicit messages, with MPI_Send and MPI_Recv.</p></div>
+      <div class="exam-note"><p>The true/false form of June 2025. The same statement is true for a DSM; the word "cluster" decides.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l34-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">On a machine with private address spaces, P0 and P1 both execute <code>LD F2, 0(R1)</code> with R1 = 0x2000. What do they load?</p>
+    <ul class="options">
+      <li>The same value, from the same memory cell <span class="fb">That is a shared address space; here each 0x2000 is a different cell.</span></li>
+      <li data-correct>Each the contents of its own 0x2000, two different cells <span class="fb">Same number, two locations. They hold the same value only if a message copied it.</span></li>
+      <li>P1's load faults, because 0x2000 belongs to P0 <span class="fb">Nothing of P0 is in P1's address space: P1 has its own complete set of addresses.</span></li>
+      <li>Whatever the last MPI_Send wrote into the shared cell <span class="fb">There is no shared cell; a receive copies the message into the receiver's own memory.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">With the latencies of the widget of section 3, 80 ns local and 240 ns remote, a loop's data are interleaved over the four nodes, so 25% of its misses are local. What is the average miss latency?</p>
+    <ul class="options">
+      <li>160 ns <span class="fb">That is the plain mean of 80 and 240; the fractions weigh them: 0.25 × 80 + 0.75 × 240.</span></li>
+      <li data-correct>200 ns <span class="fb">0.25 × 80 + 0.75 × 240 = 20 + 180 = 200 ns.</span></li>
+      <li>120 ns <span class="fb">That is 75% local: the two fractions are swapped.</span></li>
+      <li>240 ns <span class="fb">That would be every miss remote; a quarter of them are local.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which are disadvantages of the shared-address-space model? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>Building scalable, coherent shared memory is hard <span class="fb">Every copy of a block must agree: the coherence protocols of lessons 35 to 38.</span></li>
+      <li data-correct>Locks and barriers are needed to order the accesses <span class="fb">Communication is implicit, so the order must be enforced explicitly.</span></li>
+      <li data-correct>Little control over where shared data sits, which hurts on NUMA <span class="fb">Placement decides local or remote latency, and the program does not say where data goes.</span></li>
+      <li>Every transfer needs an explicit send and receive <span class="fb">That is the cost of message passing.</span></li>
+      <li>Caches cannot be used for shared data <span class="fb">They can, and they cut remote traffic; the price is coherence.</span></li>
+    </ul>
+    <p class="q-fb">The three costs mirror the three strengths of message passing: simple hardware, natural synchronization, placement control.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Which of these machines is NUMA?</p>
+    <ul class="options">
+      <li>A single chip with 16 cores, private L1 and L2, a shared L3 and one memory controller <span class="fb">One memory system for all cores: UMA, an SMP on a chip, with a banked L3 and a NoC if it is large.</span></li>
+      <li data-correct>A server with two 8-core sockets, each with its own memory <span class="fb">A core reaches the other socket's memory only across the link between the chips: local and remote latencies differ.</span></li>
+      <li>A cluster of 16 single-core servers <span class="fb">No shared address space at all: another node's data arrives only in messages, so there is no remote memory access to be slow.</span></li>
+      <li>A dual-core laptop chip <span class="fb">A small SMP: uniform access to one memory.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Four processors share a bulk-synchronous step; they receive 250, 250, 250 and 400 elements, one time unit per element. When does the step end?</p>
+    <ul class="options">
+      <li>At 287.5, the average load <span class="fb">The barrier waits for everybody, not for the average.</span></li>
+      <li data-correct>At 400 <span class="fb">The slowest processor sets the end of the phase; the others wait at the barrier.</span></li>
+      <li>At 1150, the sum <span class="fb">The processors work in parallel; the sum is the sequential time.</span></li>
+      <li>At 250, when most processors are done <span class="fb">Three are done at 250, but the barrier opens only when the fourth arrives.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why does a cluster survive the failure of one node better than a DSM?</p>
+    <ul class="options">
+      <li data-correct>Its nodes share no memory and no operating system, so a failure stays inside its node <span class="fb">Fault isolation (p. 439): nothing in the rest of the machine depends on the dead node's memory.</span></li>
+      <li>MPI resends every lost message automatically <span class="fb">The isolation comes from the architecture, not from a resend mechanism.</span></li>
+      <li>Commodity servers never fail <span class="fb">They fail like any other computer; the point is how much a failure takes down.</span></li>
+      <li>In a DSM a failed node is replaced by its home node <span class="fb">Each address has exactly one home; if that node dies, its range of the shared address space is gone for everybody.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">MPI is…</p>
+    <ul class="options">
+      <li data-correct>a standardized library interface: a specification plus libraries for C, C++, Fortran and Python <span class="fb">The notes stress it (p. 438): not a language.</span></li>
+      <li>a programming language for clusters <span class="fb">It is called from ordinary languages; it is not one itself.</span></li>
+      <li>the network hardware of a cluster <span class="fb">That is Ethernet or InfiniBand; MPI is the software interface on top of it.</span></li>
+      <li>a cache-coherence protocol for DSM machines <span class="fb">Message passing needs no coherence protocol: the memories are private.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l34-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>The address space is the first axis: shared (one logical memory, implicit communication by loads and stores, threads and OpenMP) or private (one space per processor, explicit send/receive with MPI).</li>
+    <li>Physical placement is the second, independent axis: UMA keeps one centralized memory with uniform latency and stops at about 32 processors because of contention; NUMA puts a memory in every node, so local accesses are fast and remote ones slow.</li>
+    <li>A small multicore is an SMP on a chip — private L1/L2, a shared L3, snooping — and with more cores the L3 is banked and the bus becomes a network-on-chip.</li>
+    <li>A DSM spreads one address space over the nodes' memories: the home node of an address is the node whose memory holds it, the local node is the one that issues the access, and data placement decides the average latency.</li>
+    <li>A cluster gives each node its own memory and operating system and connects the nodes by messages: it scales, is cheap and isolates faults, but is harder to program and pays the network latency.</li>
+    <li>The three programming models are shared memory (loads and stores plus locks), message passing (send/receive plus collectives) and data-parallel SPMD (the same program on its own slice, in bulk-synchronous phases).</li>
+    <li>The January 2026 picture is a DSM: one memory per node, every memory addressable by every processor.</li>
+  </ul>
+
+  <aside class="cheat" id="l34-cheat">
+    <dl>
+      <dt>Shared address space</dt><dd>one logical memory: any processor loads/stores any address; implicit communication (threads, OpenMP, Pthreads)</dd>
+      <dt>Private address spaces</dt><dd>one space per processor, the same number names different cells; explicit send/receive (MPI)</dd>
+      <dt>UMA = SMP</dt><dd>one centralized memory, same latency and bandwidth for every processor; snooping; about 32 processors at most (contention)</dd>
+      <dt>NUMA = DSM = cc-NUMA</dt><dd>node = processor(s) + caches + local memory; one global address space; local fast, remote slow; directory coherence</dd>
+      <dt>The four cells</dt><dd>shared + centralized: SMP · shared + distributed: DSM · private + centralized: MPI on one box · private + distributed: cluster</dd>
+      <dt>Home node, local node</dt><dd>home: the node whose memory holds the address — with 4 KiB per node, the top hex digit (0x2200 → N2); local: the node that issues the access</dd>
+      <dt>Average miss latency</dt><dd>\(t = f\,t_{loc} + (1-f)\,t_{rem}\): \(f\) = fraction of the misses homed in the local node, \(t_{loc}\) and \(t_{rem}\) = latency of a local and of a remote miss</dd>
+      <dt>CPI with memory misses</dt><dd>\(CPI = CPI_{ideal} + m \times t \times f_{CLK}\): \(CPI_{ideal}\) = CPI when every reference hits, \(m\) = misses per instruction, \(t \times f_{CLK}\) = the average miss latency in clock cycles</dd>
+      <dt>Programming models</dt><dd>shared memory (loads/stores + locks) · message passing (send/receive + collectives) · SPMD (same program, own slice; compute → barrier → next phase)</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l34-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=PhUo1IMo6UU" target="_blank" rel="noopener">Lecture 27. Multiprocessors — Carnegie Mellon, Computer Architecture 2015</a>
+      <span class="res-by">Onur Mutlu</span>
+      <p class="res-why">The MIMD design space, shared memory against message passing, UMA against NUMA, tightly against loosely coupled machines: the two axes of this lesson, drawn on the board before you meet them in the notes.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.engineering.upenn.edu/~leebcc/teachdir/ece252_fall11/Lenoski.pdf" target="_blank" rel="noopener">The Stanford Dash Multiprocessor</a>
+      <span class="res-by">D. Lenoski et al., IEEE Computer, March 1992</span><span class="res-dur">17 pages</span>
+      <p class="res-why">A real DSM: up to 64 processors in clusters joined by a directory. Look for its "home cluster", the cluster that contains the directory and physical memory for a given address: the home node of section 3, in the words of the people who built it.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://users.cs.utah.edu/~hari/teaching/paralg/Flynn72.pdf" target="_blank" rel="noopener">Some Computer Organizations and Their Effectiveness</a>
+      <span class="res-by">Michael J. Flynn, IEEE Transactions on Computers, 1972</span><span class="res-dur">13 pages</span>
+      <p class="res-why">Read the part on MIMD machines: in 1972 Flynn already warned that multiprocessors "are subjected to a saturation syndrome based on general communications lockout" — the contention that caps a UMA machine.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>In the DSM of this lesson, P0's load left a copy of the block of 0x2200 in C0. Suppose P3 reads the same block, and then P0 writes it. Two caches hold the same block, and one of them is now wrong: what does P3 see?</p>
+</aside>
+
+</main>
+</body>
+</html>

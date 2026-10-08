@@ -1,0 +1,1220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fewer misses: size, blocks, ways, victims, prediction, prefetching and the compiler · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l25">
+
+<header class="lesson-head">
+  <h1>Fewer misses: size, blocks, ways, victims, prediction, prefetching and the compiler</h1>
+  <p class="lede">After this lesson you will name, for each of the eight techniques of the notes' miss-rate family, the kind of miss it removes and the price it pays — and compute when a bigger block or a more associative cache is slower, not faster.</p>
+</header>
+
+<div class="hook" data-label="Three true facts">
+  <p><b>One.</b> A 4 KB cache with 64-byte blocks misses less often than the same cache with 32-byte blocks — 7.00 % of accesses against 7.24 % — and yet its average access is slower. <b>Two.</b> Turning a 512 KB direct-mapped cache into a 2-way set-associative one lowers its miss rate from 0.8 % to 0.7 %, and makes it slower too. Both with the textbook's numbers (Hennessy &amp; Patterson).</p>
+  <p><b>Three.</b> In a loop over a 5000 × 100 array of 4-byte words, swapping the two <code>for</code> lines cuts the misses sixteen-fold with 64-byte blocks. Same cache, same data, not one transistor changed.</p>
+  <p>The first two look like contradictions, the third like a free lunch. One sentence explains all three; you will be able to write it at the end of the lesson.</p>
+</div>
+
+<section id="l25-frame">
+  <h2>One metric, three terms: what a knob really buys</h2>
+
+  <p>Every technique in this lesson is judged by the formula of <a href="l22.html">lesson 22</a>, the first line under "Memory Hierarchy" on the example formula sheet of the course page:</p>
+
+  <div class="formula">
+    \[ \text{AMAT} = \text{HT} + \text{MR} \times \text{MP} \]
+    <dl class="legend">
+      <dt>HT</dt><dd>hit time: what every access pays, in cycles</dd>
+      <dt>MR</dt><dd>miss rate: the fraction of accesses that miss</dd>
+      <dt>MP</dt><dd>miss penalty: the extra cycles of one miss</dd>
+    </dl>
+  </div>
+
+  <p>The notes sort the ways to improve it into three families, one per term (p. 321): fewer misses (this lesson, pages 323–341), cheaper misses (<a href="l26.html">lesson 26</a>), faster hits (<a href="l28.html">lesson 28</a>). Most knobs here aim at one of the three C's of <a href="l24.html">lesson 24</a>: <em>compulsory</em> misses (the first touch of a block), <em>capacity</em> misses (the cache cannot hold the working set), <em>conflict</em> misses (too many busy blocks share one set).</p>
+
+  <p>Turning a knob lowers the miss rate and almost always pushes up another cost — the hit time, the penalty or the memory bandwidth. So the question is never "does it cut misses?" but "does it cut AMAT?".</p>
+
+  <p class="memo"><mark class="key">A knob that lowers the miss rate pays only if the misses it saves, times the penalty, outweigh what it adds to the other terms.</mark></p>
+
+  <h3>The first knob: a bigger cache</h3>
+
+  <aside class="margin-note">A rule of thumb from the literature, not in the notes: each doubling divides the miss rate by about \(\sqrt{2}\) — some 30 % fewer misses, not 50 %.</aside>
+
+  <p>A bigger cache holds more blocks, so fewer of them are thrown out and fetched again: it removes <mark class="key">capacity misses</mark> (p. 323). It does nothing for compulsory misses — the first touch of a block misses in any cache — and the returns diminish: "doubling the cache size doesn't halve the miss rate" (p. 323). In the textbook's measurements a direct-mapped cache misses 9.8 % of its accesses at 4 KB and 4.2 % at 32 KB: eight times the capacity, the miss rate divided by 2.3.</p>
+
+  <p>The price is in the first term. A bigger array has longer wires, a bigger decoder and a bigger tag store, so the hit time grows, and so do area, power and cost (the table on p. 323). Every access pays the hit time, only the misses pay the penalty — so the L1 stays small and fast, one or two cycles at the processor's clock, and the capacity goes into the second and third levels, which "absorb the remaining misses" (p. 323).</p>
+</section>
+
+<section id="l25-block">
+  <h2>Bigger blocks: fewer first touches, then a U-turn</h2>
+
+  <p>Start with Example 9 of the notes (p. 324), taking <code>a</code> as 100 four-byte integers that begin at a block boundary:</p>
+
+<pre><code>for (i = 0; i &lt; 100; i++)
+    sum += a[i];</code></pre>
+
+  <aside class="margin-note">Check it by hand: 400 bytes are 25 blocks of 16 bytes, or 6.25 blocks of 64 — that is 7 blocks, the last one only partly used.</aside>
+
+  <p>Every element is touched once, so every miss is compulsory, and the misses are simply the blocks the array spans: 25 with 16-byte blocks, 7 with 64-byte blocks. A bigger block <mark class="key">preloads the neighbours</mark> of the word you asked for: spatial locality, turned into fewer misses.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l25-fig-blocks">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 140" role="img" aria-label="Sixteen consecutive four-byte elements in four 16-byte blocks: the first access to each block misses, the next three hit; 4 misses in 16 accesses">
+        <text x="14" y="18" class="tx-sm tx-muted">a[0] … a[15], 4 bytes each</text>
+        <rect x="14" y="44" width="17" height="30" class="fw-s2 st-s2"/>
+        <rect x="31" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="48" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="65" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="82" y="44" width="17" height="30" class="fw-s2 st-s2"/>
+        <rect x="99" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="116" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="133" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="150" y="44" width="17" height="30" class="fw-s2 st-s2"/>
+        <rect x="167" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="184" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="201" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="218" y="44" width="17" height="30" class="fw-s2 st-s2"/>
+        <rect x="235" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="252" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="269" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="14" y="44" width="68" height="30" class="sw-2"/>
+        <rect x="82" y="44" width="68" height="30" class="sw-2"/>
+        <rect x="150" y="44" width="68" height="30" class="sw-2"/>
+        <rect x="218" y="44" width="68" height="30" class="sw-2"/>
+        <text x="22" y="37" class="tx-sm tx-mid">miss</text>
+        <text x="90" y="37" class="tx-sm tx-mid">miss</text>
+        <text x="158" y="37" class="tx-sm tx-mid">miss</text>
+        <text x="226" y="37" class="tx-sm tx-mid">miss</text>
+        <text x="22" y="90" class="tx-mono tx-sm tx-mid">a[0]</text>
+        <text x="278" y="90" class="tx-mono tx-sm tx-mid">a[15]</text>
+        <text x="14" y="126" class="tx-hand">1 miss, then 3 hits</text>
+      </svg>
+      <p class="fig-label">Before: 16-byte blocks — 4 misses in 16 accesses</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 140" role="img" aria-label="The same sixteen elements in one 64-byte block: only the first access misses, the next fifteen hit">
+        <text x="14" y="18" class="tx-sm tx-muted">a[0] … a[15], 4 bytes each</text>
+        <rect x="14" y="44" width="17" height="30" class="fw-s2 st-s2"/>
+        <rect x="31" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="48" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="65" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="82" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="99" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="116" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="133" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="150" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="167" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="184" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="201" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="218" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="235" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="252" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="269" y="44" width="17" height="30" class="fw-s1 st-s1"/>
+        <rect x="14" y="44" width="272" height="30" class="sw-2"/>
+        <text x="22" y="37" class="tx-sm tx-mid">miss</text>
+        <text x="22" y="90" class="tx-mono tx-sm tx-mid">a[0]</text>
+        <text x="278" y="90" class="tx-mono tx-sm tx-mid">a[15]</text>
+        <text x="14" y="126" class="tx-hand">1 miss, then 15 hits</text>
+      </svg>
+      <p class="fig-label">After: 64-byte blocks — 1 miss in 16 accesses</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> The first sixteen accesses of <code>sum += a[i]</code>. Orange: the access that misses and brings the block in; blue: accesses served by a block already fetched. Four times larger blocks, a quarter of the compulsory misses — 25 become 7 for the whole loop.</figcaption>
+  </figure>
+
+  <p>Now hold the cache size fixed and keep growing the block. A 4 KB cache has 256 lines of 16 bytes, but only 16 lines of 256 bytes. With so few lines, blocks that are still needed are thrown out to make room: conflict and capacity misses rise, and the curve of miss rate against block size turns upward — the U-shaped curve of p. 325. Large blocks also carry bytes nobody uses, wasting bandwidth and energy when spatial locality is weak (the table on p. 324). In practice 16 to 64 bytes are common, and instruction caches, fetched in sequence, tolerate larger blocks than data caches (p. 325).</p>
+
+  <aside class="redpen" data-page="325">
+    <p class="claim">"But beyond an optimal size, it begins to increase again due to: – Fewer total blocks (higher conflict/capacity pressure). – Higher miss penalty."</p>
+    <p class="fix">Only the first reason raises the <em>miss rate</em>. A higher miss penalty does not change how often you miss; it changes what each miss costs, so it raises AMAT — and it is the reason the best block for AMAT is never larger than the best block for the miss rate.</p>
+    <p class="because">The miss rate counts misses per access; the penalty only prices each one. Run the same program on the same cache with a memory twice as slow: every miss costs twice as much, but not one more access misses. In the widget of the next section, drag the memory latency L: the miss-rate curve does not move, only AMAT does.</p>
+  </aside>
+
+  <h3>The penalty grows with the block, so AMAT turns earlier</h3>
+
+  <p>A miss costs a fixed latency before the first bytes arrive, plus the transfer of the whole block. The textbook's model: 80 cycles, then 16 bytes every 2 cycles.</p>
+
+  <div class="formula">
+    \[ \text{MP}(B) = 80 + 2 \cdot \frac{B}{16} \ \text{cycles} \]
+    <dl class="legend">
+      <dt>\(B\)</dt><dd>block size in bytes: 82, 84, 88, 96, 112 cycles for 16, 32, 64, 128, 256 bytes</dd>
+    </dl>
+  </div>
+
+  <p>Put it next to the miss rates the textbook measured for a 4 KB cache, with a 1-cycle hit time:</p>
+
+  <figure class="tbl-fig" id="l25-tbl-4k">
+    <figcaption>4 KB cache: the miss rate is lowest at 64 bytes, AMAT at 32 bytes.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Block size</th><th>Miss rate</th><th>Miss penalty (cycles)</th><th>AMAT = 1 + MR × MP</th></tr></thead>
+        <tbody>
+          <tr><td class="num">16 B</td><td class="num">8.57 %</td><td class="num">82</td><td class="num">8.03</td></tr>
+          <tr class="is-key"><td class="num">32 B</td><td class="num">7.24 %</td><td class="num">84</td><td class="num">7.08</td></tr>
+          <tr><td class="num">64 B</td><td class="num">7.00 %</td><td class="num">88</td><td class="num">7.16</td></tr>
+          <tr><td class="num">128 B</td><td class="num">7.78 %</td><td class="num">96</td><td class="num">8.47</td></tr>
+          <tr><td class="num">256 B</td><td class="num">9.51 %</td><td class="num">112</td><td class="num">11.65</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>That is fact one of the hook: from 32 to 64 bytes the miss rate drops by 0.24 points, but every remaining miss costs 4 cycles more. It is not an accident of these numbers — the optimum for AMAT can never lie to the right of the optimum for the miss rate:</p>
+
+  <ol class="steps" id="l25-steps-left">
+    <li><p>Only two terms depend on the block size \(B\); the hit time does not:</p> \[ \begin{aligned} \text{AMAT}(B) &amp;= \text{HT} \\ &amp;+ \text{MR}(B) \times \text{MP}(B) \end{aligned} \]</li>
+    <li><p>Call \(B^*\) the block with the lowest miss rate, and take any larger block \(B \gt B^*\). Its miss rate is not lower, by the choice of \(B^*\):</p> \[ \text{MR}(B) \ge \text{MR}(B^*) \]</li>
+    <li><p>Its penalty is higher, because more bytes must travel:</p> \[ \text{MP}(B) \gt \text{MP}(B^*) \]</li>
+    <li><p>Neither factor shrank and the penalty grew, so the product grew, and with it AMAT. No block larger than \(B^*\) beats \(B^*\): the AMAT optimum is \(B^*\) or smaller.</p> \[ \text{AMAT}(B) \gt \text{AMAT}(B^*) \]</li>
+    <li><p>How much smaller depends on the memory: when the latency dominates, the penalty hardly grows with the block and the two optima meet; when the transfer dominates, small blocks win. Move that balance in the widget of the next section.</p></li>
+  </ol>
+
+  <aside class="redpen" data-page="325">
+    <p class="claim">"Empirical Behavior: Miss Rate vs. Block Size" (the title of the plot, whose points are 20, 12, 9, 11, 15 and 22 % for blocks of 16 to 512 bytes)</p>
+    <p class="fix">The plot is an illustration, not a measurement: it names no cache size, no program and no source, and its points match none of the measured curves the textbook prints. Keep the U shape, not the numbers.</p>
+    <p class="because">Measured curves depend on the cache size: the minimum moves to larger blocks as the cache grows. In the textbook's data the 4 KB cache is lowest at 64 bytes and the 64 KB cache at 128 bytes, while the 256 KB cache is still flat at 256 bytes — check all four sizes in the widget below.</p>
+  </aside>
+</section>
+
+<section id="l25-ways">
+  <h2>More ways: conflict misses out, hit time up</h2>
+
+  <p>Example 10 (p. 327): a loop reads <code>a[i]</code>, <code>b[i]</code> and <code>c[i]</code>, and the three blocks map to the same set 5. In a direct-mapped cache each evicts the one read before it — three misses per iteration, while the rest of the cache may sit empty. In a 4-way set-associative cache (three ways would do) the three live in set 5 together and stop evicting each other.</p>
+
+  <p><mark class="key">Associativity</mark> is the number of places a block may occupy: 1 for direct-mapped, n for n-way, every line for fully associative (placement is <a href="l23.html">lesson 23</a>). Raising it removes conflict misses and nothing else: compulsory and capacity misses stay the same (p. 326), and a fully associative cache has, by definition, no conflict misses at all.</p>
+
+  <h3>Two rules of thumb</h3>
+
+  <p>The <mark class="key">2:1 cache rule</mark> (p. 327): a direct-mapped cache of size N has about the same miss rate as a 2-way set-associative cache of size N/2 — associativity can be traded for size. And the gain flattens fast. The textbook's 4 KB cache misses 9.8 % direct-mapped, 7.6 % 2-way, 7.1 % 4-way and 7.1 % 8-way: most of the gain comes with the first doubling — the notes' sweet spot is 2- or 4-way (p. 327) — and 8-way is, for practical purposes, as good as fully associative.</p>
+
+  <h3>The price is paid at the multiplexer</h3>
+
+  <p>A direct-mapped cache has one candidate line, so it can send the data towards the processor while the tag comparison is still running; if the comparison fails, the data is simply dropped. An n-way cache reads n candidates and compares n tags in parallel — but it can pick the data only after a comparator has said which way hit. That way-select multiplexer sits on the path of every hit, and reading n ways at once costs power on every access (the table on p. 327).</p>
+
+  <p>The textbook prices it as a slower clock: × 1.36 for 2-way, × 1.44 for 4-way, × 1.52 for 8-way, with a 25-cycle penalty. For a 4 KB cache the saved misses win: AMAT falls from 3.45 cycles direct-mapped to 3.22 at 4-way. For a 512 KB cache there are almost no conflicts left to remove, and the hit time wins: 1.20 cycles direct-mapped, 1.54 for 2-way — fact two of the hook.</p>
+
+  <div class="pitfall">
+    <p>"Associativity lowers the miss rate, so it lowers AMAT." Only while the conflict misses it removes, times the penalty, outweigh the slower hit — true for small caches and expensive misses, false for a large cache with a cheap penalty. That is why second- and third-level caches, whose hit time matters less and whose misses cost more, use 8 to 16 ways.</p>
+  </div>
+
+  <div class="widget" id="l25-w-amat">
+    <h3 class="widget-title">AMAT optimiser: every knob moves two terms</h3>
+    <p class="widget-intro">Two plots share the horizontal axis: on top the miss rate, below the AMAT it produces. With the knob "block size" you get the textbook's measured miss rates for four cache sizes, a 1-cycle hit and the penalty L + 2 · B/16; with "associativity" its miss rates for three sizes, a fixed penalty and the hit time × 1.36, 1.44, 1.52 for 2, 4 and 8 ways. Rings mark the lowest point of each curve, the yellow dot your setting; with the associativity knob, the orange band is what the misses add to the hit time. The insight: the metric is AMAT, and every knob moves two of its terms.</p>
+    <ol class="tasks">
+      <li>Block size, 4 KB, L = 80 cycles. Before you move the slider: which block size gives the fewest misses, and which the lowest AMAT? Then step through the five sizes.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Fewest misses at 64 bytes (7.00 %), lowest AMAT at 32 bytes (7.08 cycles against 7.16). From 32 to 64 bytes the miss rate falls by 0.24 points while every miss gets 4 cycles dearer, 84 → 88.</p></details>
+      </li>
+      <li>Still at 4 KB, drag the latency L down to 0 and then up to 200. Predict where the AMAT optimum goes.
+        <details class="answer"><summary>What you should see</summary>
+          <p>At L = 0 only the transfer counts, every extra byte costs, and 16 bytes win. From L = 120 up the latency dominates, the penalty hardly grows with the block, and the AMAT optimum joins the miss-rate optimum at 64 bytes. Long latency favours big blocks; scarce bandwidth favours small ones.</p></details>
+      </li>
+      <li>Back to L = 80, switch to 256 KB. Where are the two optima now?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The miss rate is lowest at 128 and 256 bytes (0.49 %), AMAT at 64 bytes (1.45 cycles). A big cache has lines to spare, so the "fewer blocks" effect starts late and the miss-rate optimum moves right — the AMAT optimum stays at or left of it, as the stepper proved.</p></details>
+      </li>
+      <li>Switch the knob to associativity, price on, penalty 25 cycles. Predict the best number of ways for 4 KB and for 512 KB. Then take 32 KB and raise the penalty to 200 cycles.
+        <details class="answer"><summary>What you should see</summary>
+          <p>4 KB: 4-way, 3.22 cycles against 3.45 direct-mapped. 512 KB: direct-mapped, 1.20 against 1.54 for 2-way — fact two of the hook. 32 KB is best direct-mapped at 25 cycles (2.05) but 4-way at 200 cycles (8.84 against 9.40): associativity pays where misses are expensive. Switch the price off and more ways never look worse — the miss-rate view.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l25-w-amat', function (root, ui) {
+    var BS = [16, 32, 64, 128, 256];
+    var MRB = { '4': [8.57, 7.24, 7.00, 7.78, 9.51], '16': [3.94, 2.87, 2.64, 2.77, 3.29], '64': [2.04, 1.35, 1.06, 1.02, 1.15], '256': [1.09, 0.70, 0.51, 0.49, 0.49] };
+    var WAYS = [1, 2, 4, 8], PRICE = [1, 1.36, 1.44, 1.52];
+    var MRA = { '4': [9.8, 7.6, 7.1, 7.1], '32': [4.2, 3.8, 3.7, 3.7], '512': [0.8, 0.7, 0.6, 0.6] };
+    function r2(x) { return (Math.round(x * 100 + 1e-7) / 100).toFixed(2); }
+    function frac(mr) { return String(+(mr / 100).toFixed(4)); }
+
+    var knob = ui.select('knob to turn', [{ value: 'block', label: 'block size' }, { value: 'ways', label: 'associativity' }], null, 'block');
+    var sizeB = ui.select('cache size', [{ value: '4', label: '4 KB' }, { value: '16', label: '16 KB' }, { value: '64', label: '64 KB' }, { value: '256', label: '256 KB' }], null, '4');
+    var sizeA = ui.select('cache size', [{ value: '4', label: '4 KB' }, { value: '32', label: '32 KB' }, { value: '512', label: '512 KB' }], null, '4');
+    var blk = ui.slider({ label: 'block size B', min: 0, max: 4, step: 1, value: 2, format: function (v) { return BS[Math.round(v)] + ' bytes'; } });
+    var lat = ui.slider({ label: 'memory latency L', min: 0, max: 200, step: 10, value: 80, format: function (v) { return Math.round(v) + ' cycles'; } });
+    var way = ui.slider({ label: 'ways', min: 0, max: 3, step: 1, value: 0, format: function (v) { var n = WAYS[Math.round(v)]; return n === 1 ? '1 (direct-mapped)' : n + '-way'; } });
+    var pen = ui.slider({ label: 'miss penalty', min: 10, max: 200, step: 5, value: 25, format: function (v) { return Math.round(v) + ' cycles'; } });
+    var price = ui.toggle('charge the hit-time price of the ways (× 1.36, 1.44, 1.52)', true);
+
+    var roMR = ui.readout('miss rate'), roMP = ui.readout('miss penalty'), roHT = ui.readout('hit time'), roAM = ui.readout('AMAT');
+    var roBM = ui.readout('fewest misses at'), roBA = ui.readout('lowest AMAT at');
+    var note = ui.note('');
+
+    var pB1 = ui.plot({ x: [0, 272], y: [0, 11], xTicks: BS, xLabel: 'block size (bytes)', yLabel: 'miss rate (%)', aspect: 2.7, minHeight: 190, label: 'Measured miss rate against block size for the chosen cache size' });
+    var pB2 = ui.plot({ x: [0, 272], y: [0, 12], xTicks: BS, xLabel: 'block size (bytes)', yLabel: 'AMAT (cycles)', aspect: 2.7, minHeight: 190, label: 'AMAT against block size, hit time 1 cycle and miss penalty L plus 2 cycles per 16 bytes' });
+    var pA1 = ui.plot({ x: [0.4, 8.6], y: [0, 11], xTicks: WAYS, xLabel: 'ways', yLabel: 'miss rate (%)', aspect: 2.7, minHeight: 190, label: 'Measured miss rate against associativity for the chosen cache size' });
+    var pA2 = ui.plot({ x: [0.4, 8.6], y: [0, 4], xTicks: WAYS, xLabel: 'ways', yLabel: 'AMAT (cycles)', aspect: 2.7, minHeight: 190, label: 'AMAT and hit time against associativity' });
+
+    function S() {
+      if (knob.value === 'block') {
+        var mr = MRB[sizeB.value] || MRB['4'], L = Math.round(lat.value);
+        return { mode: 'block', k: Math.round(blk.value), L: L, pts: BS.map(function (b, i) { var mp = L + 2 * b / 16; return { x: b, mr: mr[i], mp: mp, ht: 1, amat: 1 + mr[i] / 100 * mp }; }) };
+      }
+      var mra = MRA[sizeA.value] || MRA['4'], P = Math.round(pen.value), on = price.value;
+      return { mode: 'ways', k: Math.round(way.value), pts: WAYS.map(function (n, i) { var ht = on ? PRICE[i] : 1; return { x: n, mr: mra[i], mp: P, ht: ht, amat: ht + mra[i] / 100 * P }; }) };
+    }
+    function lowest(pts, key) {
+      var m = Infinity; pts.forEach(function (p) { m = Math.min(m, p[key]); });
+      return pts.filter(function (p) { return p[key] <= m + 1e-9; });
+    }
+    function xName(s, p) { return s.mode === 'block' ? p.x + ' B' : (p.x === 1 ? 'direct-mapped' : p.x + '-way'); }
+    function mrText(s, v) { return (s.mode === 'block' ? v.toFixed(2) : v.toFixed(1)) + ' %'; }
+    function names(s, list) { return list.map(function (p) { return xName(s, p); }).join(' and '); }
+    function show(ctrl, on) { var w = ctrl.el.closest('.ctl'); if (w) w.hidden = !on; }
+
+    function curve(g, s, key, color) {
+      var P = s.pts.map(function (p) { return [p.x, p[key]]; });
+      g.vline(P[s.k][0], { color: 'soft', dash: true });
+      g.line(P, { color: color, width: 2.5 });
+      g.points(P, { color: color, r: 3.5 });
+      g.points(lowest(s.pts, key).map(function (p) { return [p.x, p[key]]; }), { shape: 'ring', color: 'ink', r: 9 });
+      g.points([P[s.k]], { color: 'key', r: 6.5 });
+    }
+    pB1.draw(function (g) { var s = S(); if (s.mode === 'block') curve(g, s, 'mr', 's2'); });
+    pB2.draw(function (g) { var s = S(); if (s.mode === 'block') curve(g, s, 'amat', 's4'); });
+    pA1.draw(function (g) { var s = S(); if (s.mode === 'ways') curve(g, s, 'mr', 's2'); });
+    pA2.draw(function (g) {
+      var s = S(); if (s.mode !== 'ways') return;
+      var H = s.pts.map(function (p) { return [p.x, p.ht]; }), A = s.pts.map(function (p) { return [p.x, p.amat]; });
+      g.band(H, A, { color: 's2', alpha: 0.18 });
+      g.line(H, { color: 'soft', dash: true, width: 2 });
+      curve(g, s, 'amat', 's4');
+    });
+    ui.legend([{ label: 'miss rate', color: 's2', mark: 'line' }, { label: 'AMAT', color: 's4', mark: 'line' }, { label: 'hit time', color: 'soft', mark: 'dash' },
+               { label: 'what the misses add: MR × MP', color: 's2', mark: 'area' }, { label: 'your setting', color: 'key', mark: 'dot' }, { label: 'lowest point', color: 'ink', mark: 'ring' }]);
+
+    ui.onChange(function () {
+      var s = S(), bm = s.mode === 'block';
+      show(sizeB, bm); show(blk, bm); show(lat, bm); show(sizeA, !bm); show(way, !bm); show(pen, !bm); show(price, !bm);
+      pB1.el.hidden = !bm; pB2.el.hidden = !bm; pA1.el.hidden = bm; pA2.el.hidden = bm;
+      var mrs = s.pts.map(function (p) { return p.mr; }), ams = s.pts.map(function (p) { return p.amat; });
+      var mrMax = Math.max.apply(null, mrs), lo = Math.min.apply(null, ams), hi = Math.max.apply(null, ams), sp = Math.max(hi - lo, 0.05);
+      if (bm) { pB1.setView({ y: [0, mrMax * 1.2] }); pB2.setView({ y: [Math.max(0, lo - 0.3 * sp), hi + 0.15 * sp] }); }
+      else { pA1.setView({ y: [0, mrMax * 1.2] }); pA2.setView({ y: [0, hi * 1.15] }); }
+      var p = s.pts[s.k];
+      roMR.set(mrText(s, p.mr));
+      roMP.set(bm ? s.L + ' + 2 · ' + p.x + '/16 = ' + p.mp + ' cycles' : p.mp + ' cycles');
+      roHT.set(r2(p.ht) + (p.ht === 1 ? ' cycle' : ' cycles'));
+      roAM.set(r2(p.amat) + ' cycles');
+      var bmr = lowest(s.pts, 'mr'), bam = lowest(s.pts, 'amat');
+      roBM.set(names(s, bmr) + ' (' + mrText(s, bmr[0].mr) + ')');
+      roBA.set(names(s, bam) + ' (' + r2(bam[0].amat) + ' cycles)');
+      note.set('AMAT = ' + r2(p.ht) + ' + ' + frac(p.mr) + ' × ' + p.mp + ' = ' + r2(p.amat) + ' cycles' +
+        (bam.some(function (q) { return q === p; }) ? ' — the lowest AMAT for this cache.' : bmr.some(function (q) { return q === p; }) ? ' — fewest misses, but not the lowest AMAT.' : '.'));
+    });
+  });
+  </script>
+</section>
+
+<section id="l25-cheap">
+  <h2>Associativity on the cheap: a tray, a guess, a second address</h2>
+
+  <p>Associativity removes conflict misses but slows every hit. Three tricks get most of the benefit without slowing the normal hit.</p>
+
+  <h3>The victim cache: catch the block on its way out</h3>
+
+  <p>Take an 8-line direct-mapped cache and a loop that alternates between blocks 5 and 13. Both map to line 5 (5 mod 8 = 13 mod 8 = 5), so each access throws out the block the next access needs — a ping-pong of conflict misses, with seven lines standing empty.</p>
+
+  <p>A <mark class="key">victim cache</mark> (p. 328) is a small buffer of 4 to 16 entries, fully associative, placed between the cache and the next level. Every block evicted from the cache goes into it. On a miss the cache looks there: if the block is found, the two are <em>swapped</em> — the requested block returns to its line, the block it displaces takes its seat in the tray; if not, the block comes from the next level as usual (the flow on p. 329).</p>
+
+  <p>Two choices carry the idea. The tray is fully associative because its job is to hold blocks whose index collided: indexed the same way, they would collide again. And it is consulted only after a miss, so the hit path of the cache does not change — "No Change to Main Cache Hit Time" (p. 328).</p>
+
+  <div class="story" data-year="1990">
+    <p>Norman Jouppi, at DEC's research lab, proposed both the victim cache and the stream buffer of the next section in a single ISCA paper. When he received the Eckert-Mauchly Award in 2015, the citation noted that these ideas "have been widely adopted by industry with numerous machines containing victim caches and virtually all machines incorporating prefetching stream buffers".</p>
+  </div>
+
+  <div class="widget" id="l25-w-victim">
+    <h3 class="widget-title">Ping-pong on line 5, with and without a victim cache</h3>
+    <p class="widget-intro">An 8-line direct-mapped cache on the left (reads only, so D stays 0) and a 4-entry fully associative victim cache on the right; every block of the chosen pattern maps to line 5. The strip on top is the sequence of twelve accesses: orange means a trip to the next level, blue a block found in the victim cache. LRU 1 marks the tray entry that leaves first. Step through with the tray off, then on. The insight: a tiny buffer next to the cache removes the conflict misses without touching the hit path.</p>
+    <ol class="tasks">
+      <li>Pattern 5, 13, 5, 13 …, victim cache off. Predict how many of the twelve accesses go to the next level.
+        <details class="answer"><summary>What you should see</summary>
+          <p>All twelve. The first two are compulsory (cold-start) misses; the other ten are conflict misses — each access throws out the block the next one needs, while seven lines stand empty.</p></details>
+      </li>
+      <li>Turn the victim cache on and step again. What happens at access 3?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Block 5 is not in line 5 (13 is) but it is in the tray: the two swap, 5 back into line 5 and 13 into the tray. From then on every access is a swap: 2 trips to the next level instead of 12.</p></details>
+      </li>
+      <li>Choose the six-block pattern. Before stepping: does a 4-entry tray still help? And the three blocks of Example 10?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Six blocks: no. Line 5 plus four entries are five seats for six blocks used in a circle, and the block needed next is always the one dropped longest ago — all twelve accesses go to the next level. Three blocks: 3 trips and 9 swaps. The tray rescues small conflict sets only, "very effective for small conflict sets" (p. 328).</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l25-w-victim', function (root, ui) {
+    var PATTERNS = { two: [5, 13], three: [5, 13, 21], six: [5, 13, 21, 29, 37, 45] };
+    var N = 12, LINES = 8, VCN = 4;
+    var pat = ui.select('access pattern', [{ value: 'two', label: '2 blocks: 5, 13, 5, 13 …' }, { value: 'three', label: '3 blocks: 5, 13, 21 … (like Example 10)' }, { value: 'six', label: '6 blocks: 5, 13, 21, 29, 37, 45 …' }], null, 'two');
+    var vc = ui.toggle('victim cache (4 entries, fully associative)', false);
+    var st = ui.stepper({ steps: N + 1 });
+    var roH = ui.readout('L1 hits', { digits: 0 }), roV = ui.readout('victim-cache hits (swaps)', { digits: 0 }), roM = ui.readout('trips to the next level', { digits: 0 });
+    var note = ui.note('');
+    var svg = ui.svg(560, 320, { label: 'An 8-line direct-mapped cache, a 4-entry fully associative victim cache and the next level; all blocks of the access pattern map to line 5' });
+
+    function run(k) {
+      var P = PATTERNS[pat.value] || PATTERNS.two, seq = [], L = [], V = [], seen = {}, out = { hits: 0, vh: 0, mem: 0, log: [], last: null };
+      for (var i = 0; i < N; i++) seq.push(P[i % P.length]);
+      for (var j = 0; j < LINES; j++) L.push(null);
+      for (var a = 0; a < k; a++) {
+        var b = seq[a], idx = b % LINES, ev = { block: b, idx: idx, first: !seen[b], out: null, dropped: null };
+        seen[b] = true;
+        if (L[idx] === b) { out.hits++; ev.kind = 'hit'; }
+        else {
+          var pos = vc.value ? V.indexOf(b) : -1;
+          ev.out = L[idx];
+          if (pos >= 0) { V.splice(pos, 1); L[idx] = b; if (ev.out !== null) V.push(ev.out); out.vh++; ev.kind = 'swap'; }
+          else {
+            out.mem++; ev.kind = 'miss'; L[idx] = b;
+            if (vc.value && ev.out !== null) { V.push(ev.out); if (V.length > VCN) ev.dropped = V.shift(); }
+          }
+        }
+        out.log.push(ev.kind); out.last = ev;
+      }
+      out.seq = seq; out.L = L; out.V = V; out.k = k;
+      return out;
+    }
+    function el(tag, attrs) { return Course.svg(tag, attrs, svg); }
+    function txt(x, y, s, cls) { var t = el('text', { x: x, y: y, 'class': cls || '' }); t.textContent = s; return t; }
+    function tag3(b) { var t = (Math.floor(b / LINES)).toString(2); while (t.length < 3) t = '0' + t; return t; }
+
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var i, k = s.k, on = vc.value;
+      txt(8, 14, 'the 12 accesses, in order (all map to line 5)', 'tx-sm tx-muted');
+      for (i = 0; i < N; i++) {
+        var x = 8 + i * 46, cls = i >= k ? 'fi-paper st-muted dash' : s.log[i] === 'miss' ? 'fw-s2 st-s2' : s.log[i] === 'swap' ? 'fw-s1 st-s1' : 'fi-soft';
+        if (i === k - 1) el('rect', { x: x - 3, y: 21, width: 46, height: 32, rx: 5, 'class': 'hl' });
+        el('rect', { x: x, y: 24, width: 40, height: 26, rx: 4, 'class': cls });
+        txt(x + 20, 42, String(s.seq[i]), 'tx-mono tx-mid' + (i >= k ? ' tx-muted' : ''));
+      }
+      /* L1 */
+      txt(40, 80, 'L1: direct-mapped, 8 lines', 'tx-sm');
+      var cols = [[40, 24, 'V'], [64, 24, 'D'], [88, 50, 'Tag'], [138, 100, 'Data']];
+      cols.forEach(function (c) { el('rect', { x: c[0], y: 88, width: c[1], height: 22, 'class': 'fw-s3 st-s3' }); txt(c[0] + c[1] / 2, 104, c[2], 'tx-mono tx-sm tx-mid'); });
+      var ev = s.last;
+      if (ev) el('rect', { x: 36, y: 110 + 5 * 24 - 2, width: 206, height: 28, 'class': 'hl' });
+      for (i = 0; i < LINES; i++) {
+        var y = 110 + i * 24, b = s.L[i];
+        cols.forEach(function (c) { el('rect', { x: c[0], y: y, width: c[1], height: 24, 'class': 'fi-paper' }); });
+        txt(32, y + 17, String(i), 'tx-mono tx-sm tx-end');
+        txt(52, y + 17, b === null ? '0' : '1', 'tx-mono tx-mid' + (b === null ? ' tx-muted' : ''));
+        if (b !== null) { txt(76, y + 17, '0', 'tx-mono tx-mid'); txt(113, y + 17, tag3(b), 'tx-mono tx-mid'); txt(188, y + 17, 'block ' + b, 'tx-mono tx-mid'); }
+      }
+      /* victim cache */
+      txt(330, 80, on ? 'victim cache (4 entries)' : 'victim cache: off', 'tx-sm' + (on ? '' : ' tx-muted'));
+      var vcols = [[330, 24, 'V'], [354, 70, 'Block'], [424, 90, 'Data'], [514, 40, 'LRU']];
+      vcols.forEach(function (c) { el('rect', { x: c[0], y: 88, width: c[1], height: 22, 'class': on ? 'fw-s3 st-s3' : 'fi-soft st-muted dash' }); txt(c[0] + c[1] / 2, 104, c[2], 'tx-mono tx-sm tx-mid' + (on ? '' : ' tx-muted')); });
+      for (i = 0; i < VCN; i++) {
+        var vy = 110 + i * 24, vb = on && i < s.V.length ? s.V[i] : null;
+        vcols.forEach(function (c) { el('rect', { x: c[0], y: vy, width: c[1], height: 24, 'class': on ? 'fi-paper' : 'fi-soft st-muted dash' }); });
+        if (on) {
+          txt(342, vy + 17, vb === null ? '0' : '1', 'tx-mono tx-mid' + (vb === null ? ' tx-muted' : ''));
+          if (vb !== null) { txt(389, vy + 17, String(vb), 'tx-mono tx-mid'); txt(469, vy + 17, 'block ' + vb, 'tx-mono tx-mid'); txt(534, vy + 17, String(i + 1), 'tx-sm tx-mid'); }
+        }
+      }
+      /* next level */
+      el('rect', { x: 330, y: 262, width: 220, height: 44, rx: 4, 'class': 'fi-paper sw-2' });
+      txt(440, 289, 'next level (L2 / memory)', 'tx-sm tx-mid');
+      if (!ev) return;
+      var line5 = 110 + 5 * 24;
+      if (ev.kind === 'miss') {
+        el('line', { x1: 246, y1: line5 + 6, x2: 326, y2: 268, 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+        el('line', { x1: 330, y1: 290, x2: 248, y2: line5 + 20, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' });
+      }
+      if (on && ev.out !== null && ev.kind !== 'hit') {
+        var slot = s.V.indexOf(ev.out), ty = 110 + Math.max(0, slot) * 24 + 12;
+        el('line', { x1: 246, y1: line5 + 2, x2: 326, y2: ty + 4, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' });
+        if (ev.kind === 'swap') {
+          el('line', { x1: 328, y1: ty - 6, x2: 248, y2: line5 - 6, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' });
+          txt(296, (line5 + ty) / 2 - 2, 'swap', 'tx-sm halo');
+        }
+      }
+      var gone = !on && ev.out !== null && ev.kind === 'miss' ? ev.out : ev.dropped;
+      if (gone !== null && gone !== undefined) {
+        el('path', { d: 'M334 222 l10 10 M344 222 l-10 10', 'class': 'st-bad sw-3' });
+        txt(352, 232, 'block ' + gone + (on ? ' dropped from the tray' : ' thrown out'), 'tx-sm');
+      }
+    }
+
+    ui.onChange(function () {
+      var s = run(st.index), ev = s.last;
+      draw(s);
+      roH.set(s.hits); roV.set(s.vh); roM.set(s.mem + ' of ' + s.k, s.k && s.mem === s.k ? 'bad' : null);
+      if (!ev) { note.set('The cache is empty. Press Next to run the first access.'); return; }
+      var t = 'Access ' + s.k + ': block ' + ev.block + ' (line ' + ev.idx + '). ';
+      if (ev.kind === 'hit') t += 'It is in line ' + ev.idx + ': a hit.';
+      else if (ev.kind === 'swap') t += 'Line ' + ev.idx + ' holds block ' + ev.out + ', but block ' + ev.block + ' is in the tray: swap — ' + ev.block + ' back into the line, ' + ev.out + ' into the tray. No trip to the next level.';
+      else {
+        t += (ev.first ? 'First touch: a compulsory (cold-start) miss' : 'It was here before and was thrown out: a conflict miss') + ', fetched from the next level';
+        if (ev.out !== null) t += vc.value ? '; block ' + ev.out + ' moves into the tray' + (ev.dropped !== null ? ', which was full, so block ' + ev.dropped + ' leaves it' : '') : '; block ' + ev.out + ', still needed, is thrown out — seven lines stand empty';
+        t += '.';
+      }
+      note.set(t);
+    });
+  });
+  </script>
+
+  <aside class="redpen" data-page="321">
+    <p class="claim">"Reduce Miss Penalty. Once a miss happens, the delay can be high. We aim to reduce the time spent waiting by: […] Using victim caches."</p>
+    <p class="fix">The notes file the victim cache under the miss penalty here and under "Reducing Miss Rate Techniques" on p. 328. Both views exist, and you need both. Counted at the cache plus its tray, fewer accesses go to the next level: the miss rate falls (p. 328, and this lesson). Counted at the cache alone, the misses are still there, but most cost a quick swap instead of a trip down: the miss penalty falls.</p>
+    <p class="because">The widget shows both readings at once: with the tray on, every access still misses in line 5, but only two of the twelve reach the next level. The textbook itself has listed the victim cache under fewer misses in one edition and under cheaper misses in the next. In an exam answer, name the mechanism and both effects.</p>
+  </aside>
+
+  <h3>Way prediction: knock on one door first</h3>
+
+  <p>The notes' analogy (p. 332) is a hotel: floors are sets, rooms are ways. Without way prediction, staff knock on every door of the floor at once — quick, but noisy and costly. With it, the receptionist's notebook says where the guest was last time, and you knock there first.</p>
+
+  <p>The notebook is the <mark class="key">way predictor table</mark> (WPT, p. 330): indexed by the set index, one entry per set, holding the way of the last hit (or of the last fill) — \(\lceil \log_2 n \rceil\) bits per entry. A 4-way cache with 1024 sets needs 1024 × 2 = 2048 bits, 256 bytes (p. 331). An access reads the predicted way only. If its tag matches, it is a correct-prediction hit in 1 cycle; if not, the other n − 1 ways are checked: found there, it is a misprediction-hit one cycle later; found nowhere, it is a miss. Example 11 of the notes (pp. 331–332), set 12 of a 4-way cache:</p>
+
+  <figure class="tbl-fig" id="l25-tbl-wpt">
+    <figcaption>Example 11: three accesses to set 12. The entry changes whenever the guess was wrong.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Access</th><th>WPT(12) before</th><th>Block found in</th><th>Outcome</th><th>Time</th><th>WPT(12) after</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>way 3</td><td>way 3</td><td>correct-prediction hit</td><td>1 cycle</td><td>way 3</td></tr>
+          <tr><td class="num">2</td><td>way 3</td><td>way 0</td><td>misprediction-hit</td><td>1 + 1 cycles</td><td>way 0</td></tr>
+          <tr class="is-key"><td class="num">3</td><td>way 0</td><td>not in the set</td><td>miss: block loaded into way 2 (LRU)</td><td>miss penalty</td><td>way 2</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="331">
+    <p class="claim">"The WPT is updated only on hits."</p>
+    <p class="fix">The entry of a set is rewritten whenever the guess was wrong: after a misprediction-hit it points to the way where the block was found, after a miss to the way that received the new block.</p>
+    <p class="because">The notes' own Example 11 does exactly that on the next page: access 3 is a miss, and it ends with "Update WPT(12) = Way 2". Keeping the old entry would send the next access to that block to the wrong way again.</p>
+  </aside>
+
+  <figure class="fig fig--pair fig--plain" id="l25-fig-wayp">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 205" role="img" aria-label="A hit in a 2-way set-associative cache without prediction: read both ways, compare both tags, then the multiplexer picks the way and the data goes out; the hit time spans all three steps">
+        <text x="10" y="18" class="tx-sm tx-muted">one hit, left to right in time</text>
+        <rect x="10" y="34" width="86" height="32" rx="4" class="fi-paper sw-2"/>
+        <rect x="104" y="34" width="92" height="32" rx="4" class="fw-s2 st-s2 sw-2"/>
+        <rect x="204" y="34" width="62" height="32" rx="4" class="fi-paper sw-2"/>
+        <text x="53" y="54" class="tx-sm tx-mid">read 2 ways</text>
+        <text x="150" y="54" class="tx-sm tx-mid">compare tags</text>
+        <text x="235" y="54" class="tx-sm tx-mid">mux</text>
+        <line x1="266" y1="50" x2="292" y2="50" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="292" y="86" class="tx-sm tx-end">data out</text>
+        <line x1="10" y1="104" x2="266" y2="104"/>
+        <line x1="10" y1="97" x2="10" y2="111"/>
+        <line x1="266" y1="97" x2="266" y2="111"/>
+        <text x="138" y="126" class="tx-sm tx-mid">hit time</text>
+        <text x="12" y="176" class="tx-hand">data waits for the compare</text>
+      </svg>
+      <p class="fig-label">Before: the multiplexer waits</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 205" role="img" aria-label="The same hit with way prediction: the predictor table names way 1, only way 1 is read and its data goes out at once, while one tag comparison runs alongside to confirm the hit; the hit time spans one step">
+        <text x="10" y="18" class="tx-sm tx-muted">one hit, left to right in time</text>
+        <rect x="10" y="28" width="86" height="26" rx="4" class="fw-s3 st-s3"/>
+        <text x="53" y="45" class="tx-mono tx-sm tx-mid">WPT: way 1</text>
+        <rect x="10" y="62" width="86" height="32" rx="4" class="fi-paper sw-2"/>
+        <text x="53" y="82" class="tx-sm tx-mid">read way 1</text>
+        <line x1="96" y1="78" x2="146" y2="78" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="152" y="82" class="tx-sm">data out</text>
+        <rect x="10" y="102" width="86" height="32" rx="4" class="fw-s2 st-s2 sw-2"/>
+        <text x="53" y="122" class="tx-sm tx-mid">compare 1 tag</text>
+        <line x1="96" y1="118" x2="118" y2="118" marker-end="url(#arr)"/>
+        <text x="124" y="122" class="tx-sm">confirms the hit</text>
+        <text x="124" y="140" class="tx-sm tx-muted">mismatch: +1 cycle</text>
+        <line x1="10" y1="152" x2="96" y2="152"/>
+        <line x1="10" y1="145" x2="10" y2="159"/>
+        <line x1="96" y1="145" x2="96" y2="159"/>
+        <text x="53" y="174" class="tx-sm tx-mid">hit time</text>
+        <text x="122" y="192" class="tx-hand">mux set early</text>
+      </svg>
+      <p class="fig-label">After: the WPT sets the multiplexer</p>
+    </div>
+    <figcaption><b>Fig. 2.</b> Where the time goes in a hit of a 2-way cache. Without prediction the data can leave only after the comparison has chosen the way. With way prediction the table chooses it before the comparison, the data leaves at once, as in a direct-mapped cache, and the comparison only confirms; a wrong guess costs a cycle to check the other way.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="332">
+    <p class="claim">"Potentially reduces access time (one comparator instead of n)."</p>
+    <p class="fix">The time is saved by not waiting for the tag comparison before selecting the data: the predicted way is sent out at once, as in a direct-mapped cache. Using one comparator instead of n saves power, not time.</p>
+    <p class="because">In a normal n-way access the n comparisons run in parallel and take as long as one; the delay comes from the multiplexer that can choose only after them (Fig. 2, left). Remove the wait, as the WPT does, and the hit gets shorter even if all n comparators were kept.</p>
+  </aside>
+
+  <p>The pay-off: most hits are as fast and as cheap as in a direct-mapped cache, with the miss rate of the set-associative one. With prediction accuracy \(p\) and \(t_m\) extra cycles per wrong guess:</p>
+
+  <div class="formula">
+    \[ \text{HT}_{\text{eff}} = \text{HT} + (1 - p)\, t_m \]
+  </div>
+
+  <p>The notes quote 80–95 % accuracy (p. 332); at 90 % with one extra cycle, a 1-cycle hit becomes 1.1 cycles on average. What way prediction does <em>not</em> do is remove a miss: it changes how a hit is found, not what the cache holds. The notes' own p. 334 says so — it "reduces hit time", the family of <a href="l28.html">lesson 28</a>.</p>
+
+  <h3>Pseudo-associativity: a second chance for a direct-mapped cache</h3>
+
+  <p>A <mark class="key">pseudo-associative</mark> (column-associative) cache stays direct-mapped but gives every block a second possible line, typically the index with its most significant bit flipped (p. 333). An access checks the primary line first — a hit there takes 1 cycle; then the secondary line — a hit there is a slow hit, one cycle more; then it is a miss. Take blocks 5 and 13 of the ping-pong above: both have line 5 as first choice and line 1 as second, so one can sit in each line instead of throwing the other out. Lines 1 and 5 together behave like one 2-way set, and most conflict misses disappear with little hardware (p. 334).</p>
+
+  <aside class="redpen" data-page="333">
+    <p class="claim">"This ensures that if two blocks map to the same primary index, they probably don’t also share the same secondary index."</p>
+    <p class="fix">With the flipped most significant bit — or any rule that looks at the index alone — two blocks with the same primary index always share the secondary index too. The conflict goes away because the colliding blocks now have two lines between them, not because their second choices differ.</p>
+    <p class="because">Flip the leading bit of 101 (line 5) and you get 001 (line 1), whatever the tag: blocks 5, 13, 21 … all have line 1 as their second chance. Only a rule that also mixes tag bits into the second index could send two such blocks to different lines.</p>
+  </aside>
+
+  <p>The price is a hit time with two values, which the pipeline must be able to absorb. Not in the notes, but standard: after a slow hit the two blocks are usually swapped, so that the block in use sits in the fast place next time. Memorise the notes' "Key Difference" box (p. 334): way prediction works on set-associative caches and cuts the hit time; pseudo-associativity works on direct-mapped caches and cuts conflict misses.</p>
+</section>
+
+<section id="l25-prefetch">
+  <h2>Fetching before the miss: stream buffers and prefetch instructions</h2>
+
+  <p>Size, ways and trays leave one kind of miss untouched: the compulsory one. A block that has never been touched is nowhere above memory. The only way around it is to fetch the block before it is asked for, overlapping the fetch with useful work (p. 335).</p>
+
+  <h3>In hardware: the stream buffer</h3>
+
+  <p>Instructions run mostly in sequence, which makes <mark class="key">instruction prefetching</mark> simple: on an instruction-cache miss, fetch the requested block into the cache and the next sequential block into an <em>instruction stream buffer</em>; when the next fetch hits in the buffer, that block moves into the cache and the one after it is requested (pp. 335–336). The notes' Example 13, the Alpha AXP 21064, is the textbook's case of exactly this.</p>
+
+  <aside class="redpen" data-page="335">
+    <p class="claim">"The 21064's data cache was direct-mapped, which is fast but prone to conflict misses. To help hide memory latency, DEC implemented hardware prefetching using stream buffers"</p>
+    <p class="fix">The textbook's 21064 example is about the instruction cache: on a miss it fetches two blocks, the requested one into the instruction cache and the next one into the instruction stream buffer — exactly the summary at the end of the notes' own example. And prefetching does not cure conflict misses: it targets compulsory (and some capacity) misses.</p>
+    <p class="because">A conflict miss is a block that was in the cache and was thrown out by another block with the same index; fetching the next sequential block early does not stop two such blocks from evicting each other. Conflict misses of a direct-mapped cache are what the victim cache above is for.</p>
+  </aside>
+
+  <p>Data prefetching works the same way for sequential or strided streams such as A[0], A[1], A[2] … (p. 336), with a <em>D-stream buffer</em> beside the cache (Fig. 3).</p>
+
+  <figure class="fig fig--plain" id="l25-fig-stream">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="Stream-buffer prefetching: a miss on block X fetches X into the L1 cache, the prefetcher fills a four-entry stream buffer with X+1 to X+4 from the next level, and the later access to X+1 moves it from the buffer into the cache">
+      <rect x="20" y="70" width="70" height="40" class="fi-paper sw-2"/>
+      <text x="55" y="95" class="tx-mid">CPU</text>
+      <line x1="90" y1="90" x2="146" y2="90" class="st-muted sw-2"/>
+      <rect x="150" y="50" width="140" height="80" class="fi-paper sw-2"/>
+      <text x="220" y="95" class="tx-mid">L1 cache</text>
+      <rect x="150" y="176" width="40" height="28" class="hl"/>
+      <rect x="150" y="176" width="40" height="28" class="fw-s1 st-s1"/>
+      <rect x="190" y="176" width="40" height="28" class="fw-s1 st-s1"/>
+      <rect x="230" y="176" width="40" height="28" class="fw-s1 st-s1"/>
+      <rect x="270" y="176" width="40" height="28" class="fw-s1 st-s1"/>
+      <text x="170" y="195" class="tx-mono tx-sm tx-mid">X+1</text>
+      <text x="210" y="195" class="tx-mono tx-sm tx-mid">X+2</text>
+      <text x="250" y="195" class="tx-mono tx-sm tx-mid">X+3</text>
+      <text x="290" y="195" class="tx-mono tx-sm tx-mid">X+4</text>
+      <text x="230" y="228" class="tx-sm tx-mid">stream buffer (FIFO)</text>
+      <rect x="450" y="30" width="80" height="180" class="fi-paper sw-2"/>
+      <line x1="450" y1="60" x2="530" y2="60" class="st-muted"/>
+      <line x1="450" y1="90" x2="530" y2="90" class="st-muted"/>
+      <line x1="450" y1="120" x2="530" y2="120" class="st-muted"/>
+      <line x1="450" y1="150" x2="530" y2="150" class="st-muted"/>
+      <line x1="450" y1="180" x2="530" y2="180" class="st-muted"/>
+      <text x="490" y="20" class="tx-sm tx-mid">next level</text>
+      <text x="490" y="50" class="tx-mono tx-sm tx-mid">X</text>
+      <text x="490" y="80" class="tx-mono tx-sm tx-mid">X+1</text>
+      <text x="490" y="110" class="tx-mono tx-sm tx-mid">X+2</text>
+      <text x="490" y="140" class="tx-mono tx-sm tx-mid">X+3</text>
+      <text x="490" y="170" class="tx-mono tx-sm tx-mid">X+4</text>
+      <text x="490" y="200" class="tx-mono tx-sm tx-mid">X+5</text>
+      <line x1="290" y1="62" x2="446" y2="46" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="450" y1="56" x2="294" y2="80" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <path d="M450,135 C400,135 370,190 314,190" class="st-s1 sw-2 dash" marker-end="url(#arr-s1)"/>
+      <line x1="170" y1="174" x2="170" y2="134" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <circle cx="316" cy="40" r="9" class="fi-paper"/>
+      <text x="316" y="45" class="tx-sm tx-mid">1</text>
+      <text x="332" y="36" class="tx-sm">miss on X</text>
+      <circle cx="338" cy="94" r="9" class="fi-paper"/>
+      <text x="338" y="99" class="tx-sm tx-mid">2</text>
+      <text x="354" y="99" class="tx-sm">X</text>
+      <circle cx="396" cy="128" r="9" class="fi-paper"/>
+      <text x="396" y="133" class="tx-sm tx-mid">3</text>
+      <circle cx="132" cy="154" r="9" class="fi-paper"/>
+      <text x="132" y="159" class="tx-sm tx-mid">4</text>
+      <text x="22" y="236" class="tx-hand">no pollution</text>
+    </svg>
+    <figcaption><b>Fig. 3.</b> A miss on block X (1) brings X into the cache (2); the prefetcher fills the stream buffer with X + 1 … X + 4 behind it (3); when the program asks for X + 1, it moves up from the buffer (4) — a fast hit instead of a miss — and X + 5 is requested. A wrong guess dies in the buffer and never evicts a useful block from the cache.</figcaption>
+  </figure>
+
+  <p>Why a separate buffer, and not straight into the cache? Because a guess can be wrong: a prefetched block that is never used would have evicted a useful one — <mark class="key">cache pollution</mark> (p. 337). In the notes' picture, the waiter puts the next dish on a side tray; if nobody wants it, it goes back without touching your plate. What remains is the bandwidth spent on wrong guesses, and the need for a prefetch to arrive in time.</p>
+
+  <h3>In software: the compiler issues the fetch</h3>
+
+  <p>A hardware prefetcher sees only past addresses; the compiler sees the loop. It can insert prefetch instructions ahead of the use (p. 338): a <em>register prefetch</em> is a normal load done early (the notes cite HP PA-RISC), a <em>cache prefetch</em> an instruction that only brings the block into the cache (MIPS IV, PowerPC, SPARC v9). Example 15 prefetches eight elements ahead:</p>
+
+<pre><code>for (i = 0; i &lt; N; i++) {
+    __prefetch(&amp;A[i+8]);  // 8 ahead
+    sum += A[i];
+}</code></pre>
+
+  <aside class="margin-note">Older papers add a dollar sign to every register: $F2.</aside>
+
+  <p>The same loop in the papers' mnemonics, with 8-byte elements, so that eight elements ahead is 64 bytes. <code>PREF</code> stands for a cache-prefetch instruction (MIPS IV has one under that name; the papers have none):</p>
+
+<pre><code>LOOP: PREF  64(R1)       ; block of A[i+8]: cache only
+      LD    F2, 0(R1)    ; F2 = A[i]
+      FADD  F0, F0, F2   ; sum += A[i]
+      ADDUI R1, R1, 8
+      BNE   R1, R2, LOOP</code></pre>
+
+  <p>Two conditions, not in the notes, make the idea work. The prefetch must be <em>non-faulting</em>: in the last iterations <code>A[i+8]</code> runs past the end of the array, and a prefetch to a bad address must quietly do nothing instead of raising an exception. And the cache must be <em>non-blocking</em> — able to keep serving the loop's loads while the prefetched block is on its way (<a href="l26.html">lesson 26</a>); a cache that stalls on a prefetch gains nothing.</p>
+
+  <p>The hard part is the <mark class="key">prefetch distance</mark> (p. 339): too close, and the block arrives after the load that needed it — the penalty is still paid; too far, and it may be evicted before use. The usual rule: prefetch as many iterations ahead as one miss lasts,</p>
+
+  <div class="formula">
+    \[ d = \left\lceil \frac{\text{miss latency}}{\text{cycles per iteration}} \right\rceil \]
+  </div>
+
+  <p>— with a 100-cycle miss and a 12-cycle iteration, 9 iterations ahead. The costs (p. 339): issue slots for the extra instructions, less of a problem on a superscalar; bandwidth for blocks never used; and in Example 15 plain redundancy — with eight elements per 64-byte block, seven prefetches in eight ask for a block already requested, so a compiler unrolls the loop by eight and issues one per block (unrolling is <a href="l15.html">lesson 15</a>).</p>
+</section>
+
+<section id="l25-compiler">
+  <h2>The compiler reorders the accesses</h2>
+
+  <p>The last knob moves no hardware at all. The compiler rearranges the data or the loops so that the program's order of accesses fits the cache — related data together for spatial locality, reused data reused soon for temporal locality (p. 340). Four transformations.</p>
+
+  <h3>Merging arrays</h3>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before: two arrays">
+<pre><code>int val[SIZE];
+int key[SIZE];</code></pre>
+    </div>
+    <div class="compare-col" data-label="After: one array of structures">
+<pre><code>struct {
+    int val;
+    int key;
+} merged_array[SIZE];</code></pre>
+    </div>
+  </div>
+
+  <p>If <code>val[i]</code> and <code>key[i]</code> are always used together, two arrays keep them in two different blocks — a visit to some <code>i</code> can cost two misses — and two arrays of the same size can even map onto the same sets and evict each other. Merged into one array of structures, both fields sit in the same block (p. 340): one miss serves the pair, and the conflict between the arrays is gone.</p>
+
+  <h3>Loop interchange</h3>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before: down the columns">
+<pre><code>for (j = 0; j &lt; 100; j++)
+  for (i = 0; i &lt; 5000; i++)
+    x[i][j] = 2 * x[i][j];</code></pre>
+    </div>
+    <div class="compare-col" data-label="After: along the rows">
+<pre><code>for (i = 0; i &lt; 5000; i++)
+  for (j = 0; j &lt; 100; j++)
+    x[i][j] = 2 * x[i][j];</code></pre>
+    </div>
+  </div>
+
+  <p>C stores arrays row by row: <code>x[i][j]</code> and <code>x[i][j+1]</code> are neighbours, while <code>x[i][j]</code> and <code>x[i+1][j]</code> are 100 words apart. The "before" loop walks down a column. With 4-byte words and 64-byte blocks, every access lands in a new block, and the loop comes back to that block only after visiting the other 4999 rows — 320 KB of blocks later. In a smaller cache the block is gone by then, and every one of the 500 000 elements misses. Interchanged, the loop walks along the rows and uses all 16 words of a block before moving on: 31 250 misses, sixteen times fewer — fact three of the hook. In Fortran, which stores arrays column by column, the good order is the other one; and the swap is legal only if no dependence between iterations forbids it.</p>
+
+  <h3>Loop fusion</h3>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Before: two loops">
+<pre><code>for (i = 0; i &lt; N; i++)
+  A[i] = B[i] + 1;
+for (i = 0; i &lt; N; i++)
+  C[i] = A[i] * 2;</code></pre>
+    </div>
+    <div class="compare-col" data-label="After: one loop">
+<pre><code>for (i = 0; i &lt; N; i++) {
+  A[i] = B[i] + 1;
+  C[i] = A[i] * 2;
+}</code></pre>
+    </div>
+  </div>
+
+  <p>The first loop writes all of <code>A</code>; when <code>A</code> is larger than the cache, the second loop finds <code>A[0]</code> long evicted and misses on it again. Fused, each <code>A[i]</code> is used right after it was written, while still in the cache — temporal locality (p. 341). The cost is a longer loop body that needs more registers.</p>
+
+  <h3>Blocking</h3>
+
+  <aside class="redpen" data-page="341">
+    <p class="claim">"Improves temporal locality, elements in the block are reused before being evicted." (of the tiled loop that calls <code>process(A[i][j])</code> once per element)</p>
+    <p class="fix">In that loop every element is used exactly once, so there is nothing to reuse: tiling a single sweep over one array cannot remove a miss. Blocking pays only when the same data are used again by later iterations — matrix multiplication is the textbook case.</p>
+    <p class="because">The original row-by-row sweep already misses once per block, the compulsory minimum; no reordering of one pass can go below it. The tiled version touches the same blocks, at best equally often.</p>
+  </aside>
+
+  <p>In <code>x = y × z</code> with N × N matrices, every element of <code>z</code> is used N times — once for each row of <code>y</code>. Blocking computes on B × B sub-matrices, so that a tile of <code>z</code> is reused while it is still in the cache. The textbook's version, with the blocking factor B:</p>
+
+<pre><code>for (jj = 0; jj &lt; N; jj += B)
+  for (kk = 0; kk &lt; N; kk += B)
+    for (i = 0; i &lt; N; i++)
+      for (j = jj; j &lt; min(jj+B, N); j++) {
+        r = 0;
+        for (k = kk; k &lt; min(kk+B, N); k++)
+          r = r + y[i][k] * z[k][j];
+        x[i][j] = x[i][j] + r;
+      }</code></pre>
+
+  <p>The arithmetic is the same N³ multiply-adds; what changes is how many words travel from memory:</p>
+
+  <ol class="steps" id="l25-steps-tile">
+    <li><p>Unblocked, in the worst case — the cache keeps neither a row of <code>y</code> nor a column of <code>z</code> between uses — each of the N² results reads a row of <code>y</code> and a column of <code>z</code> and writes one word of <code>x</code>:</p> \[ N^2 \cdot 2N + N^2 = 2N^3 + N^2 \]</li>
+    <li><p>Blocked: for one pair (jj, kk) the B × B tile of <code>z</code> is loaded once and then used by all N rows i. There are (N/B)² pairs:</p> \[ \left(\frac{N}{B}\right)^{2} B^2 = N^2 \]</li>
+    <li><p>For each pair and each row i, a strip of B words of <code>y</code> is loaded and reused for the B values of j; <code>x</code> likewise, read and written:</p> \[ \left(\frac{N}{B}\right)^{2} N \cdot B = \frac{N^3}{B} \]</li>
+    <li><p>Add <code>z</code>, <code>y</code> and <code>x</code>: about B times fewer words, as long as the tile and its two strips fit in the cache — about B² + 2B words:</p> \[ \frac{2N^3}{B} + N^2 \]</li>
+  </ol>
+
+  <div class="widget" id="l25-w-order">
+    <h3 class="widget-title">Same accesses, different order: interchange and blocking</h3>
+    <p class="widget-intro">Tab "loop interchange": a shrunken x[8][32] of 4-byte words, stored row by row, 16 words per 64-byte block (the outlined groups); the cache holds 4 blocks, fully associative, LRU. A cell turns orange when its access missed, blue when it hit; the yellow cell is the current access. Tab "blocking": x = y × z with 16 × 16 matrices and a cache of 32 or 128 words (one word per block, LRU), simulated access by access; the darker a matrix, the more times each of its words was fetched; solid outline: the first tile of z, dashed: the strips of y and x it works with. The insight: the compiler cuts misses by changing the order of the accesses — the hardware is the same.</p>
+    <ol class="tasks">
+      <li>Loop interchange, j outer (the notes' "Before"). A column touches 8 blocks before it returns to the first; the cache holds 4. Predict the misses after all 256 accesses, then press "Show all 256".
+        <details class="answer"><summary>What you should see</summary>
+          <p>256: every access misses. Each block is fetched 16 times, once for every column it holds.</p></details>
+      </li>
+      <li>Switch to i outer ("After").
+        <details class="answer"><summary>What you should see</summary>
+          <p>16 misses: one per block, then 15 hits. Sixteen times fewer — the number of words in a block, as for x[5000][100].</p></details>
+      </li>
+      <li>Blocking, cache of 32 words. Predict which tile size moves the fewest words, then try B = 1, 2, 4, 8 and 16 (B = 16 is the original loop).
+        <details class="answer"><summary>What you should see</summary>
+          <p>B = 4: 2304 words against 8448 for the original loop, exactly the estimate 2N³/B + N². At B = 8 the 64-word tile of z no longer fits in 32 words: z is fetched again for every row, and the count jumps to 5120.</p></details>
+      </li>
+      <li>Now take the cache of 128 words.
+        <details class="answer"><summary>What you should see</summary>
+          <p>B = 8 fits and wins: 1280 words, against 4608 for the original loop with this cache. A bigger cache allows a bigger tile; the best tile is the largest one that fits.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l25-w-order', function (root, ui) {
+    var R = 8, C = 32, W = 16, K = 4, TOTAL = R * C, NM = 16, TILES = [1, 2, 4, 8, 16];
+    var mode = ui.select('tab', [{ value: 'inter', label: 'loop interchange' }, { value: 'block', label: 'blocking (matrix multiply)' }], null, 'inter');
+    var order = ui.select('loop order', [{ value: 'j', label: 'j outer, i inner (Before)' }, { value: 'i', label: 'i outer, j inner (After)' }], null, 'j');
+    var pos = 0;
+    var player = ui.player({ ms: 45, max: TOTAL, label: 'Run', onTick: function () { if (pos < TOTAL) pos++; if (pos >= TOTAL) player.stop(); }, onReset: function () { pos = 0; } });
+    ui.button('Show all 256', function () { player.stop(); pos = TOTAL; }, { kind: 'ghost' });
+    var playerRow = ui.controls.lastElementChild;
+    var tile = ui.slider({ label: 'tile size B', min: 0, max: 4, step: 1, value: 2, format: function (v) { var b = TILES[Math.round(v)]; return b === NM ? '16 (= N: the original loop)' : String(b); } });
+    var cache = ui.select('cache size', [{ value: '32', label: '32 words' }, { value: '128', label: '128 words' }], null, '32');
+    var roA = ui.readout('accesses', { digits: 0 }), roMi = ui.readout('misses = blocks fetched', { digits: 0 }), roPer = ui.readout('accesses per fetched block');
+    var roW = ui.readout('words moved'), roF = ui.readout('estimate 2N³/B + N²'), roO = ui.readout('original loop, same cache');
+    var note = ui.note('');
+    var svg = ui.svg(560, 240, { label: 'Left tab: the array x[8][32] in memory order with each access marked hit or miss; right tab: the matrices x, y and z shaded by how many times each word was fetched' });
+
+    function lru(cap) {
+      var m = new Map();
+      return { access: function (a) { if (m.has(a)) { m.delete(a); m.set(a, 1); return true; } m.set(a, 1); if (m.size > cap) m.delete(m.keys().next().value); return false; },
+               list: function () { return Array.from(m.keys()); } };
+    }
+    function interSim(ord) {
+      var c = lru(K), acc = [];
+      for (var a = 0; a < R; a++) for (var b = 0; b < C; b++) {
+        var i = ord === 'j' ? b % R : a, j = ord === 'j' ? Math.floor((a * C + b) / R) : b;
+        var blk = Math.floor((i * C + j) / W), hit = c.access(blk);
+        acc.push({ i: i, j: j, hit: hit, cache: c.list() });
+      }
+      return acc;
+    }
+    var INTER = { j: interSim('j'), i: interSim('i') };
+    function mm(cap, B) {
+      var c = lru(cap), cnt = { x: [], y: [], z: [] }, n2 = NM * NM, t, total = 0;
+      for (t = 0; t < n2; t++) { cnt.x.push(0); cnt.y.push(0); cnt.z.push(0); }
+      function acc(m, i, j) { if (!c.access(m + (i * NM + j))) { cnt[m][i * NM + j]++; total++; } }
+      for (var jj = 0; jj < NM; jj += B) for (var kk = 0; kk < NM; kk += B) for (var i = 0; i < NM; i++)
+        for (var j = jj; j < Math.min(jj + B, NM); j++) { for (var k = kk; k < Math.min(kk + B, NM); k++) { acc('y', i, k); acc('z', k, j); } acc('x', i, j); }
+      cnt.total = total; return cnt;
+    }
+    var MM = {};
+    ['32', '128'].forEach(function (cs) { MM[cs] = TILES.map(function (B) { return mm(+cs, B); }); });
+
+    function el(tag, attrs) { return Course.svg(tag, attrs, svg); }
+    function txt(x, y, s, cls) { var t = el('text', { x: x, y: y, 'class': cls || '' }); t.textContent = s; return t; }
+    function show(node, on) { if (node) node.hidden = !on; }
+    function ctl(c) { return c.el.closest('.ctl'); }
+
+    function drawInter() {
+      var acc = INTER[order.value] || INTER.j, cell = 15, x0 = 44, y0 = 28, a, n;
+      txt(x0, 16, 'x[8][32] in memory: each row is 32 words = 2 blocks of 16', 'tx-sm tx-muted');
+      var state = {};
+      for (a = 0; a < pos; a++) state[acc[a].i * C + acc[a].j] = acc[a].hit ? 'fw-s1 st-s1' : 'fi-s2 st-s2';
+      if (pos > 0) state[acc[pos - 1].i * C + acc[pos - 1].j] = 'fi-key st-ink sw-2';
+      for (n = 0; n < R * C; n++) {
+        var i = Math.floor(n / C), j = n % C;
+        el('rect', { x: x0 + j * cell, y: y0 + i * cell, width: cell, height: cell, 'class': state[n] || 'fi-paper st-grid sw-1' });
+      }
+      for (n = 0; n < R * C / W; n++) el('rect', { x: x0 + (n % 2) * W * cell, y: y0 + Math.floor(n / 2) * cell, width: W * cell, height: cell, 'class': 'sw-2' });
+      for (n = 0; n < R; n++) txt(x0 - 6, y0 + n * cell + 11, 'i=' + n, 'tx-mono tx-sm tx-end');
+      txt(x0 + 7.5, y0 + R * cell + 16, 'j=0', 'tx-mono tx-sm tx-mid');
+      txt(x0 + 16 * cell + 7.5, y0 + R * cell + 16, 'j=16', 'tx-mono tx-sm tx-mid');
+      txt(x0 + 31 * cell + 7.5, y0 + R * cell + 16, 'j=31', 'tx-mono tx-sm tx-mid');
+      txt(x0, 190, 'cache: 4 blocks, least recently used first', 'tx-sm');
+      var list = pos > 0 ? acc[pos - 1].cache : [];
+      for (n = 0; n < K; n++) {
+        el('rect', { x: x0 + n * 122, y: 198, width: 116, height: 26, rx: 4, 'class': n < list.length ? 'fw-s1 st-s1' : 'fi-soft st-muted dash' });
+        if (n < list.length) { var b = list[n], r = Math.floor(b / 2), h = b % 2; txt(x0 + n * 122 + 58, 216, 'x[' + r + '][' + (h ? '16–31' : '0–15') + ']', 'tx-mono tx-sm tx-mid'); }
+      }
+    }
+    function drawBlock() {
+      var B = TILES[Math.round(tile.value)], res = MM[cache.value][Math.round(tile.value)], cell = 8, ys = 28;
+      var mats = [['x', 38, 'x  (16 × 16)'], ['y', 216, 'y'], ['z', 394, 'z']];
+      txt(191, ys + 72, '=', 'tx-lg tx-mid'); txt(369, ys + 72, '×', 'tx-lg tx-mid');
+      el('rect', { x: 38, y: ys, width: NM * cell, height: NM * cell, 'class': 'sw-1' });
+      el('rect', { x: 216, y: ys, width: NM * cell, height: NM * cell, 'class': 'sw-1' });
+      el('rect', { x: 394, y: ys, width: NM * cell, height: NM * cell, 'class': 'sw-1' });
+      mats.forEach(function (m) {
+        var name = m[0], x0 = m[1], c = res[name], n, maxc = 0;
+        txt(x0 + 64, 18, m[2], 'tx-mono tx-sm tx-mid');
+        for (n = 0; n < NM * NM; n++) {
+          maxc = Math.max(maxc, c[n]);
+          var op = 0.1 + 0.7 * Math.log(Math.max(1, c[n])) / Math.log(16);
+          el('rect', { x: x0 + (n % NM) * cell, y: ys + Math.floor(n / NM) * cell, width: cell, height: cell, 'class': 'fi-s2 st-none', 'fill-opacity': op.toFixed(2) });
+        }
+        for (n = 0; n <= NM; n += B) {
+          el('line', { x1: x0 + n * cell, y1: ys, x2: x0 + n * cell, y2: ys + NM * cell, 'class': 'st-muted sw-1' });
+          el('line', { x1: x0, y1: ys + n * cell, x2: x0 + NM * cell, y2: ys + n * cell, 'class': 'st-muted sw-1' });
+        }
+        var uni = c.every(function (v) { return v === c[0]; });
+        txt(x0 + 64, 176, uni ? 'fetched ' + c[0] + '× each' : 'up to ' + maxc + '× each', 'tx-sm tx-mid');
+      });
+      el('rect', { x: 394, y: ys, width: B * cell, height: B * cell, 'class': 'hl' });
+      el('rect', { x: 394, y: ys, width: B * cell, height: B * cell, 'class': 'st-ink sw-3' });
+      el('rect', { x: 216, y: ys, width: B * cell, height: NM * cell, 'class': 'st-ink sw-2 dash' });
+      el('rect', { x: 38, y: ys, width: B * cell, height: NM * cell, 'class': 'st-ink sw-2 dash' });
+      txt(38, 214, 'solid: first tile of z · dashed: strips of y and x', 'tx-sm tx-muted');
+    }
+
+    ui.onChange(function () {
+      var inter = mode.value === 'inter';
+      show(ctl(order), inter); show(playerRow, inter); show(ctl(tile), !inter); show(ctl(cache), !inter);
+      [roA, roMi, roPer].forEach(function (r) { show(r.el, inter); }); [roW, roF, roO].forEach(function (r) { show(r.el, !inter); });
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      if (inter) {
+        var acc = INTER[order.value] || INTER.j, miss = 0;
+        for (var a = 0; a < pos; a++) if (!acc[a].hit) miss++;
+        roA.set(pos + ' of ' + TOTAL); roMi.set(miss); roPer.set(miss ? (pos / miss).toFixed(1) : '—');
+        drawInter();
+        note.set(pos === 0 ? 'Press Run, One step or Show all.' : order.value === 'j' ? 'Down a column: each access is in a different block from the previous one, and 8 rows are more blocks than the 4 the cache can keep.' : 'Along a row: one miss brings 16 words, the next 15 accesses use them.');
+      } else {
+        var k = Math.round(tile.value), B = TILES[k], cs = cache.value, res = MM[cs][k], orig = MM[cs][TILES.length - 1].total;
+        var est = 2 * Math.pow(NM, 3) / B + NM * NM, fits = B * B + 2 * B <= +cs;
+        roW.set(String(res.total), res.total <= orig && B < NM ? 'good' : null);
+        roF.set(fits ? String(est) : 'not valid: the tile does not fit');
+        roO.set(String(orig));
+        drawBlock();
+        note.set(B === NM ? 'B = 16 is one tile as big as the matrix: the original loop order.' :
+          !fits ? 'The tile (' + B * B + ' words of z) and its strips (' + 2 * B + ' words) do not fit in ' + cs + ' words: z is fetched again for every row of y.' :
+          res.total === est ? 'The tile and its strips fit: each word of z is fetched once, each word of y and x N/B = ' + NM / B + ' times — exactly the estimate.' :
+          'The cache holds more than one tile here, so fewer words move than the estimate assumes.');
+      }
+    });
+  });
+  </script>
+
+  <aside class="redpen" data-page="341">
+    <p class="claim">"Reduces both compulsory &amp; capacity misses."</p>
+    <p class="fix">Loop interchange, fusion and blocking touch exactly the same blocks as the original code, so the compulsory misses — the first touch of each block — stay the same; and merging arrays does not change how many blocks the data fill. What these transformations remove are repeat misses: blocks thrown out and fetched again, capacity (and conflict) misses.</p>
+    <p class="because">In the widget the row walk misses 16 times, once per block: that is the compulsory count, and the column walk pays it too. The column walk's other 240 misses are blocks fetched again after eviction — those are the ones interchange removes.</p>
+  </aside>
+
+  <h3>The eight knobs side by side</h3>
+
+  <figure class="tbl-fig" id="l25-tbl-score">
+    <figcaption>The eight knobs of this lesson: what each removes, what it lowers, what it costs. <a href="l28.html">Lesson 28</a> sets them next to the miss-penalty and hit-time techniques in one scorecard.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Technique</th><th>Misses it removes</th><th>AMAT term it lowers</th><th>What it costs</th></tr></thead>
+        <tbody>
+          <tr><td>Larger cache</td><td>capacity</td><td>miss rate</td><td>hit time, area, power</td></tr>
+          <tr><td>Larger block</td><td>compulsory</td><td>miss rate, up to a point</td><td>miss penalty; fewer blocks bring conflict and capacity misses back</td></tr>
+          <tr><td>Higher associativity</td><td>conflict</td><td>miss rate</td><td>hit time (multiplexer after the compare), power</td></tr>
+          <tr><td>Victim cache</td><td>conflict</td><td>miss rate (or miss penalty, seen from the cache alone)</td><td>a few entries, comparators, swap logic</td></tr>
+          <tr><td>Way prediction</td><td>none</td><td>hit time and power</td><td>a small table; +1 cycle on a wrong guess</td></tr>
+          <tr><td>Pseudo-associativity</td><td>conflict</td><td>miss rate</td><td>a second, slower hit time</td></tr>
+          <tr><td>Prefetching, hardware or software</td><td>compulsory (and some capacity)</td><td>miss rate</td><td>bandwidth; extra instructions (software); needs a non-blocking cache</td></tr>
+          <tr><td>Compiler: merging, interchange, fusion, blocking</td><td>capacity, conflict</td><td>miss rate</td><td>compiler work, code size; no hardware</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Back to the three facts</h3>
+
+  <p>Fact one: 64-byte blocks miss less, but each miss costs 4 cycles more — 7.00 % × 88 = 6.16 cycles of misses per access against 7.24 % × 84 = 6.08. Fact two: the 2-way 512 KB cache saves 0.1 % × 25 = 0.025 cycles of misses per access and adds 0.36 cycles to every hit. Fact three: same cache, same 500 000 elements, but each 64-byte block now serves 16 of them instead of one.</p>
+
+  <p class="memo"><mark class="key">The metric is AMAT, not the miss rate: the plain hardware knobs cut misses but push up another term, and the compiler cuts misses by changing only the order of the accesses.</mark></p>
+</section>
+
+<section id="l25-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="8" id="l25-exam-open">
+    <div class="exam-q" lang="en">
+      <p>(In the form of the June 2026 Question 1.) Explain the main concepts and benefits of each one of the following cache optimization techniques: 1. Larger block size; 2. Higher associativity; 3. Victim cache; 4. Way prediction; 5. Pseudo-associativity; 6. Hardware prefetching with stream buffers; 7. Software (compiler-controlled) prefetching; 8. Loop interchange and loop blocking.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>1. Larger block size: a miss brings in the neighbouring words too, exploiting spatial locality, so compulsory misses decrease. For a fixed cache size there are fewer blocks, so beyond an optimum conflict and capacity misses grow (U-shaped miss rate), and the miss penalty grows with the block (latency + transfer). The AMAT-optimal block is at or below the miss-rate-optimal one; common sizes are 16–64 bytes.</p>
+        <p>2. Higher associativity: a block can be placed in any of the n ways of its set, so blocks with the same index can coexist: conflict misses decrease, compulsory and capacity misses do not change. Rules of thumb: a direct-mapped cache of size N misses about as often as a 2-way cache of size N/2; 8-way is practically fully associative. Cost: the way-select multiplexer must wait for the n tag comparisons, so the hit time (clock cycle) and the power grow; for large caches AMAT can increase.</p>
+        <p>3. Victim cache: a small (4–16 entries) fully associative buffer between the cache and the next level, holding the blocks recently evicted. On a miss it is checked; on a hit there the block is swapped back into the cache. It removes many conflict misses of a direct-mapped cache (a few blocks that keep evicting each other) without changing the hit time of the main cache; low cost. Seen from the main cache, it makes those misses cheap (miss-penalty view).</p>
+        <p>4. Way prediction: a small table indexed by the set index stores, for each set, the way that hit last (log2 n bits). Only the predicted way is read and its data is sent out at once, as in a direct-mapped cache; one tag comparison confirms it. On a mismatch the other ways are checked (+1–2 cycles); the table is updated on every wrong prediction, misses included. Benefit: hit time and energy close to direct-mapped with the miss rate of a set-associative cache (accuracy 80–95 %). It does not reduce the miss rate.</p>
+        <p>5. Pseudo-associativity: a direct-mapped cache where each block has a second possible line (e.g. the index with its MSB flipped). Check the primary line (1-cycle hit), then the secondary (slow hit, +1 cycle), then miss. Two blocks with the same index can now both stay, one in each line (the pair of lines acts as one 2-way set), so it removes many conflict misses with little hardware; cost: two different hit times, harder to pipeline; blocks are swapped so that the most recently used one is in the primary line.</p>
+        <p>6. Hardware prefetching: on a miss on block X the hardware fetches X into the cache and X+1, X+2, … into a stream buffer next to it (instruction stream buffer for sequential code, data stream buffers for sequential or strided accesses). If the next access finds the block in the buffer, it is moved into the cache and the following one is prefetched. It removes compulsory (and some capacity) misses by overlapping memory accesses with execution; the separate buffer avoids polluting the cache with wrong guesses. Cost: memory bandwidth, useless prefetches.</p>
+        <p>7. Software prefetching: the compiler inserts prefetch instructions ahead of the use (e.g. prefetch A[i+8] while using A[i]), at a distance of about miss latency / cycles per iteration. Cache prefetch (into the cache, not a register) is the common form; the prefetch must be non-faulting and the cache non-blocking, so that execution continues while the block arrives. Benefits: removes compulsory/capacity misses of predictable patterns the hardware may not detect, tunable by profiling. Costs: extra instructions (issue slots), bandwidth; too close is useless, too far may be evicted.</p>
+        <p>8. Loop interchange swaps nested loops so that the inner loop walks memory sequentially (row-major C arrays: inner loop on the last index), so each block fetched serves all its words before eviction (e.g. 16 times fewer misses with 4-byte words and 64-byte blocks). Loop blocking (tiling) splits a computation that reuses data, such as matrix multiplication, into B × B tiles that fit in the cache, so that each tile is reused before eviction: words moved go from 2N³ + N² to 2N³/B + N². Both reduce capacity (and conflict) misses at no hardware cost; they must respect the data dependences.</p>
+      </div>
+      <div class="exam-note"><p>A complete sub-point has three parts: the mechanism in one or two sentences, the kind of miss (or the term of AMAT) it attacks, and its cost. Two classic traps: crediting way prediction with fewer misses, and saying that larger blocks reduce capacity misses. Short of time, write the AMAT term and the miss category first — they carry the answer.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="64" data-tol="0.5" id="l25-exam-block">
+    <div class="exam-q" lang="en">
+      <p>A 64 KB cache has a hit time of 1 clock cycle. Its measured miss rate is 2.04 % with 16-byte blocks, 1.35 % with 32-byte blocks, 1.06 % with 64-byte blocks, 1.02 % with 128-byte blocks and 1.15 % with 256-byte blocks. On a miss, main memory delivers the first 16 bytes after 80 clock cycles and 16 more bytes every 2 clock cycles. Which block size (in bytes) minimizes the average memory access time?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Miss penalty = 80 + 2 × (B/16) clock cycles; AMAT = 1 + Miss rate × Miss penalty.</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>Block size</th><th>Miss rate</th><th>Miss penalty</th><th>AMAT</th></tr></thead>
+            <tbody>
+              <tr><td class="num">16 B</td><td class="num">2.04 %</td><td class="num">82</td><td class="num">1 + 0.0204 × 82 = 2.67</td></tr>
+              <tr><td class="num">32 B</td><td class="num">1.35 %</td><td class="num">84</td><td class="num">1 + 0.0135 × 84 = 2.13</td></tr>
+              <tr class="is-key"><td class="num">64 B</td><td class="num">1.06 %</td><td class="num">88</td><td class="num">1 + 0.0106 × 88 = 1.93</td></tr>
+              <tr><td class="num">128 B</td><td class="num">1.02 %</td><td class="num">96</td><td class="num">1 + 0.0102 × 96 = 1.98</td></tr>
+              <tr><td class="num">256 B</td><td class="num">1.15 %</td><td class="num">112</td><td class="num">1 + 0.0115 × 112 = 2.29</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The minimum AMAT is 1.93 clock cycles with 64-byte blocks, although the lowest miss rate is at 128 bytes: from 64 to 128 bytes the miss rate drops only from 1.06 % to 1.02 % while the miss penalty grows from 88 to 96 cycles.</p>
+      </div>
+      <div class="exam-note"><p>The tempting wrong answer is 128, the miss-rate optimum. Write the penalty formula first and the table second: a slip then stays in one row, where it is easy to spot.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l25-exam-table">
+    <div class="exam-q" lang="en">
+      <p>Let's consider a 32-block main memory with a direct-mapped 8-block cache based on a write allocate with write-back protocol. The addresses are expressed as: Memory Addresses: [0, 1, 2, … 31]<sub>10</sub>; Cache Addresses: [a, b, c, d, e, f, g, h] and Cache Tags are expressed as binary numbers. At cold start the cache is empty, then there is the following sequence of memory accesses: Read [03]<sub>10</sub>, Read [11]<sub>10</sub>, Write [03]<sub>10</sub>, Read [11]<sub>10</sub>, Write [05]<sub>10</sub>, Read [03]<sub>10</sub>, Read [13]<sub>10</sub>, Read [05]<sub>10</sub>.</p>
+      <p>(a) Please complete the table (Type of memory access, Memory Address, Hit/Miss Type, Cache Tag, Set, Cache Address, Dirty bit, Write in memory). How much is the miss rate? (b) Repeat with a 2-way set associative 8-block cache with LRU. (c) Which misses of (a) disappear in (b), and why? (d) How many accesses of (a) must still fetch the block from main memory if a 2-entry fully associative victim cache is added to the direct-mapped cache?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) Direct-mapped: 8 sets, Set = address mod 8, Tag = address div 8 (2 bits); set k is cache address a + k (set 3 = d, set 5 = f).</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>#</th><th>Type of memory access</th><th>Memory Address</th><th>Hit/Miss Type</th><th>Cache Tag</th><th>Set</th><th>Cache Address</th><th>Dirty bit</th><th>Write in memory</th></tr></thead>
+            <tbody>
+              <tr><td class="num">1</td><td>Read</td><td class="num">[03]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[00]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>d</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">2</td><td>Read</td><td class="num">[11]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[01]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>d</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">3</td><td>Write</td><td class="num">[03]<sub>10</sub></td><td>Conflict Miss</td><td class="num">[00]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>d</td><td class="num">1</td><td>No</td></tr>
+              <tr><td class="num">4</td><td>Read</td><td class="num">[11]<sub>10</sub></td><td>Conflict Miss</td><td class="num">[01]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>d</td><td class="num">0</td><td>Yes (write-back of block 3)</td></tr>
+              <tr><td class="num">5</td><td>Write</td><td class="num">[05]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[00]<sub>2</sub></td><td class="num">[5]<sub>10</sub></td><td>f</td><td class="num">1</td><td>No</td></tr>
+              <tr><td class="num">6</td><td>Read</td><td class="num">[03]<sub>10</sub></td><td>Conflict Miss</td><td class="num">[00]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>d</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">7</td><td>Read</td><td class="num">[13]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[01]<sub>2</sub></td><td class="num">[5]<sub>10</sub></td><td>f</td><td class="num">0</td><td>Yes (write-back of block 5)</td></tr>
+              <tr><td class="num">8</td><td>Read</td><td class="num">[05]<sub>10</sub></td><td>Conflict Miss</td><td class="num">[00]<sub>2</sub></td><td class="num">[5]<sub>10</sub></td><td>f</td><td class="num">0</td><td>No</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Miss rate = 8/8 = 100 %.</p>
+        <p>(b) 2-way: 4 sets, Set = address mod 4, Tag = address div 4 (3 bits); set 0 = a, b; set 1 = c, d; set 2 = e, f; set 3 = g, h.</p>
+        <div class="scroll-x">
+          <table class="tbl tbl--center">
+            <thead><tr><th>#</th><th>Type of memory access</th><th>Memory Address</th><th>Hit/Miss Type</th><th>Cache Tag</th><th>Set</th><th>Cache Address</th><th>Dirty bit</th><th>Write in memory</th></tr></thead>
+            <tbody>
+              <tr><td class="num">1</td><td>Read</td><td class="num">[03]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[000]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>g</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">2</td><td>Read</td><td class="num">[11]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[010]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>h</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">3</td><td>Write</td><td class="num">[03]<sub>10</sub></td><td>Hit</td><td class="num">[000]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>g</td><td class="num">1</td><td>No</td></tr>
+              <tr><td class="num">4</td><td>Read</td><td class="num">[11]<sub>10</sub></td><td>Hit</td><td class="num">[010]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>h</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">5</td><td>Write</td><td class="num">[05]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[001]<sub>2</sub></td><td class="num">[1]<sub>10</sub></td><td>c</td><td class="num">1</td><td>No</td></tr>
+              <tr><td class="num">6</td><td>Read</td><td class="num">[03]<sub>10</sub></td><td>Hit</td><td class="num">[000]<sub>2</sub></td><td class="num">[3]<sub>10</sub></td><td>g</td><td class="num">1</td><td>No</td></tr>
+              <tr><td class="num">7</td><td>Read</td><td class="num">[13]<sub>10</sub></td><td>Cold-start Miss</td><td class="num">[011]<sub>2</sub></td><td class="num">[1]<sub>10</sub></td><td>d</td><td class="num">0</td><td>No</td></tr>
+              <tr><td class="num">8</td><td>Read</td><td class="num">[05]<sub>10</sub></td><td>Hit</td><td class="num">[001]<sub>2</sub></td><td class="num">[1]<sub>10</sub></td><td>c</td><td class="num">1</td><td>No</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Miss rate = 4/8 = 50 %.</p>
+        <p>(c) The four conflict misses of (a), rows 3, 4, 6 and 8, become hits. Blocks 3 and 11 share a set in both caches (and so do 5 and 13), but the 2-way set holds both, while the direct-mapped line holds one at a time. The four cold-start misses remain: associativity does not remove compulsory misses. The two write-backs of (a) disappear too, because no dirty block is evicted.</p>
+        <p>(d) 4: only the cold-start misses (accesses 1, 2, 5, 7). Each conflict miss of (a) finds its block in the victim cache, where the previous access to the same line put it (access 6 finds block 3, evicted by access 4), and swaps it back into the line.</p>
+      </div>
+      <div class="exam-note"><p>Label the misses as the July 2024 paper does ("Cold-start Miss" for a first reference) and say "Conflict Miss" when a block comes back after being evicted although the cache had free room: in a fully associative cache of 8 blocks these four accesses would hit. Dirty bits and write-backs are where most slips happen: memory is written only when a dirty block is evicted, never on the write itself.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="192" data-tol="0.5" data-unit="bits" id="l25-exam-wpt">
+    <div class="exam-q" lang="en">
+      <p>A 32 KB 8-way set associative cache with 64-byte blocks uses way prediction. How many bits does the way predictor table need?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Number of sets = 32 768 / (64 × 8) = 64. Each entry names one of 8 ways: log2 8 = 3 bits. Table size = 64 × 3 = 192 bits (24 bytes).</p>
+      </div>
+      <div class="exam-note"><p>The table has one entry per set, not per block: the tempting wrong answers are 512 × 3 = 1536 (one entry per block) and 64 × 8 = 512 (one bit per way).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l25-exam-conflict">
+    <div class="exam-q" lang="en">
+      <p>(MULTIPLE ANSWERS) Which of the following techniques reduce conflict misses?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Answer 1: Increasing the associativity of the cache <span class="fb">Blocks with the same index get several places in the set.</span></li>
+      <li data-correct>Answer 2: Adding a small fully associative victim cache <span class="fb">The block evicted by a collision waits in the victim cache and is swapped back.</span></li>
+      <li data-correct>Answer 3: Pseudo-associativity <span class="fb">A direct-mapped cache gets a second line for each index, so two colliding blocks can both stay.</span></li>
+      <li>Answer 4: Increasing the block size for the same cache size <span class="fb">It reduces compulsory misses, and with fewer blocks in the cache it increases conflict misses.</span></li>
+      <li>Answer 5: Way prediction <span class="fb">It never changes what the cache holds; it reduces the hit time and the power of hits.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 1, 2 and 3.</p></div>
+      <div class="exam-note"><p>The quizzes of the papers build their wrong options from neighbouring techniques; the January 2026 paper, solved in the notes' Exams chapter, asked the same question about the miss penalty (<a href="l24.html">lesson 24</a>). Sort each technique by the term of AMAT and the C it attacks — the table at the end of section 6.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l25-exam-wayp">
+    <div class="exam-q" lang="en">
+      <p>(SINGLE ANSWER) A 4-way set associative L1 cache adds a way predictor. Which statement is correct?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Answer 1: It reduces the miss rate, because the most likely way is checked first <span class="fb">The order of the checks does not change what is in the cache: the same accesses miss.</span></li>
+      <li data-correct>Answer 2: It reduces the hit time and the energy of most hits, while the miss rate is unchanged <span class="fb">Right: a correctly predicted hit reads one way and does not wait for the tag comparison; a wrong guess costs an extra cycle.</span></li>
+      <li>Answer 3: It removes the tag comparison from the access <span class="fb">The predicted way's tag is still compared — to confirm the hit, in parallel with sending the data.</span></li>
+      <li>Answer 4: The predictor is updated only on hits <span class="fb">After a miss the entry points to the way that received the new block (Example 11, access 3).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 2.</p></div>
+      <div class="exam-note"><p>Answer 4 is the sentence printed on p. 331 of the notes, which their own Example 11 contradicts one page later: after a miss the entry is rewritten too.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l25-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>(True/False, motivate your answer.) "Loop interchange, loop fusion and loop blocking reduce the compulsory misses of a program."</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">They reorder the accesses but touch the same blocks, so every block still has its first, compulsory miss.</span></li>
+      <li data-correct>False <span class="fb">Right: they remove repeat misses to blocks evicted and fetched again — capacity and conflict misses.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False. A compulsory miss is the first access to a block. These transformations change only the order of the accesses (and the loop structure), not the set of blocks the program touches, so the number of first accesses is unchanged. They reduce capacity (and conflict) misses: a block is used completely (interchange) or reused (fusion, blocking) before it is evicted.</p></div>
+      <div class="exam-note"><p>The notes' table on p. 341 says the opposite. In the papers a motivation earns its own extra point: it must say what a compulsory miss is and why reordering the accesses cannot change their number.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l25-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q">
+    <p class="q-text">A 4 KB cache goes from 64-byte to 128-byte blocks and its miss rate rises from 7.00 % to 7.78 %. Which misses grew?</p>
+    <ul class="options">
+      <li data-correct>Conflict and capacity misses: the cache now has 32 lines instead of 64 <span class="fb">Right: fewer, larger blocks — blocks still in use get thrown out to make room.</span></li>
+      <li>Compulsory misses <span class="fb">Larger blocks reduce first touches: one miss now brings in twice as many neighbours.</span></li>
+      <li>None: the miss rate rose because the miss penalty rose from 88 to 96 cycles <span class="fb">That is the sentence of p. 325 the red pen corrects: the penalty raises AMAT, not the number of misses.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these lower the miss rate without adding anything to the hit time of the L1? Select all that apply.</p>
+    <ul class="options">
+      <li data-correct>A 4-entry victim cache <span class="fb">It is consulted only after a miss; a hit in the cache is as fast as before.</span></li>
+      <li data-correct>Loop interchange <span class="fb">Same cache, same hit time; the accesses are just in a better order.</span></li>
+      <li data-correct>Prefetching into a stream buffer <span class="fb">The buffer sits beside the cache, and only the accesses that would have missed use it.</span></li>
+      <li>Doubling the L1 <span class="fb">A larger array has a longer access path: the hit time grows.</span></li>
+      <li>Going from 2-way to 8-way <span class="fb">The multiplexer waits for more comparisons, and the hit time grows (× 1.36 → × 1.52 in the textbook's example).</span></li>
+      <li>Way prediction <span class="fb">It does not lower the miss rate at all; it lowers the hit time.</span></li>
+    </ul>
+    <p class="q-fb">The three right answers are the tricks of sections 4–6; the three wrong ones are the plain knobs, or a hit-time technique.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">In a 4-way cache, WPT(7) = way 1. An access to set 7 misses, and the block is loaded into way 3, the LRU way. What does WPT(7) hold afterwards?</p>
+    <ul class="options">
+      <li data-correct>Way 3 <span class="fb">Right: the guess was wrong, and the block just loaded is the most likely next hit.</span></li>
+      <li>Way 1, because the table changes only on hits <span class="fb">That is the claim of p. 331 corrected by the red pen; the notes' own Example 11 updates on a miss.</span></li>
+      <li>Way 0, the next way in order <span class="fb">The table records where the block is, not a fixed rotation.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A loop iteration takes 15 cycles and a miss costs 120 cycles. How far ahead should a software prefetch be issued?</p>
+    <ul class="options">
+      <li>1 iteration ahead <span class="fb">The block would arrive 105 cycles after the load that needs it: most of the penalty is still paid.</span></li>
+      <li data-correct>8 iterations ahead <span class="fb">Right: 120 / 15 = 8 iterations is the time a miss lasts, so the block arrives just in time.</span></li>
+      <li>120 iterations ahead <span class="fb">Far too early: 120 iterations later the block may have been evicted by the data used in between.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Fortran stores <code>X(I,J)</code> column by column: <code>X(I,J)</code> and <code>X(I+1,J)</code> are neighbours. Which loop order walks memory sequentially?</p>
+    <ul class="options">
+      <li data-correct>Outer loop on J, inner loop on I <span class="fb">Right: the inner loop must run along the storage order, here down a column.</span></li>
+      <li>Outer loop on I, inner loop on J <span class="fb">That is the good order in C; in Fortran it jumps a whole column at every step.</span></li>
+      <li>Either: the cache does not care about the order <span class="fb">The order decides whether the words of a fetched block are used before it is evicted — a sixteen-fold difference in section 6.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A 512 × 512 matrix multiplication is blocked with B = 32, and the tile fits in the cache. By about how much do the words moved from memory shrink?</p>
+    <ul class="options">
+      <li>Not at all: the multiplications are the same <span class="fb">The arithmetic is the same; the traffic is not — that is the whole point of blocking.</span></li>
+      <li data-correct>About 31 times <span class="fb">Right: (2N³ + N²) / (2N³/B + N²) = 268 697 600 / 8 650 752 ≈ 31, close to B.</span></li>
+      <li>About 1024 times (B²) <span class="fb">z is fetched once instead of N times, but y and x are still fetched N/B times each: the gain is about B.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l25-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>The metric is AMAT, not the miss rate: the plain hardware knobs that cut misses push up another cost — the hit time (size, ways), the penalty (block size) or the memory bandwidth (prefetching).</li>
+    <li>A bigger cache removes capacity misses with diminishing returns and a slower hit, which is why the L1 stays small; a bigger block removes compulsory misses until the scarcity of lines brings conflicts back (the U-curve), and the AMAT-best block is never larger than the miss-rate-best one, because the penalty grows with the block.</li>
+    <li>Associativity removes conflict misses only (2:1 rule, 8-way ≈ fully associative); its multiplexer waits for the tag comparison on every hit, so a large cache can be faster direct-mapped.</li>
+    <li>A victim cache (a few fully associative entries, swap on a hit) and pseudo-associativity (a second line, so two lines act as one 2-way set) remove conflict misses without slowing the normal hit; way prediction keeps the miss rate and cuts the hit time and power, and its table is rewritten on every wrong guess, misses included.</li>
+    <li>Prefetching attacks compulsory misses by fetching early: stream buffers beside the cache, so wrong guesses do not pollute it; software prefetches that are non-faulting, need a non-blocking cache and run about one miss latency ahead.</li>
+    <li>Merging arrays, interchange, fusion and blocking change only the layout and order of the accesses: they cut capacity and conflict misses for free, never compulsory ones, and blocking pays only when data is reused — 2N³ + N² → 2N³/B + N² words for matrix multiplication.</li>
+  </ul>
+  <aside class="cheat" id="l25-cheat">
+    <dl>
+      <dt>AMAT</dt><dd>\(\text{AMAT} = \text{HT} + \text{MR} \times \text{MP}\) — HT hit time and MP miss penalty in cycles, MR miss rate; a knob pays only if its ΔMR × MP outweighs what it adds to HT or MP</dd>
+      <dt>Miss penalty vs block size</dt><dd>MP(B) = L + B / w: latency L plus B bytes at w bytes per cycle (textbook: 80 + 2 · B/16 = 82, 84, 88, 96, 112 for 16 … 256 bytes)</dd>
+      <dt>Blocks and sets</dt><dd>blocks = C / B; sets = C / (B × n) for a cache of C bytes, blocks of B bytes, n ways</dd>
+      <dt>Block-size optimum</dt><dd>B(AMAT-best) ≤ B(miss-rate-best), because MP grows with B</dd>
+      <dt>2:1 cache rule</dt><dd>MR of a direct-mapped cache of size N ≈ MR of a 2-way cache of size N/2; 8-way ≈ fully associative</dd>
+      <dt>Associativity price (textbook example)</dt><dd>HT × 1.36 / 1.44 / 1.52 for 2 / 4 / 8 ways; compare AMAT, not MR</dd>
+      <dt>Way predictor table</dt><dd>bits = sets × ⌈log₂ n⌉ (1024 sets, 4-way: 2048 bits = 256 B); rewritten on every wrong guess, misses included</dd>
+      <dt>Way prediction hit time</dt><dd>\(\text{HT}_{\text{eff}} = \text{HT} + (1 - p)\, t_m\) — \(p\) prediction accuracy, \(t_m\) extra cycles of a wrong guess (hits only)</dd>
+      <dt>Prefetch distance</dt><dd>d = ⌈miss latency / cycles per iteration⌉ iterations ahead (100 / 12 → 9)</dd>
+      <dt>Blocking, matrix multiply</dt><dd>N × N matrices, B × B tiles: words moved 2N³ + N² → 2N³/B + N² if the tile plus two strips of B words fit (≈ B² + 2B words)</dd>
+      <dt>Miss each knob removes</dt><dd>size → capacity; block → compulsory; ways, victim cache, pseudo-associativity → conflict; prefetching → compulsory (+ some capacity); compiler transformations → capacity, conflict; way prediction → none (hit time)</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l25-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://venus.cs61c.org/" target="_blank" rel="noopener">Venus RISC-V simulator, Cache tab</a>
+      <span class="res-by">UC Berkeley CS 61C</span>
+      <p class="res-why">After section 2: write a loop over an array, run it with a stride of one word and then with a stride of one block, and watch the hit rate collapse; then keep the size and switch from direct-mapped to 2-way to see conflict misses vanish. Its cache is write-through, which does not matter for these experiments.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://igoro.com/archive/gallery-of-processor-cache-effects/" target="_blank" rel="noopener">Gallery of Processor Cache Effects</a>
+      <span class="res-by">Igor Ostrovsky</span>
+      <p class="res-why">Seven tiny experiments on a real machine. Example 2 shows the block at work (touching every 16th integer costs as much as touching all of them), Example 5 shows associativity at work (strides that are multiples of a power of two pile into one set).</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www-old.cs.utah.edu/~rajeev/cs7810/papers/jouppi90.pdf" target="_blank" rel="noopener">Improving Direct-Mapped Cache Performance by the Addition of a Small Fully-Associative Cache and Prefetch Buffers</a>
+      <span class="res-by">Norman P. Jouppi, ISCA 1990</span><span class="res-dur">10 pages</span>
+      <p class="res-why">The paper behind sections 4 and 5 of this lesson: victim caches and stream buffers, with its measurements on direct-mapped caches. Read the abstract and the figures first.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.akkadia.org/drepper/cpumemory.pdf" target="_blank" rel="noopener">What Every Programmer Should Know About Memory</a>
+      <span class="res-by">Ulrich Drepper, Red Hat, 2007</span><span class="res-dur">section 6</span>
+      <p class="res-why">Section 6, "What programmers can do", runs this lesson's compiler and prefetching ideas on a real processor: the matrix multiplication rewritten for the cache, with transposition and sub-matrices, and hardware and software prefetching with measured speed-ups.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>This lesson made misses rarer. The misses that remain still cost the full trip down — next, make each of them cheaper: reads before writes, the critical word first, caches that keep working while a miss is in flight, and a second level to land on.</p>
+</aside>
+
+</main>
+</body>
+</html>

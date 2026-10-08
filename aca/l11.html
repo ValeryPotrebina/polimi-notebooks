@@ -1,0 +1,1132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Names, not values: Tomasulo’s architecture · ACA Notebook</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l11">
+
+<header class="lesson-head">
+  <h1>Names, not values: Tomasulo’s architecture</h1>
+  <p class="lede">After this lesson you will read a reservation station and a register’s status field like a sentence — “F2 will come from RS4” — and say, for any broadcast on the common data bus, who takes the value and who ignores it.</p>
+</header>
+
+<div class="hook" data-label="A warm-up puzzle">
+  <p>In October 1967 IBM delivered the first System/360 Model 91 to NASA’s Goddard Space Flight Center. About fifteen were ever built, and that first one was, for a while, the most powerful computer in user operation. Its floating-point unit ran instructions out of program order with a scheme its designer, Robert Tomasulo, had just published in a nine-page paper as “a simple common data busing and register tagging scheme”. Thirty years later the Pentium II, the Alpha 21264 and the MIPS R10000 were still built on it.</p>
+  <p>Here is the puzzle. In the four-instruction fragment of this lesson, <code>I3: FMUL F6, F10, F8</code> needs two registers that are ready from cycle 1. On a scoreboard (<a href="l09.html">lesson 9</a>) with the latencies of this lesson’s last widget it cannot issue until cycle 14, because an earlier <code>FADD</code> also writes F6 and that <code>FADD</code> is waiting for a divide. Tomasulo’s machine issues the multiply at cycle 4, writes its result at cycle 8 — and the program still ends with the right value in F6. It did not touch the code.</p>
+  <p>What did it change? Keep the question: the answer is what the word “F6” means inside the machine.</p>
+</div>
+
+<section id="l11-names">
+  <h2>Three instructions, one name: why rename at all</h2>
+
+  <p><a href="l07.html">Lesson 7</a> sorted the ways two instructions can collide into three kinds. Only one of them, <mark class="key">RAW</mark>, is about a value: the second instruction needs what the first one computes. The other two are about a <em>name</em>. In a <mark class="key">WAR</mark> hazard a later instruction writes a register that an earlier one still has to read; in a <mark class="key">WAW</mark> hazard two instructions write the same register and the second write could land first. The notes call them <mark class="key">false dependences</mark> (page 142): the instructions “appear to depend on each other because they use the same register name, but there is no true data dependency between them”. Different values are fighting over one name.</p>
+
+  <p>The whole lesson runs on the fragment the notes use, written in the mnemonics of the exam papers. The notes spell it <code>DIV.D</code>, <code>ADD.D</code>, <code>S.D</code>, <code>MUL.D</code> (page 142), the spelling of Hennessy and Patterson; the papers write <code>FDIV</code>, <code>FADD</code>, <code>SD</code>, <code>FMUL</code>, and so does this notebook. Older papers write <code>$F6</code>; the 2026 paper drops the dollar sign.</p>
+
+<pre><code>I0: FDIV F0, F2, F4
+I1: FADD F6, F0, F8      ; RAW on F0 with I0
+I2: SD   F6, 0(R1)       ; RAW on F6 with I1
+I3: FMUL F6, F10, F8     ; WAW on F6 with I1, WAR on F6 with I2</code></pre>
+
+  <p>Read the last line twice. <code>I3</code> must not deliver its product into F6 before <code>I1</code> has delivered its sum (WAW), and not before <code>I2</code> has read that sum (WAR). Neither rule asks <code>I3</code> to wait for a <em>value</em>: F10 and F8 are ready. Both ask it to wait for the name F6 to become free. On the scoreboard the WAW check happens at Issue, so <code>I3</code> waits there — and because issue is in order, everything behind it waits too.</p>
+
+  <h3>Static renaming: let the compiler pick another name</h3>
+
+  <p>The oldest cure is a second name. If the compiler has a spare register <code>S</code>, it can send the sum there and let the store read it; the multiply keeps F6, and the two name conflicts are gone while the RAW chain is untouched:</p>
+
+<pre><code>I0: FDIV F0, F2, F4
+I1: FADD S,  F0, F8      ; RAW on F0, as before
+I2: SD   S,  0(R1)       ; now reads S
+I3: FMUL F6, F10, F8     ; nobody else uses F6 any more</code></pre>
+
+  <p>The notes name the two limits (page 142). The compiler must know every hazard in advance, which means knowing the whole execution path — hard with branches, loops and inputs that change. And every spare name costs an <mark class="key">architectural register</mark>, a number that has to fit in the register field of the instruction; the ISA may not have one to spare. The machine of the hook is the extreme case: the System/360 had only four floating-point registers, so the compiler had nothing to rename into.</p>
+
+  <h3>Implicit renaming: let the hardware invent names it never shows</h3>
+
+  <p>Tomasulo’s answer is to give the result a name that exists only inside the machine. The buffer in front of a functional unit that holds a waiting instruction — the <mark class="key">reservation station</mark> — becomes the temporary name, the <mark class="key">tag</mark>, of the result it will produce. The notes picture it as a rewrite of the code (page 143), with the sum sent to “RS1” and the store reading “from RS1”:</p>
+
+<pre><code>I0: FDIV F0, F2, F4
+I1: FADD RS1, F0, F8     ; the sum will be known as RS1
+I2: SD   RS1, 0(R1)      ; the store waits for RS1, not for F6
+I3: FMUL F6, F10, F8     ; its own write to F6 collides with nobody</code></pre>
+
+  <p>Take the listing as a picture, not as a mechanism: no instruction text is rewritten. The renaming lives in two kinds of fields, one in the station and one in the register file, and the next section fills them in. The before/after pair shows what changes.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l11-fig-contend">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Without renaming, three instructions converge on the single register cell F6: the FADD writes it, the store reads it, the FMUL writes it again, so WAR and WAW arcs tie the three together">
+        <rect x="20" y="30" width="60" height="18" class="fi-paper"/>
+        <line x1="20" y1="57" x2="80" y2="57" class="hl"/>
+        <rect x="20" y="48" width="60" height="18" class="fi-paper"/>
+        <rect x="20" y="66" width="60" height="18" class="fi-paper"/>
+        <rect x="20" y="84" width="60" height="18" class="fi-paper"/>
+        <text x="26" y="43" class="tx-mono tx-sm">F0</text>
+        <text x="26" y="61" class="tx-mono tx-sm tx-bold">F6</text>
+        <text x="26" y="79" class="tx-mono tx-sm">F8</text>
+        <text x="26" y="97" class="tx-mono tx-sm">F10</text>
+        <rect x="120" y="30" width="120" height="24" rx="4" class="fi-paper"/>
+        <rect x="120" y="98" width="120" height="24" rx="4" class="fi-paper"/>
+        <rect x="120" y="166" width="120" height="24" rx="4" class="fi-paper"/>
+        <text x="126" y="46" class="tx-mono tx-sm">FADD F6,F0,F8</text>
+        <text x="126" y="114" class="tx-mono tx-sm">SD F6,0(R1)</text>
+        <text x="126" y="182" class="tx-mono tx-sm">FMUL F6,F10,F8</text>
+        <text x="100" y="46" class="tx-mono tx-sm tx-end">I1</text>
+        <text x="100" y="114" class="tx-mono tx-sm tx-end">I2</text>
+        <text x="100" y="182" class="tx-mono tx-sm tx-end">I3</text>
+        <line x1="120" y1="42" x2="86" y2="55" class="st-ink sw-2" marker-end="url(#arr)"/>
+        <line x1="84" y1="60" x2="114" y2="108" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="120" y1="176" x2="86" y2="62" class="st-ink sw-2" marker-end="url(#arr)"/>
+        <path d="M240,42 Q290,110 240,178" class="st-ink dots" marker-end="url(#arr)"/>
+        <path d="M240,110 Q270,144 240,176" class="st-ink dash" marker-end="url(#arr)"/>
+        <text x="270" y="86" class="tx-sm halo">WAW</text>
+        <text x="266" y="154" class="tx-sm halo">WAR</text>
+        <text x="20" y="150" class="tx-hand halo">one name, three users</text>
+      </svg>
+      <p class="fig-label">Before: F6 is a place</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="With renaming, each result carries its station's tag: the register cell F6 only records the newest writer RS3, the store waits for tag RS1, and the name arcs (WAW and WAR) are greyed and crossed out; only the RAW arrow from the FADD to the store remains">
+        <rect x="20" y="30" width="48" height="18" class="fi-paper"/>
+        <rect x="68" y="30" width="36" height="18" class="fw-s3"/>
+        <line x1="20" y1="57" x2="104" y2="57" class="hl"/>
+        <rect x="20" y="48" width="48" height="18" class="fi-paper"/>
+        <rect x="68" y="48" width="36" height="18" class="fw-s3"/>
+        <rect x="20" y="66" width="48" height="18" class="fi-paper"/>
+        <rect x="68" y="66" width="36" height="18" class="fw-s3"/>
+        <rect x="20" y="84" width="48" height="18" class="fi-paper"/>
+        <rect x="68" y="84" width="36" height="18" class="fw-s3"/>
+        <text x="26" y="43" class="tx-mono tx-sm">F0</text>
+        <text x="26" y="61" class="tx-mono tx-sm tx-bold">F6</text>
+        <text x="26" y="79" class="tx-mono tx-sm">F8</text>
+        <text x="26" y="97" class="tx-mono tx-sm">F10</text>
+        <text x="86" y="61" class="tx-mono tx-sm tx-mid">RS3</text>
+        <text x="112" y="24" class="tx-sm tx-muted">Qi</text>
+        <rect x="150" y="30" width="120" height="24" rx="4" class="fi-paper"/>
+        <rect x="150" y="98" width="120" height="24" rx="4" class="fi-paper"/>
+        <rect x="150" y="166" width="120" height="24" rx="4" class="fi-paper"/>
+        <text x="156" y="46" class="tx-mono tx-sm">FADD F6,F0,F8</text>
+        <text x="156" y="114" class="tx-mono tx-sm">SD F6,0(R1)</text>
+        <text x="156" y="182" class="tx-mono tx-sm">FMUL F6,F10,F8</text>
+        <rect x="112" y="33" width="34" height="18" rx="6" class="fw-s3 st-s3"/>
+        <rect x="112" y="101" width="34" height="18" rx="6" class="fw-s3 st-s3"/>
+        <rect x="112" y="169" width="34" height="18" rx="6" class="fw-s3 st-s3"/>
+        <text x="129" y="46" class="tx-mono tx-sm tx-mid">RS1</text>
+        <text x="129" y="114" class="tx-mono tx-sm tx-mid">RS2</text>
+        <text x="129" y="182" class="tx-mono tx-sm tx-mid">RS3</text>
+        <path d="M270,42 Q296,110 270,174" class="st-muted dash"/>
+        <line x1="279" y1="104" x2="291" y2="116" class="st-bad sw-2"/>
+        <line x1="291" y1="104" x2="279" y2="116" class="st-bad sw-2"/>
+        <text x="266" y="160" class="tx-sm tx-muted tx-end">WAW, WAR</text>
+        <line x1="150" y1="178" x2="108" y2="64" class="st-ink sw-2" marker-end="url(#arr)"/>
+        <path d="M210,54 L210,94" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="216" y="78" class="tx-mono tx-sm halo">RS1</text>
+        <text x="20" y="148" class="tx-hand halo">two results, two names</text>
+        <text x="20" y="208" class="tx-sm tx-muted">only the newest writer owns F6</text>
+      </svg>
+      <p class="fig-label">After: F6 is the newest promise</p>
+    </div>
+    <figcaption><b>Fig. 1.</b> Before: every reader and writer of F6 points at the same cell, and the name arcs (dotted WAW, dashed WAR) tie <code>I3</code> to the two instructions ahead of it. After: the sum is called RS1 and the store waits for that tag; the register cell F6 only records who will write it last (<code>Qi = RS3</code>); both name arcs are crossed out, and the orange RAW arrow is the one dependence that survives.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">RAW is about a value and stays; WAR and WAW are about a name and disappear the moment every result gets a name of its own.</mark></p>
+</section>
+
+<section id="l11-station">
+  <h2>A station holds a value or a name</h2>
+
+  <p>Page 144 of the notes calls the reservation stations “Tomasulo’s brain”, and the reason is where they sit. The scoreboard kept one central table and asked it before every move. Tomasulo puts the control <em>next to each functional unit</em>: the adder has its own small buffers, the multiplier has its own, the memory unit has its own. Each buffer holds one issued instruction together with everything it needs to decide, alone, when to go. The fields of one station are few, and the exam expects you to know them by name.</p>
+
+  <figure class="tbl-fig" id="l11-tbl-rs">
+    <figcaption>The record of one reservation station (notes, page 146; the field A is Hennessy and Patterson’s, used by loads and stores).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Field</th><th>What it holds</th><th>Set when</th></tr></thead>
+        <tbody>
+          <tr><td><code>Busy</code></td><td>yes while the station holds an instruction</td><td>at issue; cleared at write result</td></tr>
+          <tr><td><code>Op</code></td><td>the operation (FADD, FMUL, LD, SD, ADDUI, BNE)</td><td>at issue</td></tr>
+          <tr><td><code>Vj</code>, <code>Vk</code></td><td>the <em>values</em> of the two source operands, when they are available</td><td>at issue (copied from the register file) or when the tag arrives on the CDB</td></tr>
+          <tr><td><code>Qj</code>, <code>Qk</code></td><td>the <em>tags</em> of the stations that will produce the operands; 0 means “nothing pending, use the value”</td><td>at issue (copied from the register’s Qi); cleared when the value arrives</td></tr>
+          <tr><td><code>A</code></td><td>loads and stores only: the immediate at issue, the effective address once computed</td><td>at issue; updated by the address unit</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>For each operand exactly one of the pair is meaningful at any moment: either <code>Vj</code> holds the value, or <code>Qj</code> names who will deliver it. A station whose two Q fields are 0 is <em>ready</em>; a station with a non-zero Q field is waiting — not for a register, but for a tag to come down the bus. The notes’ slogan on page 144 says it in one line: “We no longer wait for registers, we wait for values, and when they’re ready, we go.”</p>
+
+  <aside class="margin-note">Qi lives in the register file (who will write this register). Qj and Qk live in the station (who delivers my operand). All three hold station names.</aside>
+  <p>The register file gets a matching field. Each register <code>Fi</code> now carries its value <code>Vi</code> and a tag <code>Qi</code> (page 147): the name of the station that will produce the next value of the register. <code>Qi = 0</code> means the value is valid, use it; <code>Qi = RS4</code> means “F2 will come from RS4”. The tag is written at issue, by the instruction whose destination the register is, and it is <em>overwritten</em> by every later instruction that writes the same register. So the register remembers only its <mark class="key">newest writer</mark>: older claims are simply forgotten. That single rule is the renaming.</p>
+
+  <aside class="redpen" data-page="143">
+    <p class="claim">“Tomasulo’s algorithm automatically tracks which RS (Reservation Stations) produces what and only writes to the actual register file once the instruction retires. Until then, everything is handled with RS tags.”</p>
+    <p class="fix">In the algorithm of these pages the register file is written in the Write Result stage, over the CDB, as soon as the producing unit finishes — provided the register’s <code>Qi</code> still names that station. There is no retire stage.</p>
+    <p class="because">“Retire” (commit) is the vocabulary of the reorder buffer, <a href="l17.html">lessons 17</a>–<a href="l18.html">18</a>, where the register file really is written in program order. Page 150 says it itself under Write Result: “Register file updates any registers whose Qi matches the tag” — and that cycle is the exam table’s WRITE RESULT column (<a href="l12.html">lesson 12</a>).</p>
+  </aside>
+
+  <aside class="redpen" data-page="146">
+    <p class="claim">“Finally, note that for memory instructions (like Load/Store), Vj often holds the address, not a register value.”</p>
+    <p class="fix">A load or store buffer has an extra field <code>A</code>: the immediate at issue, the effective address after the address unit has added the base register. <code>Vj</code>/<code>Qj</code> hold the base register (its value or its tag); for a store, <code>Vk</code>/<code>Qk</code> hold the data to be stored.</p>
+    <p class="because">That is Hennessy and Patterson’s record (chapter 3, the station table of their Tomasulo example: Busy, Op, Vj, Vk, Qj, Qk, A), and the page’s own table has no address field at all. If <code>Vj</code> were the address, a load whose base register is still being computed — <code>LD F2, A(R1)</code> right after <code>ADDUI R1, R1, 8</code> — would have nowhere to put the tag of the ADDUI; with the field <code>A</code> it waits with <code>Qj = RS5</code> like any other instruction. (The notes’ past-paper tables write a load’s offset in <code>Vj</code> and its base in <code>Vk</code>: a notation of their own, not the record.)</p>
+  </aside>
+
+  <h3>The bus that shouts a name</h3>
+
+  <p>Now the third piece, the one that ties the fields together. When a functional unit finishes, the result does not go to its destination register first. It is put on the <mark class="key">common data bus</mark> (CDB) together with the tag of the station that produced it — the pair <code>&lt;tag, value&gt;</code> — and three things happen at once (page 145): every station whose <code>Qj</code> or <code>Qk</code> equals the tag copies the value into <code>Vj</code> or <code>Vk</code> and clears the tag; the register file writes the value into every register whose <code>Qi</code> equals the tag and clears that <code>Qi</code>; and the producing station becomes free. The notes call this “a kind of hardware-level forwarding, operands are handed off before they hit the register file” — the forwarding path of <a href="l02.html">lesson 2</a>, generalised to every unit at once.</p>
+
+  <p>Two consequences are the heart of the exam questions on this topic. First, the tag on the bus is the name of the <em>producer</em>, never of the destination register. A normal data bus says “this value goes to F2”; the CDB says “this value comes from RS1”, and every consumer decides for itself whether it was waiting for RS1. (This “come-from” reading is standard lecture material on Tomasulo’s algorithm; the notes do not use the word.) Second, the register is written <em>only if its <code>Qi</code> still matches</em>: if a later instruction has renamed the register to its own station, the register ignores the broadcast — the value still reaches every station that was waiting for it, so nobody loses anything, and the register keeps its promise to the newest writer. That is how a WAW hazard dies without a single stall.</p>
+
+  <p>Try it on the loop body of the 15 July 2024 paper, the first exercise of that exam. Imagine all six instructions issued and no result written yet. The loads and the store share stations RS1 and RS2 in front of the two load/store units, the two FADD share RS3 and RS4 in front of the FP unit, the integer instructions RS5 and RS6 in front of the ALU — the exam’s standard machine.</p>
+
+<pre><code>I0: LD    F2, A(R1)
+I1: FADD  F2, F2, F2      ; RAW on F2 with I0, WAW with I0
+I2: FADD  F2, F2, F4      ; RAW on F2 with I1, WAR and WAW with I1
+I3: SD    F2, A(R1)       ; RAW on F2 with I2
+I4: ADDUI R1, R1, 8       ; WAR on R1 with I0 and I3
+I5: BNE   R1, R2, FOR     ; RAW on R1 with I4</code></pre>
+
+  <figure class="tbl-fig" id="l11-tbl-state">
+    <figcaption>The frozen state: every instruction issued, nothing written. Register values before the loop: F2 = 0.0, F4 = 0.5, R1 = 100, R2 = 200; the offset A is taken as 0, so the load and the store both address 100, where memory holds 1.5.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>RS</th><th>Busy</th><th>Op</th><th>Vj</th><th>Qj</th><th>Vk</th><th>Qk</th><th>A</th><th>Unit</th></tr></thead>
+        <tbody>
+          <tr><td>RS1</td><td>yes</td><td>LD</td><td class="num">100</td><td>0</td><td>—</td><td>—</td><td class="num">100</td><td>LDU1</td></tr>
+          <tr><td>RS2</td><td>yes</td><td>SD</td><td class="num">100</td><td>0</td><td>—</td><td>RS4</td><td class="num">100</td><td>LDU2</td></tr>
+          <tr><td>RS3</td><td>yes</td><td>FADD</td><td>—</td><td>RS1</td><td>—</td><td>RS1</td><td>—</td><td>FPU1</td></tr>
+          <tr><td>RS4</td><td>yes</td><td>FADD</td><td>—</td><td>RS3</td><td class="num">0.5</td><td>0</td><td>—</td><td>FPU1</td></tr>
+          <tr><td>RS5</td><td>yes</td><td>ADDUI</td><td class="num">100</td><td>0</td><td class="num">8</td><td>0</td><td>—</td><td>ALU1</td></tr>
+          <tr><td>RS6</td><td>yes</td><td>BNE</td><td>—</td><td>RS5</td><td class="num">200</td><td>0</td><td>—</td><td>ALU1</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Register status</th><th>F2</th><th>F4</th><th>R1</th><th>R2</th></thead>
+        <tbody>
+          <tr><td>Vi</td><td class="num">0.0</td><td class="num">0.5</td><td class="num">100</td><td class="num">200</td></tr>
+          <tr class="is-key"><td>Qi</td><td>RS4</td><td>0</td><td>RS5</td><td>0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Read the tables as sentences before you touch the widget. <code>RS3</code> says: “I add two copies of whatever RS1 delivers.” <code>RS2</code> says: “I store at address 100 whatever RS4 delivers” — and notice that it already holds R1 = 100, copied at issue, so the <code>ADDUI</code> in RS5 can change R1 whenever it likes. The register status says: “F2 will come from RS4, R1 from RS5.” F2 has been promised three times, by I0, I1 and I2; only the newest promise is kept.</p>
+
+  <div class="widget" id="l11-w-listen">
+    <h3 class="widget-title">Who listens? One broadcast on the common data bus</h3>
+    <p class="widget-intro">The six stations and the register file of the frozen state above. Pick the station that finishes next and press <b>Broadcast</b>: its <code>&lt;tag, value&gt;</code> goes on the bus, and every field that carries that tag fills at once. A station that still has a tag in Qj or Qk cannot finish — the widget tells you why. The one thing to see: a tag is the <em>producer’s</em> name, one broadcast serves every consumer of it, and the register file takes the value only if its Qi still says that name.</p>
+    <ol class="tasks">
+      <li>Before pressing anything: RS1 (the load of F2) finishes first. How many fields will its broadcast fill, and will the register F2 be written? Then select RS1 and press Broadcast.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Two fields fill from one broadcast, and both are in the same station: <code>RS3.Vj</code> and <code>RS3.Vk</code> become 1.5, because <code>FADD F2, F2, F2</code> takes both operands from RS1. F2 is <em>not</em> written: its <code>Qi</code> says RS4 — I1 and I2 renamed it after I0 — so the register ignores the value that was once meant for it. Nothing is lost: the only consumer of I0’s load, RS3, got it.</p></details>
+      </li>
+      <li>Now finish RS5, the <code>ADDUI</code>. Who listens? Does the store in RS2, whose address was computed from R1, change?
+        <details class="answer"><summary>What you should see</summary>
+          <p><code>RS6.Vj</code> fills with 108 (the branch was waiting for RS5), and R1 becomes 108 with <code>Qi</code> cleared, because R1 still named RS5. The store does not change: it copied R1 = 100 at issue. That copy is why the WAR hazard between the store and the <code>ADDUI</code> cannot hurt — the reader never goes back to the register.</p></details>
+      </li>
+      <li>Try to finish RS4 before RS3. What does the widget answer, and which rule is it quoting?
+        <details class="answer"><summary>What you should see</summary>
+          <p>RS4 is refused: it still holds <code>Qj = RS3</code>, so it has never started executing. The execute condition is <code>Qj = Qk = 0</code> — both operands as values — and a station cannot broadcast what it has not computed. Finish RS3 first; then RS4 becomes ready.</p></details>
+      </li>
+      <li>Finish RS3, then RS4, then the store in RS2. When RS4 broadcasts, who takes the value? And when the store finishes, what appears on the bus?
+        <details class="answer"><summary>What you should see</summary>
+          <p>RS4’s <code>&lt;RS4, 3.5&gt;</code> fills <code>RS2.Vk</code> (the store’s data) and is written into F2, because this time <code>F2.Qi = RS4</code> matches — the newest writer delivers. The store then puts <em>nothing</em> on the bus: it writes 3.5 into memory at address 100 and nobody listens for RS2, because no instruction can read a store’s result through a register. A store listens on the CDB but never speaks on it.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l11-w-listen', function (root, ui) {
+    var S = Course.svg;
+    function initial() {
+      return {
+        st: [
+          { id: 'RS1', unit: 'LDU1', kind: 'load',  op: 'LD',    ins: 'LD F2, A(R1)',    dst: 'F2', Vj: 100, Qj: 0, Vk: null, Qk: null, A: 100, busy: true },
+          { id: 'RS2', unit: 'LDU2', kind: 'store', op: 'SD',    ins: 'SD F2, A(R1)',    dst: null, Vj: 100, Qj: 0, Vk: null, Qk: 'RS4', A: 100, busy: true },
+          { id: 'RS3', unit: 'FPU1', kind: 'fp',    op: 'FADD',  ins: 'FADD F2, F2, F2', dst: 'F2', Vj: null, Qj: 'RS1', Vk: null, Qk: 'RS1', A: null, busy: true },
+          { id: 'RS4', unit: 'FPU1', kind: 'fp',    op: 'FADD',  ins: 'FADD F2, F2, F4', dst: 'F2', Vj: null, Qj: 'RS3', Vk: 0.5, Qk: 0, A: null, busy: true },
+          { id: 'RS5', unit: 'ALU1', kind: 'int',   op: 'ADDUI', ins: 'ADDUI R1, R1, 8', dst: 'R1', Vj: 100, Qj: 0, Vk: 8, Qk: 0, A: null, busy: true },
+          { id: 'RS6', unit: 'ALU1', kind: 'br',    op: 'BNE',   ins: 'BNE R1, R2, FOR', dst: null, Vj: null, Qj: 'RS5', Vk: 200, Qk: 0, A: null, busy: true }
+        ],
+        regs: [ { n: 'F2', V: 0, Q: 'RS4' }, { n: 'F4', V: 0.5, Q: 0 }, { n: 'R1', V: 100, Q: 'RS5' }, { n: 'R2', V: 200, Q: 0 } ],
+        mem: [ { a: 100, v: 1.5 }, { a: 108, v: 2.5 }, { a: 116, v: 4 }, { a: 124, v: 0 } ],
+        ev: null, done: 0
+      };
+    }
+    var st = initial();
+    function byId(id) { for (var i = 0; i < st.st.length; i++) if (st.st[i].id === id) return st.st[i]; return null; }
+    function isFP(name) { return name && name.charAt(0) === 'F'; }
+    function fmt(v, fp) { return v === null || v === undefined ? '—' : (fp ? Course.fmt(v, 1) : Course.fmt(v, 0)); }
+    function fpOf(s) { return s.kind === 'load' || s.kind === 'store' || s.kind === 'fp'; }
+    var sel = ui.select('station that finishes next', st.st.map(function (s) { return { value: s.id, label: s.id + ' — ' + s.ins }; }), null, 'RS1');
+    ui.button('Broadcast on the CDB', finish, { kind: 'primary', icon: 'play' });
+    ui.button('Reset the state', function () { st = initial(); }, { icon: 'refresh' });
+    var roFields = ui.readout('fields filled by the last broadcast', { digits: 0 });
+    var roReg = ui.readout('register write');
+    var roDone = ui.readout('instructions finished', { digits: 0 });
+    var note = ui.note('Choose a station and press Broadcast.');
+    var svg = ui.svg(560, 340, { label: 'Six reservation stations above the common data bus, the register status below it, a small memory on the right; the last broadcast is drawn as arrows from the bus into every field that was waiting for that tag' });
+    ui.legend([
+      { label: 'value travelling on the CDB', color: 's1', mark: 'line' },
+      { label: 'tag — a station name', color: 's3', mark: 'square' },
+      { label: 'field filled by this broadcast', color: 'ink', mark: 'hl' },
+      { label: 'ignored: Qi names a newer writer', color: 'bad', mark: 'cross' }
+    ]);
+
+    function finish() {
+      var s = byId(sel.value), ev = { src: s.id, ins: s.ins, kind: 'none', fills: [], regs: [], ignored: [], msg: '' };
+      st.ev = ev;
+      if (!s.busy) { ev.msg = '<b>' + s.id + '</b> is empty: its instruction has already finished and the station was freed at its write result. Pick another station or press Reset.'; return; }
+      var waits = [];
+      if (s.Qj) waits.push('Qj = ' + s.Qj);
+      if (s.Qk) waits.push('Qk = ' + s.Qk);
+      if (waits.length) {
+        ev.kind = 'blocked';
+        ev.msg = '<b>' + s.id + '</b> (' + s.ins + ') cannot finish: it still holds ' + waits.join(' and ') + ', so it has not even started executing. The execute condition is Qj = Qk = 0 — finish ' + (s.Qj || s.Qk) + ' first.';
+        return;
+      }
+      var value = null, fp = fpOf(s), i, r, m;
+      if (s.kind === 'load') { for (i = 0; i < st.mem.length; i++) if (st.mem[i].a === s.A) value = st.mem[i].v; }
+      else if (s.kind === 'fp') value = s.Vj + s.Vk;
+      else if (s.kind === 'int') value = s.Vj + s.Vk;
+      s.busy = false; st.done++;
+      if (s.kind === 'store') {
+        ev.kind = 'store';
+        for (i = 0; i < st.mem.length; i++) if (st.mem[i].a === s.A) { st.mem[i].v = s.Vk; st.mem[i].hl = true; }
+        ev.msg = '<b>' + s.id + '</b> (' + s.ins + ') has its address (100) and its data (' + fmt(s.Vk, true) + '): it writes memory at 100. <b>Nothing goes on the CDB</b> — no station and no register waits for a store’s tag. In the exam table the store still gets a WRITE RESULT cycle: the cycle its memory write completes (lesson 12).';
+        s.Vj = null; s.Vk = null; s.Qj = null; s.Qk = null; s.A = null;
+        return;
+      }
+      if (s.kind === 'br') {
+        ev.kind = 'branch';
+        ev.msg = '<b>' + s.id + '</b> (' + s.ins + ') resolves: R1 = ' + fmt(s.Vj, false) + ' differs from R2 = ' + fmt(s.Vk, false) + ', the branch is taken. A branch produces no register value, so there is nothing to broadcast and nobody listens. (Whether it still occupies a CDB slot in the exam table is an open convention — lesson 12.)';
+        s.Vj = null; s.Vk = null; s.Qj = null; s.Qk = null;
+        return;
+      }
+      ev.kind = 'cdb'; ev.value = value; ev.fp = fp;
+      for (i = 0; i < st.st.length; i++) {
+        r = st.st[i];
+        if (!r.busy) continue;
+        if (r.Qj === s.id) { r.Vj = value; r.Qj = 0; ev.fills.push({ id: r.id, f: 'Vj' }); }
+        if (r.Qk === s.id) { r.Vk = value; r.Qk = 0; ev.fills.push({ id: r.id, f: 'Vk' }); }
+      }
+      for (i = 0; i < st.regs.length; i++) {
+        m = st.regs[i];
+        if (m.Q === s.id) { m.V = value; m.Q = 0; ev.regs.push(m.n); }
+        else if (s.dst && m.n === s.dst && m.Q) ev.ignored.push({ n: m.n, q: m.Q });
+      }
+      var parts = [], who = ev.fills.map(function (f) { return f.id + '.' + f.f; });
+      parts.push('<b>&lt;' + s.id + ', ' + fmt(value, fp) + '&gt;</b> on the CDB (' + s.ins + ').');
+      parts.push(who.length ? 'Listeners: ' + who.join(' and ') + (who.length > 1 && ev.fills[0].id === ev.fills[1].id ? ' — both operands of ' + ev.fills[0].id + ' come from ' + s.id + ', so one broadcast fills two fields of one station' : '') + ' → tag cleared, value copied.' : 'No station was waiting for ' + s.id + '.');
+      if (ev.regs.length) parts.push('Register ' + ev.regs.join(', ') + ': Qi = ' + s.id + ' matches → written, Qi ← 0.');
+      ev.ignored.forEach(function (g) { parts.push('Register ' + g.n + ': Qi = ' + g.q + ' ≠ ' + s.id + ' → <b>not written</b>: a newer instruction has renamed ' + g.n + ' to ' + g.q + '. The value is not lost — it went to the stations that needed it.'); });
+      parts.push(s.id + ' is free again.');
+      ev.msg = parts.join(' ');
+      s.Vj = null; s.Vk = null; s.Qj = null; s.Qk = null; s.A = null;
+    }
+
+    /* geometry */
+    var COL = [ { k: 'id', x: 30, w: 40 }, { k: 'busy', x: 70, w: 40 }, { k: 'op', x: 110, w: 66 }, { k: 'Vj', x: 176, w: 56 }, { k: 'Qj', x: 232, w: 50 }, { k: 'Vk', x: 282, w: 56 }, { k: 'Qk', x: 338, w: 50 }, { k: 'A', x: 388, w: 52 } ];
+    var HEAD = { id: 'RS', busy: 'Busy', op: 'Op', Vj: 'Vj', Qj: 'Qj', Vk: 'Vk', Qk: 'Qk', A: 'A' };
+    var ROW_Y = 30, ROW_H = 24, BUS_Y = 200, REG_Y = 236, REG_H = 22, TAB_R = 440;
+    function rowMid(i) { return ROW_Y + i * ROW_H + ROW_H / 2; }
+    function regMid(i) { return REG_Y + i * REG_H + REG_H / 2; }
+    function clear() { while (svg.firstChild) svg.removeChild(svg.firstChild); }
+    function cell(x, y, w, h, cls) { return S('rect', { x: x, y: y, width: w, height: h, 'class': cls }, svg); }
+    function label(x, y, text, cls) { return S('text', { x: x, y: y, 'class': cls, text: text }, svg); }
+    function pill(cx, cy, text) {
+      S('rect', { x: cx - 22, y: cy - 9, width: 44, height: 18, rx: 6, 'class': 'fw-s3 st-s3' }, svg);
+      label(cx, cy + 4, text, 'tx-mono tx-sm tx-mid');
+    }
+    function field(cx, cy, v, isTag, fp) {
+      if (isTag) { if (v) pill(cx, cy, v); else label(cx, cy + 4, v === 0 ? '0' : '—', 'tx-mono tx-sm tx-mid' + (v === 0 ? '' : ' tx-muted')); }
+      else label(cx, cy + 4, fmt(v, fp), 'tx-mono tx-sm tx-mid' + (v === null || v === undefined ? ' tx-muted' : ''));
+    }
+    function cross(x, y) {
+      S('line', { x1: x - 5, y1: y - 5, x2: x + 5, y2: y + 5, 'class': 'st-bad sw-2' }, svg);
+      S('line', { x1: x + 5, y1: y - 5, x2: x - 5, y2: y + 5, 'class': 'st-bad sw-2' }, svg);
+    }
+    function draw() {
+      clear();
+      var ev = st.ev, i, j, c, s, hlFields = {}, hlRegs = {};
+      if (ev && ev.kind === 'cdb') {
+        ev.fills.forEach(function (f) { hlFields[f.id + '.' + f.f] = true; });
+        ev.regs.forEach(function (n) { hlRegs[n] = true; });
+      }
+      /* station table */
+      for (j = 0; j < COL.length; j++) {
+        c = COL[j];
+        cell(c.x, 6, c.w, ROW_H, 'fw-s3');
+        label(c.x + c.w / 2, 22, HEAD[c.k], 'tx-mono tx-sm tx-mid');
+      }
+      for (i = 0; i < st.st.length; i++) {
+        s = st.st[i];
+        var y = ROW_Y + i * ROW_H, my = rowMid(i), active = ev && ev.kind !== 'none' && ev.kind !== 'blocked' && ev.src === s.id;
+        for (j = 0; j < COL.length; j++) {
+          c = COL[j];
+          cell(c.x, y, c.w, ROW_H, active ? 'fw-s1 st-s1' : 'fi-paper');
+        }
+        for (j = 0; j < COL.length; j++) {
+          c = COL[j];
+          var cx = c.x + c.w / 2;
+          if (c.k === 'id') label(c.x + 4, my + 4, s.id, 'tx-mono tx-sm');
+          else if (c.k === 'busy') label(cx, my + 4, s.busy ? 'yes' : 'no', 'tx-mono tx-sm tx-mid' + (s.busy ? '' : ' tx-muted'));
+          else if (c.k === 'op') label(cx, my + 4, s.busy ? s.op : '—', 'tx-mono tx-sm tx-mid' + (s.busy ? '' : ' tx-muted'));
+          else {
+            if (hlFields[s.id + '.' + c.k]) S('line', { x1: c.x + 3, y1: my, x2: c.x + c.w - 3, y2: my, 'class': 'hl' }, svg);
+            if (c.k === 'Vj' || c.k === 'Vk') field(cx, my, s[c.k], false, fpOf(s) && !(c.k === 'Vj' && (s.kind === 'load' || s.kind === 'store')));
+            else if (c.k === 'Qj' || c.k === 'Qk') field(cx, my, s[c.k], true);
+            else field(cx, my, s.A, false, false);
+          }
+        }
+      }
+      /* the bus */
+      S('line', { x1: 30, y1: BUS_Y, x2: 480, y2: BUS_Y, 'class': 'st-ink sw-4' }, svg);
+      label(486, BUS_Y + 4, 'CDB', 'tx-sm');
+      /* register status */
+      var RC = [ { k: 'n', x: 30, w: 40, h: 'Reg' }, { k: 'V', x: 70, w: 60, h: 'Vi' }, { k: 'Q', x: 130, w: 50, h: 'Qi' } ];
+      for (j = 0; j < RC.length; j++) { cell(RC[j].x, REG_Y - 20, RC[j].w, 20, 'fw-s3'); label(RC[j].x + RC[j].w / 2, REG_Y - 6, RC[j].h, 'tx-mono tx-sm tx-mid'); }
+      for (i = 0; i < st.regs.length; i++) {
+        var r = st.regs[i], ry = REG_Y + i * REG_H, rm = regMid(i);
+        for (j = 0; j < RC.length; j++) cell(RC[j].x, ry, RC[j].w, REG_H, 'fi-paper');
+        label(34, rm + 4, r.n, 'tx-mono tx-sm');
+        if (hlRegs[r.n]) { S('line', { x1: 73, y1: rm, x2: 177, y2: rm, 'class': 'hl' }, svg); }
+        label(100, rm + 4, fmt(r.V, isFP(r.n)), 'tx-mono tx-sm tx-mid');
+        if (r.Q) pill(155, rm, r.Q); else label(155, rm + 4, '0', 'tx-mono tx-sm tx-mid');
+      }
+      /* memory */
+      S('rect', { x: 430, y: 236, width: 110, height: 96, 'class': 'fi-paper' }, svg);
+      for (i = 0; i < st.mem.length; i++) {
+        var mm = st.mem[i], myy = 236 + i * 24 + 12;
+        if (i) S('line', { x1: 430, y1: 236 + i * 24, x2: 540, y2: 236 + i * 24, 'class': 'st-muted' }, svg);
+        if (mm.hl) S('line', { x1: 436, y1: myy, x2: 534, y2: myy, 'class': 'hl' }, svg);
+        label(485, myy + 4, mm.a + ': ' + Course.fmt(mm.v, 1), 'tx-mono tx-sm tx-mid');
+      }
+      label(485, 228, 'memory', 'tx-sm tx-muted tx-mid');
+      /* the event */
+      if (!ev || ev.kind === 'none' || ev.kind === 'blocked') return;
+      var si = -1;
+      for (i = 0; i < st.st.length; i++) if (st.st[i].id === ev.src) si = i;
+      var sy = rowMid(si);
+      if (ev.kind === 'store') {
+        S('polyline', { points: TAB_R + ',' + sy + ' 530,' + sy + ' 530,230', 'class': 'st-s1 sw-2', fill: 'none', 'marker-end': 'url(#arr-s1)' }, svg);
+        label(500, 110, 'to memory,', 'tx-hand');
+        label(500, 136, 'not the bus', 'tx-hand');
+        return;
+      }
+      if (ev.kind === 'branch') { label(500, 110, 'resolved:', 'tx-hand'); label(500, 136, 'nothing to say', 'tx-hand'); return; }
+      /* the value leaves the station on the left and enters the bus */
+      S('polyline', { points: '30,' + sy + ' 14,' + sy + ' 14,' + BUS_Y + ' 24,' + BUS_Y, 'class': 'st-s1 sw-2', fill: 'none', 'marker-end': 'url(#arr-s1)' }, svg);
+      label(300, BUS_Y - 8, '<' + ev.src + ', ' + fmt(ev.value, ev.fp) + '>', 'tx-mono tx-sm tx-mid halo');
+      /* listeners among the stations: a spine on the right */
+      var tops = [];
+      ev.fills.forEach(function (f) { for (i = 0; i < st.st.length; i++) if (st.st[i].id === f.id) tops.push(rowMid(i)); });
+      if (tops.length) {
+        var top = Math.min.apply(null, tops);
+        S('line', { x1: 470, y1: BUS_Y, x2: 470, y2: top, 'class': 'st-s1 sw-2' }, svg);
+        tops.forEach(function (ty) { S('line', { x1: 470, y1: ty, x2: TAB_R + 6, y2: ty, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' }, svg); });
+      }
+      /* registers: written or ignored */
+      var bots = [];
+      st.regs.forEach(function (r, k) { if (hlRegs[r.n]) bots.push(regMid(k)); ev.ignored.forEach(function (g) { if (g.n === r.n) bots.push(regMid(k)); }); });
+      if (bots.length) {
+        S('line', { x1: 200, y1: BUS_Y, x2: 200, y2: Math.max.apply(null, bots), 'class': 'st-s1 sw-2' }, svg);
+        st.regs.forEach(function (r, k) {
+          var rm = regMid(k), ign = false;
+          ev.ignored.forEach(function (g) { if (g.n === r.n) ign = true; });
+          if (hlRegs[r.n]) S('line', { x1: 200, y1: rm, x2: 186, y2: rm, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' }, svg);
+          else if (ign) { S('line', { x1: 200, y1: rm, x2: 186, y2: rm, 'class': 'st-muted dash', 'marker-end': 'url(#arr-muted)' }, svg); cross(193, rm - 10); S('rect', { x: 130, y: REG_Y + k * REG_H, width: 50, height: REG_H, 'class': 'st-bad dash fi-none' }, svg); }
+        });
+      }
+    }
+    ui.onChange(function () {
+      var ev = st.ev;
+      draw();
+      roDone.set(st.done + ' of ' + st.st.length, st.done === st.st.length ? 'good' : undefined);
+      if (!ev) { roFields.set(0); roReg.set('—'); note.set('Choose a station and press Broadcast. Try RS1 first.'); return; }
+      roFields.set(ev.kind === 'cdb' ? ev.fills.length : 0);
+      if (ev.kind === 'cdb') roReg.set(ev.regs.length ? ev.regs.join(', ') + ' written' : (ev.ignored.length ? ev.ignored[0].n + ' ignored (Qi = ' + ev.ignored[0].q + ')' : 'none'), ev.regs.length ? 'good' : (ev.ignored.length ? 'bad' : undefined));
+      else roReg.set(ev.kind === 'store' ? 'memory, not a register' : '—');
+      note.set(ev.msg);
+    });
+  });
+  </script>
+
+  <p class="memo"><mark class="key">A tag is the name of a producer: one broadcast fills every field that carries it, and a register takes it only if its Qi still says so.</mark></p>
+</section>
+
+<section id="l11-machine">
+  <h2>The whole machine: Figure 26 end to end</h2>
+
+  <p>The notes’ Figure 26 (page 149) is Hennessy and Patterson’s drawing of the floating-point unit of a RISC-V processor built this way — in the 5th edition the same figure is drawn for MIPS. Figure 2 redraws it. Follow one floating-point instruction and one load through it; every block has a job you now know.</p>
+
+  <figure class="fig fig--plain" id="l11-fig-fpu">
+    <svg class="dia" viewBox="0 0 560 470" role="img" aria-label="The Tomasulo floating-point unit: an instruction queue sends loads and stores to an address unit and to the store and load buffers in front of the memory unit, and floating-point operations over the operation bus to the reservation stations in front of the FP adders and FP multipliers; the FP registers, each with a Qi tag field, feed the operand buses; the common data bus at the bottom carries every result back up to the reservation stations, the store buffers and the FP registers">
+      
+      <text x="285" y="16" class="tx-mid tx-sm tx-muted">from the instruction unit</text>
+      <line x1="285" y1="22" x2="285" y2="36" class="st-ink" marker-end="url(#arr)"/>
+      <rect x="235" y="40" width="100" height="80" class="fi-paper sw-2"/>
+      <line x1="235" y1="60" x2="335" y2="60" class="st-muted"/>
+      <line x1="235" y1="80" x2="335" y2="80" class="st-muted"/>
+      <line x1="235" y1="100" x2="335" y2="100" class="st-muted"/>
+      <text x="227" y="56" class="tx-end tx-sm">instruction</text>
+      <text x="227" y="74" class="tx-end tx-sm">queue</text>
+      
+      <rect x="400" y="50" width="120" height="80" class="fi-paper sw-2"/>
+      <rect x="470" y="52" width="48" height="76" class="fw-s3 st-none"/>
+      <line x1="400" y1="70" x2="520" y2="70" class="st-muted"/>
+      <line x1="400" y1="90" x2="520" y2="90" class="st-muted"/>
+      <line x1="400" y1="110" x2="520" y2="110" class="st-muted"/>
+      <text x="460" y="44" class="tx-mid tx-sm">FP registers</text>
+      <text x="406" y="65" class="tx-mono tx-sm">F0</text>
+      <text x="406" y="85" class="tx-mono tx-sm">F2</text>
+      <text x="406" y="105" class="tx-mono tx-sm">F4</text>
+      <text x="406" y="125" class="tx-mono tx-sm">…</text>
+      <text x="494" y="65" class="tx-mono tx-sm tx-mid">Qi</text>
+      
+      <polyline points="235,110 120,110 120,146" class="st-ink" marker-end="url(#arr)"/>
+      <text x="120" y="102" class="tx-mid tx-sm">loads and stores</text>
+      <rect x="40" y="150" width="160" height="30" class="fi-paper sw-2"/>
+      <text x="120" y="170" class="tx-mid">Address unit</text>
+      <line x1="56" y1="180" x2="56" y2="208" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="184" y1="180" x2="184" y2="208" class="st-ink" marker-end="url(#arr)"/>
+      <text x="56" y="200" class="tx-mid tx-sm halo">store buffers</text>
+      <text x="184" y="200" class="tx-mid tx-sm halo">load buffers</text>
+      <rect x="26" y="212" width="60" height="60" class="fi-paper"/>
+      <line x1="26" y1="232" x2="86" y2="232" class="st-muted"/>
+      <line x1="26" y1="252" x2="86" y2="252" class="st-muted"/>
+      <rect x="154" y="212" width="60" height="60" class="fi-paper"/>
+      <line x1="154" y1="232" x2="214" y2="232" class="st-muted"/>
+      <line x1="154" y1="252" x2="214" y2="252" class="st-muted"/>
+      <line x1="56" y1="272" x2="56" y2="340" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="184" y1="272" x2="184" y2="340" class="st-ink" marker-end="url(#arr)"/>
+      <text x="50" y="300" class="tx-sm tx-end">data</text>
+      <text x="178" y="300" class="tx-sm tx-end">address</text>
+      <rect x="26" y="344" width="188" height="40" class="fi-paper sw-2"/>
+      <text x="120" y="369" class="tx-mid">Memory unit</text>
+      
+      <line x1="285" y1="120" x2="285" y2="198" class="st-ink"/>
+      <text x="297" y="150" class="tx-sm">FP operations</text>
+      <line x1="240" y1="200" x2="540" y2="200" class="st-ink sw-4"/>
+      <text x="430" y="222" class="tx-sm tx-end">operation bus</text>
+      <line x1="250" y1="200" x2="250" y2="282" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="440" y1="200" x2="440" y2="300" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="455" y1="130" x2="455" y2="266" class="st-ink"/>
+      <line x1="485" y1="130" x2="485" y2="300" class="st-ink" marker-end="url(#arr)"/>
+      <polyline points="455,266 275,266 275,282" class="st-ink" marker-end="url(#arr)"/>
+      <text x="448" y="180" class="tx-sm tx-end">operand buses</text>
+      
+      <rect x="225" y="286" width="85" height="54" class="fi-paper"/>
+      <line x1="225" y1="304" x2="310" y2="304" class="st-muted"/>
+      <line x1="225" y1="322" x2="310" y2="322" class="st-muted"/>
+      <rect x="420" y="304" width="130" height="36" class="fi-paper"/>
+      <line x1="420" y1="322" x2="550" y2="322" class="st-muted"/>
+      <text x="365" y="300" class="tx-mid tx-sm">reservation</text>
+      <text x="365" y="318" class="tx-mid tx-sm">stations</text>
+      <line x1="267" y1="340" x2="267" y2="360" class="st-ink" marker-end="url(#arr)"/>
+      <line x1="485" y1="340" x2="485" y2="360" class="st-ink" marker-end="url(#arr)"/>
+      <rect x="225" y="364" width="85" height="36" class="fi-paper sw-2"/>
+      <rect x="420" y="364" width="130" height="36" class="fi-paper sw-2"/>
+      <text x="267" y="387" class="tx-mid">FP adders</text>
+      <text x="485" y="387" class="tx-mid">FP multipliers</text>
+      
+      <line x1="120" y1="384" x2="120" y2="426" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="267" y1="400" x2="267" y2="426" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="485" y1="400" x2="485" y2="426" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="12" y1="430" x2="556" y2="430" class="st-ink sw-4"/>
+      <text x="556" y="446" class="tx-sm tx-end">common data bus (CDB)</text>
+      <line x1="556" y1="430" x2="556" y2="100" class="st-ink sw-2"/>
+      <line x1="556" y1="100" x2="526" y2="100" class="st-ink sw-2" marker-end="url(#arr)"/>
+      <line x1="556" y1="246" x2="305" y2="246" class="st-ink sw-2"/>
+      <line x1="305" y1="246" x2="305" y2="282" class="st-ink sw-2" marker-end="url(#arr)"/>
+      <line x1="510" y1="246" x2="510" y2="300" class="st-ink sw-2" marker-end="url(#arr)"/>
+      <line x1="12" y1="430" x2="12" y2="242" class="st-ink sw-2"/>
+      <line x1="12" y1="242" x2="22" y2="242" class="st-ink sw-2" marker-end="url(#arr)"/>
+      <text x="14" y="464" class="tx-hand">tag and value, to everyone</text>
+    </svg>
+    <figcaption><b>Fig. 2.</b> The notes’ Figure 26 (page 149), redrawn. Loads and stores leave the instruction queue for the address unit and the store and load buffers in front of the memory unit; floating-point operations travel on the operation bus to the reservation stations (three for the adders, two for the multipliers); the FP registers, each with its <code>Qi</code> field, feed the operand buses. Every result — from the memory unit, the adders or the multipliers — goes onto the common data bus, which runs back up to the reservation stations, the store buffers and the FP registers.</figcaption>
+  </figure>
+
+  <p>An <code>FADD</code> leaves the queue in program order, travels on the <mark class="key">operation bus</mark> to a free adder station, and fills it: values from the FP registers over the operand buses where <code>Qi = 0</code>, tags where it is not. Its destination register gets the station’s name as <code>Qi</code>. The station then watches the CDB until both Q fields are 0, sends the operation into an adder when one is free, and finally puts <code>&lt;tag, value&gt;</code> on the bus. A load takes the other path: the <mark class="key">address unit</mark> adds the base register and the offset, the load buffer waits for the memory unit, and the loaded value goes on the same bus with the load buffer’s tag — a load is a producer like any other.</p>
+
+  <h3>Loads and stores: the buffer that listens but never speaks</h3>
+
+  <p>Memory operations need two steps instead of one, and the notes separate them (page 147). A <mark class="key">load buffer</mark> first computes the effective address, base register plus offset, then waits for the memory unit and reads. A <mark class="key">store buffer</mark> needs two things before it can act — the address <em>and</em> the data — and either may be a tag, so store buffers monitor the CDB like any reservation station. When both are present it writes memory. What it never does is put anything on the bus: a store has no destination register, so no station and no <code>Qi</code> can be waiting for its tag. That missing arrow is the whole difference between the two panels of Figure 3, and the exam quizzes it directly.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l11-fig-ls">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="A load buffer: the base register value and the offset go to the address unit, the memory unit reads the word, and the result goes onto the common data bus with the buffer's tag">
+        <rect x="10" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="54" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="98" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="142" y="10" width="44" height="22" class="fw-s3"/>
+        <text x="32" y="25" class="tx-mono tx-sm tx-mid">Busy</text>
+        <text x="76" y="25" class="tx-mono tx-sm tx-mid">A</text>
+        <text x="120" y="25" class="tx-mono tx-sm tx-mid">Vj</text>
+        <text x="164" y="25" class="tx-mono tx-sm tx-mid">Qj</text>
+        <rect x="10" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="54" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="98" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="142" y="32" width="44" height="22" class="fi-paper"/>
+        <text x="32" y="47" class="tx-mono tx-sm tx-mid">yes</text>
+        <text x="76" y="47" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="120" y="47" class="tx-mono tx-sm tx-mid">100</text>
+        <text x="164" y="47" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="200" y="47" class="tx-mono tx-sm">RS1: LD</text>
+        <line x1="98" y1="54" x2="98" y2="78" class="st-ink" marker-end="url(#arr)"/>
+        <rect x="40" y="82" width="116" height="28" class="fi-paper sw-2"/>
+        <text x="98" y="100" class="tx-mid tx-sm">Address unit</text>
+        <text x="166" y="100" class="tx-mono tx-sm">A ← Vj + A</text>
+        <line x1="98" y1="110" x2="98" y2="134" class="st-ink" marker-end="url(#arr)"/>
+        <rect x="40" y="138" width="116" height="28" class="fi-paper sw-2"/>
+        <text x="98" y="156" class="tx-mid tx-sm">Memory unit</text>
+        <text x="166" y="156" class="tx-mono tx-sm">read [100]</text>
+        <line x1="98" y1="166" x2="98" y2="190" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="10" y1="196" x2="290" y2="196" class="st-ink sw-4"/>
+        <text x="110" y="186" class="tx-mono tx-sm halo">&lt;RS1, 1.5&gt;</text>
+        <text x="270" y="214" class="tx-end tx-sm">CDB</text>
+        <text x="150" y="130" class="tx-hand">speaks on the bus</text>
+      </svg>
+      <p class="fig-label">Load: address, then memory, then the bus</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="A store buffer: it waits for the address and for the data, which arrives from the common data bus into its Vk field; then it writes memory, and no arrow leads from it back to the bus">
+        <rect x="10" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="54" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="98" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="142" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="186" y="10" width="44" height="22" class="fw-s3"/>
+        <rect x="230" y="10" width="44" height="22" class="fw-s3"/>
+        <text x="32" y="25" class="tx-mono tx-sm tx-mid">Busy</text>
+        <text x="76" y="25" class="tx-mono tx-sm tx-mid">A</text>
+        <text x="120" y="25" class="tx-mono tx-sm tx-mid">Vj</text>
+        <text x="164" y="25" class="tx-mono tx-sm tx-mid">Qj</text>
+        <text x="208" y="25" class="tx-mono tx-sm tx-mid">Vk</text>
+        <text x="252" y="25" class="tx-mono tx-sm tx-mid">Qk</text>
+        <rect x="10" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="54" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="98" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="142" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="186" y="32" width="44" height="22" class="fi-paper"/>
+        <rect x="230" y="32" width="44" height="22" class="fi-paper"/>
+        <text x="32" y="47" class="tx-mono tx-sm tx-mid">yes</text>
+        <text x="76" y="47" class="tx-mono tx-sm tx-mid">100</text>
+        <text x="120" y="47" class="tx-mono tx-sm tx-mid">100</text>
+        <text x="164" y="47" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="208" y="47" class="tx-mono tx-sm tx-mid tx-muted">—</text>
+        <rect x="230" y="34" width="44" height="18" rx="6" class="fw-s3 st-s3"/>
+        <text x="252" y="47" class="tx-mono tx-sm tx-mid">RS4</text>
+        <line x1="252" y1="190" x2="252" y2="60" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="258" y="130" class="tx-mono tx-sm halo">&lt;RS4,</text>
+        <text x="258" y="146" class="tx-mono tx-sm halo">3.5&gt;</text>
+        <line x1="98" y1="54" x2="98" y2="78" class="st-ink" marker-end="url(#arr)"/>
+        <rect x="40" y="82" width="116" height="28" class="fi-paper sw-2"/>
+        <text x="98" y="100" class="tx-mid tx-sm">Address unit</text>
+        <line x1="98" y1="110" x2="98" y2="134" class="st-ink" marker-end="url(#arr)"/>
+        <rect x="40" y="138" width="116" height="28" class="fi-paper sw-2"/>
+        <text x="98" y="156" class="tx-mid tx-sm">Memory unit</text>
+        <text x="160" y="156" class="tx-mono tx-sm">write [100]</text>
+        <line x1="10" y1="196" x2="290" y2="196" class="st-ink sw-4"/>
+        <text x="40" y="214" class="tx-sm">CDB</text>
+        <text x="100" y="186" class="tx-hand">nothing goes up here</text>
+      </svg>
+      <p class="fig-label">Store: listens for its data, writes memory, says nothing</p>
+    </div>
+    <figcaption><b>Fig. 3.</b> Both buffers compute their address and use the memory unit. The load ends on the common data bus with its tag; the store takes its data <em>from</em> the bus (here <code>&lt;RS4, 3.5&gt;</code> into <code>Vk</code>) and ends in memory. No instruction waits for a store, so a store never broadcasts.</figcaption>
+  </figure>
+
+  <h3>One bus, one result per cycle</h3>
+
+  <p>Look at Figure 2 once more and count how many things hang on the CDB: every reservation station, every store buffer, every register. That is why one broadcast can wake everybody at once — and it is also the price. A bus can carry one <code>&lt;tag, value&gt;</code> per cycle, so <em>one CDB means one result per cycle</em>, however many units finish together; the exam’s “single Common Data Bus” is exactly this rule, and the older instruction gets the bus first (<a href="l12.html">lesson 12</a>). Behind the rule sits hardware the notes do not mention: every station and every register compares its tag with the bus every cycle — associative compares at full speed — and the bus fans out to every unit, so it is long, loaded and slow to drive. More buses mean more comparators everywhere. (Standard lecture material on Tomasulo’s drawbacks; the notes list only the benefits.)</p>
+
+  <p>Page 148 sums up why the design works, and the four reasons are the four blocks you have just seen: issue is decoupled from operand readiness, so out-of-order execution is natural; several stations per unit let several instructions of one type be in flight; the register file need not remember everything, because the stations hold the values and the dependences; and the broadcast hands every waiting unit what it needs without any central control. The notes’ word for the result is <em>dataflow-like</em> (page 145): an instruction runs when its operands are ready, not when a global scheduler says so.</p>
+
+  <aside class="redpen" data-page="150">
+    <p class="claim">“Function Units (FUs). Includes separate pipelined units for ADD, MULT, and DIV. Each can execute one instruction at a time.”</p>
+    <p class="fix">The two halves contradict each other: a pipelined unit accepts a new instruction every cycle and holds several in flight; a unit that executes “one instruction at a time” is not pipelined. Figure 26 has FP adders and FP multipliers only (the multipliers also divide). In the exam’s model every unit is non-pipelined: busy from START EXEC through WRITE RESULT.</p>
+    <p class="because">The notes’ own reproduction of the professor’s solution of the 5 May 2025 midterm (page 533) shows it: FPU1 has latency 4, <code>I3: FADD F4, F0, F0</code> starts at 4 and writes at 8, and <code>I4: FADD F6, F2, F2</code>, whose operands need nobody, starts only at 9 — the single FP unit was busy. Counting a unit as pipelined gives a wrong START EXEC and a wrong CPI.</p>
+  </aside>
+
+  <aside class="redpen" data-page="150">
+    <p class="claim">“Load/Store Queue (optional). In a full Tomasulo implementation, memory operations are handled by Load and Store buffers. This diagram is focused on FP register-register instructions, so memory is abstracted.”</p>
+    <p class="fix">Nothing is abstracted: Figure 26 draws the address unit, the load buffers, the store buffers and the memory unit, and connects the memory unit’s output to the CDB. Load and store buffers are an integral part of the algorithm — loads and stores are treated as functional units with reservation stations of their own.</p>
+    <p class="because">Look at the figure on the same page (Figure 2 redraws it block by block). The exam’s machine agrees: loads and stores get their own stations RS1 and RS2 in front of LDU1 and LDU2, and the first row of every exercise table is a load with ISSUE 1, START EXEC 2, WRITE RESULT 6.</p>
+  </aside>
+</section>
+
+<section id="l11-flow">
+  <h2>Issue, execute, write result: the flow in three steps</h2>
+
+  <p>Page 150 ends with the execution flow, and it is shorter than the scoreboard’s: three steps, not four. There is no Read Operands stage, because reading happens at issue (the values that exist) or on the bus (the ones that do not). Each step has one condition that lets an instruction through; the stepper states it and says why it is the right one. The exact rules for the exam table — what “the cycle after” means, ties on the bus, when a station is reusable — are <a href="l12.html">lesson 12</a>; the full cycle-by-cycle run of the notes’ six-instruction example is <a href="l13.html">lesson 13</a>.</p>
+
+  <ol class="steps" id="l11-steps-flow">
+    <li><p><b>Issue</b> (instruction queue → station), in program order. Condition: <em>a station of the right type is free</em>. Copy the instruction in; for each source register copy the value into <code>Vj</code>/<code>Vk</code> if <code>Qi = 0</code>, otherwise copy the register’s <code>Qi</code> into <code>Qj</code>/<code>Qk</code>; then set the destination register’s <code>Qi</code> to this station’s tag. Why in order: the renaming must see the instructions in program order, so that <code>Qi</code> always names the <em>latest</em> writer and every later reader captures the right producer. If no station is free the instruction waits — a structural hazard — and so does everything behind it.</p></li>
+    <li><p><b>Execute</b> (station → functional unit), out of order. Condition: <code>Qj = Qk = 0</code> <em>and</em> the unit is free. The station sends the operation into the unit, which computes for its latency. Why operands and not order: a RAW dependence is the only thing the hardware still has to honour, and “both tags cleared” is exactly “both producers have broadcast”. The station stays <code>Busy</code> while the unit works — it still has to deliver the result.</p></li>
+    <li><p><b>Write result</b> (unit → CDB), out of order. Condition: <em>the CDB is free</em>. Put <code>&lt;tag, value&gt;</code> on the bus; every station with a matching <code>Qj</code>/<code>Qk</code> fills the field and clears the tag; every register with a matching <code>Qi</code> is written and its <code>Qi</code> cleared; the station becomes free. Why the register is written at all when the consumers already have the value: instructions issued <em>later</em> will read the register file, and <code>Qi = 0</code> tells them the value there is good.</p></li>
+  </ol>
+
+  <div class="pitfall" data-label="Watch the wording">
+    <p>“The station is released when the instruction enters the functional unit.” No — at write result. From issue through write result the station holds the instruction, and in the exam’s tables it can be reused only from the cycle <em>after</em> WRITE RESULT: on page 559 the notes’ reproduction of a professor’s solution has <code>LD $F0</code> write at 8 and the next load/store instruction take the same RS1 at 9. Count the station as free at execute and every later ISSUE cycle shifts.</p>
+  </div>
+
+  <p class="memo"><mark class="key">Issue needs a free station; execute needs both tags at 0 and a free unit; write result needs the bus.</mark></p>
+</section>
+
+<section id="l11-versus">
+  <h2>Scoreboard versus Tomasulo, and the answer to the puzzle</h2>
+
+  <p>The notes compare the two machines twice, in Table 16 (page 141) and Table 17 (page 145). Merged, with the vocabulary of lesson 9 on the left:</p>
+
+  <figure class="tbl-fig" id="l11-tbl-compare">
+    <figcaption>Tables 16 and 17 of the notes merged (pages 141 and 145). Scoreboard = CDC 6600, Tomasulo = IBM 360/91.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Feature</th><th>Scoreboard</th><th>Tomasulo</th></tr></thead>
+        <tbody>
+          <tr><td>Register renaming</td><td>none</td><td>implicit, through the reservation stations</td></tr>
+          <tr><td>WAR / WAW hazards</td><td>stall (WAW at Issue, WAR at Write Result)</td><td>avoided by renaming</td></tr>
+          <tr><td>Operand waiting</td><td>for a <em>register</em> to be written</td><td>for a <em>value</em> — held in the station, or named by the <em>tag</em> that will bring it</td></tr>
+          <tr><td>Operand tracking</td><td>centralised, in the scoreboard’s tables</td><td>distributed, in every station</td></tr>
+          <tr><td>Data communication</td><td>through the register file, no forwarding</td><td>broadcast with a tag on the CDB</td></tr>
+          <tr><td>Control</td><td>one central scoreboard</td><td>distributed: each unit has its own stations</td></tr>
+          <tr><td>Execution starts when</td><td>the operand registers are ready and have been read (Read Operands)</td><td>both operand values are in the station (<code>Qj = Qk = 0</code>) and the unit is free</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="145">
+    <p class="claim">“Communication — Implicit write-back — Broadcast over CDB” (Table 17, the scoreboard’s column against Tomasulo’s)</p>
+    <p class="fix">There is nothing implicit about the scoreboard’s write-back: Write Result is one of its four stages (lesson 9). What the row means is that on the scoreboard a result travels <em>only through the register file</em> — written at Write Result, read again by the consumer at Read Operands, no forwarding — while Tomasulo’s CDB forwards it with a tag to every waiting station.</p>
+    <p class="because">In this chapter “implicit” means “done by the hardware, invisible to the ISA” (implicit renaming); applied to the scoreboard’s write-back it says the opposite of what happens. In an answer write “through the register file, no forwarding” against “broadcast with a tag on the CDB”.</p>
+  </aside>
+
+  <p>Every row of the table is one consequence of renaming, and the widget below shows the first two on the fragment of the hook. The two timelines run on the <em>same</em> machine — one station per unit, FDIV 7 cycles, FADD and FMUL 3, the store 4, operands usable the cycle after their producer writes, one CDB — and the switch changes one thing only: whether a second writer of a register must wait for the name (the scoreboard’s two rules: WAW at issue, WAR at write result) or gets a tag of its own.</p>
+
+  <div class="widget" id="l11-w-rename">
+    <h3 class="widget-title">Renaming on, renaming off: which waits disappear</h3>
+    <p class="widget-intro">Top: the four instructions with their dependence arcs — orange RAW arrows on the left, the dotted WAW and dashed WAR arcs on the right. Bottom: the timeline, one row per instruction (I = issue, blue = executing, dashed orange = waiting for the hazard written inside, blue tick = write result). Fragment A is the notes’ example; fragment B changes the multiply so that the only name conflict is a WAR. The one thing to see: renaming erases exactly the name dependences, their arcs and their waits — and nothing else, the RAW chain included.</p>
+    <ol class="tasks">
+      <li>Renaming off, fragment A. Predict the issue cycle of <code>I3</code> (the FMUL), whose operands are ready from cycle 1. Then read the timeline.
+        <details class="answer"><summary>What you should see</summary>
+          <p>Cycle 14: the dashed bar “WAW F6” runs from 4 to 13. <code>I3</code> may not enter the machine while <code>I1</code> still has to write F6, and <code>I1</code> is waiting for the divide; so the multiply, which needs nothing from anybody, inherits the divide’s latency plus the add’s. It executes 15–17 and writes at 18.</p></details>
+      </li>
+      <li>Switch renaming on. Which bars vanish, which stay, and does the last write-result cycle move?
+        <details class="answer"><summary>What you should see</summary>
+          <p>Only the WAW bar vanishes: <code>I3</code> issues at 4, executes 5–7, writes at 8. The RAW bars stay exactly where they were — <code>I1</code> still waits for F0 until 9, the store still waits for the sum until 13 — and the last write result is 18 in both runs. The critical path is the RAW chain FDIV → FADD → SD, and renaming does not touch it.</p></details>
+      </li>
+      <li>Pick fragment B with renaming off. Where is <code>I3</code>’s wait now, and what is it waiting for?
+        <details class="answer"><summary>What you should see</summary>
+          <p>At the end of its row: <code>I3</code> issues at 4 and finishes computing at 7, but may not write F8 until <code>I1</code> has read the old F8 — and <code>I1</code> reads only when it starts, at 10. A WAR wait from 8 to 10; write result at 11. With renaming on it writes at 8: <code>I1</code> copied F8 at issue and never looks at the register again.</p></details>
+      </li>
+      <li>Renaming on, fragment A: <code>I3</code> writes F6 at cycle 8 and <code>I1</code> broadcasts its sum at 13. Which value is in F6 at the end, and how did the machine get it right?
+        <details class="answer"><summary>What you should see</summary>
+          <p>The product — program order’s last writer. At issue <code>I3</code> set <code>F6.Qi</code> to its own station; when <code>I1</code> broadcasts at 13, the register sees a different tag and ignores the sum, while the store takes it from the bus through its <code>Qk</code>. Two writers, two names, no collision — the rule of the first widget.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l11-w-rename', function (root, ui) {
+    var S = Course.svg;
+    /* sim-begin */
+    var PRESETS = {
+      A: [
+        { n: 'I0', op: 'FDIV F0, F2, F4', dst: 'F0', src: ['F2', 'F4'], unit: 'Div', lat: 7, store: false },
+        { n: 'I1', op: 'FADD F6, F0, F8', dst: 'F6', src: ['F0', 'F8'], unit: 'Add', lat: 3, store: false },
+        { n: 'I2', op: 'SD F6, 0(R1)', dst: null, src: ['F6', 'R1'], unit: 'LS', lat: 4, store: true },
+        { n: 'I3', op: 'FMUL F6, F10, F8', dst: 'F6', src: ['F10', 'F8'], unit: 'Mult', lat: 3, store: false }
+      ],
+      B: [
+        { n: 'I0', op: 'FDIV F0, F2, F4', dst: 'F0', src: ['F2', 'F4'], unit: 'Div', lat: 7, store: false },
+        { n: 'I1', op: 'FADD F6, F0, F8', dst: 'F6', src: ['F0', 'F8'], unit: 'Add', lat: 3, store: false },
+        { n: 'I2', op: 'SD F6, 0(R1)', dst: null, src: ['F6', 'R1'], unit: 'LS', lat: 4, store: true },
+        { n: 'I3', op: 'FMUL F8, F10, F2', dst: 'F8', src: ['F10', 'F2'], unit: 'Mult', lat: 3, store: false }
+      ]
+    };
+    /* the timeline model: in-order issue; start = max(issue+1, producer write+1, unit free); write = start+latency;
+       renaming off adds the scoreboard's name rules (WAW at issue, WAR at write); one CDB, older first; stores skip the CDB */
+    function simulate(prog, renaming) {
+      var res = [], unitFree = {}, cdb = {}, i, j, k;
+      for (i = 0; i < prog.length; i++) {
+        var ins = prog[i], waits = [], issue = i === 0 ? 1 : res[i - 1].issue + 1, nomIssue = issue;
+        if (!renaming && ins.dst) for (j = 0; j < i; j++) if (prog[j].dst === ins.dst && res[j].write >= issue) { issue = Math.max(issue, res[j].write + 1); }
+        if (issue > nomIssue) { for (j = 0; j < i; j++) if (prog[j].dst === ins.dst && res[j].write + 1 === issue) waits.push({ kind: 'WAW', reg: ins.dst, from: nomIssue, to: issue - 1 }); }
+        var start = issue + 1, rawReg = null;
+        for (k = 0; k < ins.src.length; k++) {
+          var prod = -1;
+          for (j = 0; j < i; j++) if (prog[j].dst === ins.src[k]) prod = j;
+          if (prod >= 0 && res[prod].write + 1 > start) { start = res[prod].write + 1; rawReg = ins.src[k]; }
+        }
+        if (start > issue + 1) waits.push({ kind: 'RAW', reg: rawReg, from: issue + 1, to: start - 1 });
+        start = Math.max(start, unitFree[ins.unit] || 0);
+        var write = start + ins.lat, nomWrite = write;
+        if (!renaming && ins.dst) for (j = 0; j < i; j++) if (ins.src !== prog[j].src && prog[j].src.indexOf(ins.dst) >= 0 && res[j].start + 1 > write) write = res[j].start + 1;
+        if (write > nomWrite) waits.push({ kind: 'WAR', reg: ins.dst, from: nomWrite, to: write - 1 });
+        if (!ins.store) { while (cdb[write]) { waits.push({ kind: 'CDB', reg: '', from: write, to: write }); write++; } cdb[write] = true; }
+        unitFree[ins.unit] = write + 1;
+        res.push({ n: ins.n, op: ins.op, dst: ins.dst, src: ins.src, store: ins.store, lat: ins.lat, issue: issue, start: start, write: write, waits: waits });
+      }
+      return res;
+    }
+    /* sim-end */
+    var frag = ui.select('fragment', [
+      { value: 'A', label: 'A — the notes’ fragment: FMUL writes F6 (WAW with I1, WAR with I2)' },
+      { value: 'B', label: 'B — variant: FMUL writes F8, which I1 still has to read (WAR only)' }], null, 'A');
+    var ren = ui.toggle('register renaming (Tomasulo)', false);
+    var roI3 = ui.readout('I3: issue / start exec / write result');
+    var roLast = ui.readout('last write result of the fragment', { digits: 0 });
+    var roName = ui.readout('cycles I3 waits for a name', { digits: 0 });
+    var note = ui.note('');
+    var svgA = ui.svg(560, 170, { label: 'The four instructions as boxes with their dependence arcs: RAW on the left, WAR and WAW on the right; with renaming on, the WAR and WAW arcs are greyed and crossed out' });
+    var svgB = ui.svg(560, 150, { label: 'Timeline of the four instructions over eighteen cycles: issue cells, waiting bars labelled with the hazard, execution bars and write-result ticks' });
+    ui.legend([
+      { label: 'executing', color: 's1', mark: 'area' },
+      { label: 'waiting (the hazard inside the bar)', color: 's2', mark: 'dash' },
+      { label: 'write result', color: 's1', mark: 'square' },
+      { label: 'RAW — a value', color: 's2', mark: 'line' },
+      { label: 'WAR / WAW — a name', color: 'ink', mark: 'dash' }
+    ]);
+    function clear(s) { while (s.firstChild) s.removeChild(s.firstChild); }
+    function deps(prog) {
+      var out = [], i, j, k;
+      for (i = 0; i < prog.length; i++) for (j = 0; j < i; j++) {
+        for (k = 0; k < prog[i].src.length; k++) if (prog[j].dst === prog[i].src[k]) {
+          var later = false, m;
+          for (m = j + 1; m < i; m++) if (prog[m].dst === prog[i].src[k]) later = true;
+          if (!later) out.push({ kind: 'RAW', from: j, to: i, reg: prog[i].src[k] });
+        }
+        if (prog[i].dst && prog[j].src.indexOf(prog[i].dst) >= 0) out.push({ kind: 'WAR', from: j, to: i, reg: prog[i].dst });
+        if (prog[i].dst && prog[j].dst === prog[i].dst) out.push({ kind: 'WAW', from: j, to: i, reg: prog[i].dst });
+      }
+      return out;
+    }
+    function drawArcs(prog, renaming) {
+      clear(svgA);
+      var BX = 120, BW = 224, i;
+      for (i = 0; i < prog.length; i++) {
+        var y = 12 + i * 36;
+        S('rect', { x: BX, y: y, width: BW, height: 24, rx: 4, 'class': 'fi-paper' }, svgA);
+        S('text', { x: BX + 8, y: y + 16, 'class': 'tx-mono', text: prog[i].n + ': ' + prog[i].op }, svgA);
+      }
+      deps(prog).forEach(function (d) {
+        var y0 = 24 + d.from * 36, y1 = 24 + d.to * 36, gone = renaming && d.kind !== 'RAW', cls, path, lx;
+        if (d.kind === 'RAW') {
+          path = 'M' + BX + ',' + (y0 + 8) + ' Q' + (BX - 60) + ',' + ((y0 + y1) / 2) + ' ' + BX + ',' + (y1 - 8);
+          S('path', { d: path, 'class': 'st-s2 sw-2', fill: 'none', 'marker-end': 'url(#arr-s2)' }, svgA);
+          S('text', { x: 10, y: (y0 + y1) / 2 + 4, 'class': 'tx-mono tx-sm', text: 'RAW ' + d.reg }, svgA);
+        } else {
+          var span = d.to - d.from, bulge = span > 1 ? 140 : 70;
+          path = 'M' + (BX + BW) + ',' + (y0 + 8) + ' Q' + (BX + BW + bulge) + ',' + ((y0 + y1) / 2) + ' ' + (BX + BW) + ',' + (y1 - 8);
+          cls = gone ? 'st-muted dash' : (d.kind === 'WAW' ? 'st-ink dots' : 'st-ink dash');
+          S('path', { d: path, 'class': cls, fill: 'none', 'marker-end': gone ? 'url(#arr-muted)' : 'url(#arr)' }, svgA);
+          lx = BX + BW + bulge / 2 + 22;
+          S('text', { x: lx, y: (y0 + y1) / 2 + 4, 'class': 'tx-mono tx-sm' + (gone ? ' tx-muted' : ''), text: d.kind + ' ' + d.reg }, svgA);
+          if (gone) {
+            var cx = BX + BW + bulge / 2, cy = (y0 + y1) / 2;
+            S('line', { x1: cx - 6, y1: cy - 6, x2: cx + 6, y2: cy + 6, 'class': 'st-bad sw-2' }, svgA);
+            S('line', { x1: cx + 6, y1: cy - 6, x2: cx - 6, y2: cy + 6, 'class': 'st-bad sw-2' }, svgA);
+          }
+        }
+      });
+    }
+    function drawTimeline(res) {
+      clear(svgB);
+      var X0 = 44, CW = 28, N = 18, c, i;
+      for (c = 1; c <= N; c++) S('text', { x: X0 + (c - 1) * CW + CW / 2, y: 14, 'class': 'tx-mid tx-sm tx-muted', text: String(c) }, svgB);
+      for (i = 0; i < res.length; i++) {
+        var r = res[i], y = 24 + i * 30;
+        S('text', { x: 10, y: y + 14, 'class': 'tx-mono tx-sm', text: r.n }, svgB);
+        r.waits.forEach(function (w) {
+          if (w.kind === 'CDB') return;
+          var x = X0 + (w.from - 1) * CW, wd = (w.to - w.from + 1) * CW;
+          S('rect', { x: x, y: y, width: wd, height: 20, 'class': 'fw-s2 st-s2 dash' }, svgB);
+          if (wd >= 3 * CW) S('text', { x: x + wd / 2, y: y + 14, 'class': 'tx-mid tx-sm halo', text: w.kind + ' ' + w.reg }, svgB);
+        });
+        S('rect', { x: X0 + (r.issue - 1) * CW, y: y, width: CW, height: 20, 'class': 'fi-paper' }, svgB);
+        S('text', { x: X0 + (r.issue - 1) * CW + CW / 2, y: y + 14, 'class': 'tx-mid tx-mono tx-sm', text: 'I' }, svgB);
+        S('rect', { x: X0 + (r.start - 1) * CW, y: y, width: r.lat * CW, height: 20, 'class': 'fw-s1 st-s1' }, svgB);
+        S('rect', { x: X0 + (r.write - 1) * CW + CW / 2 - 3, y: y + 1, width: 6, height: 18, 'class': 'fi-s1' }, svgB);
+      }
+    }
+    ui.onChange(function () {
+      var prog = PRESETS[frag.value], renaming = !!ren.value, res = simulate(prog, renaming), i3 = res[3], last = 0, nameWait = 0, i;
+      for (i = 0; i < res.length; i++) last = Math.max(last, res[i].write);
+      i3.waits.forEach(function (w) { if (w.kind === 'WAW' || w.kind === 'WAR') nameWait += w.to - w.from + 1; });
+      drawArcs(prog, renaming);
+      drawTimeline(res);
+      roI3.set(i3.issue + ' / ' + i3.start + ' / ' + i3.write);
+      roLast.set(last);
+      roName.set(nameWait, nameWait ? 'bad' : 'good');
+      var msg;
+      if (!renaming) msg = nameWait ? ('Renaming off: I3 waits ' + nameWait + ' cycles for the <b>name</b> ' + i3.dst + (frag.value === 'A' ? ' — at issue, until I1 has written F6 (WAW), although I3’s own operands were ready at cycle 1.' : ' — at write result, until I1 has read the old F8 (WAR); its product is finished at 7 and sits in the unit.')) : 'Renaming off: no name wait in this fragment.';
+      else msg = 'Renaming on: I3 issues at ' + i3.issue + ', executes ' + i3.start + '–' + (i3.start + i3.lat - 1) + ' and writes at ' + i3.write + '. Its result carries its station’s tag, so it never waits for the name ' + i3.dst + '. The RAW chain I0 → I1 → I2 is unchanged: last write result ' + last + '.';
+      note.set(msg);
+    });
+  });
+  </script>
+
+  <h3>The answer to the puzzle</h3>
+
+  <p>What Tomasulo’s machine changed is the meaning of “F6”. On the scoreboard F6 is a <em>place</em>: one cell, and whoever wants to write it must wait until the previous writer has written and the previous reader has read. In Tomasulo’s machine F6 is a <em>promise</em>: the cell records the name of the station that will write it last, and nothing else. The sum of <code>I1</code> is called RS-whatever-the-adder’s-station-is from the moment it is issued; the store asks for that name, not for F6; the multiply, issued two cycles later, writes its own name into <code>F6.Qi</code> and runs. When the sum finally arrives on the bus it goes to the store, which was waiting for it, and is ignored by F6, which has promised itself to the multiply. No stall, no wrong value — and no change to the code, because the compiler never sees a station name.</p>
+
+  <aside class="margin-note">Costs, for the theory question: more hardware (stations, comparators, the bus), one result per bus per cycle, and still imprecise exceptions until the reorder buffer.</aside>
+  <p>State the cost next to the benefit, as the open question of the exam expects. The benefit: WAR and WAW can never stall or corrupt, only true dependences remain, and the machine runs code compiled for other implementations because the renaming is invisible to the ISA — the ISA’s register count no longer limits what can be in flight. The cost: every station and every register is an associative comparator on the bus, the bus itself is the throughput limit, and results are still written out of order, so an exception leaves the registers in a state no sequential program would have produced — the problem that the reorder buffer of <a href="l17.html">lesson 17</a> fixes.</p>
+
+  <div class="story" data-year="1967">
+    <p>Robert Tomasulo published the scheme in January 1967, three years after the CDC 6600 and its scoreboard, in a paper whose abstract promises “a simple common data busing and register tagging scheme which permits simultaneous execution of independent instructions while preserving the essential precedences” — with hardware that looked ahead about eight instructions. The Model 91 it was built for had imprecise exceptions and out-of-order stores, the two problems the reorder buffer later solved. Tomasulo received the Eckert–Mauchly Award in 1997 “for the ingenious Tomasulo algorithm, which enabled out-of-order execution processors to be implemented”.</p>
+  </div>
+</section>
+
+<section id="l11-exam" class="no-num">
+  <h2>Exam-style questions</h2>
+
+  <div class="exam" data-kind="open" data-points="3" id="l11-exam-open8">
+    <div class="exam-q" lang="en">
+      <p>Explain the main concepts and benefits of each one of the following techniques used by modern superscalar processors (Tomasulo-style): 4. Reservation stations; 5. Dynamic register renaming; 6. Out-of-order execution. <em>(Three of the eight items of Question 1, 22 June 2026 — five lines each.)</em></p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><b>Reservation stations.</b> Buffers in front of each functional unit. An issued instruction waits there with its operation, its operand values (Vj, Vk) or the tags of the producers it waits for (Qj, Qk), and a busy bit. They decouple issue from execution: an instruction waits locally for its operands instead of blocking the pipeline, the station’s name is the temporary name of its result (renaming), and the control is distributed — each unit schedules itself. Benefit: no central scoreboard, no stall of the instructions behind a waiting one, more instructions in flight than there are registers.</p>
+        <p><b>Dynamic register renaming.</b> At issue the destination register’s status field Qi is set to the station’s tag, and every later consumer records that tag instead of the register name. Results are broadcast with the tag; a register is written only if its Qi still holds that tag (the newest writer owns the register). Benefit: WAR and WAW hazards — name dependences — can never stall or corrupt; only true RAW dependences remain; the renaming is done by hardware, invisible to the ISA, so the register count of the ISA no longer limits scheduling.</p>
+        <p><b>Out-of-order execution.</b> An instruction leaves its station for the functional unit as soon as Qj = Qk = 0 and the unit is free, independently of program order; results return out of order over the common data bus. Benefit: independent instructions proceed while a long-latency one (a load, a divide) waits, so stalls are filled and the CPI falls. Cost: completion out of order gives imprecise exceptions unless a reorder buffer restores in-order commit.</p>
+      </div>
+      <div class="exam-note">
+        <p>The form of the real question is a table with five lines per item: write labelled statements, not an essay. Full marks need the concept (what the structure holds or does), the mechanism (tags, Qi, the CDB) and a benefit stated as a benefit; for item 6, naming the cost (imprecise exceptions) shows you know what the next item, the reorder buffer, is for.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="5" id="l11-exam-war">
+    <div class="exam-q" lang="en">
+      <p>Why does the scoreboard stall on a WAR hazard while Tomasulo’s algorithm does not? Where in Tomasulo’s three stages is the WAR hazard resolved?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>In the scoreboard an instruction reads its operands from the register file in the Read Operands stage. A later instruction that writes one of those registers must therefore wait at Write Result until the read has happened, otherwise the reader would get the new value: the WAR hazard costs a stall of the writer. In Tomasulo’s algorithm the reader takes a copy of the operand at Issue (into Vj/Vk) if it is available, or records the producer’s tag (Qj/Qk) and receives the value from the CDB; it never reads the register file later. The later writer cannot overwrite anything the reader still needs; it only sets the register’s Qi to its own station. The WAR hazard is dissolved at Issue — copy or tag — and no stage ever stalls for it.</p>
+      </div>
+      <div class="exam-note"><p>Two sentences carry the marks: “the reader copies or tags at issue and never returns to the register” and “the writer renames the register to its own station”. The stage asked for is Issue.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="2" id="l11-exam-dep">
+    <div class="exam-q" lang="en">
+      <p>Let’s consider the following assembly code containing multiple types of intra-loop dependences. Complete the following table by inserting all types of true-data-dependences, anti-dependences and output dependences for each instruction (I0 and I2: None). <em>(Part 1 of Exercise 1, 22 June 2026.)</em></p>
+<pre><code>I0  FOR: LD    F2, AA(R1)
+I1       FADD  F2, F2, F2
+I2       LD    F4, BB(R1)
+I3       FADD  F2, F2, F4
+I4       SD    F2, A(R1)
+I5       ADDUI R1, R1, 8
+I6       BNE   R1, R2, FOR</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th>I#</th><th>Dependences</th></tr></thead>
+            <tbody>
+              <tr><td>I0</td><td>None</td></tr>
+              <tr><td>I1</td><td>True data dependence with I0 for F2; output dependence with I0 for F2</td></tr>
+              <tr><td>I2</td><td>None</td></tr>
+              <tr><td>I3</td><td>True data dependence with I1 for F2 and with I2 for F4; anti-dependence with I1 for F2 (I1 reads F2, I3 writes it); output dependence with I1 and with I0 for F2</td></tr>
+              <tr><td>I4</td><td>True data dependence with I3 for F2</td></tr>
+              <tr><td>I5</td><td>Anti-dependence with I0, I2 and I4 for R1 (they read R1, I5 writes it)</td></tr>
+              <tr><td>I6</td><td>True data dependence with I5 for R1</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="exam-note"><p>The paper wants every pair named “with I# for Fx”. The ones students miss: the anti-dependences of the ADDUI on <em>every</em> earlier reader of R1 (two loads and the store), and the output dependence of I3 on I0 as well as on I1. In the Tomasulo table of part 2 (lesson 12) all the WAR and WAW entries are “solved by renaming” — but part 1 asks you to find them.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l11-exam-mcq1">
+    <div class="exam-q" lang="en"><p>In Tomasulo’s algorithm, a reservation station is released: (single answer)</p></div>
+    <ul class="options" lang="en">
+      <li>when the instruction is issued into it <span class="fb">At issue the station is filled, not freed: it must hold the operands or tags until the instruction can execute.</span></li>
+      <li>when the instruction starts execution in the functional unit <span class="fb">The station stays busy while the unit works; it still has to deliver the result with its tag.</span></li>
+      <li data-correct>when the instruction writes its result on the CDB <span class="fb">Write result: broadcast the pair, fill every waiting field, write the register if Qi matches, free the station.</span></li>
+      <li>when the next instruction of the same type is issued <span class="fb">A later instruction can take the station only because it is already free — from the cycle after the write result.</span></li>
+    </ul>
+    <details class="exam-solution"><summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answer 3: the station is busy from Issue through Write Result and reusable from the next cycle.</p></div>
+      <div class="exam-note"><p>The notes themselves say “the RS is now free” during execution on page 155; that is the wrong answer here and the wrong ISSUE column in the exercise.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l11-exam-multi">
+    <div class="exam-q" lang="en"><p>Which of the following can stall the ISSUE stage of Tomasulo’s algorithm? (multiple answers)</p></div>
+    <ul class="options" lang="en">
+      <li>a RAW hazard on a source register <span class="fb">No: the instruction is issued with the producer’s tag in Qj or Qk and waits inside its station.</span></li>
+      <li data-correct>no free reservation station of the required type <span class="fb">The structural hazard — the most common “STRUCTURAL” entry in the exam tables.</span></li>
+      <li>a WAW hazard on the destination register <span class="fb">No: the destination is renamed to the new station; the older writer’s claim is simply forgotten.</span></li>
+      <li data-correct>a full load/store buffer <span class="fb">A load or store needs a free buffer of its own kind, exactly as an FP operation needs a free station.</span></li>
+      <li data-correct>an unresolved branch in a machine without speculation <span class="fb">Without speculation the instructions after the branch cannot be issued until it resolves — dynamic scheduling stays inside the basic block.</span></li>
+    </ul>
+    <details class="exam-solution"><summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Answers 2, 4 and 5. Data hazards never stall issue in Tomasulo’s algorithm: RAW waits in the station, WAR and WAW are dissolved by the tags.</p></div>
+      <div class="exam-note"><p>The question tests the one thing the scoreboard and Tomasulo disagree about at Issue: WAW stalls the scoreboard there and never stalls Tomasulo.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="1" id="l11-exam-tf">
+    <div class="exam-q" lang="en"><p>True or false: in Tomasulo’s algorithm a store instruction writes its result on the common data bus.</p></div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">A store has no destination register; nothing can wait for its tag, so there is nothing to broadcast.</span></li>
+      <li data-correct>False <span class="fb">A store waits for its address and its data (the data may arrive from the CDB), then writes memory. It listens on the bus and never speaks on it.</span></li>
+    </ul>
+    <details class="exam-solution"><summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>False: the store buffer monitors the CDB for its data and writes memory; it broadcasts nothing. In the exam table its WRITE RESULT entry is the cycle the memory write completes.</p></div>
+      <div class="exam-note"><p>“Motivate your answer” is worth the extra point: say what the store waits for and where its result goes.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l11-quiz">
+  <h2>Check yourself</h2>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Which of these are name dependences — the ones renaming removes?</p>
+    <ul class="options">
+      <li data-correct>WAR, a later instruction writing a register an earlier one still has to read <span class="fb">No value flows between the two; they only share a name.</span></li>
+      <li data-correct>WAW, two instructions writing the same register <span class="fb">Give the two results two names and the conflict is gone.</span></li>
+      <li>RAW, a later instruction reading what an earlier one computes <span class="fb">A value really flows: this is the dependence renaming keeps, and the one that still costs cycles.</span></li>
+      <li>a structural hazard, two instructions wanting the same unit <span class="fb">A resource conflict, not a register-name conflict; renaming does nothing about it.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">RS3 broadcasts &lt;RS3, 2.0&gt;. The register file holds F6.Qi = RS5 and F8.Qi = RS3. What happens in the register file?</p>
+    <ul class="options">
+      <li>Both F6 and F8 are written with 2.0 <span class="fb">F6 is waiting for RS5, a newer writer; writing it now would put a stale value under a newer promise.</span></li>
+      <li data-correct>Only F8 is written; F6 ignores the broadcast <span class="fb">The register takes the value only if its Qi equals the tag: F8 matches, F6 does not.</span></li>
+      <li>Only F6 is written, because it was renamed last <span class="fb">Being renamed last means F6 belongs to RS5, not to RS3.</span></li>
+      <li>Neither: registers are written only when the instruction commits <span class="fb">That is the reorder-buffer version (lesson 17); basic Tomasulo writes the register at Write Result.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Why can a reader in Tomasulo’s machine never be hurt by a later writer of its source register (a WAR hazard)?</p>
+    <ul class="options">
+      <li>Because it reads the register file at Write Result, after the writer <span class="fb">Reading after the writer would give the new value — the very error a WAR rule prevents.</span></li>
+      <li data-correct>Because it copies the operand at issue, or takes it from the CDB by tag, and never reads the register later <span class="fb">The station is the reader’s private copy; the register can change freely afterwards.</span></li>
+      <li>Because the later writer is stalled at issue until the reader has read <span class="fb">That is the scoreboard’s cure (a stall); Tomasulo needs none.</span></li>
+      <li>Because the register file keeps two copies of every register <span class="fb">It keeps one value and one tag; the copies live in the stations.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Compared with static (compiler) renaming, hardware renaming needs more of what?</p>
+    <ul class="options">
+      <li>architectural registers encoded in the ISA <span class="fb">That is exactly the limit of static renaming; the hardware’s names are invisible to the ISA.</span></li>
+      <li data-correct>reservation stations — temporary names that exist only inside the machine <span class="fb">Each station is one name; more stations, more results in flight.</span></li>
+      <li>compile-time knowledge of the whole execution path <span class="fb">The other limit of static renaming; the hardware renames at run time, whatever the path.</span></li>
+      <li>bits in the instruction format <span class="fb">The instruction still names F6; the tag never appears in the code.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">A store buffer holding <code>SD F2, A(R1)</code> can write memory only when it has … (select all that apply)</p>
+    <ul class="options">
+      <li data-correct>the base register R1 as a value, to compute the address <span class="fb">Vj/Qj: if the ADDUI that writes R1 is still pending, the buffer holds its tag.</span></li>
+      <li data-correct>the data F2 as a value <span class="fb">Vk/Qk: the data may arrive from the CDB, which is why store buffers monitor the bus.</span></li>
+      <li>a free slot on the CDB to broadcast the stored value <span class="fb">A store broadcasts nothing; it writes memory.</span></li>
+      <li>its destination register’s Qi equal to its own tag <span class="fb">A store has no destination register and no Qi to match.</span></li>
+    </ul>
+    <p class="q-fb">Address and data, both possibly tags; then memory, never the bus.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">A machine has three functional units that all finish in the same cycle and a single CDB. How many results are written in that cycle, and why?</p>
+    <ul class="options">
+      <li>Three — each unit writes its own register <span class="fb">Results do not go to registers directly; they go on the bus, and the bus carries one pair per cycle.</span></li>
+      <li data-correct>One — the bus carries one &lt;tag, value&gt; per cycle; the others wait their turn <span class="fb">One CDB, one result per cycle; in the exam the older instruction goes first.</span></li>
+      <li>One per reservation station that is waiting <span class="fb">Listeners do not limit the bus; the bus limits the producers.</span></li>
+      <li>Two — one for the register file and one for the stations <span class="fb">There is one bus and everyone listens to it.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Where do the fields Qi and Qj/Qk live, and what does each one say?</p>
+    <ul class="options">
+      <li>All three live in the reservation station <span class="fb">Qj and Qk do; Qi is a field of each register in the register file.</span></li>
+      <li>All three live in the register file <span class="fb">Qi does; Qj and Qk are the station’s own fields for its two operands.</span></li>
+      <li data-correct>Qi in the register file (“who will write this register”), Qj and Qk in the station (“who delivers my operands”) — all three hold station tags <span class="fb">At issue the station copies the register’s Qi into its Qj or Qk: the same name, seen from the other side.</span></li>
+      <li>Qi in the instruction queue, Qj and Qk in the functional unit <span class="fb">Neither the queue nor the unit keeps tags; the station and the register file do.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l11-recap">
+  <h2>Key take-aways</h2>
+  <ul>
+    <li>WAR and WAW are name conflicts and only RAW carries a value; give every result a name of its own and only RAW remains.</li>
+    <li>Static renaming spends architectural registers and needs the whole path at compile time; Tomasulo renames in hardware, invisibly: the reservation station is the temporary name — the tag — of the result it will produce.</li>
+    <li>A station holds Busy, Op and, for each operand, either a value (Vj, Vk) or the tag of its producer (Qj, Qk), never both; loads and stores add the address field A.</li>
+    <li>Each register carries Qi, the tag of the newest instruction that will write it; Qi = 0 means the value is valid. The newest writer owns the register, older claims are forgotten.</li>
+    <li>A result is broadcast on the common data bus as &lt;tag, value&gt;: every matching Qj/Qk fills, the register is written only if its Qi still matches, and the station is freed. One bus means one result per cycle. A store listens on the bus but never speaks.</li>
+    <li>Three steps, no Read Operands: issue needs a free station (and renames the destination), execute needs Qj = Qk = 0 and a free unit, write result needs the bus; the station stays busy until write result.</li>
+  </ul>
+  <aside class="cheat" id="l11-cheat">
+    <dl>
+      <dt>Reservation station</dt><dd>Busy · Op · Vj, Vk (operand values) · Qj, Qk (producer tags, 0 = ready) · A (load/store: immediate, then effective address)</dd>
+      <dt>Register status</dt><dd>Qi = tag of the newest pending writer of the register; Qi = 0 → use Vi</dd>
+      <dt>Issue</dt><dd>free station of the right type → copy values or tags from the register file; Qi[dest] ← this station</dd>
+      <dt>Execute</dt><dd>Qj = Qk = 0 (both operands as values) and the unit is free → compute for the latency</dd>
+      <dt>Write result</dt><dd>CDB free → broadcast &lt;tag, value&gt;; every Qj/Qk = tag fills; register written only if Qi = tag; station freed</dd>
+      <dt>Store</dt><dd>waits for address and data (either may be a tag) → writes memory; never uses the CDB</dd>
+      <dt>CDB capacity</dt><dd>one result per bus per cycle; in the exam the older instruction writes first</dd>
+      <dt>Scoreboard vs Tomasulo</dt><dd>stalls on WAR / WAW vs renames; data through the register file vs broadcast with a tag; central vs distributed control; waits for a register vs for a value or tag</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l11-resources">
+  <h2>What to watch and read</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=1HKeCTb0CDI" target="_blank" rel="noopener">Tomasulo Intro — Georgia Tech — HPCA: Part 2</a>
+      <span class="res-by">Udacity (Milos Prvulovic)</span><span class="res-dur">short clip</span>
+      <p class="res-why">A whiteboard sketch of the same blocks as Figure 2 — stations, tags, the bus — before you read the fields one by one.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://en.wikipedia.org/wiki/Tomasulo%27s_algorithm" target="_blank" rel="noopener">Tomasulo’s algorithm</a>
+      <span class="res-by">Wikipedia</span><span class="res-dur">10 min</span>
+      <p class="res-why">The definitions of the CDB and the tag in two paragraphs, and the remark on why the scheme came back in the 1990s: it tolerates the unpredictable latency of cache misses.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://aca-iiith.vlabs.ac.in/exp/dynamic-scheduling-tomasulo/simulation/index.html" target="_blank" rel="noopener">Dynamic Scheduling with Tomasulo Algorithm — simulator</a>
+      <span class="res-by">Virtual Labs, IIIT Hyderabad</span>
+      <p class="res-why">Type the six instructions of the frozen state, set the latencies, and step: the reservation stations, the register alias table and the CDB activity of this lesson, live. Its procedure page asks you to watch “how different writes to R1 get different reservation station tags” — the WAW rule of the first widget.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=AhtIrJNSQws" target="_blank" rel="noopener">Digital Design and Computer Architecture — Lecture 15: Out-of-Order Execution</a>
+      <span class="res-by">Onur Mutlu, ETH Zürich</span><span class="res-dur">full lecture</span>
+      <p class="res-why">Tomasulo as “restricted dataflow”: a tag is a promise of a value, the station a waiting room, the bus a loudspeaker. Watch the walk-through of a small code sequence before lesson 12’s table.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.virginia.edu/evans/greatworks/tomasulo.pdf" target="_blank" rel="noopener">An Efficient Algorithm for Exploiting Multiple Arithmetic Units</a>
+      <span class="res-by">R. M. Tomasulo, IBM Journal of Research and Development, 1967</span><span class="res-dur">9 pages</span>
+      <p class="res-why">Read the abstract and the section on the common data bus, and recognise Vj, Vk, Qj, Qk in Tomasulo’s own “sink”, “source” and tags.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>You can now read every field of the machine. What you cannot yet do is fill the exam table: in which cycle does each instruction issue, start and write, and what goes in the Hazards column? Next: the exact rules of the three stages, the paper’s conventions, and the 22 June 2026 exercise filled in — CPI 19/7.</p>
+</aside>
+
+</main>
+</body>
+</html>
