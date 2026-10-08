@@ -57,9 +57,9 @@ window.SYLLABUS = {
     ] }
   ],
   extras: [
-    { id: 'formulas', file: 'formulas.html', title: 'Formula sheet', teaser: 'Every formula and rule of the course on one page, with every letter explained — what belongs on your A4.', ready: false },
-    { id: 'exam', file: 'exam.html', title: 'Exam trainer', teaser: 'Every exam-style question of the course with model answers, filters and a random ten.', ready: false },
-    { id: 'glossary', file: 'glossary.html', title: 'Glossary', teaser: 'The terms of the course and the exam papers, and what they mean.', ready: false },
-    { id: 'errata', file: 'errata.html', title: 'Red pen: slips in the notes', teaser: 'Every mistake of the notes that the lessons correct, in page order, with the quotation, the correct statement and the reason.', ready: false }
+    { id: 'formulas', file: 'formulas.html', title: 'Formula sheet', teaser: 'Every formula and rule of the course on one page, with every letter explained — what belongs on your A4.' },
+    { id: 'exam', file: 'exam.html', title: 'Exam trainer', teaser: 'Every exam-style question of the course with model answers, filters and a random ten.' },
+    { id: 'glossary', file: 'glossary.html', title: 'Glossary', teaser: 'The terms of the course and the exam papers, and what they mean.' },
+    { id: 'errata', file: 'errata.html', title: 'Red pen: slips in the notes', teaser: 'Every mistake of the notes that the lessons correct, in page order, with the quotation, the correct statement and the reason.' }
   ]
 };
