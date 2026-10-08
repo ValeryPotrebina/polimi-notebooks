@@ -1216,6 +1216,397 @@
   }
 
   /* ------------------------------------------------------------------------
+     7b. Slide references and the slide viewer (the viewer of the AN2DL notebook, in English)
+     The source of this notebook is the course's slide decks merged into one PDF, and the lessons cite its pages:
+     "p. 15", "pp. 23–25", "Page 104", "the slide of p. 1214". The learner has the decks, not that PDF, so at load time
+     every such reference becomes a slide reference that names the deck and the slide and opens the slide image:
+       <a class="slide-ref" href="assets/slides/l01_015.webp" data-deck="l01" data-slide="15">lecture 1, slide 15</a>
+     The syllabus declares course.decks (id -> label, title, file, slides) and course.pagemap ([first page, last page,
+     deck id, first slide | [the slide of every page]] - a list where the merge dropped duplicate pages). The image of
+     slide N of a deck is assets/slides/<deck>_<NNN>.webp. With course.slideImages: false (a copy without the images)
+     the references name the slide and link nowhere. "their p. 20" - a page of the course notes - stays as written.
+     In a drawing a reference becomes "slide 15" (there is no room for the deck); in code and in attributes it is text.
+     ------------------------------------------------------------------------ */
+  var DECKS = (function () {
+    var src = CFG.decks, out = {}, any = false, k;
+    if (!src || typeof src !== 'object') return null;
+    for (k in src) {
+      if (!Object.prototype.hasOwnProperty.call(src, k) || !src[k] || typeof src[k] !== 'object') continue;
+      var n = parseInt(src[k].slides, 10);
+      if (!(n > 0)) continue;
+      out[k] = { id: k, label: String(src[k].label || k), title: String(src[k].title || ''), file: String(src[k].file || ''),
+        slides: n, ext: String(src[k].ext || 'webp').replace(/^\./, '') };
+      any = true;
+    }
+    return any ? out : null;
+  })();
+  var PAGEMAP = DECKS && Array.isArray(CFG.pagemap) ? CFG.pagemap.filter(function (r) {
+    return Array.isArray(r) && r.length >= 4 && Object.prototype.hasOwnProperty.call(DECKS, r[2]);
+  }) : null;
+  var SLIDE_LINKS = !!DECKS && CFG.slideImages !== false;
+  function slideSrc(deck, n) { var s = String(n); while (s.length < 3) s = '0' + s; return 'assets/slides/' + deck.id + '_' + s + '.' + deck.ext; }
+  /* page N of the merged source -> { deck, slide }; null when no deck holds it */
+  function pageSlide(n) {
+    if (!PAGEMAP) return null;
+    for (var i = 0; i < PAGEMAP.length; i++) {
+      var r = PAGEMAP[i];
+      if (n >= r[0] && n <= r[1]) {
+        var own = Array.isArray(r[3]) ? r[3][n - r[0]] : r[3] + (n - r[0]);
+        return own > 0 ? { deck: DECKS[r[2]], slide: own } : null;
+      }
+    }
+    return null;
+  }
+  /* pages a..b -> one part per deck { deck, from, to }; null when a page has no deck */
+  function pageParts(a, b) {
+    if (!(a > 0) || b < a || b - a > 400) return null;
+    var out = [], cur = null;
+    for (var n = a; n <= b; n++) {
+      var s = pageSlide(n);
+      if (!s) return null;
+      if (cur && cur.deck === s.deck) { cur.from = Math.min(cur.from, s.slide); cur.to = Math.max(cur.to, s.slide); }
+      else { cur = { deck: s.deck, from: s.slide, to: s.slide }; out.push(cur); }
+    }
+    return out;
+  }
+  function slideNums(p) { return p.from === p.to ? 'slide' + NBSP + p.from : 'slides' + NBSP + p.from + '–' + p.to; }
+  function deckName(deck) { return deck.label.replace(' ', NBSP); }
+  function capFirst(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+  /* the words of one part: "lecture 1, slide 15"; after "the slide of": "slide 15 of lecture 1"; in a drawing: "slide 15" */
+  function partLabel(p, form) {
+    if (form === 'short') return slideNums(p);
+    return form === 'of' ? slideNums(p) + ' of ' + deckName(p.deck) : deckName(p.deck) + ', ' + slideNums(p);
+  }
+  function partNode(p, form, linked) {
+    var text = partLabel(p, form);
+    if (!linked) return doc.createTextNode(text);
+    return el('a', { 'class': 'slide-ref', href: slideSrc(p.deck, p.from), 'data-deck': p.deck.id,
+      'data-slide': p.from === p.to ? String(p.from) : p.from + '-' + p.to, text: text });
+  }
+  /* "p. 15", "pp. 23–25", "page 104", "Pages 9–12", each optionally after "the slide(s) of / on / in / at" */
+  var PAGE_REF = /(^|[^\w.])((?:([Tt]he)[  ])?([Ss]lides?)[  ](?:of|on|in|at)[  ])?(pp?\.|[Pp]ages?)[  ]+(\d{1,4})(?:[  ]*[–—-][  ]*(\d{1,4}))?(?!\d)/g;
+  var PAGE_HINT = /p\.|age/;
+  var TEX_SPLIT = /(\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\])/;
+  /* one match -> { parts, form, capital } or null (a page outside the decks, or a page of another document) */
+  function pageRef(m, before, short) {
+    if (/\btheir[  ]*$/i.test(before)) return null;                    // "their p. 20": the course notes
+    var a = parseInt(m[6], 10), b = m[7] ? parseInt(m[7], 10) : a, parts = pageParts(a, b);
+    if (!parts) return null;
+    var capital = m[2] ? (m[3] === 'The' || (!m[3] && /^S/.test(m[4]))) : /^P/.test(m[5]);
+    return { parts: parts, form: short ? 'short' : m[2] ? 'of' : '', capital: capital };
+  }
+  function refText(ref) {
+    var s = ref.parts.map(function (p) { return partLabel(p, ref.form); }).join(' and ');
+    return ref.capital ? capFirst(s) : s;
+  }
+  /* a string (an attribute, a text without links) with its references named */
+  function namePageRefs(s, short) {
+    if (!PAGEMAP || !s || !PAGE_HINT.test(s)) return s;
+    var parts = String(s).split(TEX_SPLIT);
+    for (var i = 0; i < parts.length; i += 2) {
+      parts[i] = parts[i].replace(PAGE_REF, function () {
+        var m = arguments, offset = m[m.length - 2], whole = m[m.length - 1];
+        var ref = pageRef(m, whole.slice(0, offset + m[1].length), short);
+        return ref ? m[1] + refText(ref) : m[0];
+      });
+    }
+    return parts.join('');
+  }
+  /* one text node: its references become links (or named text where a link cannot be) */
+  function convertTextNode(tn) {
+    var p = tn.parentNode;
+    if (!p || !p.closest || !PAGE_HINT.test(tn.nodeValue) || p.closest('script, style, textarea, noscript, .no-math, mjx-container')) return;
+    var short = !!p.closest('svg');
+    var linked = SLIDE_LINKS && !short && !p.closest('a, button, label, select, option, summary, pre, code, [contenteditable]');
+    if (linked && p.closest('.options li') && !p.closest('.fb')) linked = false;     // the text of an option becomes a button (quiz, exam): its feedback keeps links
+    var parts = tn.nodeValue.split(TEX_SPLIT), frag = doc.createDocumentFragment(), buf = '', changed = false;
+    for (var i = 0; i < parts.length; i++) {
+      if (i % 2) { buf += parts[i]; continue; }
+      var s = parts[i], last = 0, m;
+      PAGE_REF.lastIndex = 0;
+      while ((m = PAGE_REF.exec(s))) {
+        var start = m.index + m[1].length, ref = pageRef(m, s.slice(0, start), short);
+        if (!ref) continue;
+        buf += s.slice(last, start);
+        if (buf) { frag.appendChild(doc.createTextNode(buf)); buf = ''; }
+        ref.parts.forEach(function (part, k) {
+          if (k) frag.appendChild(doc.createTextNode(' and '));
+          var node = partNode(part, ref.form, linked);
+          if (!k && ref.capital) { if (node.nodeType === 3) node.nodeValue = capFirst(node.nodeValue); else node.textContent = capFirst(node.textContent); }
+          frag.appendChild(node);
+        });
+        last = m.index + m[0].length;
+        changed = true;
+      }
+      buf += s.slice(last);
+    }
+    if (!changed) return;
+    if (buf) frag.appendChild(doc.createTextNode(buf));
+    p.replaceChild(frag, tn);
+  }
+  var REF_ATTRS = ['aria-label', 'data-label', 'data-tab', 'title', 'alt'];
+  function convertPageRefs(scope) {
+    if (!PAGEMAP || !scope) return;
+    var walker = doc.createTreeWalker(scope, NodeFilter.SHOW_TEXT, null), tn, list = [];
+    while ((tn = walker.nextNode())) if (PAGE_HINT.test(tn.nodeValue)) list.push(tn);
+    list.forEach(function (n) { try { convertTextNode(n); } catch (e) { report('page reference', e); } });
+    var els = scope.querySelectorAll ? Array.prototype.slice.call(scope.querySelectorAll('[aria-label], [data-label], [data-tab], [title], [alt]')) : [];
+    if (scope.nodeType === 1) els.push(scope);
+    els.forEach(function (n) {
+      REF_ATTRS.forEach(function (k) {
+        var v = n.getAttribute(k);
+        if (v && PAGE_HINT.test(v)) { var w = namePageRefs(v, false); if (w !== v) n.setAttribute(k, w); }
+      });
+    });
+  }
+  /* the caption of a red pen is generated content (course.css, from data-page): it becomes a line of its own */
+  function redpenHeads(scope) {
+    if (!PAGEMAP || !scope || !scope.querySelectorAll) return;
+    var list = Array.prototype.slice.call(scope.querySelectorAll('.redpen[data-page]'));
+    if (scope.matches && scope.matches('.redpen[data-page]')) list.push(scope);
+    list.forEach(function (r) {
+      if (r.classList.contains('has-head')) return;
+      var m = /^(\d{1,4})(?:\s*[–-]\s*(\d{1,4}))?$/.exec(r.getAttribute('data-page') || '');
+      var parts = m ? pageParts(parseInt(m[1], 10), m[2] ? parseInt(m[2], 10) : parseInt(m[1], 10)) : null;
+      if (!parts) return;
+      var head = el('p', { 'class': 'label redpen-head' }, [CFG.redpenLabel + ' · ']);
+      parts.forEach(function (p, k) { if (k) head.appendChild(doc.createTextNode(' and ')); head.appendChild(partNode(p, '', SLIDE_LINKS)); });
+      r.insertBefore(head, r.firstChild);
+      r.classList.add('has-head');
+    });
+  }
+  /* the lesson head: the chip of the source pages becomes the chip of the slides, one link per deck */
+  function slideChip() {
+    if (!PAGEMAP || !chrome.main) return;
+    var li = chrome.main.querySelector('.lesson-head li[data-meta="pages"]');
+    if (!li) return;
+    var text = li.textContent.replace(CFG.sourceLabel, ''), re = /(\d{1,4})(?:\s*[–-]\s*(\d{1,4}))?/g, m, groups = [], at = {};
+    while ((m = re.exec(text))) {
+      var parts = pageParts(parseInt(m[1], 10), m[2] ? parseInt(m[2], 10) : parseInt(m[1], 10));
+      if (!parts) return;
+      parts.forEach(function (p) {
+        if (!Object.prototype.hasOwnProperty.call(at, p.deck.id)) { at[p.deck.id] = groups.length; groups.push({ deck: p.deck, ranges: [] }); }
+        var g = groups[at[p.deck.id]], prev = g.ranges[g.ranges.length - 1];
+        if (prev && p.from <= prev[1] + 1) prev[1] = Math.max(prev[1], p.to); else g.ranges.push([p.from, p.to]);
+      });
+    }
+    if (!groups.length) return;
+    var old = chrome.main.querySelector('.lesson-head li[data-meta="slides"]');
+    if (old && old !== li) old.parentNode.removeChild(old);
+    var box = el('span', { 'class': 'meta-text' });
+    groups.forEach(function (g, k) {
+      if (k) box.appendChild(doc.createTextNode('; '));
+      var one = g.ranges.length === 1 && g.ranges[0][0] === g.ranges[0][1];
+      var nums = g.ranges.map(function (r) { return r[0] === r[1] ? String(r[0]) : r[0] + '–' + r[1]; }).join(', ');
+      var label = deckName(g.deck) + ', ' + (one ? 'slide' : 'slides') + NBSP + nums;
+      box.appendChild(SLIDE_LINKS ? el('a', { 'class': 'slide-ref', href: slideSrc(g.deck, g.ranges[0][0]), 'data-deck': g.deck.id,
+        'data-slide': g.ranges.map(function (r) { return r[0] === r[1] ? String(r[0]) : r[0] + '-' + r[1]; }).join(','), text: label }) : doc.createTextNode(label));
+    });
+    li.textContent = '';
+    li.setAttribute('data-meta', 'slides');
+    li.appendChild(icon('slides'));
+    li.appendChild(box);
+  }
+  /** "5" · "9-15" · "21-24,27-28" -> [5] · [9, …, 15] · [21, 22, 23, 24, 27, 28]; null when the text is not in this grammar */
+  function slideList(spec) {
+    spec = String(spec == null ? '' : spec);
+    if (!/^\d{1,4}(?:-\d{1,4})?(?:,\d{1,4}(?:-\d{1,4})?)*$/.test(spec)) return null;
+    var out = [], parts = spec.split(',');
+    for (var i = 0; i < parts.length; i++) {
+      var ab = parts[i].split('-'), a = parseInt(ab[0], 10), b = ab.length > 1 ? parseInt(ab[1], 10) : a;
+      if (a < 1 || b < a) return null;
+      for (var k = a; k <= b; k++) if (out.indexOf(k) < 0) out.push(k);
+    }
+    return out;
+  }
+  /* what a link says: { deck, list } - or { problem } when its data is wrong */
+  function slideRefOf(a) {
+    var id = a.getAttribute('data-deck'), spec = a.getAttribute('data-slide');
+    var deck = id != null && Object.prototype.hasOwnProperty.call(DECKS, id) ? DECKS[id] : null;
+    if (!deck) return { problem: 'unknown deck data-deck="' + (id == null ? '' : id) + '" (course.decks of assets/syllabus.js has: ' + Object.keys(DECKS).join(', ') + ')' };
+    var list = slideList(spec);
+    if (!list) return { problem: 'data-slide="' + (spec == null ? '' : spec) + '" is not a number, a range or a list ("5", "9-15", "21-24,27-28")' };
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] > deck.slides) return { problem: 'slide ' + list[i] + ' is outside the deck ' + deck.id + ' (' + deck.label + ' has ' + deck.slides + ' slides)' };
+    }
+    return { deck: deck, list: list };
+  }
+  var slideProblems = [], slideFlat = [];        // for the self-test: links with wrong data; links that sit inside a button
+  function slideProblem(a, msg) {
+    var line = msg + ' @ ' + cssPath(a) + ': "' + short(a.textContent, 50) + '"';
+    if (slideProblems.indexOf(line) >= 0) return;
+    slideProblems.push(line);
+    if (!SELFTEST) console.warn('Course: slide reference: ' + line);
+  }
+  /* one link: check its data, fill a missing href, give it the "slides" icon. Runs once per element. */
+  function decorateSlideRef(a) {
+    if (a._slideRef !== undefined) return;
+    var ref = slideRefOf(a), href = a.getAttribute('href');
+    a._slideRef = ref.problem ? null : ref;
+    if (ref.problem) { slideProblem(a, ref.problem); return; }
+    var want = slideSrc(ref.deck, ref.list[0]);
+    if (!href) a.setAttribute('href', want);
+    else if (href.replace(/^\.\//, '') !== want) slideProblem(a, 'href="' + href + '" is not the image of the first slide of data-slide: expected "' + want + '"');
+    /* a link cannot live inside a button - the text of a quiz or exam option becomes one: there the reference is text */
+    var host = a.closest('button, label, select');
+    if (host) {
+      var flat = el('span', { 'class': 'slide-ref-flat' });
+      while (a.firstChild) flat.appendChild(a.firstChild);
+      a.parentNode.replaceChild(flat, a);
+      var where = '"' + short(flat.textContent, 50) + '" @ ' + cssPath(host);
+      if (slideFlat.indexOf(where) < 0) slideFlat.push(where);
+      return;
+    }
+    a.setAttribute('aria-haspopup', 'dialog');
+    if (!a.getAttribute('title')) a.setAttribute('title', 'Show the slide');
+    if (a.closest('[data-meta="slides"], .redpen-head') || a.querySelector('.slide-ref-ico')) return;      // the chip and the red pen line have their own look
+    /* the icon sits in the left padding of the link, out of the text flow (course.css): an icon in the flow would let
+       the line break between "(" and the link. The empty span is its anchor on the line. */
+    a.classList.add('slide-ref--ico');
+    a.insertBefore(el('span', { 'class': 'slide-ref-ico', 'aria-hidden': 'true' }, icon('slides')), a.firstChild);
+  }
+  function decorateSlideRefs(scope) {
+    if (!scope || !scope.querySelectorAll) return;
+    var list = Array.prototype.slice.call(scope.querySelectorAll('a.slide-ref'));
+    if (scope.matches && scope.matches('a.slide-ref')) list.push(scope);
+    list.forEach(function (a) { try { decorateSlideRef(a); } catch (e) { report('slide reference', e); } });
+  }
+
+  /* The viewer: ONE native <dialog> for the whole page, built on first use. Left / Right walk through the deck, Esc and
+     a click on the backdrop close it, the focus goes back to the link. Without dialog.showModal a link opens its image. */
+  var slideView = null, slidesShowable = null;
+  function canShowSlides() {
+    if (slidesShowable === null) slidesShowable = typeof doc.createElement('dialog').showModal === 'function';
+    return slidesShowable;
+  }
+  function buildSlideView() {
+    var v = { deck: null, list: [], at: 1, opener: null };
+    v.title = el('p', { 'class': 'sv-title', id: 'course-slide-title', 'aria-live': 'polite' });
+    v.close = el('button', { 'class': 'tb-btn sv-close', type: 'button', 'aria-label': 'Close the slide', title: 'Close (Esc)' }, icon('close'));
+    v.img = el('img', { 'class': 'sv-img', alt: '' });
+    v.miss = el('p', { 'class': 'sv-miss', hidden: true });
+    v.prev = el('button', { 'class': 'btn btn--ghost sv-prev', type: 'button', title: 'Previous slide (←)' }, [icon('arrow-left'), el('span', { text: 'Previous' })]);
+    v.next = el('button', { 'class': 'btn btn--ghost sv-next', type: 'button', title: 'Next slide (→)' }, [el('span', { text: 'Next' }), icon('arrow-right')]);
+    v.cited = el('div', { 'class': 'sv-cited', role: 'group', 'aria-label': 'The slides of the reference' });
+    v.cap = el('p', { 'class': 'sv-cap' });
+    v.dlg = el('dialog', { 'class': 'slide-view', 'aria-labelledby': 'course-slide-title' }, el('div', { 'class': 'sv-box' }, [
+      el('div', { 'class': 'sv-head' }, [v.title, v.close]),
+      el('div', { 'class': 'sv-stage' }, [v.img, v.miss]),
+      el('div', { 'class': 'sv-foot' }, [v.prev, el('div', { 'class': 'sv-info' }, [v.cited, v.cap]), v.next])
+    ]));
+    v.close.addEventListener('click', function () { v.dlg.close(); });
+    v.prev.addEventListener('click', function () { showSlide(v.at - 1); });
+    v.next.addEventListener('click', function () { showSlide(v.at + 1); });
+    v.dlg.addEventListener('click', function (e) { if (e.target === v.dlg) v.dlg.close(); });            // the backdrop
+    v.dlg.addEventListener('keydown', function (e) {
+      if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      var d = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      showSlide(v.at + d);
+    });
+    v.dlg.addEventListener('close', function () {
+      var o = v.opener;
+      v.opener = null;
+      if (o && o.isConnected) { try { o.focus({ preventScroll: true }); } catch (e) { /* older engines */ } }
+    });
+    v.img.addEventListener('load', function () {
+      if (v.img.naturalWidth && v.img.naturalHeight) v.dlg.style.setProperty('--sv-ratio', v.img.naturalWidth + ' / ' + v.img.naturalHeight);
+    });
+    v.img.addEventListener('error', function () {
+      v.img.hidden = true; v.miss.hidden = false;
+      v.miss.textContent = 'The image of this slide is missing: ' + v.img.getAttribute('src');
+    });
+    doc.body.appendChild(v.dlg);
+    return v;
+  }
+  function showSlide(n) {
+    var v = slideView, d = v.deck;
+    n = clamp(n, 1, d.slides);
+    v.at = n;
+    var src = slideSrc(d, n);
+    v.miss.hidden = true; v.img.hidden = false;
+    v.img.alt = capFirst(d.label) + ', slide ' + n + (d.title ? ' · ' + d.title : '');
+    if (v.img.getAttribute('src') !== src) v.img.setAttribute('src', src);
+    v.title.textContent = '';
+    addKids(v.title, [el('b', { text: capFirst(d.label) }), d.title ? ' · ' + d.title : '', ' · ', el('span', { 'class': 'sv-pos', text: 'slide ' + n + ' of ' + d.slides })]);
+    v.prev.disabled = n <= 1; v.next.disabled = n >= d.slides;
+    Array.prototype.forEach.call(v.cited.querySelectorAll('button'), function (b) {
+      if (parseInt(b.getAttribute('data-n'), 10) === n) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current');
+    });
+    /* where to find the slide in the course material: the file of the deck and its page */
+    v.cap.textContent = '';
+    addKids(v.cap, [(d.file ? d.file + ', ' : '') + 'page' + NBSP + n + NBSP + '· ',
+      el('a', { href: src, target: '_blank', rel: 'noopener' }, ['open on its own', icon('ext')])]);
+    if (!SELFTEST) [n - 1, n + 1].forEach(function (k) { if (k >= 1 && k <= d.slides) { try { new Image().src = slideSrc(d, k); } catch (e) { /* no preload */ } } });
+  }
+  /* list = the slides the link cites: they are offered as buttons, and the one on screen is marked among them */
+  function openSlides(deck, list, at, opener) {
+    if (!slideView) slideView = buildSlideView();
+    var v = slideView;
+    v.deck = deck; v.list = list.slice(); v.opener = opener || null;
+    v.cited.textContent = '';
+    if (v.list.length > 1) {
+      v.cited.appendChild(el('span', { text: 'In the reference:' }));
+      v.list.forEach(function (k) {
+        v.cited.appendChild(el('button', { type: 'button', 'data-n': k, 'aria-label': 'Slide ' + k, text: String(k), onclick: function () { showSlide(k); } }));
+      });
+    }
+    showSlide(at);
+    if (!v.dlg.open) v.dlg.showModal();
+  }
+  function initSlideRefs() {
+    if (!DECKS) return;
+    convertPageRefs(chrome.main);                 // what the steps after the typography wrote (quiz and exam blocks, the toc)
+    redpenHeads(chrome.main);
+    slideChip();
+    if (SLIDE_LINKS) {
+      decorateSlideRefs(doc);
+      doc.addEventListener('click', function (e) {
+        if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        var a = e.target && e.target.closest ? e.target.closest('a.slide-ref') : null;
+        if (!a) return;
+        try {
+          decorateSlideRef(a);                       // a link that a widget wrote a moment ago
+          var ref = a._slideRef;
+          if (!ref || !canShowSlides()) return;      // wrong data, or a browser without <dialog>: the link opens its image
+          e.preventDefault();
+          openSlides(ref.deck, ref.list, ref.list[0], a);
+        } catch (err) { report('slide viewer', err); }
+      });
+    }
+    /* text that widgets write later: a note, a readout, a table */
+    if (PAGEMAP && chrome.main && window.MutationObserver) {
+      try {
+        new MutationObserver(function (records) {
+          for (var i = 0; i < records.length; i++) {
+            var rec = records[i];
+            if (rec.type === 'characterData') {
+              if (rec.target.parentNode && PAGE_HINT.test(rec.target.nodeValue)) { try { convertTextNode(rec.target); } catch (e) { report('page reference', e); } }
+              continue;
+            }
+            var added = rec.addedNodes;
+            for (var k = 0; k < added.length; k++) {
+              var n = added[k];
+              try {
+                if (n.nodeType === 3) { if (n.parentNode && PAGE_HINT.test(n.nodeValue)) convertTextNode(n); }
+                else if (n.nodeType === 1) { convertPageRefs(n); redpenHeads(n); if (SLIDE_LINKS) decorateSlideRefs(n); }
+              } catch (e) { report('page reference', e); }
+            }
+          }
+        }).observe(chrome.main, { childList: true, subtree: true, characterData: true });
+      } catch (e) { /* very old browser */ }
+    }
+    /* a hook for tools and for looking at the viewer: page.html?slide=l06-5 opens it on slide 5 of the deck l06 */
+    var ask = /^(.+)-(\d{1,4})$/.exec(params.get('slide') || '');
+    if (ask && SLIDE_LINKS) {
+      var deck = Object.prototype.hasOwnProperty.call(DECKS, ask[1]) ? DECKS[ask[1]] : null, n = parseInt(ask[2], 10);
+      if (deck && n >= 1 && n <= deck.slides && canShowSlides()) openSlides(deck, [n], n, null);
+      else console.warn('Course: ?slide=' + params.get('slide') + ' names no slide of course.decks (expected <deck id>-<number>, for example ' + Object.keys(DECKS)[0] + '-1)');
+    }
+  }
+
+  /* ------------------------------------------------------------------------
      8. Hub page
      ------------------------------------------------------------------------ */
   function renderHub() {
@@ -2694,7 +3085,10 @@
         var m = CSS_COLOUR.exec(st.textContent || '');
         if (m) stFail('colour', 'literal colour "' + m[0].replace(/^:\s*/, '') + '" in a page <style>: use the tokens (var(--ink), var(--s1), …)');
       });
-      each('img, picture, iframe, object, embed, video, audio', function (n) { stFail('page', '<' + n.tagName.toLowerCase() + '> is not allowed (draw with inline SVG / canvas, link to videos) @ ' + cssPath(n)); }, main);
+      each('img, picture, iframe, object, embed, video, audio', function (n) {
+        if (slideView && n === slideView.img) return;                 // the one image course.js itself shows: the slide in the slide viewer
+        stFail('page', '<' + n.tagName.toLowerCase() + '> is not allowed (draw with inline SVG / canvas, link to videos) @ ' + cssPath(n));
+      }, main);
       each('[style]', function (n) {
         if (n.closest('mjx-container, .net, .lg-key, .plot, .hub-progress, #course-sprite')) return;
         var st = n.getAttribute('style') || '';
@@ -2861,6 +3255,29 @@
       }, main);
     }
 
+    /* slide references (only in a course whose syllabus declares decks): wrong data fails; a page reference that is
+       still a bare page of the merged source is advice - the learner has the decks, not that PDF */
+    function checkSlideRefs() {
+      if (!DECKS) return;
+      slideProblems.forEach(function (p) { stFail('slide-ref', p); });
+      slideFlat.forEach(function (p) {
+        stWarn('slide-ref', 'a slide reference inside a button (the text of a quiz or exam option) cannot be a link and is shown as plain text: ' + p);
+      });
+      if (!PAGEMAP) return;
+      var walker = doc.createTreeWalker(main, NodeFilter.SHOW_TEXT, null), tn, found = 0, m;
+      while ((tn = walker.nextNode())) {
+        var p = tn.parentNode, t = tn.nodeValue;
+        if (!PAGE_HINT.test(t) || !p || p.closest('script, style, textarea, noscript, .no-math, mjx-container')) continue;
+        PAGE_REF.lastIndex = 0;
+        while ((m = PAGE_REF.exec(t))) {
+          var start = m.index + m[1].length;
+          if (!pageRef(m, t.slice(0, start), false)) continue;
+          if (++found <= 10) stWarn('slide-ref', 'a page of the merged source that was not turned into a slide reference: «' + short(t.slice(Math.max(0, start - 30), start + 40), 90) + '» @ ' + cssPath(p));
+        }
+      }
+      if (found > 10) stWarn('slide-ref', (found - 10) + ' more page reference(s) left as pages on this page');
+    }
+
     function checkText() {
       var walker = doc.createTreeWalker(main, NodeFilter.SHOW_TEXT, null), tn, dollars = 0, emoji = 0;
       while ((tn = walker.nextNode())) {
@@ -2925,6 +3342,22 @@
           Array.prototype.forEach.call(ex.querySelectorAll('.opt'), function (o) { o.click(); counts.controls++; });
           Array.prototype.forEach.call(ex.querySelectorAll('.q-actions .btn'), function (b) { if (!b.disabled) b.click(); });
         });
+      });
+      /* the slide viewer: opened from the first slide reference of the page, one step forward, one back, closed */
+      guard('slide viewer', function () {
+        var ref = DECKS && SLIDE_LINKS && canShowSlides() ? Array.prototype.filter.call(main.querySelectorAll('a.slide-ref'), function (a) { return a._slideRef; })[0] : null;
+        if (!ref) return;
+        at('the slide viewer, opened from the first slide reference of the page');
+        ref.click();
+        if (!slideView || !slideView.dlg.open) throw new Error('a click on the slide reference "' + short(ref.textContent, 40) + '" did not open the slide viewer');
+        var v = slideView, start = v.at;
+        if (!v.next.disabled) v.next.click(); else v.prev.click();
+        if (v.at === start && v.deck.slides > 1) throw new Error('the next / previous buttons of the slide viewer do not move');
+        v.dlg.dispatchEvent(new KeyboardEvent('keydown', { key: v.at > start ? 'ArrowLeft' : 'ArrowRight', bubbles: true, cancelable: true }));
+        if (v.at !== start) throw new Error('the arrow keys of the slide viewer do not move');
+        v.close.click();
+        if (v.dlg.open) throw new Error('the slide viewer did not close');
+        counts.controls++;
       });
       /* chrome: done button twice, drawer, theme round trip (exercises every onTheme handler and redraw) */
       guard('chrome', function () {
@@ -2995,7 +3428,7 @@
       Array.prototype.forEach.call(doc.querySelectorAll('[id]'), function (n) { if (n.id.indexOf('MJX-') === 0) return; if (seen[n.id]) dups[n.id] = 1; seen[n.id] = 1; });
       Object.keys(dups).forEach(function (id) { stFail('ids', 'duplicate id="' + id + '"'); });
       /* (e) the authoring contract */
-      [['page', checkPage], ['hub', checkHub], ['layout', checkLayoutRules], ['structure', checkStructure], ['svg', checkSvg], ['scripts', checkScripts], ['text', checkText]].forEach(function (c) {
+      [['page', checkPage], ['hub', checkHub], ['layout', checkLayoutRules], ['structure', checkStructure], ['svg', checkSvg], ['scripts', checkScripts], ['text', checkText], ['slide references', checkSlideRefs]].forEach(function (c) {
         try { c[1](); } catch (e) { stFail('selftest ' + c[0], (e && e.message) || e); }
       });
       console.log('SELFTEST DONE widgets=' + counts.widgets + ' controls=' + counts.controls + ' math=' + counts.math + ' fails=' + stCounts.fail + ' warnings=' + stCounts.warn);
@@ -3017,13 +3450,14 @@
     authorStyles = Array.prototype.slice.call(doc.querySelectorAll('style:not([data-host])'));
     step('sprite', injectSprite);
     step('chrome', buildChrome);
-    step('typography', function () { glueDashes(chrome.main); glueDashes(doc.querySelector('.site-foot')); glueWords(chrome.main); });
+    step('typography', function () { convertPageRefs(chrome.main); glueDashes(chrome.main); glueDashes(doc.querySelector('.site-foot')); glueWords(chrome.main); });
     step('lesson head', initLessonHead);
     step('steps', initSteps);
     step('quiz', initQuizzes);
     step('exam', initExams);
     step('tabs', initTabs);
     step('misc', initMisc);
+    step('slide references', initSlideRefs);
     step('toc', initToc);
     booted = true;
     widgets.forEach(function (w) { mountWidget(w); });
