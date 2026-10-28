@@ -1,0 +1,1551 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Смысл как координаты: embeddings, сходство и поиск соседей · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l27">
+
+<header class="lesson-head">
+  <h1>Смысл как координаты: embeddings, сходство и поиск соседей</h1>
+  <p class="lede">После этого урока ты сможешь объяснить, как эмбеддинг превращает предложение или картинку в точку, посчитать и сравнить косинусное сходство, евклидово расстояние и скалярное произведение и рассказать, как K-D деревья, R-деревья, LSH, HNSW и IVFPQ находят ближайших соседей запроса — и чем каждый из них за это платит.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Слайд лекции (p. 656) сравнивает одно новое предложение, "Rainy days make me sad", с десятью сохранёнными. Первое, с оценкой 0.764: "Rainy days can be gloomy." Неудивительно: два общих слова. Второе, с 0.419: "Colds are unpleasant." С запросом у него нет ни одного общего слова. Последнее, с 0.034: "Success is rewarding."</p>
+  <p>Инвертированный индекс — структура, на которой держится поиск по ключевым словам (<a href="l24.html#l24-index">урок 24</a>), — ни за что не поставил бы "Colds are unpleasant" вторым: он находит документы по словам, которые в них есть. Что-то на этом слайде читает смысл. А векторная база данных должна выдавать такое ранжирование по миллионам объектов за миллисекунды, хотя сравнение запроса с каждой сохранённой точкой "for large datasets is computationally prohibitive" (p. 658).</p>
+  <p>Итак, два вопроса. Как машина видит, что грустный дождливый день и неприятная простуда — из одной компании? И как она находит лучшее совпадение, не просматривая всё подряд? К концу урока ты ответишь на оба — и узнаешь цену второго ответа.</p>
+</div>
+
+
+<section id="l27-points">
+  <h2>От вещей к точкам</h2>
+
+  <p>"Vector databases are gaining popularity due to the rise of AI and ML applications" — так начинается этот раздел лекции, и дальше: "In particular, applications that use LLM + RAG (Retrieval Augmented Generation)". В генерации с дополнением через поиск (retrieval-augmented generation) языковая модель, прежде чем ответить, достаёт сохранённые фрагменты, ближайшие по смыслу к вопросу, и читает их. Следующий слайд (p. 641) расширяет картину: векторные базы данных дают "more efficient and semantically rich data retrieval", "enhancing search and recommendation systems". Быстро доставать ближайшие объекты — это и есть тема урока.</p>
+
+  <div class="def">
+    <p><dfn>Векторная база данных (vector database)</dfn> — "A vector database stores data as high-dimensional vector representations. It enables contextual search and discovery of data, going beyond keyword matching" (p. 645). Векторные БД "organize the vectors by their semantic similarity, allowing for efficient and meaningful data retrieval based on context" (p. 646).</p>
+  </div>
+
+  <p>Векторный поиск — это ещё и функция баз данных, которые ты уже знаешь. Диаграмма лекции отделяет "Dedicated vector databases" от "Databases that support vector search", и во вторую группу входят Neo4j, Cassandra, Elasticsearch, MongoDB и Redis — графовая, колоночная (column-family), поисковая, документная и key-value базы, с которыми ты работаешь в этом курсе.</p>
+
+  <h3>Вектор — это список чисел, а ещё стрелка</h3>
+
+  <p>"In mathematics and physics, a vector is a quantity with both magnitude and direction. In vector databases, vectors represent various attributes of an object" (p. 647). Следующий слайд (p. 648) превращает дом в четыре таких атрибута: 3 ванные, 1 спальня, площадь 130 и цена 340000 — вектор \((3, 1, 130, 340000)\). Занятие добавляет два слова: вектор "is a list of numbers that represent magnitude and direction", и "When most values are non-zero, it is referred to as a dense vector" (p. 1685). <mark class="key">Векторное пространство (vector space)</mark> — это "a mathematical set of vectors that can be added together and scaled", непрерывное, "when values can take on any real number" (p. 1686).</p>
+
+  <details class="why">
+    <summary>Можно ли сравнивать два дома по этим сырым числам?</summary>
+    <p>Пока нет. Подними цену дома на 5000 — и новый вектор окажется в 5000 от старого. Оставь цену и поменяй всё остальное — 1 ванная, 4 спальни, площадь 250, — и новый вектор будет всего в 120.05 от старого. Цена, самое большое число, забивает все остальные координаты. Вручную собранные векторы атрибутов сначала надо стандартизировать (z-оценки, как перед PCA в статистике). У векторов модели эмбеддингов, о которых ниже, такой проблемы нет: каждая координата — в собственном масштабе модели, ни одна из них не цена и не площадь.</p>
+  </details>
+
+  <h3>Эмбеддинг: похожие вещи — близкие точки</h3>
+
+  <div class="def">
+    <p><dfn>Эмбеддинг (embedding)</dfn> — "Vectorization / embedding is the process of converting data (such as text or images) into dense numerical vectors that capture their semantics, using an embedding model" (p. 1684). Словами лекции, "Embedding is a technique to transform text, images, or any other data into vectors" (p. 649).</p>
+  </div>
+
+  <p>Полезными эмбеддинги делает свойство пространства: они "represent data (like text, images, audio, or graphs) as vectors of numbers so that similar items are close together in this vector space" (p. 1687): лица ложатся рядом с лицами, фрукты — рядом с фруктами.</p>
+
+  <p>Что делает одна координата? Занятие заимствует пример с едой у Google (p. 1688; рис. 1). На единственной оси, «бутербродности» (sandwichness), пять блюд выстраиваются от борща до шаурмы; по одной бутербродности яблочный штрудель попал бы между хот-догом и шаурмой. Добавь «десертность» (dessertness) — и он поднимается прочь от них. Третья ось, «жидкость» (liquidness), уводит борщ от салата и поднимает высоко сразу по двум осям тангъюань — сладкие клёцки, которые подают в супе. Каждое новое измерение разводит то, что предыдущие путали.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l27-fig-food">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Одна ось, sandwichness: борщ, салат, пицца, хот-дог, яблочный штрудель и шаурма в один ряд; штрудель лежит между хот-догом и шаурмой">
+        <text x="150" y="36" class="tx-hand tx-mid">штрудель или бутерброд?</text>
+        <line x1="150" y1="130" x2="284" y2="130" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="130" x2="16" y2="130" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="203" y1="123" x2="211" y2="98" class="st-muted"/>
+        <line x1="229" y1="137" x2="237" y2="163" class="st-muted"/>
+        <circle cx="47" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="94" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="134" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="179" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="201" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="228" cy="130" r="6" class="fi-s1 st-paper sw-2"/>
+        <text x="47" y="114" class="tx-sm tx-mid">борщ</text>
+        <text x="94" y="154" class="tx-sm tx-mid">салат</text>
+        <text x="134" y="114" class="tx-sm tx-mid">пицца</text>
+        <text x="179" y="154" class="tx-sm tx-mid">хот-дог</text>
+        <text x="214" y="90" class="tx-sm tx-mid">яблочный штрудель</text>
+        <text x="240" y="178" class="tx-sm tx-mid">шаурма</text>
+        <text x="18" y="216" class="tx-sm tx-muted">меньше бутерброд</text>
+        <text x="282" y="216" class="tx-sm tx-muted tx-end">больше бутерброд</text>
+      </svg>
+      <p class="fig-label">До: одно измерение</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Две оси, sandwichness и dessertness: бутерброды остаются в ряд под горизонтальной осью, борщ слева, а яблочный штрудель поднимается высоко над ними">
+        <line x1="150" y1="150" x2="284" y2="150" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="150" x2="16" y2="150" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="150" x2="150" y2="16" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="150" y1="150" x2="150" y2="234" class="st-muted" marker-end="url(#arr-muted)"/>
+        <circle cx="201" cy="150" r="6" class="st-muted dash"/>
+        <line x1="201" y1="142" x2="201" y2="78" class="sw-2 dash" marker-end="url(#arr)"/>
+        <circle cx="45" cy="168" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="94" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="134" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="179" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="228" cy="178" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="201" cy="66" r="6" class="fi-s1 st-paper sw-2"/>
+        <text x="158" y="22" class="tx-sm tx-muted">dessertness</text>
+        <text x="284" y="140" class="tx-sm tx-muted tx-end">sandwichness</text>
+        <text x="214" y="48" class="tx-sm tx-mid">яблочный штрудель</text>
+        <text x="212" y="114" class="tx-hand">поднят</text>
+        <text x="45" y="200" class="tx-sm tx-mid halo">борщ</text>
+        <text x="134" y="200" class="tx-sm tx-mid halo">пицца</text>
+        <text x="228" y="200" class="tx-sm tx-mid halo">шаурма</text>
+        <text x="94" y="219" class="tx-sm tx-mid halo">салат</text>
+        <text x="179" y="219" class="tx-sm tx-mid halo">хот-дог</text>
+      </svg>
+      <p class="fig-label">После: два измерения</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Пример с едой со слайда (p. 1688), который занятие взяло из Machine Learning Crash Course от Google, перерисован. До: на одной оси бутербродности яблочный штрудель оказывается между хот-догом и шаурмой. После: ось десертности поднимает его прочь от бутербродов.</figcaption>
+  </figure>
+
+  <p>У настоящих измерений эмбеддинга таких имён нет: модель эмбеддингов "often is black box" (p. 1684). Прочитать смысл 17-й координаты нельзя; можно только измерить, какие точки рядом с какими. И этого достаточно: эмбеддинг позволяет векторным базам "find relevant information through vector similarity, rather than exact text matches" (p. 653).</p>
+
+  <p class="memo"><mark class="key">Эмбеддинг превращает смысл в положение: похожие объекты получают близкие координаты, так что «похожий» становится «близким».</mark></p>
+</section>
+
+
+<section id="l27-encoders">
+  <h2>Откуда берутся координаты</h2>
+
+  <p>Занятие называет два решения, которые принимаются до того, как построена хоть какая-то модель (p. 1689). Первое: "decide what ‘similar’ means for the data at hand (words in similar contexts, images of the same object, etc.)". Слайд добавляет, что "In Deep Learning, this is automatically inferred": признаки ты вручную не конструируешь, но понятие сходства всё равно задано — парами, на которых обучают модель. Второе: "choose the number of dimensions": "more dimensions capture more detail but are slower and heavier; fewer dimensions are faster but less precise".</p>
+
+  <p>Затем "build an <mark class="key">encoder</mark> model that converts the data into vectors (e.g., BERT for text, CNN/ViT for images)" и "Train the encoder using metric learning so that similar items are clustered together, and dissimilar ones are separated" (p. 1690). Механика — из глубокого обучения: контрастная (contrastive) или триплетная (triplet) функция потерь притягивает якорь к его положительному примеру и отталкивает от отрицательных, а вектор — это последнее скрытое представление сети, без классификационной головы.</p>
+
+  <ul>
+    <li><strong>Картинки, CNN.</strong> Свёрточные сети "capture the semantic meaning of images by processing them through their convolutional layers"; названы семейства VGG, ResNet, Inception и EfficientNet (p. 1692).</li>
+    <li><strong>Картинки, ViT.</strong> "An image is divided into fixed-size patches, which are fed into a transformer encoder. Using self-attention, it learns relationships between patches across the entire image" (p. 1693).</li>
+    <li><strong>Текст.</strong> Эмбеддинги слов помещают "similar words close to each other"; эмбеддинги текстов и документов "represent longer text units such as sentences, paragraphs, or entire documents" (p. 1694). Слайд лекции (p. 649) перечисляет модели: text-embedding-ada-002 от OpenAI и её родственниц, Sentence Transformers вроде all-MiniLM-L6-v2 и all-mpnet-base-v1, сервисы вроде Google Vertex AI и Elasticsearch. В ноутбуке занятия Vectorization all-MiniLM-L6-v2 превращает четыре предложения в "four 384-dimensional embeddings".</li>
+    <li><strong>Текст и картинки вместе, CLIP.</strong> Он "projects text and image embeddings into the same embedding space, so ‘a photo of a dog’ and a real dog image should be closer" (p. 1695). Слайд "Multi-modal vectorization" (p. 650) отправляет эмбеддинги текста, видео и аудио в одну векторную базу данных.</li>
+  </ul>
+
+  <p>Конвейер (pipeline), который их использует, состоит из трёх шагов (p. 1691, рис. 2): превратить данные в эмбеддинги, "Store embeddings in a vector database for fast retrieval", затем применить их для "semantic search, retrieval-augmented generation (RAG), classification, clustering, and recommendations". Запрос должна превращать в эмбеддинг та же модель, что и сохранённые данные; иначе два набора координат значат разное.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-pipeline">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="Текст, картинка и аудио попадают в модель эмбеддингов, которая выдаёт векторы; векторы хранятся в векторной базе данных, где вектор запроса находит три ближайших сохранённых вектора">
+      <line x1="88" y1="68" x2="139" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="88" y1="140" x2="139" y2="140" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="88" y1="212" x2="139" y2="168" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="266" y1="140" x2="284" y2="140" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="368" y1="140" x2="392" y2="140" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="24" y="48" width="60" height="40" class="fi-paper"/>
+      <line x1="32" y1="60" x2="76" y2="60" class="st-muted"/>
+      <line x1="32" y1="68" x2="76" y2="68" class="st-muted"/>
+      <line x1="32" y1="76" x2="64" y2="76" class="st-muted"/>
+      <rect x="24" y="120" width="60" height="40" class="fi-paper"/>
+      <polyline points="28,154 44,136 56,148 66,140 80,154" class="st-muted"/>
+      <circle cx="70" cy="130" r="4" class="st-muted"/>
+      <rect x="24" y="192" width="60" height="40" class="fi-paper"/>
+      <path d="M30 212 q6 -12 12 0 t12 0 t12 0 t12 0" class="st-muted"/>
+      <polygon points="144,96 154,86 262,86 252,96" class="fi-paper"/>
+      <polygon points="252,96 262,86 262,174 252,184" class="fi-paper"/>
+      <rect x="144" y="96" width="108" height="88" class="fi-paper sw-2"/>
+      <rect x="290" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="302" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="314" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="326" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="338" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="350" y="110" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="290" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="302" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="314" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="326" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="338" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="350" y="134" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="290" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="302" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="314" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="326" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="338" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="350" y="158" width="12" height="12" class="fw-s1 st-s1"/>
+      <rect x="398" y="44" width="150" height="200" rx="10" class="fi-paper sw-2"/>
+      <circle cx="424" cy="100" r="5" class="fi-s1"/>
+      <circle cx="436" cy="90" r="5" class="fi-s1"/>
+      <circle cx="430" cy="114" r="5" class="fi-s1"/>
+      <circle cx="446" cy="104" r="5" class="fi-s1"/>
+      <circle cx="500" cy="96" r="5" class="fi-s1"/>
+      <circle cx="516" cy="106" r="5" class="fi-s1"/>
+      <circle cx="504" cy="120" r="5" class="fi-s1"/>
+      <circle cx="476" cy="138" r="5" class="fi-s1"/>
+      <circle cx="494" cy="152" r="5" class="fi-s1"/>
+      <circle cx="510" cy="176" r="5" class="fi-s1"/>
+      <circle cx="502" cy="194" r="5" class="fi-s1"/>
+      <circle cx="522" cy="208" r="5" class="fi-s1"/>
+      <circle cx="460" cy="184" r="5" class="fi-s1"/>
+      <circle cx="450" cy="214" r="5" class="fi-s1"/>
+      <circle cx="472" cy="206" r="5" class="fi-s1"/>
+      <circle cx="460" cy="184" r="9" class="st-s3 sw-2 dash"/>
+      <circle cx="450" cy="214" r="9" class="st-s3 sw-2 dash"/>
+      <circle cx="472" cy="206" r="9" class="st-s3 sw-2 dash"/>
+      <path d="M434 190 l12 12 M446 190 l-12 12" class="st-s2 sw-3"/>
+      <text x="200" y="24" class="tx-sm tx-bold tx-mid">1 · эмбеддинг</text>
+      <text x="330" y="24" class="tx-sm tx-bold tx-mid">2 · хранение</text>
+      <text x="473" y="24" class="tx-sm tx-bold tx-mid">3 · поиск</text>
+      <text x="204" y="66" class="tx-hand tx-mid">часто чёрный ящик</text>
+      <text x="54" y="104" class="tx-sm tx-mid">текст</text>
+      <text x="54" y="176" class="tx-sm tx-mid">картинка</text>
+      <text x="54" y="248" class="tx-sm tx-mid">аудио</text>
+      <text x="198" y="136" class="tx-sm tx-mid">модель</text>
+      <text x="198" y="154" class="tx-sm tx-mid">эмбеддингов</text>
+      <text x="198" y="206" class="tx-sm tx-mid tx-muted">BERT, CNN, ViT</text>
+      <text x="198" y="224" class="tx-sm tx-mid tx-muted">или CLIP</text>
+      <text x="326" y="192" class="tx-sm tx-mid">векторы</text>
+      <text x="473" y="66" class="tx-sm tx-bold tx-mid">векторная БД</text>
+      <text x="440" y="172" class="tx-sm tx-mid halo">запрос</text>
+      <text x="500" y="234" class="tx-sm tx-mid">3 ближайших</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Три шага со слайда (p. 1691) с несколькими видами данных со слайда (p. 650). Модель эмбеддингов превращает каждый объект в вектор (all-MiniLM-L6-v2 даёт 384 числа); база данных хранит векторы; запрос, превращённый в эмбеддинг той же моделью, получает обратно ближайшие сохранённые векторы — здесь 3 обведённых.</figcaption>
+  </figure>
+
+  <h3>Смотрим на пространство</h3>
+
+  <p>Слайд (p. 651) превращает в эмбеддинги предложения вроде 'Sunsets are breathtaking' "using models like paraphrase-MiniLM" и описывает процесс: "Take a sentence", "Transform it into (numerical) vector representation", "Possibly reduce dimensionality if needed / wanted". Следующий слайд (p. 652) делает это с десятью предложениями — "sentences to 32 dimensions vectors, and then PCA to top 2 principal components", — и график (рис. 3) отделяет негативные предложения, такие как "Colds are unpleasant.", "Mosquitoes are annoying." и "Traffic jams are frustrating.", от позитивных, таких как "Laughter brings joy.", "Music is uplifting." и "Success is rewarding.".</p>
+
+  <figure class="fig fig--plain" id="l27-fig-pca">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Десять предложений, спроецированных на первые две главные компоненты: негативные (colds, mosquitoes, traffic jams, failure, rainy days) слева, позитивные (laughter, music, success, sunsets) справа, kindness посередине; colds и mosquitoes почти совпадают">
+      <circle cx="409" cy="41" r="5" class="fi-s1"/>
+      <circle cx="184" cy="148" r="5" class="fi-s1"/>
+      <circle cx="80" cy="180" r="5" class="fi-s1"/>
+      <circle cx="94" cy="191" r="5" class="fi-s1"/>
+      <circle cx="499" cy="207" r="5" class="fi-s1"/>
+      <circle cx="450" cy="223" r="5" class="fi-s1"/>
+      <circle cx="144" cy="252" r="5" class="fi-s1"/>
+      <circle cx="283" cy="255" r="5" class="fi-s1"/>
+      <circle cx="234" cy="259" r="5" class="fi-s1"/>
+      <circle cx="495" cy="264" r="5" class="fi-s1"/>
+      <text x="20" y="22" class="tx-sm tx-muted">PC 2 ↑</text>
+      <text x="545" y="296" class="tx-sm tx-muted tx-end">PC 1 →</text>
+      <text x="419" y="46" class="tx-sm">sunsets</text>
+      <text x="194" y="152" class="tx-sm">rainy days</text>
+      <text x="72" y="172" class="tx-sm tx-end">colds</text>
+      <text x="104" y="198" class="tx-sm">mosquitoes</text>
+      <text x="134" y="257" class="tx-sm tx-end">traffic jams</text>
+      <text x="290" y="238" class="tx-sm tx-mid">kindness</text>
+      <text x="234" y="284" class="tx-sm tx-mid">failure</text>
+      <text x="489" y="203" class="tx-sm tx-end">laughter</text>
+      <text x="440" y="240" class="tx-sm tx-end">music</text>
+      <text x="485" y="269" class="tx-sm tx-end">success</text>
+      <text x="40" y="110" class="tx-hand">негативные</text>
+      <text x="430" y="120" class="tx-hand">позитивные</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> График PCA со слайда (p. 652), перерисованный: положения сняты с графика на слайде, подписи сокращены. Негативные предложения лежат слева по PC 1, позитивные — справа; "Kindness is contagious." — посередине. "Colds" и "mosquitoes" почти совпадают: текст ниже объясняет, почему это доказывает меньше, чем кажется.</figcaption>
+  </figure>
+
+  <p>Это PCA из статистики: два направления наибольшей дисперсии. И это всего лишь проекция. "Colds are unpleasant." и "Mosquitoes are annoying." на графике почти накладываются, но против "Rainy days make me sad" у них оценки 0.419 и 0.296, потому что оценки считаются во всех измерениях. Ноутбук занятия Visualization рисует такой же график для трёх разных моделей.</p>
+</section>
+
+
+<section id="l27-similarity">
+  <h2>Насколько близко — это близко: три способа сравнить векторы</h2>
+
+  <p>"Metrics like Cosine and Euclidean distances are used to measure the similarity between two vectors" (p. 654). Евклидово расстояние (Euclidean distance) — это длина отрезка между двумя точками; косинус смотрит только на угол между двумя стрелками, проведёнными из начала координат.</p>
+
+  <div class="formula">
+    \[ \text{similarity}(A,B) = \cos\theta = \frac{A\cdot B}{\norm{A}\,\norm{B}} \]
+    \[ = \frac{\sum_{i=1}^{n} A_i B_i}{\sqrt{\sum_{i=1}^{n} A_i^2 \, \sum_{i=1}^{n} B_i^2}} \]
+    \[ d(A,B) = \norm{A - B} \]
+    \[ = \sqrt{\textstyle\sum_{i=1}^{n} (A_i - B_i)^2} \]
+    <dl class="legend">
+      <dt>\(A, B\)</dt><dd>два ненулевых вектора с \(n\) компонентами \(A_i\), \(B_i\)</dd>
+      <dt>\(A\cdot B\)</dt><dd>скалярное произведение (inner, dot product), \(\sum_i A_i B_i\)</dd>
+      <dt>\(\norm{A}\)</dt><dd>длина \(A\), \(\sqrt{\sum_i A_i^2}\)</dd>
+      <dt>\(\theta\)</dt><dd>угол между двумя векторами</dd>
+      <dt>\(d(A,B)\)</dt><dd>евклидово расстояние между их концами</dd>
+    </dl>
+  </div>
+
+  <p>Косинус зависит только от угла (p. 655, p. 1696; рис. 4): близок к 1, когда две стрелки смотрят в одну сторону, равен 0, когда они ортогональны, и −1, когда противоположны. <mark class="key">Скалярное произведение (inner product)</mark> — это один только числитель, поэтому оно растёт ещё и вместе с длинами.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-angles">
+    <svg class="dia" viewBox="0 0 560 230" role="img" aria-label="Три пары стрелок A и B из начала координат: малый угол, косинус близок к 1, похожи; прямой угол, косинус 0, ортогональны; развёрнутый угол, косинус минус 1, противоположны">
+      <line x1="15" y1="120" x2="175" y2="120" class="st-muted"/>
+      <line x1="95" y1="175" x2="95" y2="40" class="st-muted"/>
+      <line x1="200" y1="120" x2="360" y2="120" class="st-muted"/>
+      <line x1="280" y1="175" x2="280" y2="40" class="st-muted"/>
+      <line x1="385" y1="120" x2="545" y2="120" class="st-muted"/>
+      <line x1="465" y1="175" x2="465" y2="40" class="st-muted"/>
+      <path d="M121 109.5 A28 28 0 0 0 112.2 97.9" class="sw-2"/>
+      <polyline points="290.9,114.9 285.8,104 274.9,109.1" class="sw-2"/>
+      <path d="M485.7 112.5 A22 22 0 0 0 444.3 127.5" class="sw-2"/>
+      <line x1="95" y1="120" x2="139.3" y2="63.3" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="95" y1="120" x2="165.5" y2="91.5" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="280" y1="120" x2="249.6" y2="54.7" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="280" y1="120" x2="348.9" y2="87.9" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="465" y1="120" x2="403" y2="142.6" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="465" y1="120" x2="527" y2="97.4" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="148" y="54" class="tx-sm tx-mid">A</text>
+      <text x="178" y="88" class="tx-sm tx-mid">B</text>
+      <text x="133" y="100" class="tx-sm tx-mid">θ</text>
+      <text x="242" y="44" class="tx-sm tx-mid">A</text>
+      <text x="361" y="84" class="tx-sm tx-mid">B</text>
+      <text x="294" y="96" class="tx-sm tx-mid">θ</text>
+      <text x="392" y="156" class="tx-sm tx-mid">A</text>
+      <text x="540" y="94" class="tx-sm tx-mid">B</text>
+      <text x="465" y="88" class="tx-sm tx-mid">θ</text>
+      <text x="95" y="202" class="tx-mono tx-mid">cos θ ≈ 1</text>
+      <text x="280" y="202" class="tx-mono tx-mid">cos θ = 0</text>
+      <text x="465" y="202" class="tx-mono tx-mid">cos θ = −1</text>
+      <text x="95" y="222" class="tx-sm tx-mid">похожи</text>
+      <text x="280" y="222" class="tx-sm tx-mid">ортогональны</text>
+      <text x="465" y="222" class="tx-sm tx-mid">противоположны</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Три случая со слайдов (p. 655 и p. 1696). Важен только угол: если растянуть A или B, не изменятся ни \(\theta\), ни его косинус.</figcaption>
+  </figure>
+
+  <p>Ноутбук занятия Comparison считает это на двух стрелках, \(A = (2, 1)\) и \(B = (0, 2)\):</p>
+
+  <div class="formula">
+    \[ A\cdot B = 2\cdot 0 + 1\cdot 2 = 2 \]
+    \[ \norm{A} = \sqrt{2^2 + 1^2} = \sqrt{5} \approx 2.236 \]
+    \[ \norm{B} = \sqrt{0^2 + 2^2} = 2 \]
+    \[ \cos\theta = \frac{2}{2.236 \cdot 2} \approx 0.447 \]
+    \[ \theta = \arccos 0.447 \approx 63.4^\circ \]
+  </div>
+
+  <p>Положительный и заметно меньше 1: стрелки разошлись на 63°, это ближе к ортогональным, чем к одинаковым. Две другие меры для той же пары — скалярное произведение, 2, и евклидово расстояние между концами:</p>
+
+  \[ \norm{A - B} = \sqrt{(2-0)^2 + (1-2)^2} \]
+  \[ = \sqrt{5} \approx 2.236 \]
+
+  <p>Три числа, три разных масштаба. Код ноутбука, без ячейки с графиком:</p>
+
+<pre><code>import numpy as np
+
+vec1 = np.array([2, 1])
+vec2 = np.array([0, 2])
+
+def cosine_similarity(vec1, vec2):
+    dot_product = np.dot(vec1, vec2)
+    norm_vec1 = np.linalg.norm(vec1)
+    norm_vec2 = np.linalg.norm(vec2)
+    similarity = dot_product / (norm_vec1 * norm_vec2)
+    return similarity
+
+similarity_score = cosine_similarity(vec1, vec2)
+print(f"Cosine Similarity between vec1 and vec2: {similarity_score:.4f}")
+# prints: Cosine Similarity between vec1 and vec2: 0.4472</code></pre>
+
+  <p>Теперь прочитай этими инструментами таблицу из загадки. В её столбце — косинусное сходство "Rainy days make me sad" с каждым сохранённым предложением, уже отсортированное: 0.764286 для "Rainy days can be gloomy." — угол 40°; 0.418937 для "Colds are unpleasant." — 65°; и так вниз до 0.033636 для "Success is rewarding." — 88°, почти ортогонально. Сохранённые векторы не единичной длины (одна напечатанная в таблице координата — 1.2116411), а косинусу всё равно: он делит на длины и избавляется от них.</p>
+
+  <aside class="redpen" data-page="656">
+    <p class="claim">"Distance Calculation" … "What’s the distance wrt the other sentences? Which is the best match?"</p>
+    <p class="fix">Столбец, отвечающий на вопрос, — косинусное сходство, а не расстояние. Лучшее совпадение — наибольшее значение, "Rainy days can be gloomy." с 0.764286. Если нужно расстояние, бери косинусное расстояние \(1 - \cos\theta\) — 0.236 для этого предложения, — и тогда лучшее совпадение — наименьшее значение.</p>
+    <p class="because">Косинус равен 1 для стрелок, смотрящих в одну сторону, и падает с ростом угла (p. 655), поэтому таблицу читают сверху: её последняя строка, 0.033636, — худшее совпадение, а не самое близкое. Слайд (p. 654) тоже говорит о "Cosine and Euclidean distances". Экзамен может использовать формулировку слайда: говори, по какой величине ранжируешь, и помни, что для сходства лучшее — максимум.</p>
+  </aside>
+
+  <h3>Почему косинус — и когда метрики расходятся</h3>
+
+  <p>Причина со слайда: "Cosine similarity is commonly used due to its efficiency" (p. 654). На векторах длины 1 это действительно одно скалярное произведение. Ещё две причины приводятся вне слайдов: косинус игнорирует длину, поэтому длинный и короткий тексты на одну тему всё равно смотрят в одну сторону; и метрика должна совпадать с той, на которой обучали модель эмбеддингов.</p>
+
+  <p>Игнорирование длины важно, потому что метрики могут расходиться. Возьми \(a = (1, 1)\), \(b = (2, 2)\), \(c = (1, 0)\). По косинусу ближайший сосед \(a\) — это \(b\): то же направление, косинус 1. По евклидову расстоянию — \(c\), на расстоянии 1, а \(b\) — на расстоянии 1.414. Нормализуй все три вектора до длины 1 — и расхождение исчезает, по причине, которую стоит один раз вывести:</p>
+
+  <ol class="steps" id="l27-steps-unit">
+    <li><p>Запиши квадрат расстояния как скалярное произведение разности на саму себя:</p> \[ \norm{A - B}^2 = (A - B)\cdot(A - B) \]</li>
+    <li><p>Раскрой скобки, как в \((a - b)^2\); скалярное произведение дистрибутивно, и \(A\cdot B = B\cdot A\):</p> \[ \norm{A - B}^2 = \norm{A}^2 + \norm{B}^2 - 2\,A\cdot B \]</li>
+    <li><p>Нормализуй: раздели каждый вектор на его длину, чтобы \(\norm{A} = \norm{B} = 1\):</p> \[ \norm{A - B}^2 = 2 - 2\,A\cdot B \]</li>
+    <li><p>При длинах 1 знаменатель косинуса равен 1, так что скалярное произведение <em>и есть</em> косинус:</p> \[ A\cdot B = \cos\theta \] \[ \norm{A - B} = \sqrt{2 - 2\cos\theta} \]</li>
+    <li><p>Читай: расстояние уменьшается ровно тогда, когда косинус растёт. Сортировка по наименьшему евклидову расстоянию, по наибольшему скалярному произведению или по наибольшему косинусу даёт один и тот же список. Для лучшего совпадения из таблицы загадки расстояние при единичных длинах было бы \(\sqrt{2 - 2 \cdot 0.764} \approx 0.687\) — всё равно первое место.</p></li>
+  </ol>
+
+  <p>Вот почему FAISS может выполнять косинусный поиск индексом по скалярному произведению на нормализованных векторах, и вот почему поиск по скалярному произведению — <code>"metric_type": "IP"</code>, напечатанный в вызове Zilliz на экзамене 11 Feb 2025 (<a href="l28.html#l28-fill">урок 28</a>), — ранжирует ровно как косинусный, как только у векторов длина 1. Попробуй три метрики на одном запросе:</p>
+
+  <div class="widget" id="l27-w-space">
+    <h3 class="widget-title">Три метрики, один запрос: кто ближайшие соседи?</h3>
+    <p class="widget-intro">Каждая точка — отзыв об одном ресторане в виде игрушечного двумерного вектора: его направление говорит, о чём отзыв (еда, обслуживание, цены, зал), а длина меняется, как меняются длины сырых эмбеддингов. Положения придуманы для этого виджета, а не посчитаны моделью. Тащи запрос, выбирай метрику и k; закрашенная область содержит ровно k ближайших, а при наведении на точку видно её текст. Главное, что надо увидеть: пока длины разные, метрики расходятся, а когда у каждого вектора длина 1 — сходятся.</p>
+    <ol class="tasks">
+      <li>Начни с косинусного сходства и k = 3. Прежде чем переключиться на евклидово расстояние, предскажи: победят ли те же три отзыва?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Остаётся только «Паста была идеальной.». Косинус выбрал три ближайших по направлению, «Свежая рыба, отличный соус.» (2.5°), «Паста была идеальной.» (3.0°) и «Лучший тирамису в Милане.» (5.0°), какой бы ни была их длина. Евклидову расстоянию нужны концы рядом с концом запроса: «Паста была идеальной.» (0.16), «Ризотто немного пересолено.» (0.25), «Ньокки тают во рту.» (0.38). Конус превратился в круг.</p></details>
+      </li>
+      <li>Переключись на скалярное произведение. Какие векторы ты ждёшь наверху?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Длинные векторы, смотрящие примерно в нужную сторону: «Корочка пиццы подгорела.» (2.38), «Лучший тирамису в Милане.» (2.19) — и «Мы ждали час.» (2.00), отзыв про обслуживание, отклонённый на 38°, который попадает в список, потому что это самый длинный вектор из всех. Скалярное произведение награждает длину; его область — полуплоскость.</p></details>
+      </li>
+      <li>Включи «нормализовать каждый вектор до длины 1». Что станет с тремя ранжированиями?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Они совпадут: «Свежая рыба, отличный соус.», «Паста была идеальной.», «Лучший тирамису в Милане.» при всех трёх метриках, и табло отвечает «да». Каждая точка теперь сидит на единичной окружности, где круг, конус и полуплоскость вырезают одну и ту же дугу: \(\norm{A-B}^2 = 2 - 2\cos\theta\) и \(A\cdot B = \cos\theta\).</p></details>
+      </li>
+      <li>Нормализацию выключи. Тащи запрос наружу вдоль его собственного направления, пока он не станет примерно вдвое длиннее. Какая метрика сменит соседей?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Только евклидово расстояние, которое теперь предпочитает длинные векторы: ровно при удвоенном начальном запросе, (2.24, 0.56), оно выдаёт «Лучший тирамису в Милане.», «Корочка пиццы подгорела.» и «Свежая рыба, отличный соус.». Косинус смотрит только на угол, а скалярное произведение умножает каждую оценку на один и тот же множитель, так что его порядок не меняется.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-space', function (root, ui) {
+    /* toy 2-D vectors of restaurant reviews: [text, direction in degrees, length] — made up for the widget, not computed by a model */
+    var REVIEWS = [
+      ['Паста была идеальной.', 11, 1.0], ['Лучший тирамису в Милане.', 19, 1.9], ['Суп был холодным.', 7, 0.6],
+      ['Ризотто немного пересолено.', 25, 1.25], ['Свежая рыба, отличный соус.', 16.5, 1.55], ['Корочка пиццы подгорела.', 3.5, 2.1],
+      ['Ньокки тают во рту.', 21.5, 0.8], ['Официант был груб.', 55, 1.7], ['Персонал очень любезный.', 63, 1.0],
+      ['Мы ждали час.', 52, 2.2], ['Приветливое, быстрое обслуживание.', 66, 0.7], ['Никто не принял заказ.', 58, 1.3],
+      ['Хозяин нас запомнил.', 69, 1.9], ['Слишком дорого за такое.', 100, 1.6], ['Честные цены.', 108, 0.6],
+      ['В счёте была ошибка.', 96, 1.1], ['Выгодное обеденное меню.', 112, 1.8], ['Вино слишком дорогое.', 104, 0.9],
+      ['Чудесная терраса.', 145, 1.2], ['Музыка слишком громкая.', 156, 1.8], ['Уютно и тихо.', 150, 0.7],
+      ['Столики слишком тесно.', 141, 1.5], ['Отличный вид на Дуомо.', 161, 1.0]
+    ];
+    var P = REVIEWS.map(function (r) { var a = r[1] * Math.PI / 180; return { t: r[0], x: r[2] * Math.cos(a), y: r[2] * Math.sin(a) }; });
+    var q = { x: 1.12, y: 0.28 };
+
+    var metric = ui.select('ранжировать отзывы по', [
+      { value: 'cos', label: 'косинусному сходству (наибольшие первыми)' },
+      { value: 'euc', label: 'евклидову расстоянию (наименьшие первыми)' },
+      { value: 'ip', label: 'скалярному произведению (наибольшие первыми)' }
+    ], null, 'cos');
+    var kS = ui.slider({ label: 'k, число соседей', min: 1, max: 5, step: 1, value: 3 });
+    var normT = ui.toggle('нормализовать каждый вектор до длины 1', false);
+
+    function len(p) { return Math.hypot(p.x, p.y); }
+    function unit(p) { var n = Math.max(len(p), 1e-9); return { x: p.x / n, y: p.y / n }; }
+    function clamp1(v) { return Math.max(-1, Math.min(1, v)); }
+    function score(m, a, p) {
+      var dot = a.x * p.x + a.y * p.y;
+      if (m === 'cos') return dot / (Math.max(len(a), 1e-9) * Math.max(len(p), 1e-9));
+      if (m === 'ip') return dot;
+      return -Math.hypot(a.x - p.x, a.y - p.y);            /* larger = nearer, for one sort order */
+    }
+    function ranking(m, a, pts) {
+      return pts.map(function (p, i) { return { i: i, s: score(m, a, p) }; }).sort(function (u, v) { return v.s - u.s; });
+    }
+    function state() {
+      var nrm = normT.value, k = Math.max(1, Math.min(5, Math.round(kS.value)));
+      var qq = nrm ? unit(q) : { x: q.x, y: q.y }, pts = nrm ? P.map(unit) : P;
+      var R = { cos: ranking('cos', qq, pts), euc: ranking('euc', qq, pts), ip: ranking('ip', qq, pts) };
+      return { nrm: nrm, k: k, qq: qq, pts: pts, R: R, top: R[metric.value].slice(0, k) };
+    }
+
+    var plot = ui.plot({
+      x: [-2.2, 2.4], y: [-0.4, 2.2], equalAspect: true, aspect: 1.55, xLabel: 'x_1', yLabel: 'x_2',
+      label: 'Двадцать три вектора отзывов на плоскости, перетаскиваемый запрос и область, в которой лежат его k ближайших соседей по выбранной метрике',
+      hover: function (p) {
+        var s = state(), best = -1, bd = 13;
+        s.pts.forEach(function (pt, i) { var a = plot.toPx(pt.x, pt.y), d = Math.hypot(a.x - p.px, a.y - p.py); if (d < bd) { bd = d; best = i; } });
+        return best < 0 ? null : { text: P[best].t, x: s.pts[best].x, y: s.pts[best].y };
+      }
+    });
+    plot.draw(function (g) {
+      var s = state(), m = metric.value, last = s.top[s.top.length - 1], R = 9;
+      var phi = Math.atan2(s.qq.y, s.qq.x), L = Math.max(len(s.qq), 1e-9), ux = s.qq.x / L, uy = s.qq.y / L;
+      var region = { color: 's2', alpha: 0.13, dash: true, width: 1.5 };
+      if (m === 'euc') g.circle(s.qq.x, s.qq.y, -last.s, region);
+      else if (m === 'cos') {
+        var d = Math.acos(clamp1(last.s)), cone = [[0, 0]];
+        for (var j = 0; j <= 60; j++) { var t = phi - d + 2 * d * j / 60; cone.push([R * Math.cos(t), R * Math.sin(t)]); }
+        g.poly(cone, region);
+      } else {
+        var b = last.s / L, bx = ux * b, by = uy * b;          /* the boundary {x : u·x = b}, u = q / |q| */
+        g.poly([[bx - uy * R, by + ux * R], [bx + uy * R, by - ux * R], [bx + uy * R + ux * R, by - ux * R + uy * R], [bx - uy * R + ux * R, by + ux * R + uy * R]], region);
+      }
+      if (s.nrm) {
+        g.circle(0, 0, 1, { fill: false, color: 'muted', dash: true, width: 1.5 });
+        g.points(P, { color: 'muted', r: 2.4, ring: false });
+        g.points([q], { shape: 'cross', color: 'muted', r: 5 });
+      }
+      g.line([[0, 0], [s.qq.x, s.qq.y]], { color: 'soft', dash: true, width: 1.25 });
+      g.points(s.pts, { color: 's1', r: 4.5 });
+      s.top.forEach(function (r) {
+        var p = s.pts[r.i];
+        g.circle(p.x, p.y, 9, { px: true, fill: false, color: 's3', dash: true, width: 2 });
+      });
+      g.points([s.qq], { shape: 'cross', color: 's2', r: 7 });
+      var qx = g.px(s.qq.x), qy = g.py(s.qq.y);
+      s.top.forEach(function (r, j) {            /* rank numbers last, on the side of the dot away from the query cross */
+        var p = s.pts[r.i], left = g.px(p.x) < qx - 1, below = g.py(p.y) > qy;
+        g.text(p.x, p.y, String(j + 1), { dx: left ? -12 : 10, dy: below ? 14 : -12, align: left ? 'right' : 'left', size: 11.5, weight: 700 });
+      });
+    });
+    plot.draggable([q], { r: 10 });
+    ui.legend([
+      { label: 'вектор отзыва', color: 's1', mark: 'dot' },
+      { label: 'запрос', color: 's2', mark: 'cross' },
+      { label: 'k ближайших (с номерами)', color: 's3', mark: 'ring' },
+      { label: 'область с k ближайшими', color: 's2', mark: 'area' },
+      { label: 'единичная окружность, при нормализации', color: 'muted', mark: 'dash' }
+    ]);
+    var roList = ui.readout('k ближайших по этой метрике');
+    var roAgree = ui.readout('согласны ли три метрики?');
+    ui.note('Закрашенная область — это конус вокруг направления запроса для косинуса, круг вокруг его конца для евклидова расстояния и полуплоскость, перпендикулярная ему, для скалярного произведения.');
+    ui.onChange(function () {
+      var s = state(), m = metric.value;
+      roList.set(s.top.map(function (r, j) {
+        var v = m === 'euc' ? Course.fmt(-r.s, 2) : m === 'cos' ? Course.fmt(r.s, 3) + ' (' + Course.fmt(Math.acos(clamp1(r.s)) * 180 / Math.PI, 1) + '°)' : Course.fmt(r.s, 2);
+        return (j + 1) + ' · ' + P[r.i].t + ' — ' + v;
+      }).join('<br>'));
+      function ids(mm) { return s.R[mm].slice(0, s.k).map(function (r) { return r.i; }); }
+      function shared(a, b) { return a.filter(function (x) { return b.indexOf(x) >= 0; }).length; }
+      var c = ids('cos'), se = shared(c, ids('euc')), si = shared(c, ids('ip'));
+      if (se === s.k && si === s.k) roAgree.set('да: при всех трёх те же отзывы (' + s.k + ')', 'key');
+      else roAgree.set('нет: с косинусом совпадают у евклидова ' + se + ' из ' + s.k + ', у скалярного произведения ' + si + ' из ' + s.k);
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l27-exact">
+  <h2>Точный поиск и почему он перестаёт работать</h2>
+
+  <p>Найти k сохранённых векторов, наиболее похожих на запрос, — это <mark class="key">поиск k ближайших соседей (k-nearest-neighbour search)</mark>. Без индекса это значит "computing the distance from the query to each point in the database" (p. 658): \(n\) векторов по \(d\) чисел стоят \(n \cdot d\) умножений на запрос. Миллион 384-мерных векторов — это \(3.84 \times 10^8\) умножений, и так на каждый запрос. Отсюда: "Let’s create indexes with tree-based exact vector search techniques" (p. 658).</p>
+
+  <h3>K-D деревья: режем пространство пополам</h3>
+
+  <p>"k-d trees are a special case of binary space partitioning trees": "a binary tree in which every node is a k-dimensional point. Every non-leaf node implicitly generates splitting hyperplane that divides the space into two parts. The split is on the median value" (p. 659). Каждый разрез перпендикулярен одной оси, и ось меняется с глубиной: в трёхмерном примере того же слайда первый разрез идёт по первой координате, следующие — по второй, потом по третьей. Разрез по медиане кладёт по половине точек на каждую сторону, так что дерево остаётся сбалансированным.</p>
+
+  <p>Слайд (p. 660) выращивает такое дерево над записями с тремя атрибутами — Name, Age, Salary — и перебирает их по кругу, уровень за уровнем. Его внутренние узлы хранят только значение разреза, а записи лежат в листьях — распространённый вариант определения. Проследи путь записи-запроса вниз по дереву, Ivan, 61, $55k (рис. 5): четыре сравнения приводят к одному листу из двадцати.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-kdtree">
+    <svg class="dia" viewBox="0 0 560 352" role="img" aria-label="K-D дерево из лекции, поиск для Ivan, 61, 55k: Ivan раньше Kevin, значит, налево; 61 не меньше 60, значит, направо; 55k меньше 80k, значит, налево; Ivan после Charlie, значит, направо, и так до листа David, 68, 40k; четыре соседних поддерева с 9, 5, 3 и 2 записями пропускаются">
+      <line x1="300" y1="44" x2="190" y2="86" class="hl"/>
+      <line x1="190" y1="114" x2="300" y2="156" class="hl"/>
+      <line x1="300" y1="184" x2="210" y2="226" class="hl"/>
+      <line x1="210" y1="254" x2="330" y2="296" class="hl"/>
+      <line x1="300" y1="44" x2="190" y2="86" class="sw-2"/>
+      <line x1="190" y1="114" x2="300" y2="156" class="sw-2"/>
+      <line x1="300" y1="184" x2="210" y2="226" class="sw-2"/>
+      <line x1="210" y1="254" x2="330" y2="296" class="sw-2"/>
+      <line x1="300" y1="44" x2="450" y2="86" class="st-muted dash"/>
+      <line x1="190" y1="114" x2="80" y2="156" class="st-muted dash"/>
+      <line x1="300" y1="184" x2="480" y2="226" class="st-muted dash"/>
+      <line x1="210" y1="254" x2="90" y2="296" class="st-muted dash"/>
+      <rect x="240" y="16" width="120" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="140" y="86" width="100" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="230" y="156" width="140" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="140" y="226" width="140" height="28" rx="4" class="fi-paper st-s3 sw-2"/>
+      <rect x="240" y="296" width="180" height="28" rx="4" class="fw-s1 st-s1 sw-2"/>
+      <rect x="405" y="86" width="90" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <rect x="16" y="156" width="128" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <rect x="420" y="226" width="120" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <rect x="45" y="296" width="90" height="28" rx="4" class="fi-paper st-muted dash"/>
+      <text x="16" y="34" class="tx-sm tx-bold">запрос: Ivan, 61, $55k</text>
+      <text x="300" y="35" class="tx-mono tx-sm tx-mid">Name: Kevin</text>
+      <text x="190" y="105" class="tx-mono tx-sm tx-mid">Age: 60</text>
+      <text x="300" y="175" class="tx-mono tx-sm tx-mid">Salary: $80k</text>
+      <text x="210" y="245" class="tx-mono tx-sm tx-mid">Name: Charlie</text>
+      <text x="330" y="315" class="tx-mono tx-sm tx-mid">David · 68 · $40k</text>
+      <text x="450" y="105" class="tx-mono tx-sm tx-mid tx-muted">Age: 47</text>
+      <text x="80" y="175" class="tx-mono tx-sm tx-mid tx-muted">Salary: $50k</text>
+      <text x="480" y="245" class="tx-mono tx-sm tx-mid tx-muted">Name: Alice</text>
+      <text x="90" y="315" class="tx-mono tx-sm tx-mid tx-muted">Age: 73</text>
+      <text x="450" y="134" class="tx-sm tx-mid tx-muted">+9 записей</text>
+      <text x="80" y="204" class="tx-sm tx-mid tx-muted">+5 записей</text>
+      <text x="480" y="274" class="tx-sm tx-mid tx-muted">+3 записи</text>
+      <text x="90" y="344" class="tx-sm tx-mid tx-muted">+2 записи</text>
+      <text x="238" y="64" class="tx-sm tx-end halo">Ivan &lt; Kevin</text>
+      <text x="262" y="128" class="tx-sm halo">61 ≥ 60</text>
+      <text x="238" y="202" class="tx-sm tx-end halo">55k &lt; 80k</text>
+      <text x="284" y="266" class="tx-sm halo">Ivan &gt; Charlie</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> K-D дерево со слайда (p. 660), поиск для Ivan, 61, $55k (запрос наш). Name в корне, потом Age, потом Salary, потом снова Name: каждый уровень режет по следующему атрибуту. Четыре сравнения приводят к листу David; пунктирные ветви, 19 записей из 20, так и не открываются.</figcaption>
+  </figure>
+
+  <p>Для запроса ближайшего соседа лист — только первый кандидат. Потом поиск поднимается обратно и заглядывает в соседнее поддерево всякий раз, когда его разделяющая плоскость ближе к запросу, чем лучший кандидат на данный момент: настоящий сосед может лежать сразу за разрезом.</p>
+
+  <p>Слайд (p. 661) даёт стоимость вместе с её условием: "Complexity of search (and other operations): O(log n)", при гипотезе \(n \gg 2^k\), где \(n\) — число векторов, а \(k\) — их размерность. Осторожно: на этом слайде \(k\) — число измерений (это \(d\) выше), а не \(k\) из k ближайших соседей. O(log n) — стоимость, которую стоит ожидать, когда гипотеза выполняется; в худшем случае поиск обходит все листья. Дереву нужно много точек в каждой ячейке, чтобы его разрезы хоть что-то отсекали. Табл. 1 показывает, чего требует это условие.</p>
+
+  <figure class="tbl-fig" id="l27-tbl-2k">
+    <figcaption>Табл. 1. Гипотеза со слайда (p. 661), \(n \gg 2^k\), для нескольких размерностей \(k\). 384 — это размер векторов all-MiniLM-L6-v2 из ноутбука занятия.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>измерений \(k\)</th><th>\(2^k\)</th><th>хватит векторов?</th></tr></thead>
+        <tbody>
+          <tr><td class="num">2</td><td class="num">4</td><td>легко</td></tr>
+          <tr><td class="num">10</td><td class="num">1 024</td><td>легко</td></tr>
+          <tr><td class="num">20</td><td class="num">\(1.05 \times 10^{6}\)</td><td>нужно много миллионов</td></tr>
+          <tr><td class="num">32</td><td class="num">\(4.3 \times 10^{9}\)</td><td>почти никогда</td></tr>
+          <tr><td class="num">128</td><td class="num">\(3.4 \times 10^{38}\)</td><td>никогда</td></tr>
+          <tr class="is-key"><td class="num">384</td><td class="num">\(3.9 \times 10^{115}\)</td><td>никогда</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Ни одна коллекция никогда не будет содержать \(10^{115}\) векторов. Для эмбеддингов действует последняя строка слайда: "With high-dimensional data, most of the points in the tree will be evaluated and the efficiency is no better than exhaustive search" (p. 661).</p>
+
+  <h3>R-деревья: коробки внутри коробок</h3>
+
+  <p>R означает rectangle, прямоугольник. Идея лекции — "to group nearby objects and represent them with their minimum bounding rectangle in the next higher level of the tree", и отсюда правило отсечения: "a query that does not intersect the bounding rectangle also cannot intersect any of the contained objects". В листьях каждый прямоугольник — один объект; выше каждый покрывает больше объектов — "an increasingly coarse approximation of the data set" (рис. 6).</p>
+
+  <figure class="fig fig--plain" id="l27-fig-rtree">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Слева: прямоугольники R1 и R2, внутри них R3, R4, R5, R6 по два объекта в каждом и прямоугольник запроса Q внутри R3. Справа: дерево; поиск открывает только R1 и R3, а R2 с R5 и R6, а также R4 пропускаются">
+      <rect x="24" y="36" width="156" height="150" class="sw-2 dash"/>
+      <rect x="150" y="128" width="124" height="126" class="sw-2 dash"/>
+      <rect x="38" y="62" width="70" height="60" class="st-s3 sw-2"/>
+      <rect x="112" y="118" width="60" height="58" class="st-s3 sw-2"/>
+      <rect x="184" y="154" width="50" height="46" class="st-s3 sw-2"/>
+      <rect x="206" y="204" width="60" height="44" class="st-s3 sw-2"/>
+      <rect x="48" y="98" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="86" y="104" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="128" y="150" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="152" y="158" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="196" y="182" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="216" y="176" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="220" y="230" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="246" y="226" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="66" y="68" width="34" height="28" class="fw-s2 st-s2 sw-2 dash"/>
+      <text x="30" y="52" class="tx-sm">R1</text>
+      <text x="268" y="146" class="tx-sm tx-end">R2</text>
+      <text x="42" y="80" class="tx-sm halo">R3</text>
+      <text x="118" y="136" class="tx-sm halo">R4</text>
+      <text x="188" y="170" class="tx-sm halo">R5</text>
+      <text x="210" y="221" class="tx-sm halo">R6</text>
+      <text x="83" y="87" class="tx-sm tx-mid tx-bold">Q</text>
+      <line x1="402" y1="56" x2="360" y2="110" class="hl"/>
+      <line x1="338" y1="136" x2="320" y2="190" class="hl"/>
+      <line x1="402" y1="56" x2="360" y2="110" class="sw-2"/>
+      <line x1="338" y1="136" x2="320" y2="190" class="sw-2"/>
+      <line x1="446" y1="56" x2="494" y2="110" class="st-muted dash"/>
+      <line x1="382" y1="136" x2="370" y2="190" class="st-muted dash"/>
+      <line x1="472" y1="136" x2="460" y2="190" class="st-muted dash"/>
+      <line x1="516" y1="136" x2="520" y2="190" class="st-muted dash"/>
+      <rect x="380" y="30" width="44" height="26" class="fi-paper sw-2"/>
+      <rect x="424" y="30" width="44" height="26" class="fi-paper sw-2"/>
+      <rect x="316" y="110" width="44" height="26" class="fi-paper st-s3 sw-2"/>
+      <rect x="360" y="110" width="44" height="26" class="fi-paper st-s3 sw-2"/>
+      <rect x="450" y="110" width="44" height="26" class="fi-paper st-muted dash"/>
+      <rect x="494" y="110" width="44" height="26" class="fi-paper st-muted dash"/>
+      <rect x="300" y="190" width="40" height="24" class="fi-paper sw-2"/>
+      <rect x="350" y="190" width="40" height="24" class="fi-paper st-muted dash"/>
+      <rect x="440" y="190" width="40" height="24" class="fi-paper st-muted dash"/>
+      <rect x="500" y="190" width="40" height="24" class="fi-paper st-muted dash"/>
+      <rect x="306" y="197" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="323" y="197" width="10" height="10" class="fw-s1 st-s1"/>
+      <rect x="356" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="373" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="446" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="463" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="506" y="197" width="10" height="10" class="st-muted"/>
+      <rect x="523" y="197" width="10" height="10" class="st-muted"/>
+      <text x="402" y="48" class="tx-sm tx-mid">R1</text>
+      <text x="446" y="48" class="tx-sm tx-mid">R2</text>
+      <text x="338" y="128" class="tx-sm tx-mid">R3</text>
+      <text x="382" y="128" class="tx-sm tx-mid">R4</text>
+      <text x="472" y="128" class="tx-sm tx-mid tx-muted">R5</text>
+      <text x="516" y="128" class="tx-sm tx-mid tx-muted">R6</text>
+      <text x="490" y="254" class="tx-hand tx-mid">пропущены</text>
+    </svg>
+    <figcaption><b>Рис. 6.</b> Двухуровневое R-дерево, нарисованное для этого урока; дерево побольше, до трёх записей на страницу, есть на слайде (p. 663). Запрос Q пересекает R1 и внутри него только R3: R2 и R4 пропускаются вместе со всем содержимым — правило со слайда (p. 662).</figcaption>
+  </figure>
+
+  <p>R-дерево сбалансировано и "Organizes data in pages"; у каждой страницы есть максимальное и минимальное заполнение, и слайд сообщает о "Best performance with min filling around 40%" (p. 663). Самое трудное — построить хорошее дерево: оно должно оставаться сбалансированным, его прямоугольники не должны "cover too much empty space" и должны "not overlap too much (so that during search, fewer subtrees need to be processed)". Вариант M-дерево (M-tree) использует вместо прямоугольников "circles / spheres".</p>
+
+  <p>Оба дерева упираются в одну стену: "For high-dimensional data, also tree-based exact vector search techniques such as the k-d tree and R-tree do not perform well enough because of the curse of dimensionality" (проклятие размерности). Для R-дерева эта стена выглядит так: в сотнях измерений коробка даже вокруг нескольких точек охватывает большую часть диапазона большинства координат, поэтому коробки перекрываются, и почти каждый запрос пересекает почти каждую коробку. Поэтому "Vector databases use Approximate Nearest Neighbor algorithms" (p. 665).</p>
+
+  <p class="memo"><mark class="key">Точные деревья отсекают по геометрии; в сотнях измерений отсечь почти ничего нельзя, и поиск скатывается к полному перебору.</mark></p>
+</section>
+
+
+<section id="l27-ann">
+  <h2>Приближённый поиск: хеши и графы</h2>
+
+  <p>Поиск <mark class="key">приближённых ближайших соседей (approximate nearest neighbour, ANN)</mark> возвращает векторы, которые с очень большой вероятностью ближайшие. HNSW, как сказано в лекции, "sacrifices a small amount of accuracy to achieve much faster search times". Расстояния, которые считает HNSW, точные; что он может сделать — это пропустить вектор, на который так и не посмотрел (IVFPQ в конце урока добавляет вторую ошибку: расстояния, оценённые по сжатым кодам). Обычная мера качества — полнота (recall), доля настоящих ближайших соседей, которую возвращает поиск. Слайд (p. 666) перечисляет четыре таких алгоритма: LSH, HNSW, IVFADC и IVFPQ — последние два на самом деле один метод (раздел 6).</p>
+
+  <h3>LSH: хеш, который хочет коллизий</h3>
+
+  <p>"locality-sensitive hashing (LSH) is a fuzzy hashing technique that hashes similar input items into the same ‘buckets’ with high probability"; "The number of buckets is much smaller than the universe of possible input items"; и ключевая фраза: "It differs from conventional hashing techniques in that hash collisions are maximized, not minimized" (p. 667). Сравни с хешем CRC16 в Redis Cluster (<a href="l19.html#l19-topologies">урок 19</a>), который построен, чтобы равномерно раскидать ключи по слотам. Запрос хешируется, и точно сравниваются только объекты из его бакета. Раз длинный вектор превращается в короткий код бакета, "LSH can be seen as a way to reduce the dimensionality of high-dimensional data".</p>
+
+  <p>Одно классическое семейство для косинуса делает «с высокой вероятностью» точным (справка, не со слайдов): проведи случайную гиперплоскость через начало координат и запиши, по какую сторону от неё лежит вектор, — один бит. Несколько таких разрезов дают каждому вектору короткий код, и этот код — его бакет (рис. 7).</p>
+
+  <figure class="fig fig--plain" id="l27-fig-lsh">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Три случайные прямые через начало координат режут плоскость на шесть секторов с 3-битными кодами. Запрос q и вектор a попадают в сектор 100 и делят бакет; b, близкий к q, но за разрезом, попадает в 110; c попадает в 111">
+      <line x1="44" y1="171" x2="276" y2="109" class="st-s3 sw-2 dash"/>
+      <line x1="119" y1="253" x2="201" y2="27" class="st-s3 sw-2 dash"/>
+      <line x1="229" y1="238" x2="91" y2="42" class="st-s3 sw-2 dash"/>
+      <line x1="160" y1="140" x2="231" y2="102" class="st-muted"/>
+      <line x1="160" y1="140" x2="206" y2="85" class="st-muted"/>
+      <line x1="160" y1="140" x2="168" y2="62" class="st-muted"/>
+      <line x1="160" y1="140" x2="83" y2="119" class="st-muted"/>
+      <circle cx="160" cy="140" r="3" class="fi-ink"/>
+      <circle cx="231" cy="102" r="5" class="fi-s1"/>
+      <circle cx="168" cy="62" r="5" class="fi-s1"/>
+      <circle cx="83" cy="119" r="5" class="fi-s1"/>
+      <path d="M200 79 l12 12 M212 79 l-12 12" class="st-s2 sw-3"/>
+      <rect x="330" y="59" width="56" height="22" class="fw-s2 st-s2 sw-2"/>
+      <rect x="330" y="99" width="56" height="22" class="fi-paper sw-2"/>
+      <rect x="330" y="139" width="56" height="22" class="fi-paper sw-2"/>
+      <line x1="392" y1="70" x2="424" y2="70" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="110" x2="424" y2="110" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="150" x2="424" y2="150" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <text x="216" y="82" class="tx-sm">q</text>
+      <text x="241" y="106" class="tx-sm">a</text>
+      <text x="157" y="60" class="tx-sm tx-end">b</text>
+      <text x="73" y="116" class="tx-sm tx-end">c</text>
+      <text x="256" y="60" class="tx-mono tx-sm tx-mid">100</text>
+      <text x="145" y="29" class="tx-mono tx-sm tx-mid">110</text>
+      <text x="47" y="87" class="tx-mono tx-sm tx-mid">111</text>
+      <text x="79" y="214" class="tx-mono tx-sm tx-mid">011</text>
+      <text x="173" y="239" class="tx-mono tx-sm tx-mid">001</text>
+      <text x="265" y="178" class="tx-mono tx-sm tx-mid">000</text>
+      <text x="330" y="40" class="tx-sm tx-bold">бакет → векторы</text>
+      <text x="358" y="75" class="tx-mono tx-sm tx-mid">100</text>
+      <text x="358" y="115" class="tx-mono tx-sm tx-mid">110</text>
+      <text x="358" y="155" class="tx-mono tx-sm tx-mid">111</text>
+      <text x="432" y="75" class="tx-mono tx-sm">q, a</text>
+      <text x="432" y="115" class="tx-mono tx-sm">b</text>
+      <text x="432" y="155" class="tx-mono tx-sm">c</text>
+      <text x="440" y="214" class="tx-hand tx-mid">q встречает a, но не b</text>
+    </svg>
+    <figcaption><b>Рис. 7.</b> LSH на случайных гиперплоскостях с тремя разрезами (справка, не со слайдов). Каждый пунктирный разрез через начало координат даёт один бит — по какую сторону от него лежит вектор, — так что плоскость распадается на секторы с 3-битными кодами: это бакеты. Запрос q и его сосед a делят бакет 100 и сравниваются; b, всего в 34° от q, лежит за разрезом в бакете 110 и не сравнивается никогда. Вот почему LSH-индекс держит несколько таблиц с разными разрезами.</figcaption>
+  </figure>
+
+  <p>Два вектора под углом \(\theta\) получают одинаковый бит с вероятностью \(1 - \theta / 180^\circ\). Для пары про дождливый день с углом 40° это 0.78; если код бакета — 8 таких битов, они попадут в один бакет с вероятностью \(0.78^8 \approx 0.13\), а два ортогональных предложения — с \(0.5^8 \approx 0.004\). Один код сам по себе чаще всего упускал бы хорошую пару, поэтому LSH-индекс держит несколько таблиц с разными случайными гиперплоскостями и заглядывает в бакет запроса в каждой: при 20 таблицах пара про дождливый день встретится хотя бы раз с вероятностью 0.94, ортогональная пара — с 0.08.</p>
+
+  <h3>HNSW: список с пропусками, собранный из графов</h3>
+
+  <p>Hierarchical Navigable Small World — это "an efficient algorithm for approximate nearest neighbor (ANN) search in high-dimensional spaces" (p. 668). В его названии встречаются две идеи. "Navigable Small-World Graphs" (навигируемые графы «тесного мира») — это "graphs where most nodes can be reached from any other in a small number of hops": каждый вектор — узел, связанный с близкими к нему векторами. "Hierarchical Structure" организует граф "into multiple layers, each containing fewer nodes than the layer below", и в нижнем слое лежат все данные.</p>
+
+  <p>Слайд (p. 669) объясняет поиск на списке с пропусками (skip list), "looking for 11" (рис. 8). В верхнем слое мало узлов и длинные связи, так что один прыжок перескакивает через большую часть данных; когда следующий прыжок перелетел бы цель, поиск спускается на слой ниже и продолжает короткими прыжками.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-skiplist">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="Список с пропусками со слоями от 3 до 0 над ключами 3, 5, 7, 11, 14, 19, 21 между start и end. Ищем 11: в слое 3 от start к 5, потом 5 → end перелетает; спуск в слой 2, 5 → 19 перелетает; спуск в слой 1, 5 → 11, найдено">
+      <line x1="107" y1="40" x2="191" y2="40" class="hl"/>
+      <line x1="219" y1="40" x2="527" y2="40" class="hl"/>
+      <line x1="219" y1="80" x2="415" y2="80" class="hl"/>
+      <line x1="219" y1="120" x2="303" y2="120" class="hl"/>
+      <rect x="81" y="27" width="26" height="26" class="fw-key"/>
+      <rect x="529" y="27" width="26" height="26" class="fw-key"/>
+      <rect x="81" y="27" width="26" height="146"/>
+      <rect x="529" y="27" width="26" height="146"/>
+      <rect x="193" y="27" width="26" height="26" class="fw-key"/>
+      <rect x="193" y="67" width="26" height="26" class="fw-key"/>
+      <rect x="193" y="107" width="26" height="26" class="fw-key"/>
+      <rect x="193" y="147" width="26" height="26"/>
+      <rect x="417" y="67" width="26" height="26" class="fw-key"/>
+      <rect x="417" y="107" width="26" height="26"/>
+      <rect x="417" y="147" width="26" height="26"/>
+      <rect x="305" y="107" width="26" height="26" class="fw-key sw-3"/>
+      <rect x="305" y="147" width="26" height="26"/>
+      <rect x="137" y="147" width="26" height="26"/>
+      <rect x="249" y="147" width="26" height="26"/>
+      <rect x="361" y="147" width="26" height="26"/>
+      <rect x="473" y="147" width="26" height="26"/>
+      <line x1="107" y1="40" x2="191" y2="40" marker-end="url(#arr)"/>
+      <line x1="219" y1="40" x2="527" y2="40" marker-end="url(#arr)"/>
+      <line x1="107" y1="80" x2="191" y2="80" marker-end="url(#arr)"/>
+      <line x1="219" y1="80" x2="415" y2="80" marker-end="url(#arr)"/>
+      <line x1="443" y1="80" x2="527" y2="80" marker-end="url(#arr)"/>
+      <line x1="107" y1="120" x2="191" y2="120" marker-end="url(#arr)"/>
+      <line x1="219" y1="120" x2="303" y2="120" marker-end="url(#arr)"/>
+      <line x1="331" y1="120" x2="415" y2="120" marker-end="url(#arr)"/>
+      <line x1="443" y1="120" x2="527" y2="120" marker-end="url(#arr)"/>
+      <line x1="107" y1="160" x2="135" y2="160" marker-end="url(#arr)"/>
+      <line x1="163" y1="160" x2="191" y2="160" marker-end="url(#arr)"/>
+      <line x1="219" y1="160" x2="247" y2="160" marker-end="url(#arr)"/>
+      <line x1="275" y1="160" x2="303" y2="160" marker-end="url(#arr)"/>
+      <line x1="331" y1="160" x2="359" y2="160" marker-end="url(#arr)"/>
+      <line x1="387" y1="160" x2="415" y2="160" marker-end="url(#arr)"/>
+      <line x1="443" y1="160" x2="471" y2="160" marker-end="url(#arr)"/>
+      <line x1="499" y1="160" x2="527" y2="160" marker-end="url(#arr)"/>
+      <line x1="206" y1="54" x2="206" y2="65" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="206" y1="94" x2="206" y2="105" class="sw-2" marker-end="url(#arr)"/>
+      <text x="6" y="45" class="tx-sm">слой 3</text>
+      <text x="6" y="85" class="tx-sm">слой 2</text>
+      <text x="6" y="125" class="tx-sm">слой 1</text>
+      <text x="6" y="165" class="tx-sm">слой 0</text>
+      <text x="94" y="196" class="tx-mono tx-mid">start</text>
+      <text x="150" y="196" class="tx-mono tx-mid">3</text>
+      <text x="206" y="196" class="tx-mono tx-mid">5</text>
+      <text x="262" y="196" class="tx-mono tx-mid">7</text>
+      <text x="318" y="196" class="tx-mono tx-mid tx-bold">11</text>
+      <text x="374" y="196" class="tx-mono tx-mid">14</text>
+      <text x="430" y="196" class="tx-mono tx-mid">19</text>
+      <text x="486" y="196" class="tx-mono tx-mid">21</text>
+      <text x="542" y="196" class="tx-mono tx-mid">end</text>
+      <text x="420" y="234" class="tx-hand tx-mid">looking for 11</text>
+    </svg>
+    <figcaption><b>Рис. 8.</b> Список с пропусками со слайда (p. 669), перерисованный. Слой 3 (входной): start → 5, потом 5 → end перелетает, значит, спуск на 5. Слой 2: 5 → 19 перелетает, снова спуск. Слой 1: 5 → 11, найдено. Выделены клетки, на которые поиск смотрит; нижний ряд, где лежит всё, он не обходит никогда.</figcaption>
+  </figure>
+
+  <p>В HNSW слои содержат векторы, а «перелетел» превращается в «ни один связанный узел не ближе к запросу». Поиск начинается в точке входа (entry point) верхнего слоя и переходит к тому связанному узлу, который ближе всего к запросу; когда ближе нет ни одного, он спускается на слой ниже с того места, где стоит, "refining the result by looking at more nodes" (p. 669), вплоть до слоя 0, где он может держать сразу несколько кандидатов (параметр <code>ef</code> из статьи про HNSW; справка). Новые векторы добавляются "in a probabilistic manner": "the algorithm randomly selects a level in the hierarchy where the point should be placed. It then connects the new point to its closest neighbors at that level" (p. 670) — и, о чём слайд умалчивает, на каждом уровне ниже тоже, вплоть до слоя 0.</p>
+
+  <aside class="redpen" data-page="668">
+    <p class="claim">"The highest layer consists of the most representative points (like hubs), and as you go down the hierarchy, more detailed points are added, eventually representing all the data at the lowest level."</p>
+    <p class="fix">Никто не выбирает представительные точки. Когда вектор вставляется, его верхний слой выпадает случайно, с вероятностью, которая уменьшается от слоя к слою; вектор кладётся в этот слой и во все слои ниже, со связями с ближайшими соседями в каждом. Верхние слои — это редеющая случайная выборка данных; в слое 0 лежат все данные.</p>
+    <p class="because">Сам слайд (p. 670) говорит, что "the algorithm randomly selects a level in the hierarchy where the point should be placed"; в статье про HNSW уровень равен \(\lfloor -\ln(u)\, m_L \rfloor\), где \(u\) равномерно выбирается из (0, 1), а \(m_L\) — фиксированная константа, так что каждый следующий слой вверх сохраняет лишь долю нижнего. В виджете ниже (при N = 400) единственный узел верхнего слоя сидит у правого края облака: его не выбрали хабом, ему просто выпал самый высокий уровень. Экзамен может процитировать фразу со слайда; знай её и знай, что слои случайны.</p>
+  </aside>
+
+  <div class="widget" id="l27-w-hnsw">
+    <h3 class="widget-title">Прогулка HNSW против полного перебора</h3>
+    <p class="widget-intro">N точек двумерного облака, проиндексированных HNSW как в статье: до 4 связей на узел в верхних слоях и 8 в слое 0, уровень каждой точки выбирается случайно. График показывает граф того слоя, в котором идёт поиск; остальные данные — маленькие серые точки. Нажми «Поиск», чтобы посмотреть прогулку шаг за шагом, от точки входа вниз до слоя 0; кольцом отмечен каждый вектор, расстояние до которого от запроса уже посчитано. Выбери готовый запрос или щёлкни по графику, чтобы поставить свой. Главное, что надо увидеть: прогулка считает несколько десятков расстояний там, где полный перебор считает N, — и время от времени останавливается на близком соседе, который не самый близкий.</p>
+    <ol class="tasks">
+      <li>Запрос A, N = 400, ef = 1. Прежде чем нажать «Поиск»: сколько из 400 расстояний понадобится прогулке? Потом посмотри, где она начинается и какой длины её прыжки.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>32. Она начинается в единственном узле верхнего слоя (слой 5, точка входа), делает длинные прыжки, пока слои редкие, и короткие в слое 0 и заканчивает на настоящем ближайшем соседе. Полный перебор посчитал бы 400 расстояний.</p></details>
+      </li>
+      <li>Следи за строкой «200 тестовых запросов», пока двигаешь N от 100 до 1000. Полный перебор вырастает вдесятеро; насколько вырастает прогулка?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>С 20.1 до 33.1 расстояния на запрос в среднем (ef = 1), с нахождением настоящего ближайшего в 95.5 % и 96.5 % случаев. Вдесятеро больше данных стоят примерно на 13 расстояний больше, а не вдесятеро больше: медленный, примерно логарифмический рост, ради которого и нужны слои (средние немного скачут от одного N к другому, потому что каждое N строит новый случайный граф).</p></details>
+      </li>
+      <li>Запрос B при N = 400 и ef = 1: заканчивается ли прогулка на настоящем ближайшем соседе? Потом поставь ef = 2 и поищи снова.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Нет. После 27 расстояний она останавливается на 4-м по близости векторе, потому что ни один связанный с ним узел не ближе к запросу: локальный минимум жадной прогулки. С ef = 2 слой 0 держит по два кандидата сразу, и прогулка находит настоящего ближайшего за 38 расстояний. На 200 тестовых запросах ef = 1, 2, 4 находят его в 96.5 %, 98.5 % и 100 % случаев, за 30.3, 31.9 и 35.2 расстояния.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-hnsw', function (root, ui) {
+    /* the point cloud shared with l27-w-ivf: points of a 10 x 6 plane, five blobs and a uniform background */
+    function cloud(seed, n) {
+      var r = Course.rng(seed), C = [[2.0, 1.6], [3.4, 4.4], [5.6, 2.6], [7.8, 4.6], [8.3, 1.4]], out = [];
+      while (out.length < n) {
+        var p;
+        if (r.random() < 0.3) p = [r.uniform(0.2, 9.8), r.uniform(0.2, 5.8)];
+        else { var c = C[Math.floor(r.random() * C.length)]; p = [r.normal(c[0], 0.75), r.normal(c[1], 0.6)]; }
+        if (p[0] > 0.15 && p[0] < 9.85 && p[1] > 0.15 && p[1] < 5.85) out.push(p);
+      }
+      return out;
+    }
+    var ALL = cloud(27, 1000), TQ = cloud(2027, 200), M = 4, M0 = 8, EFC = 16;
+    function d2(a, b) { var dx = a[0] - b[0], dy = a[1] - b[1]; return dx * dx + dy * dy; }
+    function byDist(a, b) { return a[0] - b[0]; }
+    function nearest(pts, q) { var b = 0, bd = Infinity; for (var i = 0; i < pts.length; i++) { var d = d2(q, pts[i]); if (d < bd) { bd = d; b = i; } } return b; }
+    function rankOf(pts, q, id) { var d = d2(q, pts[id]), r = 1; for (var i = 0; i < pts.length; i++) if (d2(q, pts[i]) < d) r++; return r; }
+    function ordinal(n) { var t = n % 100, s = (t >= 11 && t <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'); return n + s; }
+
+    /* HNSW (Malkov and Yashunin): random levels, greedy layers, the neighbour-selection heuristic */
+    function build(pts) {
+      var r = Course.rng(7), mL = 1 / Math.log(M), n = pts.length, level = [], links = [], entry = -1, top = -1;
+      function lim(lc) { return lc === 0 ? M0 : M; }
+      function searchLayer(q, eps, ef, lc) {
+        var visited = {}, Cn = [], Wn = [];
+        eps.forEach(function (e) { visited[e] = 1; var d = d2(q, pts[e]); Cn.push([d, e]); Wn.push([d, e]); });
+        Cn.sort(byDist); Wn.sort(byDist);
+        while (Cn.length) {
+          var c = Cn.shift(), f = Wn[Wn.length - 1];
+          if (c[0] > f[0]) break;
+          var nb = links[c[1]][lc] || [];
+          for (var i = 0; i < nb.length; i++) {
+            var e = nb[i]; if (visited[e]) continue; visited[e] = 1;
+            var de = d2(q, pts[e]); f = Wn[Wn.length - 1];
+            if (de < f[0] || Wn.length < ef) {
+              Cn.push([de, e]); Cn.sort(byDist);
+              Wn.push([de, e]); Wn.sort(byDist);
+              if (Wn.length > ef) Wn.pop();
+            }
+          }
+        }
+        return Wn;
+      }
+      function select(cand, m) {
+        var s = cand.slice().sort(byDist), R = [], Wd = [];
+        for (var i = 0; i < s.length && R.length < m; i++) {
+          var e = s[i], ok = true;
+          for (var j = 0; j < R.length; j++) if (d2(pts[e[1]], pts[R[j][1]]) < e[0]) { ok = false; break; }
+          if (ok) R.push(e); else Wd.push(e);
+        }
+        while (R.length < m && Wd.length) R.push(Wd.shift());
+        return R.map(function (e) { return e[1]; });
+      }
+      var order = [], i, j, t;
+      for (i = 0; i < n; i++) order.push(i);
+      for (i = n - 1; i > 0; i--) { j = Math.floor(r.random() * (i + 1)); t = order[i]; order[i] = order[j]; order[j] = t; }
+      order.forEach(function (id) {
+        var u = r.random(); if (u <= 0) u = 1e-12;
+        var l = Math.floor(-Math.log(u) * mL), lc;
+        level[id] = l; links[id] = []; for (lc = 0; lc <= l; lc++) links[id][lc] = [];
+        if (entry < 0) { entry = id; top = l; return; }
+        var q = pts[id], ep = [entry], Wl;
+        for (lc = top; lc > l; lc--) { Wl = searchLayer(q, ep, 1, lc); ep = [Wl[0][1]]; }
+        for (lc = Math.min(top, l); lc >= 0; lc--) {
+          Wl = searchLayer(q, ep, EFC, lc);
+          var nbs = select(Wl, M);
+          links[id][lc] = nbs.slice();
+          nbs.forEach(function (e) {
+            var le = links[e][lc]; le.push(id);
+            if (le.length > lim(lc)) links[e][lc] = select(le.map(function (x) { return [d2(pts[e], pts[x]), x]; }), lim(lc));
+          });
+          ep = Wl.map(function (w) { return w[1]; });
+        }
+        if (l > top) { top = l; entry = id; }
+      });
+      return { pts: pts, level: level, links: links, entry: entry, top: top };
+    }
+    /* a search that records one frame per expanded node: the layer, the node, the hop, the distances so far */
+    function trace(h, q, ef) {
+      var pts = h.pts, count = 0, seen = [], mark = {}, frames = [], parent = {};
+      function dist(e) { count++; if (!mark[e]) { mark[e] = 1; seen.push(e); } return d2(q, pts[e]); }
+      function layer(eps, efl, lc) {
+        var visited = {}, Cn = [], Wn = [], prev = eps[0][1];
+        eps.forEach(function (e) { visited[e[1]] = 1; Cn.push(e.slice()); Wn.push(e.slice()); });
+        while (Cn.length) {
+          Cn.sort(byDist); var c = Cn.shift(); Wn.sort(byDist);
+          if (c[0] > Wn[Wn.length - 1][0]) break;
+          var nb = h.links[c[1]][lc] || [], fresh = 0;
+          for (var i = 0; i < nb.length; i++) {
+            var e = nb[i]; if (visited[e]) continue; visited[e] = 1;
+            var de = dist(e); fresh++; parent[lc + ':' + e] = c[1];
+            Wn.sort(byDist);
+            if (de < Wn[Wn.length - 1][0] || Wn.length < efl) {
+              Cn.push([de, e]); Wn.push([de, e]); Wn.sort(byDist);
+              if (Wn.length > efl) Wn.pop();
+            }
+          }
+          var from = parent[lc + ':' + c[1]], hop = (c[1] !== prev && from != null) ? [from, c[1]] : null;
+          if (fresh || hop) frames.push({ layer: lc, cur: c[1], hop: hop, nSeen: seen.length, count: count });
+          prev = c[1];
+        }
+        Wn.sort(byDist);
+        return Wn;
+      }
+      var ep = h.entry, cur = [[dist(ep), ep]];
+      frames.push({ layer: h.top, cur: ep, hop: null, nSeen: seen.length, count: count });
+      for (var lc = h.top; lc >= 1; lc--) {
+        var Wl = layer(cur, 1, lc); cur = [Wl[0]];
+        frames.push({ layer: lc - 1, cur: Wl[0][1], hop: null, nSeen: seen.length, count: count });
+      }
+      var W0 = layer(cur, ef, 0);
+      return { frames: frames, result: W0[0][1], count: count, seen: seen };
+    }
+
+    var PRE = { a: [5.0, 3.2], b: [6.05, 1.15] };
+    var S = { N: 400, ef: 1, q: PRE.a.slice(), h: null, tr: null, idx: 0, nn: 0, rank: 1, stats: [] };
+    function retrace() {
+      S.tr = trace(S.h, S.q, S.ef); S.idx = 0;
+      S.nn = nearest(S.h.pts, S.q); S.rank = rankOf(S.h.pts, S.q, S.tr.result);
+    }
+    function rebuild() {
+      var pts = ALL.slice(0, S.N);
+      S.h = build(pts);
+      var truth = TQ.map(function (q) { return nearest(pts, q); });
+      S.stats = [];
+      for (var ef = 1; ef <= 8; ef++) {
+        var hit = 0, cnt = 0;
+        for (var i = 0; i < TQ.length; i++) { var t = trace(S.h, TQ[i], ef); cnt += t.count; if (t.result === truth[i]) hit++; }
+        S.stats[ef] = { recall: hit / TQ.length, avg: cnt / TQ.length };
+      }
+      retrace();
+    }
+    rebuild();
+    function frame() { return S.tr.frames[Math.min(S.idx, S.tr.frames.length - 1)]; }
+    function finished() { return S.idx >= S.tr.frames.length - 1; }
+
+    var player;
+    var qSel = ui.select('запрос', [
+      { value: 'a', label: 'A · в середине облака' },
+      { value: 'b', label: 'B · трудный' },
+      { value: 'own', label: 'свой: щёлкни по графику' }
+    ], function (v) { if (PRE[v]) { S.q = PRE[v].slice(); retrace(); } player.reset(); }, 'a');
+    ui.slider({ label: 'N, число векторов', min: 100, max: 1000, step: 100, value: 400,
+      onInput: function (v) { S.N = Math.round(v); rebuild(); player.reset(); } });
+    ui.slider({ label: 'ef, кандидатов в слое 0', min: 1, max: 8, step: 1, value: 1,
+      onInput: function (v) { S.ef = Math.round(v); retrace(); player.reset(); } });
+    player = ui.player({ ms: 650, label: 'Поиск', stepLabel: 'Один шаг',
+      onTick: function (i, api) { if (!finished()) S.idx++; if (finished()) api.stop(); },
+      onReset: function () { S.idx = 0; } });
+
+    var plot = ui.plot({ x: [0, 10], y: [0, 6], equalAspect: true, aspect: 1.6, axes: false,
+      label: 'Индекс HNSW над двумерными точками: связи слоя, в котором идёт поиск, прыжки прогулки и векторы, расстояние до которых посчитано' });
+    plot.draw(function (g) {
+      var h = S.h, pts = h.pts, F = frame(), lc = F.layer, c = g.ctx, v = g.view, i, j, L;
+      c.save();
+      c.beginPath(); c.rect(g.px(v.x0), g.py(v.y1), g.px(v.x1) - g.px(v.x0), g.py(v.y0) - g.py(v.y1)); c.clip();
+      c.beginPath();
+      for (i = 0; i < pts.length; i++) {
+        if (h.level[i] < lc) continue;
+        L = h.links[i][lc] || [];
+        for (j = 0; j < L.length; j++) {
+          if (L[j] < i && (h.links[L[j]][lc] || []).indexOf(i) >= 0) continue;     /* each mutual link once */
+          c.moveTo(g.px(pts[i][0]), g.py(pts[i][1])); c.lineTo(g.px(pts[L[j]][0]), g.py(pts[L[j]][1]));
+        }
+      }
+      c.strokeStyle = g.colors.s3; c.globalAlpha = lc === 0 ? 0.32 : 0.6; c.lineWidth = lc === 0 ? 1 : 1.4; c.stroke();
+      c.restore();
+      g.points(pts, { color: 'muted', r: 1.8, ring: false });
+      var lay = [];
+      for (i = 0; i < pts.length; i++) if (h.level[i] >= lc) lay.push(pts[i]);
+      g.points(lay, { color: 's1', r: lc === 0 ? 2.8 : 4.5, ring: lc !== 0 });
+      g.points(S.tr.seen.slice(0, F.nSeen).map(function (id) { return pts[id]; }), { shape: 'ring', color: 's2', r: 6 });
+      for (var k = 0; k <= S.idx && k < S.tr.frames.length; k++) {
+        var hop = S.tr.frames[k].hop; if (!hop) continue;
+        var a = pts[hop[0]], b = pts[hop[1]];
+        g.arrow(a[0], a[1], b[0], b[1], { color: 'ink', width: 1.6, head: 7, highlight: k === S.idx });
+      }
+      var cu = pts[F.cur];
+      g.circle(cu[0], cu[1], 10, { px: true, fill: false, color: 'ink', width: 2 });
+      if (S.idx === 0) g.text(cu[0], cu[1], 'точка входа', { dx: -14, dy: -14, align: 'right', size: 11.5 });
+      if (finished()) {
+        var res = pts[S.tr.result];
+        g.circle(res[0], res[1], 13, { px: true, fill: false, color: 's3', dash: true, width: 2.5 });
+        if (S.tr.result !== S.nn) { var tn = pts[S.nn]; g.circle(tn[0], tn[1], 13, { px: true, fill: false, color: 'bad', width: 2.5 }); }
+      }
+      g.points([S.q], { shape: 'cross', color: 's2', r: 7 });
+    });
+    plot.onPointer({ down: function (p) {
+      if (!p.inside) return;
+      S.q = [Course.clamp(p.x, 0, 10), Course.clamp(p.y, 0, 6)];
+      qSel.value = 'own'; retrace(); player.reset();
+    } });
+    ui.legend([
+      { label: 'вектор', color: 'muted', mark: 'dot' },
+      { label: 'узел текущего слоя', color: 's1', mark: 'dot' },
+      { label: 'связь текущего слоя', color: 's3', mark: 'line' },
+      { label: 'запрос', color: 's2', mark: 'cross' },
+      { label: 'расстояние посчитано', color: 's2', mark: 'ring' },
+      { label: 'прыжок прогулки', color: 'ink', mark: 'hl' },
+      { label: 'результат', color: 's3', mark: 'dash' },
+      { label: 'настоящий ближайший, если пропущен', color: 'bad', mark: 'ring' }
+    ]);
+    var roLayer = ui.readout('слой'), roCount = ui.readout('посчитано расстояний'), roRes = ui.readout('результат'), roStats = ui.readout('200 тестовых запросов, при этих N и ef');
+    ui.onChange(function () {
+      var F = frame(), h = S.h, nl = 0;
+      for (var i = 0; i < h.level.length; i++) if (h.level[i] >= F.layer) nl++;
+      roLayer.set(F.layer + (F.layer === h.top ? ' (входной слой)' : F.layer === 0 ? ' (все векторы)' : '') + ' · узлов: ' + nl);
+      roCount.set(F.count + ' · полный перебор: ' + h.pts.length);
+      if (!finished()) roRes.set(player.running ? 'идёт поиск…' : 'нажми «Поиск» или «Один шаг»');
+      else if (S.tr.result === S.nn) roRes.set('настоящий ближайший сосед', 'good');
+      else roRes.set(S.rank + '-й по близости: настоящий ближайший пропущен', 'bad');
+      var st = S.stats[S.ef];
+      roStats.set('настоящий ближайший найден в ' + Course.fmt(100 * st.recall, 1) + ' % · в среднем расстояний: ' + Course.fmt(st.avg, 1) + ' · полный перебор: ' + h.pts.length);
+    });
+  });
+  </script>
+
+  <p>Слайд (p. 671) перечисляет четыре преимущества: "Scalability", вплоть до "millions or even billions of vectors"; "Speed", потому что иерархия "significantly reduces the number of comparisons needed to find a similar vector"; "Adaptability", "dynamic insertion and deletion of data points"; и "Memory Efficiency" — то самое, которое не выполняется.</p>
+
+  <aside class="redpen" data-page="671">
+    <p class="claim">"Memory Efficiency: The algorithm is designed to use memory efficiently, allowing it to handle large-scale datasets without requiring excessive computational resources."</p>
+    <p class="fix">HNSW экономит сравнения, а не память. Он хранит каждый полный вектор плюс список связей для каждого узла в каждом из его слоёв, поэтому ему нужно больше памяти, чем самим векторам (индексу полного перебора), и гораздо больше, чем сжатым кодам IVFPQ. Его настоящее преимущество — пункт "Speed". Слайд (p. 666) делает тот же промах: "with minimal memory usage".</p>
+    <p class="because">Арифметика: 384-мерный вектор из 4-байтовых чисел занимает 1536 байт, и HNSW добавляет сверху свои связи (виджет хранит до 8 на узел в слое 0); код продуктового квантования того же вектора может занимать 48 байт. Рекомендации Faiss по выбору индекса советуют HNSW, когда RAM много, а сравнение Flat, LSH, HNSW и IVF от Pinecone измеряет HNSW как самый большой индекс. Экзамен может перечислить четыре пункта слайда как напечатано; знай, какой из них не выполняется и почему.</p>
+  </aside>
+
+  <div class="story" data-year="2016">
+    <p>Ю. А. Мальков и Д. А. Яшунин опубликовали HNSW в марте 2016 года, работая в Институте прикладной физики РАН в Нижнем Новгороде. Его «тесный мир» восходит к эксперименту Стэнли Милгрэма 1960-х, в котором жители Небраски пытались передать письмо незнакомцу в Массачусетсе через знакомых, и к заметке Джона Клейнберга в Nature 2000 года, которая показала, когда такая жадная пересылка с одним лишь локальным знанием находит короткие цепочки. Именно это и делает прогулка — только среди векторов.</p>
+  </div>
+</section>
+
+
+<section id="l27-ivfpq">
+  <h2>Ячейки и коды: IVFPQ</h2>
+
+  <p>Inverted File with Product Quantization "Combines coarse quantization (to partition the vector space) and product quantization (to compress vectors)" (p. 672). Две независимые идеи: первая уменьшает, сколько векторов встретит запрос, вторая — сколько стоит хранить и сравнивать каждый из них.</p>
+
+  <h3>Грубое квантование: ячейки и инвертированный файл</h3>
+
+  <aside class="margin-note">Слайд (p. 673) говорит, что инвертированный индекс отображает "data points (or vectors) to a set of representative clusters". Поиск использует его наоборот: от центроида к списку его векторов.</aside>
+
+  <p>"The entire dataset is divided into clusters using a clustering algorithm like k-means. Each vector is assigned to its nearest cluster center (called a coarse centroid)", и центроиды становятся "bins" пространства (p. 673). Это кластеризация k-means. Вокруг каждого центроида лежит область точек, которые ближе к нему, чем к любому другому центроиду, — ячейка Вороного. Для каждого центроида индекс хранит список его векторов: это <mark class="key">инвертированный файл (inverted file)</mark>, как списки «терм → документы» в инвертированном индексе (рис. 9). "During a search, instead of searching the entire dataset, the algorithm only searches within the relevant clusters".</p>
+
+  <figure class="fig fig--plain" id="l27-fig-ivf">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="Три ячейки k-means с центроидами c1, c2, c3 и инвертированный файл: у c1 в списке векторы 4, 9, 12; у c2 — 1, 6, 15; у c3 — 2, 7, 21. Запрос лежит в ячейке c2 у её границы, поэтому читается только список c2, а его настоящий ближайший сосед 21 из ячейки c3 пропускается">
+      <polygon points="116.6,30 280,30 280,131 151.7,124.8" class="fw-s2 st-none"/>
+      <rect x="20" y="30" width="260" height="190" class="st-muted"/>
+      <polyline points="116.6,30 151.7,124.8 111.4,220" class="st-muted sw-2"/>
+      <line x1="151.7" y1="124.8" x2="280" y2="131" class="st-muted sw-2"/>
+      <path d="M75 117 l8 8 l-8 8 l-8 -8 z" class="fi-s3"/>
+      <path d="M210 67 l8 8 l-8 8 l-8 -8 z" class="fi-s3"/>
+      <path d="M205 172 l8 8 l-8 8 l-8 -8 z" class="fi-s3"/>
+      <circle cx="45" cy="70" r="5" class="fi-s1"/>
+      <circle cx="100" cy="95" r="5" class="fi-s1"/>
+      <circle cx="65" cy="180" r="5" class="fi-s1"/>
+      <circle cx="170" cy="50" r="5" class="fi-s1"/>
+      <circle cx="255" cy="60" r="5" class="fi-s1"/>
+      <circle cx="190" cy="108" r="5" class="fi-s1"/>
+      <circle cx="165" cy="195" r="5" class="fi-s1"/>
+      <circle cx="250" cy="200" r="5" class="fi-s1"/>
+      <circle cx="232" cy="148" r="5" class="fi-s1"/>
+      <path d="M219 118 l12 12 M231 118 l-12 12" class="st-s2 sw-3"/>
+      <rect x="330" y="61" width="56" height="22" class="fi-paper sw-2"/>
+      <rect x="330" y="101" width="56" height="22" class="fw-s2 st-s2 sw-2"/>
+      <rect x="330" y="141" width="56" height="22" class="fi-paper sw-2"/>
+      <line x1="392" y1="72" x2="424" y2="72" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="112" x2="424" y2="112" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="392" y1="152" x2="424" y2="152" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <text x="53" y="63" class="tx-mono tx-sm">4</text>
+      <text x="108" y="88" class="tx-mono tx-sm">9</text>
+      <text x="73" y="173" class="tx-mono tx-sm">12</text>
+      <text x="178" y="43" class="tx-mono tx-sm">1</text>
+      <text x="263" y="53" class="tx-mono tx-sm">6</text>
+      <text x="198" y="101" class="tx-mono tx-sm">15</text>
+      <text x="173" y="188" class="tx-mono tx-sm">2</text>
+      <text x="258" y="193" class="tx-mono tx-sm">7</text>
+      <text x="241" y="163" class="tx-mono tx-sm">21</text>
+      <text x="86" y="130" class="tx-sm">c₁</text>
+      <text x="222" y="70" class="tx-sm">c₂</text>
+      <text x="217" y="184" class="tx-sm">c₃</text>
+      <text x="330" y="44" class="tx-sm tx-bold">инвертированный файл</text>
+      <text x="358" y="77" class="tx-mid">c₁</text>
+      <text x="358" y="117" class="tx-mid">c₂</text>
+      <text x="358" y="157" class="tx-mid">c₃</text>
+      <text x="432" y="77" class="tx-mono tx-sm">4 · 9 · 12</text>
+      <text x="432" y="117" class="tx-mono tx-sm">1 · 6 · 15</text>
+      <text x="432" y="157" class="tx-mono tx-sm">2 · 7 · 21</text>
+      <text x="440" y="206" class="tx-hand tx-mid">читается один список</text>
+    </svg>
+    <figcaption><b>Рис. 9.</b> Инвертированный файл со слайда (p. 673) на игрушечной плоскости. k-means даёт три ячейки, у каждой свой грубый центроид (coarse centroid) c₁, c₂, c₃ (ромбы); индекс хранит для каждого центроида список векторов его ячейки — центроид → векторы, как инвертированный индекс хранит терм → документы. Запрос (крестик) сравнивается с тремя центроидами и читает только список ближайшего, c₂. Его настоящий ближайший сосед, 21, лежит сразу за границей, в списке c₃, и пропускается.</figcaption>
+  </figure>
+
+  <p>Тот же слайд (p. 673) называет риск, рисуя "Query Vector" на границе "Filtered Cell": настоящий ближайший сосед запроса может лежать в соседней ячейке, которую так и не откроют. Поиск по большему числу ячеек — <code>nprobe</code> штук, в терминах FAISS, — выкупает полноту обратно ценой большего числа расстояний.</p>
+
+  <div class="widget" id="l27-w-ivf">
+    <h3 class="widget-title">IVF: открой nprobe ячеек из шестнадцати</h3>
+    <p class="widget-intro">Те же 400 точек, что в виджете HNSW при N = 400, разбитые k-means на 16 ячеек; ромбы — грубые центроиды. Поиск сравнивает запрос с 16 центроидами, открывает nprobe ячеек с ближайшими центроидами (закрашены) и сравнивает запрос с каждым вектором внутри них; векторы остальных ячеек остаются серыми. Выбери готовый запрос или щёлкни по графику, чтобы поставить свой. Главное, что надо увидеть: больше проверенных ячеек — больше полнота и больше расстояний, а проверить все ячейки — это полный перебор с лишней работой.</p>
+    <ol class="tasks">
+      <li>Запрос A при nprobe = 1: сколько расстояний и настоящий ли это ближайший сосед?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>52 = 16 центроидов + 36 векторов ячейки запроса, и да: настоящий ближайший сосед лежит внутри этой ячейки.</p></details>
+      </li>
+      <li>Запрос B лежит у границы своей ячейки. Предскажи результат при nprobe = 1, потом подними nprobe до 2.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>С одной ячейкой он возвращает 2-й по близости вектор после 32 расстояний (16 + 16): настоящий ближайший сидит за границей, в ячейке, которую так и не открыли, — тот самый "Query Vector" на краю "Filtered Cell" со слайда (p. 673). С nprobe = 2 открывается и соседняя ячейка, и настоящий ближайший находится за 49 расстояний.</p></details>
+      </li>
+      <li>Поставь nprobe = 16 и сравни счётчик с полным перебором.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>416: все 400 векторов плюс 16 центроидов. Полнота идеальная, а индекс стоит дороже, чем отсутствие индекса. На 200 тестовых запросах nprobe = 1, 2, 3 находят настоящего ближайшего в 92.5 %, 100 % и 100 % случаев, за 43.0, 68.5 и 90.7 расстояния: в этой двумерной игрушке хватает одной лишней ячейки.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l27-w-ivf', function (root, ui) {
+    function cloud(seed, n) {               /* the same cloud as l27-w-hnsw (seed 27): its first 400 points */
+      var r = Course.rng(seed), C = [[2.0, 1.6], [3.4, 4.4], [5.6, 2.6], [7.8, 4.6], [8.3, 1.4]], out = [];
+      while (out.length < n) {
+        var p;
+        if (r.random() < 0.3) p = [r.uniform(0.2, 9.8), r.uniform(0.2, 5.8)];
+        else { var c = C[Math.floor(r.random() * C.length)]; p = [r.normal(c[0], 0.75), r.normal(c[1], 0.6)]; }
+        if (p[0] > 0.15 && p[0] < 9.85 && p[1] > 0.15 && p[1] < 5.85) out.push(p);
+      }
+      return out;
+    }
+    function d2(a, b) { var dx = a[0] - b[0], dy = a[1] - b[1]; return dx * dx + dy * dy; }
+    var pts = cloud(27, 400), TQ = cloud(2027, 200), K = 16;
+
+    /* k-means with k-means++ seeding: the coarse quantizer */
+    function kmeans(k, seed, iters) {
+      var r = Course.rng(seed), C = [pts[Math.floor(r.random() * pts.length)].slice()], assign = [], i, j, it;
+      while (C.length < k) {
+        var D = pts.map(function (p) { var m = Infinity; C.forEach(function (c) { m = Math.min(m, d2(p, c)); }); return m; });
+        var tot = D.reduce(function (s, v) { return s + v; }, 0), u = r.random() * tot, acc = 0, pick = pts.length - 1;
+        for (i = 0; i < D.length; i++) { acc += D[i]; if (acc >= u) { pick = i; break; } }
+        C.push(pts[pick].slice());
+      }
+      function assignAll() {
+        pts.forEach(function (p, i) { var b = 0, bd = Infinity; C.forEach(function (c, j) { var d = d2(p, c); if (d < bd) { bd = d; b = j; } }); assign[i] = b; });
+      }
+      for (it = 0; it < iters; it++) {
+        assignAll();
+        var S = C.map(function () { return [0, 0, 0]; });
+        pts.forEach(function (p, i) { var s = S[assign[i]]; s[0] += p[0]; s[1] += p[1]; s[2]++; });
+        C = C.map(function (c, j) { return S[j][2] ? [S[j][0] / S[j][2], S[j][1] / S[j][2]] : c; });
+      }
+      assignAll();
+      var lists = C.map(function () { return []; });
+      assign.forEach(function (a, i) { lists[a].push(i); });          /* the inverted file: centroid -> its vectors */
+      return { C: C, assign: assign, lists: lists };
+    }
+    /* the Voronoi cell of centroid j inside the plane, clipped by the bisector of every other centroid */
+    function cell(C, j) {
+      var poly = [[0, 0], [10, 0], [10, 6], [0, 6]];
+      for (var k = 0; k < C.length && poly.length; k++) {
+        if (k === j) continue;
+        var a = C[j], b = C[k], nx = b[0] - a[0], ny = b[1] - a[1], cc = (b[0] * b[0] + b[1] * b[1] - a[0] * a[0] - a[1] * a[1]) / 2, out = [];
+        for (var i = 0; i < poly.length; i++) {
+          var P = poly[i], Q = poly[(i + 1) % poly.length], fp = nx * P[0] + ny * P[1] - cc, fq = nx * Q[0] + ny * Q[1] - cc;
+          if (fp <= 0) out.push(P);
+          if ((fp < 0 && fq > 0) || (fp > 0 && fq < 0)) { var t = fp / (fp - fq); out.push([P[0] + t * (Q[0] - P[0]), P[1] + t * (Q[1] - P[1])]); }
+        }
+        poly = out;
+      }
+      return poly;
+    }
+    var IV = kmeans(K, 11, 30), cells = IV.C.map(function (c, j) { return cell(IV.C, j); });
+    function nearest(q) { var b = 0, bd = Infinity; for (var i = 0; i < pts.length; i++) { var d = d2(q, pts[i]); if (d < bd) { bd = d; b = i; } } return b; }
+    function rankOf(q, id) { var d = d2(q, pts[id]), r = 1; for (var i = 0; i < pts.length; i++) if (d2(q, pts[i]) < d) r++; return r; }
+    function ordinal(n) { var t = n % 100, s = (t >= 11 && t <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'); return n + s; }
+    function search(q, nprobe) {
+      var order = IV.C.map(function (c, j) { return [d2(q, c), j]; }).sort(function (a, b) { return a[0] - b[0]; });
+      var probed = order.slice(0, nprobe).map(function (o) { return o[1]; }), best = -1, bd = Infinity, cand = 0;
+      probed.forEach(function (j) { IV.lists[j].forEach(function (i) { cand++; var d = d2(q, pts[i]); if (d < bd) { bd = d; best = i; } }); });
+      return { probed: probed, result: best, cand: cand, count: K + cand };
+    }
+    var STATS = [];
+    (function () {
+      var truth = TQ.map(nearest);
+      for (var p = 1; p <= K; p++) {
+        var hit = 0, cnt = 0;
+        for (var i = 0; i < TQ.length; i++) { var s = search(TQ[i], p); cnt += s.count; if (s.result === truth[i]) hit++; }
+        STATS[p] = { recall: hit / TQ.length, avg: cnt / TQ.length };
+      }
+    })();
+
+    var PRE = { a: [5.0, 3.2], b: [6.45, 4.25] }, q = PRE.a.slice();
+    var qSel = ui.select('запрос', [
+      { value: 'a', label: 'A · внутри ячейки' },
+      { value: 'b', label: 'B · у границы ячейки' },
+      { value: 'own', label: 'свой: щёлкни по графику' }
+    ], function (v) { if (PRE[v]) q = PRE[v].slice(); }, 'a');
+    var nprobe = ui.slider({ label: 'nprobe, сколько ячеек искать', min: 1, max: K, step: 1, value: 1 });
+    function now() { var np = Math.max(1, Math.min(K, Math.round(nprobe.value))); var s = search(q, np); s.np = np; s.nn = nearest(q); return s; }
+
+    var plot = ui.plot({ x: [0, 10], y: [0, 6], equalAspect: true, aspect: 1.6, axes: false,
+      label: 'Шестнадцать ячеек k-means над 400 точками, запрос, ячейки, открытые поиском, и векторы, которые он сравнивает' });
+    plot.draw(function (g) {
+      var s = now(), open = {};
+      s.probed.forEach(function (j) { open[j] = 1; });
+      cells.forEach(function (poly, j) { if (open[j]) g.poly(poly, { color: 's2', alpha: 0.15, stroke: false }); });
+      cells.forEach(function (poly) { g.poly(poly, { fill: false, color: 'muted', width: 1.2 }); });
+      g.points(pts, {
+        color: function (p, i) { return open[IV.assign[i]] ? 's1' : 'muted'; },
+        r: function (p, i) { return open[IV.assign[i]] ? 3.4 : 2.2; }, ring: false
+      });
+      g.points(IV.C, { shape: 'diamond', color: 's3', r: 5 });
+      var res = pts[s.result];
+      g.circle(res[0], res[1], 12, { px: true, fill: false, color: 's3', dash: true, width: 2.5 });
+      if (s.result !== s.nn) { var t = pts[s.nn]; g.circle(t[0], t[1], 12, { px: true, fill: false, color: 'bad', width: 2.5 }); }
+      g.points([q], { shape: 'cross', color: 's2', r: 7 });
+    });
+    plot.onPointer({ down: function (p) { if (!p.inside) return; q = [Course.clamp(p.x, 0, 10), Course.clamp(p.y, 0, 6)]; qSel.value = 'own'; } });
+    ui.legend([
+      { label: 'вектор сравнён', color: 's1', mark: 'dot' },
+      { label: 'вектор не сравнён', color: 'muted', mark: 'dot' },
+      { label: 'грубый центроид', color: 's3', mark: 'diamond' },
+      { label: 'запрос', color: 's2', mark: 'cross' },
+      { label: 'ячейка, открытая поиском', color: 's2', mark: 'area' },
+      { label: 'результат', color: 's3', mark: 'dash' },
+      { label: 'настоящий ближайший, если пропущен', color: 'bad', mark: 'ring' }
+    ]);
+    var roCount = ui.readout('посчитано расстояний'), roRes = ui.readout('результат'), roStats = ui.readout('200 тестовых запросов при этом nprobe');
+    ui.onChange(function () {
+      var s = now(), st = STATS[s.np];
+      roCount.set(K + ' центроидов + ' + s.cand + ' векторов = ' + s.count + ' · полный перебор: ' + pts.length);
+      if (s.result === s.nn) roRes.set('настоящий ближайший сосед', 'good');
+      else roRes.set(rankOf(q, s.result) + '-й по близости: настоящий ближайший пропущен', 'bad');
+      roStats.set('настоящий ближайший найден в ' + Course.fmt(100 * st.recall, 1) + ' % · в среднем расстояний: ' + Course.fmt(st.avg, 1));
+    });
+  });
+  </script>
+
+  <h3>Продуктовое квантование: четыре байта вместо 512</h3>
+
+  <p>"Product quantization works by dividing each vector into smaller sub-vectors and then quantizing each sub-vector separately" (p. 674). Каждое подпространство получает свою <mark class="key">кодовую книгу (codebook)</mark> — небольшой набор центроидов, выученный k-means, — и каждый подвектор заменяется номером ближайшего к нему центроида. При 256 центроидах в кодовой книге этот номер помещается в один байт (обычный выбор; слайд говорит лишь "with fewer bits"). Рис. 10 делает это со 128-мерным вектором из 4-байтовых чисел.</p>
+
+  <figure class="fig fig--plain" id="l27-fig-pq">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="Вектор из 128 чисел, 512 байт, режется на четыре подвектора по 32 числа; каждый подвектор заменяется номером ближайшего центроида, и получается код из четырёх байт, в 128 раз меньше, декодирование которого лишь приближает вектор">
+      <rect x="40" y="34" width="480" height="30" class="fw-s1 st-s1 sw-2"/>
+      <line x1="160" y1="30" x2="160" y2="68" class="sw-2 dash"/>
+      <line x1="280" y1="30" x2="280" y2="68" class="sw-2 dash"/>
+      <line x1="400" y1="30" x2="400" y2="68" class="sw-2 dash"/>
+      <line x1="100" y1="92" x2="100" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="220" y1="92" x2="220" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="340" y1="92" x2="340" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="460" y1="92" x2="460" y2="112" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="70" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="190" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="310" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <rect x="430" y="116" width="60" height="26" class="fw-s1 st-s1"/>
+      <line x1="100" y1="146" x2="100" y2="184" marker-end="url(#arr)"/>
+      <line x1="220" y1="146" x2="220" y2="184" marker-end="url(#arr)"/>
+      <line x1="340" y1="146" x2="340" y2="184" marker-end="url(#arr)"/>
+      <line x1="460" y1="146" x2="460" y2="184" marker-end="url(#arr)"/>
+      <rect x="70" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <rect x="190" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <rect x="310" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <rect x="430" y="188" width="60" height="28" class="fi-paper st-s3 sw-2"/>
+      <text x="280" y="22" class="tx-sm tx-mid">один вектор: 128 чисел × 4 байта = 512 байт</text>
+      <text x="100" y="84" class="tx-sm tx-mid tx-muted">32 числа</text>
+      <text x="220" y="84" class="tx-sm tx-mid tx-muted">32 числа</text>
+      <text x="340" y="84" class="tx-sm tx-mid tx-muted">32 числа</text>
+      <text x="460" y="84" class="tx-sm tx-mid tx-muted">32 числа</text>
+      <text x="100" y="134" class="tx-mid">u₁</text>
+      <text x="220" y="134" class="tx-mid">u₂</text>
+      <text x="340" y="134" class="tx-mid">u₃</text>
+      <text x="460" y="134" class="tx-mid">u₄</text>
+      <text x="100" y="207" class="tx-mono tx-mid">17</text>
+      <text x="220" y="207" class="tx-mono tx-mid">203</text>
+      <text x="340" y="207" class="tx-mono tx-mid">5</text>
+      <text x="460" y="207" class="tx-mono tx-mid">88</text>
+      <text x="64" y="207" class="tx-sm tx-end">c₁</text>
+      <text x="184" y="207" class="tx-sm tx-end">c₂</text>
+      <text x="304" y="207" class="tx-sm tx-end">c₃</text>
+      <text x="424" y="207" class="tx-sm tx-end">c₄</text>
+      <text x="280" y="248" class="tx-sm tx-mid tx-bold">код: 4 байта, в 128 раз меньше</text>
+      <text x="280" y="270" class="tx-sm tx-mid">после декодирования: близко к вектору, но не равно</text>
+    </svg>
+    <figcaption><b>Рис. 10.</b> Продуктовое квантование (product quantization), как оно нарисовано на слайде (p. 674), с числами. 128-мерный вектор из 4-байтовых чисел (512 байт) режется на 4 подвектора по 32 числа, u₁ … u₄; каждый становится номером ближайшего центроида в своей кодовой книге из 256, c₁ … c₄ (четыре номера придуманы для рисунка).</figcaption>
+  </figure>
+
+  <p>Четыре байта по 256 значений дают \(256^4 \approx 4.3 \times 10^9\) разных кодов всего из \(4 \times 256 = 1024\) хранимых подцентроидов: это декартово произведение и есть «product» в названии. Цена — NOTE со слайда: "the reconstructed vector is not identical to the original vector" (p. 674), так что расстояния, посчитанные по кодам, — это оценки.</p>
+
+  <p>Поиск идёт в два шага (p. 675). "Coarse Search": алгоритм "first identifies the relevant clusters (coarse centroids) where similar vectors are likely to be found". "Refined Search": внутри них "product quantization is used to compare the query vector with the compressed representations of the vectors in those clusters". Отсюда два источника ошибки — сосед в неоткрытой ячейке и расстояние, неверно оценённое по коду, — поэтому IVFPQ "may not find the exact nearest neighbors". Его преимущества (p. 676) отражают две идеи: "Memory Efficiency" — от кодов, "Fast Search" — от ячеек, "Scalability" и "Customizable Accuracy" через параметры "like the number of clusters or the precision of quantization".</p>
+
+  <aside class="redpen" data-page="666">
+    <p class="claim">"Inverted File with Approximate Distance Calculation (IVFADC): utilizes an inverted index structure to index high-dimensional vectors."</p>
+    <p class="fix">В статье, которая его ввела, — Jégou, Douze и Schmid, «Product Quantization for Nearest Neighbor Search», 2011, — ADC означает Asymmetric Distance Computation (асимметричное вычисление расстояния). И IVFADC — не второй алгоритм рядом с IVFPQ: это название того же метода в статье, инвертированный файл плюс продуктовое квантование, которое FAISS реализует как <code>IndexIVFPQ</code>.</p>
+    <p class="because">"Asymmetric" называет трюк из Refined Search со слайда (p. 675): запрос сохраняет свои точные числа, а сохранённые векторы сравниваются через свои коды. Слайд перечисляет IVFADC и IVFPQ как два пункта и расшифровывает ADC как "Approximate Distance Calculation", и экзамен может процитировать это именно так: знай эту формулировку и знай, что правильное прочтение — один метод с Asymmetric Distance Computation.</p>
+  </aside>
+
+  <figure class="tbl-fig" id="l27-tbl-indexes">
+    <figcaption>Табл. 2. Методы поиска этого урока рядом (pp. 658–676; замечания про память — справка).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>метод</th><th>точный?</th><th>как организует векторы</th><th>чем платит</th></tr></thead>
+        <tbody>
+          <tr><td>полный перебор</td><td>да</td><td>никак: запрос встречает каждый вектор</td><td>\(n \cdot d\) операций на запрос</td></tr>
+          <tr><td>K-D дерево</td><td>да</td><td>двоичное дерево из разрезов по медиане, параллельных осям</td><td>быстро, только пока \(n \gg 2^k\)</td></tr>
+          <tr><td>R-дерево</td><td>да</td><td>вложенные минимальные ограничивающие прямоугольники, сбалансированные страницы</td><td>перекрытия и пустое место; не работает в высокой размерности</td></tr>
+          <tr><td>LSH</td><td>нет</td><td>бакеты хеша, при котором похожие векторы сталкиваются</td><td>пропускает соседей, попавших в другие бакеты</td></tr>
+          <tr class="is-key"><td>HNSW</td><td>нет</td><td>слои навигируемых графов «тесного мира»</td><td>память на связи; может остановиться, не дойдя до ближайшего</td></tr>
+          <tr><td>IVFPQ</td><td>нет</td><td>ячейки k-means плюс коды продуктового квантования</td><td>промахи в неоткрытых ячейках; оценённые расстояния</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Дождливый день: разгадка</h3>
+
+  <p>Вернёмся к таблице из загадки. "Colds are unpleasant." оказалось вторым потому, что энкодер, обученный, как того требует занятие, собирать похожие объекты вместе, поместил его в 65° от "Rainy days make me sad", а не связанное с ним предложение вроде "Success is rewarding." сидит в 88°. У инвертированного индекса не было ни шанса: у двух предложений нет ни одного общего слова. А настоящая векторная база данных не стала бы сравнивать запрос с каждым сохранённым предложением: прогулка HNSW или несколько ячеек IVF встречают несколько десятков кандидатов — 32 вместо 400 в виджете. Цена — слово «приближённый»: время от времени настоящее лучшее совпадение лежит сразу за тем, на что посмотрел поиск.</p>
+</section>
+
+
+<section id="l27-exam" class="no-num">
+  <h2>Задачи в стиле экзамена</h2>
+  <p>Теоретические вопросы в формах, которые называет readme к прошлым экзаменам, — выбор вариантов, верно/неверно, открытые ответы; за неверные ответы может быть штраф, о котором объявляют прямо перед экзаменом, — и одно практическое задание в стиле таблицы "Which DB technology" из прошлых экзаменов.</p>
+
+  <div class="exam" data-kind="mcq" id="l27-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Cosine similarity always takes values between 0 and 1. <span class="fb">Неверно: оно меняется от −1 (противоположные векторы) через 0 (ортогональные) до 1 (одно направление) (p. 655). В пределах [0, 1] остаются только векторы без отрицательных компонент.</span></li>
+      <li data-correct>Locality-sensitive hashing differs from conventional hashing in that hash collisions are maximized, not minimized. <span class="fb">Верно, почти дословно со слайда (p. 667): похожие объекты должны попадать в один бакет.</span></li>
+      <li>A K-D tree answers nearest-neighbour queries in O(log n) whatever the dimensionality of the vectors. <span class="fb">Неверно: только при гипотезе \(n \gg 2^k\) (p. 661); на высокоразмерных данных "the efficiency is no better than exhaustive search".</span></li>
+      <li data-correct>If all vectors are normalised to unit length, ranking by Euclidean distance gives the same order as ranking by cosine similarity. <span class="fb">Верно: на единичных векторах \(\norm{A-B}^2 = 2 - 2\cos\theta\) — убывающая функция косинуса.</span></li>
+      <li>HNSW guarantees to return the exact nearest neighbour. <span class="fb">Неверно: "HNSW does not guarantee an exact nearest neighbor search" (p. 670); жадная прогулка может остановиться в локальном минимуме.</span></li>
+      <li>In IVFPQ, the vector reconstructed from its product-quantization code is identical to the original vector. <span class="fb">Неверно: "the reconstructed vector is not identical to the original vector" (p. 674); квантование теряет информацию.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>True: the second and the fourth. Cosine similarity ranges from −1 to 1; the O(log n) of a K-D tree holds only when n ≫ 2^k; HNSW and IVFPQ are approximate methods, and product quantization loses information.</p></div>
+      <div class="exam-note"><p>Когда за неверные ответы возможен штраф, отмечай только то, что подкреплено фразой со слайда. Каждое неверное утверждение здесь искажает одну такую фразу: неверный диапазон, выброшенное условие ("whatever the dimensionality") или «приближённый», превращённый в «точный».</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.447" data-tol="0.002" id="l27-exam-cos">
+    <div class="exam-q" lang="en">
+      <p>Compute the cosine similarity between the vectors \(A = (2, 1)\) and \(B = (0, 2)\), to three decimals. Are the two vectors similar, orthogonal or opposite?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>\(A\cdot B = 2\cdot 0 + 1\cdot 2 = 2\); \(\norm{A} = \sqrt{5} \approx 2.236\); \(\norm{B} = 2\).</p>
+        \[ \cos\theta = \frac{A\cdot B}{\norm{A}\,\norm{B}} = \frac{2}{2.236 \cdot 2} \approx 0.447 \]
+        <p>The angle is about 63°: the vectors are moderately similar. The cosine is positive, so they are not opposite (cosine −1), and it is clearly above 0, so they are not orthogonal, but it is well below 1, the value of vectors pointing the same way.</p>
+      </div>
+      <div class="exam-note"><p>Векторы из ноутбука занятия Comparison, который печатает 0.4472. Обычные промахи: забыть квадратный корень в норме или разделить на сумму длин вместо их произведения.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-embedding">
+    <div class="exam-q" lang="en">
+      <p>Explain what an embedding is and why a vector database can retrieve documents that a keyword search based on an inverted index would miss. Use the query "Rainy days make me sad" as an example.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Vectorization or embedding is the process of converting data, such as text or images, into dense numerical vectors that capture their semantics, using an embedding model: an encoder (BERT for text, CNNs or ViTs for images, CLIP for both) trained with metric learning so that similar items are close together and dissimilar ones far apart. A vector database stores these high-dimensional vectors; a query is embedded with the same model, and the database returns the stored vectors most similar to it, typically by cosine similarity, which compares the directions of the vectors. An inverted index only finds documents that contain the query's terms. "Colds are unpleasant." shares no word with "Rainy days make me sad", yet in the lecture's example its cosine similarity with the query is 0.419, the second best after "Rainy days can be gloomy." (0.764), because both sentences express discomfort. Vector search is contextual search that goes beyond keyword matching.</p></div>
+      <div class="exam-note"><p>Полный ответ состоит из четырёх частей: определение, роль модели (смысл создаёт она; база данных хранит и сравнивает), мера сходства и контраст с поиском по ключевым словам — с примером, где нет общих слов.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-trees">
+    <div class="exam-q" lang="en">
+      <p>Why do vector databases not rely on K-D trees or R-trees to find the nearest neighbours of embedding vectors? What do they use instead, and at what price?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>A K-D tree is a binary tree whose nodes split the space with axis-aligned hyperplanes at the median, cycling through the dimensions. Its search costs O(log n) only under the hypothesis n ≫ 2^k, where k is the dimensionality; embeddings have hundreds of dimensions (2^384 ≈ 3.9 × 10^115), so the hypothesis never holds, and a nearest-neighbour search must examine most of the tree: "the efficiency is no better than exhaustive search". An R-tree groups nearby objects into minimum bounding rectangles and skips every subtree whose rectangle the query does not intersect; in high dimension the rectangles overlap and cover much empty space, so little can be skipped. This is the curse of dimensionality. Vector databases therefore use Approximate Nearest Neighbor algorithms — LSH, HNSW, IVFPQ — which are much faster but may miss the true nearest neighbour: they sacrifice a small amount of accuracy for speed.</p></div>
+      <div class="exam-note"><p>Полный ответ называет гипотезу \(n \gg 2^k\) и её смысл, фразу "curse of dimensionality" и компромисс ANN. Если назвать правило отсечения R-дерева, видно, что ты понимаешь, что именно перестаёт работать.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-hnsw-ivfpq">
+    <div class="exam-q" lang="en">
+      <p>Compare HNSW and IVFPQ: how each organizes the vectors, how a query is answered, and what each trades for speed.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>HNSW builds a navigable small-world graph in which every vector is a node linked to its near neighbours, organized in layers, each with fewer nodes than the layer below; layer 0 contains all the vectors. The top layer of a new vector is chosen at random, and the vector is linked to its closest neighbours in that layer and in the layers below. A query starts at the entry point in the top layer, moves greedily to the linked node closest to the query, and descends a layer whenever no neighbour is closer, until layer 0. It needs few comparisons but stores the full vectors plus the links, and the result is approximate. IVFPQ first partitions the space with k-means (coarse quantization): every vector is filed in the inverted list of its nearest coarse centroid. Product quantization then compresses each vector by cutting it into sub-vectors and replacing each with the id of its nearest centroid in a small codebook. A query first finds the nearest centroids and searches only those clusters (coarse search), then compares itself with the compressed codes inside them (refined search). It is memory-efficient and fast but approximate twice, since the true neighbour may sit in a cluster that was not searched and distances computed on codes are estimates; its accuracy is tuned through the number of clusters searched and the precision of the quantization.</p></div>
+      <div class="exam-note"><p>Хороший ответ ведёт два индекса параллельно — структура, поиск, компромисс. И обходит два промаха слайдов: верхние слои HNSW случайны, а не "representative points", и HNSW быстрый, а не компактный.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l27-exam-which-db">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise in the style of the past papers' "Which DB technology" table.</b> Consider the ER model of a system tracking Formula 1 races (the scenario of the Exam of 11 Feb 2025): Person (Personal_ID, Name, Surname, Birth_Date, Gender) with the subtypes Spectator (Favourite_Team), Team Member and Team Owner (Total_Assets, Biography (Textual)), an ISA hierarchy (T, E); Team Member has the subtypes Engineer and Mechanic (Role_Description (Textual)) and Pilot (Championships_Won, Career (Textual)), an ISA hierarchy (P, E); Team, Race, Track and Ticket complete the model.</p>
+      <p>The organizers want a "find similar pilots" feature: given a free-text description such as "a young driver who wins on wet tracks", return the pilots whose career is most similar in meaning, even when it uses different words. Which DB technology would be the best to store the entities and attributes involved? Fill in one row of the table ENTITIES / REL. · DB TYPE · MOTIVATION, and say what is stored for each pilot.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <div class="scroll-x">
+          <table class="tbl">
+            <thead><tr><th>ENTITIES / REL.</th><th>DB TYPE</th><th>MOTIVATION</th></tr></thead>
+            <tbody>
+              <tr><td>Pilot (Career), and in the same way Team Owner (Biography), Engineer and Mechanic (Role_Description)</td><td>Vector database (e.g. Milvus / Zilliz)</td><td>The textual attributes are converted by an embedding model into dense vectors that capture their meaning; the database indexes them (e.g. with HNSW) and returns the k vectors most similar to the embedded description, by cosine similarity: semantic search beyond keyword matching.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For each pilot: Personal_ID, Name and Championships_Won as scalar fields (to identify and filter the results), the Career text or a reference to it, and the embedding of the Career (for example 384 numbers with all-MiniLM-L6-v2). The description in the query is embedded with the same model.</p>
+      </div>
+      <div class="exam-note"><p>Упражнение наше; сама таблица стоит 1 балл на экзаменах 6 Jun 2024, 24 Jun 2024, 6 Sep 2024, 21 Jan 2025 и 13 Jun 2025 (на последнем в шапке напечатано "Jan. 21, 2025"). Хорошая строка называет одно семейство БД и даёт мотивацию, привязанную к данным или к запросу. Для текста настоящий выбор — ключевые слова против смысла: условие вроде "the career includes the words Champion and Car", задача по Elasticsearch с того же экзамена 11 Feb 2025, — это работа для поискового движка; «похожий по смыслу» — для векторной базы данных.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l27-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Запрос \(q = (1, 0)\) и два сохранённых вектора: \(a = (2, 0)\), вдвое длиннее \(q\) и в том же направлении, и \(b = (0.87, 0.5)\), длины 1 и под углом 30°. Какая метрика ставит \(b\) выше \(a\)?</p>
+    <ul class="options">
+      <li>Косинусное сходство <span class="fb">Косинус для \(a\) равен 1 (то же направление), для \(b\) — 0.87: побеждает \(a\).</span></li>
+      <li data-correct>Евклидово расстояние <span class="fb">\(\norm{q - a} = 1\), но \(\norm{q - b} \approx 0.52\): конец \(b\) ближе.</span></li>
+      <li>Скалярное произведение <span class="fb">\(q\cdot a = 2\) и \(q\cdot b = 0.87\): побеждает более длинный вектор.</span></li>
+      <li>Все три <span class="fb">Косинус и скалярное произведение предпочитают \(a\); только евклидово расстояние смотрит, где находятся концы.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Все векторы коллекции нормализованы до длины 1. Какие утверждения теперь верны? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Скалярное произведение двух векторов равно их косинусному сходству <span class="fb">Знаменатель \(\norm{A}\,\norm{B}\) равен 1.</span></li>
+      <li>Евклидово расстояние равно \(1 - \cos\theta\) <span class="fb">Оно равно \(\sqrt{2 - 2\cos\theta}\); \(1 - \cos\theta\) — это косинусное расстояние, другое число с тем же порядком.</span></li>
+      <li data-correct>Сортировка по евклидову расстоянию даёт тот же порядок, что и сортировка по косинусному сходству <span class="fb">Расстояние — убывающая функция косинуса.</span></li>
+      <li>У каждой пары векторов теперь косинусное сходство 1 <span class="fb">Нормализация меняет длины, а не направления: углы и их косинусы остаются прежними.</span></li>
+    </ul>
+    <p class="q-fb">Вот почему косинусный поиск может работать на индексе по скалярному произведению: сначала нормализуй.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">K-D дерево построено над \(10^9\) векторами-эмбеддингами размерности 384. Что говорит тебе гипотеза из лекции про K-D деревья?</p>
+    <ul class="options">
+      <li>Поиск занимает около \(\log_2 10^9 \approx 30\) шагов <span class="fb">Это стоимость при выполненной гипотезе, а здесь она не выполняется.</span></li>
+      <li>Если аккуратнее выбирать медиану, дерево станет эффективным <span class="fb">Медиана и так балансирует дерево; проблема в числе измерений, а не в разрезах.</span></li>
+      <li>K-D деревья работают только до 3 измерений <span class="fb">Они работают для любого \(k\), пока \(n \gg 2^k\): для \(k = 10\) хватит нескольких сотен тысяч точек.</span></li>
+      <li data-correct>\(n \gg 2^k\) не выполняется с огромным запасом, так что поиск деградирует до проверки большинства точек <span class="fb">\(2^{384} \approx 3.9 \times 10^{115}\) против \(10^9\) векторов: "no better than exhaustive search".</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Из каких узлов состоит верхний слой индекса HNSW?</p>
+    <ul class="options">
+      <li>Из самых представительных точек, выбранных хабами <span class="fb">Это формулировка со слайда (p. 668), исправленная красной ручкой: их никто не выбирает.</span></li>
+      <li>Из центроидов кластеризации k-means <span class="fb">Центроиды — это IVF; слои HNSW содержат настоящие векторы.</span></li>
+      <li data-correct>Из векторов, чей случайно выпавший уровень дотянулся до этого слоя <span class="fb">"the algorithm randomly selects a level in the hierarchy" (p. 670): верхние слои — редеющая случайная выборка.</span></li>
+      <li>Из первых вставленных векторов <span class="fb">Точка входа меняется всякий раз, когда новому вектору выпадает уровень выше текущего верхнего.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Индекс IVF опрашивается с nprobe = 1, и запрос лежит близко к границе своей ячейки. Что может случиться?</p>
+    <ul class="options">
+      <li data-correct>Настоящий ближайший сосед лежит в соседней ячейке, ни разу не сравнивается, и возвращается более далёкий вектор <span class="fb">Запрос B в виджете: 2-й по близости после 32 расстояний; nprobe = 2 находит настоящего.</span></li>
+      <li>Поиск падает с ошибкой <span class="fb">Он всегда что-то возвращает: ближайший среди векторов, которые он сравнил.</span></li>
+      <li>Индекс автоматически открывает все ячейки <span class="fb">Он открывает ровно nprobe ячеек; поднять nprobe — твоё решение.</span></li>
+      <li>Ничего не может пойти не так: ячейка k-means всегда содержит ближайшего соседа своего запроса <span class="fb">Ячейки строятся по сохранённым векторам, а не вокруг запросов; у границы ближайший сосед может оказаться по другую сторону.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">128-мерный вектор из 4-байтовых чисел продуктово квантуется в 4 подвектора, каждый кодируется кодовой книгой из 256 центроидов. Сколько занимает его код и что теряется?</p>
+    <ul class="options">
+      <li>4 байта; ничего не теряется <span class="fb">Размер правильный, но "the reconstructed vector is not identical to the original vector" (p. 674).</span></li>
+      <li data-correct>4 байта; декодированный вектор лишь приближает исходный <span class="fb">Один байт на подвектор (256 значений) против 512 байт: в 128 раз меньше и с потерями.</span></li>
+      <li>128 байт; ничего не теряется <span class="fb">128 — это число измерений; каждый подвектор сжимается до одного байта.</span></li>
+      <li>32 байта; теряется порядок подвекторов <span class="fb">32 — это длина подвектора; порядок кодов сохраняется.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">CRC16 в Redis Cluster раскидывает ключи по 16384 слотам. Хеш, чувствительный к локальности (locality-sensitive hash), напротив, …</p>
+    <ul class="options">
+      <li>раскидывает похожие объекты по разным бакетам, чтобы сбалансировать нагрузку <span class="fb">Так делает обычный хеш; LSH нарочно делает наоборот.</span></li>
+      <li>кладёт каждый объект в собственный бакет <span class="fb">"The number of buckets is much smaller than the universe of possible input items" (p. 667).</span></li>
+      <li>это криптографический хеш, чтобы два объекта никогда не делили бакет <span class="fb">Криптографические хеши избегают коллизий; LSH хочет их для похожих объектов.</span></li>
+      <li data-correct>с высокой вероятностью кладёт похожие объекты в один бакет: его коллизии желанны <span class="fb">"hash collisions are maximized, not minimized" (p. 667); дальше запрос сравнивает только объекты своего бакета.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l27-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Векторная база данных хранит данные как высокоразмерные векторы и ищет по сходству, а не только по ключевым словам (p. 645); Neo4j, Cassandra, Elasticsearch, MongoDB и Redis — все поддерживают векторный поиск (p. 644).</li>
+    <li>Модель эмбеддингов — энкодер вроде BERT, CNN, ViT или CLIP, обученный через metric learning, — превращает данные в плотные векторы так, чтобы похожие объекты были рядом; ты решаешь, что значит «похожий» и за сколько измерений платить (pp. 1684–1695).</li>
+    <li>Косинусное сходство сравнивает направления (1 — похожи, 0 — ортогональны, −1 — противоположны), евклидово расстояние сравнивает положения, скалярное произведение смешивает направление и длину; на единичных векторах все три ранжируют одинаково, раз \(\norm{A-B}^2 = 2 - 2\cos\theta\). Для сходства лучшее совпадение — наибольшее значение: 0.764 на слайде (p. 656).</li>
+    <li>Точный поиск стоит \(n \cdot d\) на запрос. K-D деревья (разрезы по медиане, измерения по кругу) дают O(log n), только если \(n \gg 2^k\), где \(k\) — число измерений; R-деревья отсекают по минимальным ограничивающим прямоугольникам; оба не справляются в высокой размерности — проклятие размерности (p. 665).</li>
+    <li>ANN-алгоритмы меняют немного точности на скорость: LSH заставляет похожие объекты сталкиваться в одном бакете; HNSW жадно спускается по слоям навигируемых графов «тесного мира» со случайными уровнями; IVFPQ ищет только в ячейках k-means, ближайших к запросу, и сравнивает сжатые коды продуктового квантования.</li>
+    <li>Знай формулировки слайдов и их исправления: лучшее совпадение в таблице "Distance Calculation" — наибольший косинус; верхний слой HNSW — случайная выборка, а не "representative points"; HNSW быстрый, но не экономный по памяти; ADC в IVFADC — это Asymmetric Distance Computation, тот же метод, что IVFPQ.</li>
+  </ul>
+  <aside class="cheat" id="l27-cheat">
+    <dl>
+      <dt>Vector database (p. 645)</dt><dd>хранит данные как высокоразмерные векторные представления; контекстный поиск сверх совпадения ключевых слов</dd>
+      <dt>Embedding (p. 1684)</dt><dd>данные → плотный числовой вектор, передающий их семантику, его строит модель эмбеддингов; похожие объекты рядом (p. 1687)</dd>
+      <dt>Encoders (pp. 1690–1695)</dt><dd>BERT (текст) · CNN, ViT (картинки) · CLIP (текст и картинки в одном пространстве); обучаются через metric learning</dd>
+      <dt>Pipeline (p. 1691)</dt><dd>эмбеддинг → хранение в векторной БД → semantic search, RAG, classification, clustering, recommendations</dd>
+      <dt>Inner product</dt><dd>\(A\cdot B = \sum_i A_i B_i\)</dd>
+      <dt>Cosine similarity</dt><dd>\(\cos\theta = \frac{A\cdot B}{\norm{A}\,\norm{B}}\) в [−1, 1]: 1 похожи · 0 ортогональны · −1 противоположны</dd>
+      <dt>Euclidean distance</dt><dd>\(\norm{A-B} = \sqrt{\sum_i (A_i - B_i)^2}\)</dd>
+      <dt>Единичные векторы</dt><dd>\(\norm{A-B}^2 = 2 - 2\cos\theta\) и \(A\cdot B = \cos\theta\): одинаковое ранжирование</dd>
+      <dt>Косинус на примере</dt><dd>(2, 1) и (0, 2): 2 / (√5 · 2) ≈ 0.447, около 63°</dd>
+      <dt>Brute force</dt><dd>\(n \cdot d\) умножений на запрос</dd>
+      <dt>K-D tree (1975)</dt><dd>двоичное дерево, разрезы по медиане параллельно осям, измерения по кругу; O(log n), если \(n \gg 2^k\) (\(k\) = число измерений)</dd>
+      <dt>R-tree (1984)</dt><dd>минимальные ограничивающие прямоугольники; запрос, не задевший прямоугольник, пропускает поддерево; сбалансированные страницы, минимальное заполнение ≈ 40 %; M-деревья используют сферы</dd>
+      <dt>ANN</dt><dd>approximate nearest neighbour: гораздо быстрее, может пропустить настоящего ближайшего; качество = recall</dd>
+      <dt>LSH</dt><dd>похожие объекты → тот же бакет с высокой вероятностью; коллизии максимизируются</dd>
+      <dt>HNSW</dt><dd>слои навигируемых графов «тесного мира»; жадно от точки входа наверху вниз до слоя 0; случайный уровень для каждого нового вектора; быстрый, прожорливый по памяти</dd>
+      <dt>IVFPQ</dt><dd>coarse quantization (ячейки k-means, inverted file) + product quantization (подвекторы → номера в codebook); сначала coarse search, потом refined search; nprobe ячеек</dd>
+      <dt>Размер PQ</dt><dd>128 float = 512 байт → 4 подвектора × 1 байт = 4 байта; декодированный ≠ исходный</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l27-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://developers.google.com/machine-learning/crash-course/embeddings/embedding-space" target="_blank" rel="noopener">Embeddings: embedding space and static embeddings</a>
+      <span class="res-by">Google Machine Learning Crash Course</span><span class="res-dur">10 мин</span>
+      <p class="res-why">Страница, на которую занятие ссылается (p. 1688): пример с едой в одном, двух и трёх измерениях, с короткими упражнениями для самопроверки.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.pinecone.io/learn/vector-similarity/" target="_blank" rel="noopener">Vector Similarity Explained</a>
+      <span class="res-by">Pinecone</span>
+      <p class="res-why">Евклидово расстояние, скалярное произведение и косинус рядом, с правилом, которое слайды опускают: используй ту метрику, на которой обучали твою модель эмбеддингов. Читай рядом с разделом 3.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://hnsw-visualizer.divakarnaidumahanthi.workers.dev/" target="_blank" rel="noopener">HNSW Explorer</a>
+      <span class="res-by">визуализатор статьи про HNSW с открытым кодом</span>
+      <p class="res-why">Вставляй точки и смотри, в какой слой попадает каждая, потом пройди поиск по шагам и посчитай его вычисления расстояний — виджет из раздела 5, где открыт каждый параметр.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=QvKMwLjdK-s" target="_blank" rel="noopener">HNSW for Vector Search Explained and Implemented with Faiss</a>
+      <span class="res-by">James Briggs</span><span class="res-dur">35 мин</span>
+      <p class="res-why">Видео, на которое ссылается слайд (p. 666): сначала слоистый граф, потом реализация, в которой M и ef двигают полноту и скорость на реальных данных.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.pinecone.io/learn/series/faiss/vector-indexes/" target="_blank" rel="noopener">Nearest Neighbor Indexes for Similarity Search</a>
+      <span class="res-by">Pinecone, «Faiss: The Missing Manual»</span>
+      <p class="res-why">Flat, LSH, HNSW и IVF, измеренные на одних и тех же данных, — полнота, время запроса и память, — то есть табл. 2 с числами, и доказательство того, что HNSW — самый большой индекс.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Теперь ты знаешь, как векторная база данных находит соседей. Кто упаковывает эти индексы — FAISS, библиотека; Pinecone, управляемый сервис; Milvus, база данных с коллекциями и фильтрами, — и что спрашивал о них экзамен в трёх пустых строчках вызова <code>client.search</code>?</p>
+</aside>
+
+</main>
+</body>
+</html>

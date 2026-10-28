@@ -1,0 +1,1280 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spark SQL, Catalyst и колоночные форматы файлов · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l40">
+
+<header class="lesson-head">
+  <h1>Spark SQL, Catalyst и колоночные форматы файлов</h1>
+  <p class="lede">После этого урока ты сможешь провести DataFrame-запрос через четыре фазы Catalyst, сказать, какие байты Parquet-файла он прочитает и почему, и объяснить, откуда берётся скорость Spark SQL.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>В статье, по которой построен график (p. 1287), две программы на Spark считают одно и то же: среднее одного столбца для каждого значения другого, по миллиарду пар чисел, на тех же пяти рабочих машинах. Обе написаны на Python. Одна отдаёт работу <code>map</code> и <code>reduceByKey</code> в виде лямбд; другая — одна строка, <code>df.groupBy("a").avg("b")</code>. На графике лямбдам нужно около 180 секунд, а однострочнику — около 15: в двенадцать раз меньше.</p>
+  <p>Тот же язык, те же данные, тот же кластер. Что Spark знает об однострочнике такого, чего он не может знать о лямбдах? К концу урока у тебя будет три ответа, и один из них вообще не в Spark, а в файле на диске.</p>
+</div>
+
+<section id="l40-more">
+  <h2>Spark SQL — это больше, чем SQL</h2>
+
+  <p>Титульный слайд говорит это пятью словами: Spark SQL "is about more than SQL" (p. 1262). Причины — на следующем слайде (p. 1263). Работа с большими данными должна "perform ETL to and from various (semi- or unstructured) data sources" (делать ETL из самых разных полу- и неструктурированных источников и обратно) и "perform advanced analytics (e.g. machine learning, graph processing) that are hard to express in relational systems" (то есть аналитику, которую трудно выразить в реляционных системах). Ответ: "a DataFrame API that can perform relational operations on both external data sources and Spark's built-in RDDs" плюс "a highly extensible optimizer, Catalyst".</p>
+
+  <p>Дальше (p. 1264) это превращается в три обещания <mark class="key">декларативной (declarative)</mark> обработки больших данных: <b>write less code</b> — меньше кода, <b>read less data</b> — меньше читаемых данных, <b>let the optimizer do the hard work</b> — тяжёлую работу пусть делает оптимизатор. Ты говоришь, <em>что</em> хочешь получить; Spark решает, <em>как</em>. Урок идёт вслед за данными: твой код, оптимизатор, файл.</p>
+
+  <h3>Write less code: одно среднее, четыре диалекта</h3>
+
+  <aside class="margin-note">На слайде (p. 1265) Hadoop-маппер пишет каждое значение под ключом 1: он усредняет весь файл, а строки Spark — по каждому ключу.</aside>
+
+  <p>На слайде (p. 1265) среднее считается примерно в тридцати строках Java для Hadoop и в пяти — на Spark; следующий слайд (p. 1266) пишет средний возраст по имени на четырёх диалектах: RDD, SQL, Pig и DataFrame. Возьмём <code>people(name, age)</code>: Ann 30, Bob 20, Ann 40, Cid 10. (<code>sqlCtx</code> со слайдов — это сегодняшний объект сессии <code>spark</code>.)</p>
+
+<pre><code>from pyspark.sql import functions as F
+# one row per name: Ann 35.0, Bob 20.0, Cid 10.0
+spark.table("people").groupBy("name").agg(F.avg("age")).show()</code></pre>
+
+  <aside class="redpen" data-page="1266">
+    <p class="claim">Using DataFrames: <code>sqlCtx.table("people") \ .groupBy("name") \ .agg("name", avg("age")) \ .collect()</code></p>
+    <p class="fix">Передавай только агрегат: <code>.groupBy("name").agg(F.avg("age"))</code>. Столбец группировки вернётся сам.</p>
+    <p class="because"><code>agg</code> принимает выражения над столбцами, а не имя столбца перед ними: на PySpark 4.2 строка со слайда падает с <code>AssertionError: all exprs should be Column</code>, а исправленная возвращает name и avg(age). На экзамене строку могут процитировать как напечатано: узнай её, а в ответе на SparkQL пиши исправленный вариант.</p>
+  </aside>
+
+  <p>RDD-версия со слайда (p. 1266) носит ингредиенты среднего вручную:</p>
+
+<pre><code># the same averages with RDDs: carry (sum, count) pairs yourself
+(sc.textFile("people.tsv")
+   .map(lambda line: line.split("\t"))
+   .map(lambda x: (x[0], [int(x[1]), 1]))
+   .reduceByKey(lambda x, y: [x[0] + y[0], x[1] + y[1]])
+   .map(lambda x: [x[0], x[1][0] / x[1][1]])
+   .collect())</code></pre>
+
+  <aside class="margin-note">Средние не сливаются: среднее 10 и 20 — это 15, среднее 15 и 60 — 37.5, а среднее 10, 20 и 60 — 30.</aside>
+
+  <p>Зачем <code>[int(x[1]), 1]</code>? <code>reduceByKey</code> объединяет частичные результаты в любом порядке и на любой машине, как combiner из <a href="l30.html">урока 30</a>. Средние так объединять нельзя, а пары (сумма, количество) — можно, и последний <code>map</code> делит одно на другое:</p>
+  \[ \begin{aligned} &amp;(s_1, c_1) \oplus (s_2, c_2) \\ &amp;\quad = (s_1 + s_2,\ c_1 + c_2) \end{aligned} \]
+  <p>DataFrame просто говорит <code>avg</code>, а всю эту механику Spark подставляет сам. (<code>sc.textFile(...).split("\t")</code> со слайда упал бы: у RDD нет <code>split</code>, поэтому каждую строку разбивают внутри <code>map</code>.)</p>
+
+  <h3>Один движок, два входа</h3>
+
+  <p>Spark SQL — "part of the core distribution since Spark 1.0", и он "runs SQL / HiveQL queries, optionally alongside or replacing existing Hive deployments" (выполняет SQL/HiveQL-запросы рядом с существующими установками Hive или вместо них) (p. 1270). Где он находится, показывает слайд (p. 1272).</p>
+
+  <figure class="fig fig--plain" id="l40-fig-interface">
+    <svg class="dia" viewBox="0 0 560 310" role="img" aria-label="Три слоя. Сверху JDBC, консоль и пользовательские программы на Java, Scala и Python отправляют свои запросы в Spark SQL, где находятся DataFrame API и оптимизатор Catalyst. Spark SQL работает поверх Spark и его resilient distributed datasets. Пунктирная стрелка показывает, что пользовательские программы могут вызывать Spark и напрямую.">
+      <line x1="75" y1="74" x2="75" y2="113" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="210" y1="74" x2="210" y2="113" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="350" y1="74" x2="350" y2="121" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="505" y1="74" x2="505" y2="219" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+      <line x1="240" y1="204" x2="240" y2="219" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="20" y="14" width="110" height="60" rx="4" class="fi-paper sw-2"/>
+      <rect x="150" y="14" width="120" height="60" rx="4" class="fi-paper sw-2"/>
+      <rect x="290" y="14" width="250" height="60" rx="4" class="fi-paper sw-2"/>
+      <text x="75" y="50" class="tx-mid">JDBC</text>
+      <text x="210" y="50" class="tx-mid">Console</text>
+      <text x="415" y="40" class="tx-mid">User programs</text>
+      <text x="415" y="63" class="tx-mid tx-sm">Java, Scala, Python</text>
+      <rect x="20" y="116" width="440" height="88" rx="4" class="fi-paper sw-2"/>
+      <text x="34" y="146" class="tx-bold">Spark SQL</text>
+      <rect x="240" y="124" width="206" height="32" rx="4" class="fi-paper"/>
+      <text x="343" y="146" class="tx-mid">DataFrame API</text>
+      <rect x="34" y="164" width="412" height="32" rx="4" class="fi-paper"/>
+      <text x="240" y="186" class="tx-mid">Catalyst optimizer</text>
+      <rect x="20" y="222" width="520" height="78" rx="4" class="fi-paper sw-2"/>
+      <text x="34" y="248" class="tx-bold">Spark</text>
+      <rect x="34" y="258" width="492" height="32" rx="4" class="fw-s1 st-s1"/>
+      <text x="280" y="280" class="tx-mid">Resilient Distributed Datasets</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Программный интерфейс со слайда (p. 1272). JDBC-клиенты, консоль и пользовательские программы отправляют свои запросы (оранжевые) в Spark SQL, где SQL-строки и вызовы DataFrame попадают в один и тот же оптимизатор Catalyst; то, что выходит из него, выполняется на RDD Spark. Пунктирная стрелка: программа по-прежнему может вызывать RDD напрямую.</figcaption>
+  </figure>
+
+  <p>Слайд представляет Spark SQL как "Originally called Shark" с тремя ограничениями (p. 1271): он "can only be used to query external data in Hive catalog → limited data sources", "can only be invoked via SQL string from Spark → error prone", а его "Hive optimizer tailored for MapReduce → difficult to extend". Прочитай их наоборот — и получишь устройство Spark SQL: любой источник и родные RDD, DataFrame API, новый оптимизатор.</p>
+
+  <div class="pitfall">
+    <p>«Spark SQL умеет запрашивать только таблицы Hive». Это было ограничение Shark. Строго говоря, Shark был проектом-предшественником — Hive поверх Spark, — и в июле 2014 года его остановили в пользу Spark SQL (контекст, не со слайдов).</p>
+  </div>
+
+  <h3>Что есть у программы и нет у SQL-строки</h3>
+
+  <p>Слайд (p. 1273) перечисляет "Advantages over Relational Query Languages": "Holistic optimization across functions composed in different languages", "Control structures (e.g. if, for)" и "Logical plan analyzed eagerly → identify code errors associated with data schema issues on the fly". Выполнение ленивое (lazy), а анализ — немедленный (eager): на таблице <code>sales(region, amount)</code> строка <code>sales.select("col")</code> падает сразу, ещё до чтения каких-либо данных, с <code>... `col` cannot be resolved. Did you mean one of the following? [`amount`, `region`]</code> (Spark 4.2, проверено запуском).</p>
+
+  <p>Spark SQL запрашивает и твои собственные объекты (p. 1274): он умеет "infer column names and types directly from data objects (via reflection in Java and Scala and data sampling in Python, which is dynamically typed)" — выводить имена и типы столбцов прямо из объектов, — читает их "in-place" и позволяет "combine RDDs with external structured data", причём "hot columns cached in memory".</p>
+
+  <p>Внутри полноценного языка программирования <mark class="key">пользовательской функции (user-defined function)</mark>, UDF, не нужна никакая упаковка: Spark SQL "allows inline registration of UDFs", тогда как Pig "requires the UDF to be written in a Java package", а зарегистрированная UDF "available to other interfaces" (p. 1275) — слайд регистрирует обученную модель как <code>predict</code> и вызывает <code>SELECT predict(age, weight) FROM users</code>. Ещё один слайд (p. 1269) добавляет композицию: <code>add_demographics</code> принимает DataFrame и возвращает DataFrame. В рабочем виде, вместе с вызывающим кодом со слайда (p. 1281):</p>
+
+<pre><code>from pyspark.sql import functions as F
+from pyspark.sql.types import StringType
+
+zipToCity = F.udf(lambda z: "Melbourne" if z.startswith("3")
+                            else "Other", StringType())
+
+def add_demographics(events):
+    u = spark.table("users")
+    return (events.join(u, events.user_id == u.user_id)
+                  .withColumn("city", zipToCity(u.zip)))
+
+# the timestamps of the events of users living in Melbourne
+events = add_demographics(spark.read.parquet("/data/events"))
+training_data = (events.where(events.city == "Melbourne")
+                       .select(events.timestamp)
+                       .collect())</code></pre>
+
+  <aside class="redpen" data-page="1269">
+    <p class="claim"><code>events \ .join(u, events.user_id == u.user_id) \ .withColumn("city", zipToCity(df.zip))</code> — "Takes and returns a DataFrame"</p>
+    <p class="fix">Бери почтовый индекс из таблицы пользователей, <code>zipToCity(u.zip)</code>, и возвращай цепочку через <code>return</code>.</p>
+    <p class="because"><code>df</code> нигде не определён, поэтому Python падает с <code>NameError</code>; а функция без <code>return</code> возвращает <code>None</code>, а не DataFrame, который обещает слайд. На другом слайде (p. 1281) эти строки повторяются, и экзамен может процитировать их как напечатано: знай обе версии.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">Spark SQL — это один структурированный API и один оптимизатор за SQL-строками и DataFrame-кодом одновременно, а выполняется всё как операции над RDD.</mark></p>
+</section>
+
+<section id="l40-catalyst">
+  <h2>Let the optimizer do the hard work: Catalyst</h2>
+
+  <p>Лямбда — чёрный ящик: Spark может её вызвать, но не может заглянуть внутрь. DataFrame-запрос хранится как <mark class="key">дерево (tree)</mark> объектов-узлов. Выражение <code>x + (1 + 2)</code> — это <code>Add(Attribute(x), Add(Literal(1), Literal(2)))</code>, а <mark class="key">правило (rule)</mark> — функция, которая находит в дереве шаблон и заменяет его (p. 1276):</p>
+
+<pre><code>tree.transform {
+  case Add(Literal(c1), Literal(c2)) => Literal(c1+c2)
+}</code></pre>
+
+  <figure class="fig fig--pair fig--plain" id="l40-fig-fold">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 226" role="img" aria-label="До: дерево x плюс (1 плюс 2). У корня Add дети Attribute(x) и второй Add, у которого дети Literal(1) и Literal(2). Второй Add с двумя литералами выделен: с ним совпадает правило.">
+        <rect x="124" y="78" width="172" height="118" rx="10" class="fw-key st-none"/>
+        <line x1="150" y1="44" x2="60" y2="88"/>
+        <line x1="150" y1="44" x2="215" y2="88"/>
+        <line x1="215" y1="116" x2="170" y2="156"/>
+        <line x1="215" y1="116" x2="256" y2="156"/>
+        <rect x="115" y="16" width="70" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="150" y="35" class="tx-mid">Add</text>
+        <rect x="10" y="88" width="100" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="60" y="107" class="tx-mid tx-mono">Attribute(x)</text>
+        <rect x="185" y="88" width="60" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="215" y="107" class="tx-mid">Add</text>
+        <rect x="130" y="156" width="80" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="170" y="175" class="tx-mid tx-mono">Literal(1)</text>
+        <rect x="216" y="156" width="80" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="256" y="175" class="tx-mid tx-mono">Literal(2)</text>
+        <text x="150" y="218" class="tx-mid tx-mono">x + (1 + 2)</text>
+      </svg>
+      <p class="fig-label">До: правило совпадает с выделенным поддеревом</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 226" role="img" aria-label="После: дерево x плюс 3. У корня Add дети Attribute(x) и Literal(3); Literal(3) выделен как узел, который заменил совпавшее поддерево.">
+        <rect x="182" y="104" width="96" height="40" rx="10" class="fw-key st-none"/>
+        <line x1="150" y1="58" x2="70" y2="110"/>
+        <line x1="150" y1="58" x2="230" y2="110"/>
+        <rect x="115" y="30" width="70" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="150" y="49" class="tx-mid">Add</text>
+        <rect x="20" y="110" width="100" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="70" y="129" class="tx-mid tx-mono">Attribute(x)</text>
+        <rect x="190" y="110" width="80" height="28" rx="6" class="fi-paper sw-2"/>
+        <text x="230" y="129" class="tx-mid tx-mono">Literal(3)</text>
+        <text x="236" y="178" class="tx-mid tx-hand">уже свёрнуто</text>
+        <text x="150" y="218" class="tx-mid tx-mono">x + 3</text>
+      </svg>
+      <p class="fig-label">После: один литерал, вычисленный до чтения первой строки</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Свёртка констант (constant folding) как правило Catalyst (p. 1276). <code>case Add(Literal(c1), Literal(c2))</code> совпадает с выделенным поддеревом и заменяет его на <code>Literal(3)</code>; ветка с <code>Attribute(x)</code> не совпадает и остаётся как есть.</figcaption>
+  </figure>
+
+  <p>Правила (p. 1277) — это "pattern matching functions that transform subtrees into specific structures", то есть функции сопоставления с образцом, и при этом частичные функции: они "skip over subtrees that do not match → no need to modify existing rules when adding new types of operators" — именно поэтому Catalyst расширяем. Один <code>transform</code> может содержать несколько шаблонов; правила идут <em>батчами</em> (batches) и "may take multiple batches to reach a fixed point" — неподвижной точки, где ни одно правило уже не меняет дерево (одна перезапись может открыть дорогу следующей); и "transform can contain arbitrary Scala code".</p>
+
+  <h3>Четыре фазы: от запроса до RDD</h3>
+
+  <p>Слайд (p. 1278) — карта оптимизатора, и его подпись — тот самый факт, который надо запомнить: "DataFrames and SQL share the same optimization/execution pipeline".</p>
+
+  <figure class="fig fig--plain" id="l40-fig-pipeline">
+    <svg class="dia" viewBox="0 0 560 600" role="img" aria-label="Конвейер Catalyst сверху вниз. SQL AST или DataFrame становится неразрешённым логическим планом; анализ с помощью каталога делает из него логический план; логическая оптимизация — оптимизированный логический план; физическое планирование выдаёт несколько физических планов; модель стоимости выбирает один; генерация кода превращает выбранный физический план в RDD.">
+      <line x1="100" y1="44" x2="161" y2="68" marker-end="url(#arr)"/>
+      <line x1="240" y1="44" x2="179" y2="68" marker-end="url(#arr)"/>
+      <line x1="170" y1="104" x2="170" y2="160" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="150" y1="133" x2="166" y2="133" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+      <line x1="170" y1="196" x2="170" y2="252" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="170" y1="288" x2="170" y2="344" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="170" y1="392" x2="170" y2="412" marker-end="url(#arr)"/>
+      <line x1="170" y1="444" x2="170" y2="464" marker-end="url(#arr)"/>
+      <line x1="170" y1="500" x2="170" y2="556" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="40" y="10" width="120" height="34" rx="4" class="fi-paper"/>
+      <text x="100" y="33" class="tx-mid">SQL AST</text>
+      <rect x="180" y="10" width="120" height="34" rx="4" class="fi-paper"/>
+      <text x="240" y="33" class="tx-mid">DataFrame</text>
+      <text x="318" y="34" class="tx-hand">один конвейер для обоих</text>
+      <rect x="30" y="70" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="93" class="tx-mid">Unresolved logical plan</text>
+      <rect x="40" y="117" width="110" height="32" rx="4" class="fw-s3 st-s3"/>
+      <text x="95" y="139" class="tx-mid">Catalog</text>
+      <text x="184" y="127" class="tx-bold">Analysis</text>
+      <text x="184" y="147" class="tx-sm">имена → столбцы, типы</text>
+      <rect x="30" y="162" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="185" class="tx-mid">Logical plan</text>
+      <text x="184" y="219" class="tx-bold">Logical optimization</text>
+      <text x="184" y="239" class="tx-sm">правила · 800LOC</text>
+      <rect x="30" y="254" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="277" class="tx-mid">Optimized logical plan</text>
+      <text x="184" y="311" class="tx-bold">Physical planning</text>
+      <text x="184" y="331" class="tx-sm">один или несколько планов</text>
+      <rect x="42" y="356" width="280" height="34" rx="10" class="fi-paper"/>
+      <rect x="36" y="351" width="280" height="34" rx="10" class="fi-paper"/>
+      <rect x="30" y="346" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="369" class="tx-mid">Physical plans</text>
+      <rect x="110" y="414" width="120" height="30" rx="4" class="fi-paper sw-2"/>
+      <text x="170" y="434" class="tx-mid">Cost model</text>
+      <text x="246" y="434" class="tx-sm">единственный шаг по стоимости</text>
+      <rect x="30" y="466" width="280" height="34" rx="10" class="fi-paper sw-2"/>
+      <text x="170" y="489" class="tx-mid">Selected physical plan</text>
+      <text x="184" y="523" class="tx-bold">Code generation</text>
+      <text x="184" y="543" class="tx-sm">квазицитаты → байткод</text>
+      <rect x="110" y="558" width="120" height="32" rx="4" class="fw-s1 st-s1 sw-2"/>
+      <text x="170" y="580" class="tx-mid">RDDs</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Конвейер со слайда (p. 1278), нарисованный сверху вниз. SQL-строки и вызовы DataFrame входят одним путём; только физическое планирование обращается к модели стоимости, остальные фазы применяют правила.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn>Неразрешённый атрибут (unresolved attribute)</dfn> — атрибут, чей "type is not known or it's not matched to an input table" (тип неизвестен или который не сопоставлен ни с одной входной таблицей) (p. 1279).</p>
+  </div>
+
+  <aside class="margin-note">Перед каждым именем, которое ещё не разрешено, Spark печатает кавычку '.</aside>
+
+  <p><b>Анализ (analysis)</b> (p. 1279) превращает неразрешённый логический план в логический план. Для <code>SELECT col FROM sales</code> он должен "look up relations by name from the catalog" — найти отношения по имени в каталоге, "map named attributes to the input provided given operator's children", выдать "UID for references to the same value" и "propagate and coerce types through expressions (e.g. 1 + col)". Spark даёт за этим понаблюдать: для <code>SELECT amount + 1 FROM sales</code> разобранный план содержит <code>'amount</code> и <code>'UnresolvedRelation [sales]</code>, а проанализированный — <code>amount#32 + cast(1 as double)</code>: столбец с уникальным id и литерал, приведённый к нужному типу.</p>
+
+  <p><b>Логическая оптимизация (logical optimization)</b> (p. 1280) "applies standard rule-based optimization (constant folding, predicate-pushdown, projection pruning, null propagation, boolean expression simplification, etc)", и всё это в "800LOC". <mark class="key">Проталкивание предикатов (predicate pushdown)</mark> переносит фильтр как можно ближе к данным; <mark class="key">отсечение проекций (projection pruning)</mark> оставляет только столбцы, которые используются выше. Ещё один слайд (p. 1282) расписывает одно такое правило: "Find filters on top of projections", "Check that the filter can be evaluated without the result of the project", "If so, switch the operators".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l40-fig-pushdown">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 300" role="img" aria-label="Original plan, читать снизу: People, затем Project id и name, затем Filter id = 1, затем Project name. До фильтра доходит миллион строк, выходит из него одна.">
+        <line x1="130" y1="82" x2="130" y2="59" marker-end="url(#arr)"/>
+        <line x1="130" y1="150" x2="130" y2="127" marker-end="url(#arr)"/>
+        <line x1="130" y1="218" x2="130" y2="195" marker-end="url(#arr)"/>
+        <rect x="55" y="14" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="31" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="49" class="tx-mid tx-mono">name</text>
+        <rect x="55" y="82" width="150" height="42" rx="12" class="fw-s2 st-s2 sw-2"/>
+        <text x="130" y="99" class="tx-mid tx-bold">Filter</text>
+        <text x="130" y="117" class="tx-mid tx-mono">id = 1</text>
+        <rect x="55" y="150" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="167" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="185" class="tx-mid tx-mono">id, name</text>
+        <rect x="55" y="218" width="150" height="32" rx="12" class="fw-s1 st-s1 sw-2"/>
+        <text x="130" y="239" class="tx-mid">People</text>
+        <text x="140" y="75" class="tx-sm tx-muted">1 строка</text>
+        <text x="140" y="143" class="tx-sm tx-muted">1,000,000</text>
+        <text x="140" y="211" class="tx-sm tx-muted">1,000,000</text>
+        <text x="130" y="284" class="tx-mid tx-hand">фильтрует поздно</text>
+      </svg>
+      <p class="fig-label">Original plan</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 300" role="img" aria-label="Filter push-down, читать снизу: People, затем Filter id = 1, затем Project id и name, затем Project name. До фильтра доходит миллион строк; обе проекции обрабатывают одну строку.">
+        <line x1="130" y1="82" x2="130" y2="59" marker-end="url(#arr)"/>
+        <line x1="130" y1="150" x2="130" y2="127" marker-end="url(#arr)"/>
+        <line x1="130" y1="218" x2="130" y2="195" marker-end="url(#arr)"/>
+        <rect x="55" y="14" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="31" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="49" class="tx-mid tx-mono">name</text>
+        <rect x="55" y="82" width="150" height="42" rx="12" class="fi-paper sw-2"/>
+        <text x="130" y="99" class="tx-mid tx-bold">Project</text>
+        <text x="130" y="117" class="tx-mid tx-mono">id, name</text>
+        <rect x="55" y="150" width="150" height="42" rx="12" class="fw-s2 st-s2 sw-2"/>
+        <text x="130" y="167" class="tx-mid tx-bold">Filter</text>
+        <text x="130" y="185" class="tx-mid tx-mono">id = 1</text>
+        <rect x="55" y="218" width="150" height="32" rx="12" class="fw-s1 st-s1 sw-2"/>
+        <text x="130" y="239" class="tx-mid">People</text>
+        <text x="140" y="75" class="tx-sm tx-muted">1 строка</text>
+        <text x="140" y="143" class="tx-sm tx-muted">1 строка</text>
+        <text x="140" y="211" class="tx-sm tx-muted">1,000,000</text>
+        <text x="130" y="284" class="tx-mid tx-hand">фильтрует сразу</text>
+      </svg>
+      <p class="fig-label">Filter push-down</p>
+    </div>
+    <figcaption><b>Рис. 4.</b> Пример преобразования со слайда (p. 1282), читать снизу вверх. Фильтру нужен только <code>id</code>, который уже есть в People, поэтому он может поменяться местами с проекцией. Числа строк условные (таблица People из 1,000,000 строк, у одной из них id = 1): после перестановки проекция обрабатывает 1 строку вместо 1,000,000.</figcaption>
+  </figure>
+
+  <p>Spark 4.2 идёт дальше: в его оптимизированном плане внутренней проекции нет вовсе, а фильтр превращается в <code>isnotnull(id) AND (id = 1)</code> (проверено запуском).</p>
+
+  <p>Слайд (p. 1281) прогоняет пример через три плана (виджет их воспроизводит): <code>where</code> вызывающего кода стоит поверх join, написанного внутри <code>add_demographics</code>, и Catalyst всё равно опускает его вниз — та самая "holistic optimization across functions" (p. 1273).</p>
+
+  <div class="widget" id="l40-w-plan">
+    <h3 class="widget-title">Catalyst за работой: четыре плана одного запроса</h3>
+    <p class="widget-intro">Запрос со слайда (p. 1281) ("after the join, on users.city") с одним изменением: <code>users</code> хранит сам город, так что UDF не нужна (с питоновской UDF со слайда Spark опускает фильтр ниже join, но не может протолкнуть его в сканирование). Обе таблицы — Parquet-файлы: <code>events(user_id, timestamp, kind)</code> и <code>users(user_id, zip, city)</code>. Выбери, как записан фильтр, и пройди по шагам от неразрешённого плана до физического. Планы упрощены по сравнению с тем, что Spark 4.2 печатает для этого запроса. Условные размеры для счётчика строк: 1,000,000 событий, 10,000 пользователей; у 400 пользователей из Мельбурна 40,000 событий; 250,000 событий — клики.</p>
+    <ol class="tasks">
+      <li>Оставь «после join» и дойди до проанализированного плана. Прежде чем снова нажать «Дальше»: где окажется Filter и сколько строк выдаст join?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Ниже join, прямо над отношением users (и над ним появится новый Project, который оставляет только <code>user_id</code>): <code>city</code> — столбец users, поэтому Catalyst проверяет его до соединения. Теперь join строит 40,000 строк вместо 1,000,000. Ради этого вывода виджет и существует: оптимизатор двигает фильтр к данным, в каком бы порядке ты его ни написал.</p></details>
+      </li>
+      <li>Переключись на «до join» и сравни его оптимизированный и физический планы с планами варианта «после join».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Они совпадают, узел в узел. Неразрешённый и проанализированный планы двух запросов ещё различаются; начиная с оптимизированного плана Catalyst сделал их одинаковыми. Пиши фильтр там, где он лучше читается.</p></details>
+      </li>
+      <li>Выбери «после join, по events.kind» и дойди до физического плана. Какая сторона получает фильтр и сколько столбцов <code>users</code> читается?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Сторона events: <code>kind</code> — столбец events. Сканирование users читает только <code>user_id</code>, 1 столбец из 3, потому что выше join никому не нужны ни <code>zip</code>, ни <code>city</code>. Отсечение проекций работает для каждой таблицы и для каждого запроса отдельно.</p></details>
+      </li>
+      <li>В физическом плане фильтр протолкнут в сканирование Parquet, но над сканированием всё ещё нарисован узел Filter. Зачем оба?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Сканирование использует протолкнутый фильтр, чтобы пропускать целые row group, чья статистика его исключает (следующий раздел); строки тех row group, которые оно всё же читает, затем проверяются по одной. Протолкнутые фильтры — это помощь источнику, а не обещание.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l40-w-plan', function (root, ui) {
+    var variant = ui.select('фильтр, как ты его пишешь', [
+      { value: 'A', label: 'после join, по users.city' },
+      { value: 'B', label: 'до join, по users.city' },
+      { value: 'C', label: 'после join, по events.kind' }
+    ], null, 'A');
+    var stepper = ui.stepper({ steps: [
+      "1 · Unresolved logical plan: запрос, как он написан. Имена, помеченные ', ещё не привязаны к таблице. Spark печатает это как разобранный план SQL-строки; вызовы DataFrame анализируются сразу (p. 1273).",
+      "2 · Analysis: каталог сообщает, какие столбцы есть у events и users; каждый атрибут получает тип и уникальный id вроде #38. Для фильтра по city, написанного после join, это и есть \"Logical Plan\" (p. 1281).",
+      "3 · Logical optimization: фильтр опущен ниже join, к таблице, чей столбец он проверяет, а новые Project оставляют только столбцы, нужные выше (отсечённые зачёркнуты). Слайд (p. 1281) рисует эту стадию как свой \"Physical Plan\": фильтр ниже join, на стороне users.",
+      "4 · Physical planning: настоящие операторы. Сканирования Parquet читают только нужные столбцы и получают фильтр: это \"Physical Plan with Predicate Pushdown and Column Pruning\" (p. 1281) с двумя \"optimized\" сканированиями. Выбран broadcast hash join, потому что users маленькая."
+    ] });
+    var roWhere = ui.readout('где выполняется фильтр');
+    var roCols = ui.readout('прочитанные столбцы');
+    var roRows = ui.readout('строк выдаёт join (на условных размерах)');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'фильтр', color: 's2', mark: 'area' },
+      { label: 'таблица: relation или сканирование файла', color: 's1', mark: 'area' },
+      { label: 'перенесено оптимизатором', color: 'key', mark: 'area' },
+      { label: 'столбец, отсечённый pruning (зачёркнут)', color: 'muted', mark: 'line' }
+    ]);
+    var svg = ui.svg(560, 440, { label: 'План выбранного запроса в виде дерева с отступами, корень сверху: узлы Project, Join и Filter над двумя таблицами events и users. Дерево меняется, пока ты идёшь по шагам от неразрешённого плана к физическому.' });
+
+    var EV1 = '[user_id#37, timestamp#38, kind#39]', US1 = '[user_id#40, zip#41, city#42]';
+    var PLANS = {
+      '0A': [[0, "'Project", "['timestamp]"], [1, "'Filter", "('city = Melbourne)", 'f'], [2, "'Join Inner", "('user_id = 'user_id)"],
+             [3, "'UnresolvedRelation", '[events]', 's'], [3, "'UnresolvedRelation", '[users]', 's']],
+      '0B': [[0, "'Project", "['timestamp]"], [1, "'Join Inner", "('user_id = 'user_id)"], [2, "'UnresolvedRelation", '[events]', 's'],
+             [2, "'Filter", "('city = Melbourne)", 'f'], [3, "'UnresolvedRelation", '[users]', 's']],
+      '0C': [[0, "'Project", "['timestamp]"], [1, "'Filter", "('kind = click)", 'f'], [2, "'Join Inner", "('user_id = 'user_id)"],
+             [3, "'UnresolvedRelation", '[events]', 's'], [3, "'UnresolvedRelation", '[users]', 's']],
+      '1A': [[0, 'Project', '[timestamp#38]'], [1, 'Filter', '(city#42 = Melbourne)', 'f'], [2, 'Join Inner', '(user_id#37 = user_id#40)'],
+             [3, 'Relation events (parquet)', EV1, 's'], [3, 'Relation users (parquet)', US1, 's']],
+      '1B': [[0, 'Project', '[timestamp#38]'], [1, 'Join Inner', '(user_id#37 = user_id#40)'], [2, 'Relation events (parquet)', EV1, 's'],
+             [2, 'Filter', '(city#42 = Melbourne)', 'f'], [3, 'Relation users (parquet)', US1, 's']],
+      '1C': [[0, 'Project', '[timestamp#38]'], [1, 'Filter', '(kind#39 = click)', 'f'], [2, 'Join Inner', '(user_id#37 = user_id#40)'],
+             [3, 'Relation events (parquet)', EV1, 's'], [3, 'Relation users (parquet)', US1, 's']],
+      '2A': [[0, 'Project', '[timestamp#38]'], [1, 'Join Inner', '(user_id#37 = user_id#40)'], [2, 'Project', '[user_id#37, timestamp#38]'],
+             [3, 'Relation events (parquet)', '[user_id#37, timestamp#38, ~kind#39~]', 's'], [2, 'Project', '[user_id#40]'],
+             [3, 'Filter', '(city#42 = Melbourne)', 'f', null, true], [4, 'Relation users (parquet)', '[user_id#40, ~zip#41~, city#42]', 's']],
+      '2C': [[0, 'Project', '[timestamp#38]'], [1, 'Join Inner', '(user_id#37 = user_id#40)'], [2, 'Project', '[user_id#37, timestamp#38]'],
+             [3, 'Filter', '(kind#39 = click)', 'f', null, true], [4, 'Relation events (parquet)', EV1, 's'], [2, 'Project', '[user_id#40]'],
+             [3, 'Relation users (parquet)', '[user_id#40, ~zip#41, city#42~]', 's']],
+      '3A': [[0, 'Project', '[timestamp]'], [1, 'BroadcastHashJoin', 'user_id = user_id, users broadcast'],
+             [2, 'FileScan parquet [events]', 'читает: user_id, timestamp', 's', 'пропускает: kind'], [2, 'Project', '[user_id]'],
+             [3, 'Filter', '(city = Melbourne), построчно', 'f', null, true], [4, 'FileScan parquet [users]', 'читает: user_id, city', 's', 'протолкнут: city = Melbourne']],
+      '3C': [[0, 'Project', '[timestamp]'], [1, 'BroadcastHashJoin', 'user_id = user_id, users broadcast'], [2, 'Project', '[user_id, timestamp]'],
+             [3, 'Filter', '(kind = click), построчно', 'f', null, true], [4, 'FileScan parquet [events]', 'читает: user_id, timestamp, kind', 's', 'протолкнут: kind = click'],
+             [2, 'FileScan parquet [users]', 'читает: user_id', 's', 'пропускает: zip, city']]
+    };
+    function planOf(v, k) {
+      if (k >= 2 && v === 'B') {                       // optimised B = optimised A, but nothing was moved
+        return PLANS[k + 'A'].map(function (n) { return n.length > 5 ? n.slice(0, 5) : n; });
+      }
+      return PLANS[k + v] || PLANS[k + 'A'];
+    }
+    var CODE = {
+      A: 'events.join(users, events.user_id == users.user_id).where(users.city == "Melbourne").select(events.timestamp)',
+      B: 'melb = users.where(users.city == "Melbourne") ; events.join(melb, events.user_id == melb.user_id).select(events.timestamp)',
+      C: 'events.join(users, events.user_id == users.user_id).where(events.kind == "click").select(events.timestamp)'
+    };
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    function draw(list, k) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var y = 8, nodes = [];
+      list.forEach(function (n) {
+        var h = n[4] ? 70 : 52, x = 12 + n[0] * 26;
+        nodes.push({ d: n[0], x: x, y: y, h: h, n: n });
+        y += h + 10;
+      });
+      nodes.forEach(function (c, i) {
+        if (!c.d) return;
+        var j = i - 1;
+        while (j > 0 && nodes[j].d !== c.d - 1) j--;
+        var p = nodes[j], xl = p.x + 13, ym = c.y + c.h / 2;
+        S('path', { d: 'M' + xl + ' ' + (p.y + p.h) + ' V' + ym + ' H' + c.x, 'class': 'st-muted sw-2' });
+      });
+      nodes.forEach(function (c) {
+        var kind = c.n[3], cls = kind === 'f' ? 'fw-s2 st-s2 sw-2' : kind === 's' ? 'fw-s1 st-s1' : 'fi-paper';
+        if (c.n[5]) S('rect', { x: c.x - 5, y: c.y - 5, width: 558 - c.x, height: c.h + 10, rx: 10, 'class': 'fw-key st-none' });
+        S('rect', { x: c.x, y: c.y, width: 548 - c.x, height: c.h, rx: 6, 'class': cls + (k === 0 ? ' dash' : '') });
+        T(c.x + 12, c.y + 21, c.n[1], 'tx-bold');
+        var t = S('text', { x: c.x + 12, y: c.y + 41, 'class': 'tx-mono tx-sm' });
+        String(c.n[2]).split('~').forEach(function (seg, i) {        // ~…~ marks a column that projection pruning drops
+          if (seg) Course.svg('tspan', i % 2 ? { 'class': 'tx-muted', 'text-decoration': 'line-through', text: seg } : { text: seg }, t);
+        });
+        if (c.n[4]) T(c.x + 12, c.y + 60, c.n[4], 'tx-mono tx-sm');
+      });
+    }
+    function info(v, k) {
+      var opt = k >= 2, onEvents = v === 'C';
+      var where = !opt ? (v === 'B' ? 'ниже join, над users (как написано)' : 'над join (как написано)')
+        : k === 2 ? (onEvents ? 'ниже join, прямо над events' : 'ниже join, прямо над users')
+        : (onEvents ? 'протолкнут в сканирование events, затем построчно' : 'протолкнут в сканирование users, затем построчно');
+      var cols = k === 0 ? 'пока неизвестно: только имена'
+        : k === 1 ? 'events 3 из 3 · users 3 из 3'
+        : onEvents ? 'events 3 из 3 · users 1 из 3 (user_id)' : 'events 2 из 3 (без kind) · users 2 из 3 (без zip)';
+      var rows = (!opt && v !== 'B') ? '1,000,000; потом фильтр оставляет ' + (onEvents ? '250,000' : '40,000')
+        : (onEvents ? '250,000' : '40,000');
+      return { where: where, cols: cols, rows: rows };
+    }
+    ui.onChange(function () {
+      var v = variant.value || 'A', k = stepper.index;
+      draw(planOf(v, k), k);
+      var s = info(v, k);
+      roWhere.set(s.where);
+      roCols.set(s.cols);
+      roRows.set(s.rows);
+      note.set('Твой код: <code>' + CODE[v] + '</code>' + (k >= 2 ? ' Spark ещё добавляет проверки <code>isnotnull(user_id)</code> с обеих сторон (ключ NULL никогда не соединяется); на картинке их нет.' : ''));
+    });
+  });
+  </script>
+
+  <p><b>Физическое планирование (physical planning)</b> превращает оптимизированный план в один или несколько физических планов из настоящих операторов, и <mark class="key">модель стоимости (cost model)</mark> выбирает один из них (p. 1278). В статье о Spark SQL она выбирала только алгоритм соединения — broadcast join для маленькой таблицы, как в виджете (контекст, не со слайдов). Сканирования принадлежат <em>источникам данных</em> (data sources): "Spark's Data Source API allows optimizations like column pruning and filter pushdown into custom data sources" (p. 1268) — это и есть отсечение проекций и проталкивание предикатов (p. 1280). Источник реализует <code>buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row]</code> (p. 1267): два его параметра и есть два вида проталкивания. А раз "DataFrame execution is done with Spark RDDs", собственный код может спуститься до них: <code>queryResult.rdd.mapPartitions { … }</code>.</p>
+
+  <p><b>Генерация кода (code generation)</b> (p. 1283) "relies on Scala's quasiquotes" (опирается на квазицитаты Scala): Catalyst "transforms a SQL tree into an abstract syntax tree (AST) for Scala code". Генератор на слайде — одно сопоставление с образцом:</p>
+
+<pre><code>def compile(node: Node): AST = node match {
+  case Literal(value) => q"$value"
+  case Attribute(name) => q"row.get($name)"
+  case Add(left, right) =>
+    q"${compile(left)} + ${compile(right)}"
+}</code></pre>
+
+  <p>Каждый <code>q"…"</code> — шаблон кода. Дерево с рис. 2 превращается в строку <code>row.get("x") + 3</code>, которая компилируется один раз, а не обходится заново для каждой строки данных: для x+x+x, вычисленного миллиард раз, это около 36 секунд в режиме интерпретации против примерно 9 со сгенерированным кодом, почти как написанный вручную (снято с графика), — и всё это из генератора в "700LOC".</p>
+
+  <p class="memo"><mark class="key">Ты говоришь «что»; Catalyst решает «как» — переписывает дерево правилами, выбирает операторы по стоимости и компилирует результат.</mark></p>
+</section>
+
+<section id="l40-files">
+  <h2>Файлы, которые знают свою форму: Avro и Parquet</h2>
+
+  <p>Catalyst передаёт сканированию <code>requiredColumns</code> и <code>filters</code>; что сканирование с ними сделает, зависит от файла. Слайд (p. 1242) перечисляет "Available File Formats": text и CSV, JSON, SequenceFile ("binary key/value pair format"), Avro, Parquet, ORC ("optimized row columnar format") и "Data Frames". В этом списке прячутся три семейства: текст (читается глазами, медленно парсится, без схемы), двоичные <em>строки</em> (SequenceFile, Avro) и двоичные <em>столбцы</em> (Parquet, ORC).</p>
+
+  <aside class="redpen" data-page="1242">
+    <p class="claim">Available File Formats: "-Avro -Parquet -Data Frames -ORC"</p>
+    <p class="fix">DataFrame — не формат файла, а таблица Spark в памяти, "a distributed collection of rows organized into named columns" (p. 1246), в которую файлы читаются и из которой записываются.</p>
+    <p class="because">Ни один файл на диске не является «DataFrame»: <code>df.write.parquet(path)</code> пишет Parquet. Закрытый вопрос могут сверять с напечатанным списком, так что знай оба ответа: слайд его перечисляет, а по сути — нет.</p>
+  </aside>
+
+  <h3>Avro: строки со схемой внутри</h3>
+
+  <p><mark class="key">Avro</mark> (p. 1243) — это "language neutral data serialization system", не зависящая от языка система сериализации: "write a file in python and read it in C". Схема "language independent", "usually written in JSON", а данные "encoded in binary format". Avro "supports schema evolution" — "producers and consumers at different versions of schema" (производители и потребители могут работать с разными версиями схемы) — и "supports compression and are splittable". Схема твитов со слайда (p. 1244), исправленная:</p>
+
+<pre><code>{
+  "type": "record",
+  "name": "tweets",
+  "doc": "schema for storing tweets",
+  "fields": [
+    { "name": "username",  "type": "string" },
+    { "name": "tweet",     "type": "string" },
+    { "name": "timestamp", "type": "long" }
+  ]
+}</code></pre>
+
+  <aside class="redpen" data-page="1244">
+    <p class="claim"><code>"name" : "username", "type" : "string", }, { …</code> and <code>"doc:" : “schema for storing tweets"</code></p>
+    <p class="fix">Никакой запятой перед закрывающей скобкой, только прямые кавычки, а атрибут называется <code>"doc"</code> — как в схеме выше.</p>
+    <p class="because">JSON запрещает висячую запятую, так что парсер отвергнет напечатанную схему уже на первом поле (проверено питоновским <code>json</code>); <code>"doc:"</code> оказался бы другим, неизвестным атрибутом. На экзамене схему могут показать как напечатано: структуру бери со слайда, пунктуацию — отсюда.</p>
+  </aside>
+
+  <p>Avro-файл (p. 1244) — это заголовок (метаданные с JSON-схемой и <mark class="key">маркер синхронизации (sync marker)</mark>), а за ним блоки: служебные данные (число записей и размер), сериализованные объекты и тот же маркер. Благодаря маркеру файл делится на части (splittable): задача, которая начинает с середины файла, на границе HDFS-сплита, перескакивает к следующему маркеру и оказывается выровненной по блоку. Схема записана один раз, поэтому записи не несут имён полей.</p>
+
+  <h3>Parquet: столбцы внутри row group</h3>
+
+  <p>"Apache Parquet is a columnar storage format available to any project in the Hadoop/Spark ecosystem, regardless of the choice of data processing framework, data model or programming language" (колоночный формат хранения для любого проекта экосистемы Hadoop/Spark, независимо от фреймворка, модели данных и языка) (p. 1250). Разницу показывает слайд (p. 1254) на таблице X, Y, Z: строковый формат хранит x1 y1 z1 x2 y2 z2 …, колоночный — x1 … x5, затем y1 … y5, затем z1 … z5, каждый столбец одним "encoded chunk" — это колоночное хранилище из <a href="l20.html#l20-colstore">урока 20</a>, только в виде файла.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l40-fig-files">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 340" role="img" aria-label="Avro-файл: заголовок с метаданными, где лежит JSON-схема, и маркером синхронизации, затем блоки, в каждом служебные данные (число записей и размер), сериализованные записи r1 r2 r3 и маркер синхронизации. Сплит, который начинается внутри блока 2, перескакивает вперёд к его маркеру.">
+        <rect x="10" y="10" width="280" height="66" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="28" class="tx-sm tx-bold">header</text>
+        <rect x="20" y="36" width="170" height="30" class="fw-s3 st-s3"/>
+        <text x="105" y="55" class="tx-mid tx-sm">metadata: schema (JSON)</text>
+        <rect x="196" y="36" width="84" height="30" class="fw-s3 st-s3"/>
+        <text x="238" y="55" class="tx-mid tx-sm">sync marker</text>
+        <rect x="10" y="88" width="280" height="66" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="106" class="tx-sm tx-bold">block 1</text>
+        <rect x="20" y="114" width="72" height="30" class="fi-paper"/>
+        <text x="56" y="133" class="tx-mid tx-sm">aux. data</text>
+        <rect x="98" y="114" width="108" height="30" class="fw-s1 st-s1"/>
+        <text x="152" y="133" class="tx-mid tx-mono">r1 r2 r3 …</text>
+        <rect x="212" y="114" width="68" height="30" class="fw-s3 st-s3"/>
+        <text x="246" y="133" class="tx-mid tx-sm">sync</text>
+        <rect x="10" y="166" width="280" height="66" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="184" class="tx-sm tx-bold">block 2</text>
+        <rect x="20" y="192" width="72" height="30" class="fi-paper"/>
+        <text x="56" y="211" class="tx-mid tx-sm">aux. data</text>
+        <rect x="98" y="192" width="108" height="30" class="fw-s1 st-s1"/>
+        <text x="152" y="211" class="tx-mid tx-mono">r4 r5 r6 …</text>
+        <rect x="212" y="192" width="68" height="30" class="fw-s3 st-s3"/>
+        <text x="246" y="211" class="tx-mid tx-sm">sync</text>
+        <line x1="108" y1="160" x2="108" y2="246" class="st-s2 sw-2 dash"/>
+        <line x1="108" y1="246" x2="240" y2="246" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="150" y="276" class="tx-mid tx-hand">split: прыжок к sync</text>
+        <text x="150" y="304" class="tx-mid tx-sm">… block N</text>
+        <text x="150" y="328" class="tx-mid tx-mono tx-sm">r = (username, tweet, timestamp)</text>
+      </svg>
+      <p class="fig-label">Avro: целые записи, одна за другой</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 340" role="img" aria-label="Parquet-файл: магическое число PAR1, row group 0 с тремя column chunk username, tweet и timestamp, разделёнными на страницы, row group 1, затем footer со схемой, смещениями, размерами, кодировками и кодеками каждого column chunk и статистикой min и max, длина footer и снова PAR1. Стрелка от footer указывает на column chunk.">
+        <rect x="10" y="10" width="56" height="22" class="fi-paper"/>
+        <text x="38" y="26" class="tx-mid tx-mono tx-sm">PAR1</text>
+        <rect x="10" y="40" width="270" height="96" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="57" class="tx-sm tx-bold">row group 0</text>
+        <rect x="18" y="64" width="78" height="64" class="fw-s1 st-s1"/>
+        <text x="57" y="78" class="tx-mid tx-sm">username</text>
+        <line x1="18" y1="96" x2="96" y2="96" class="st-s1 sw-1"/>
+        <line x1="18" y1="112" x2="96" y2="112" class="st-s1 sw-1"/>
+        <rect x="102" y="64" width="98" height="64" class="fw-s1 st-s1"/>
+        <text x="151" y="78" class="tx-mid tx-sm">tweet</text>
+        <line x1="102" y1="88" x2="200" y2="88" class="st-s1 sw-1"/>
+        <line x1="102" y1="101" x2="200" y2="101" class="st-s1 sw-1"/>
+        <line x1="102" y1="114" x2="200" y2="114" class="st-s1 sw-1"/>
+        <rect x="206" y="64" width="66" height="64" class="fw-s1 st-s1"/>
+        <text x="239" y="78" class="tx-mid tx-sm">timestamp</text>
+        <line x1="206" y1="96" x2="272" y2="96" class="st-s1 sw-1"/>
+        <line x1="206" y1="112" x2="272" y2="112" class="st-s1 sw-1"/>
+        <rect x="10" y="144" width="270" height="56" rx="4" class="fi-paper sw-2"/>
+        <text x="20" y="161" class="tx-sm tx-bold">row group 1</text>
+        <rect x="18" y="168" width="78" height="24" class="fw-s1 st-s1"/>
+        <rect x="102" y="168" width="98" height="24" class="fw-s1 st-s1"/>
+        <rect x="206" y="168" width="66" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="208" width="270" height="94" rx="4" class="fw-s3 st-s3"/>
+        <text x="20" y="225" class="tx-sm tx-bold">footer</text>
+        <text x="20" y="242" class="tx-sm">схема</text>
+        <text x="20" y="258" class="tx-sm">на каждую row group и column chunk:</text>
+        <text x="20" y="274" class="tx-sm">смещение, размер, кодировки, кодек,</text>
+        <text x="20" y="290" class="tx-sm">статистика min / max</text>
+        <path d="M282 252 C 297 220, 297 140, 276 104" class="st-s3 sw-2" marker-end="url(#arr-s3)"/>
+        <rect x="10" y="310" width="120" height="22" class="fi-paper"/>
+        <text x="70" y="326" class="tx-mid tx-sm">длина footer</text>
+        <rect x="138" y="310" width="56" height="22" class="fi-paper"/>
+        <text x="166" y="326" class="tx-mid tx-mono tx-sm">PAR1</text>
+      </svg>
+      <p class="fig-label">Parquet: column chunk внутри row group</p>
+    </div>
+    <figcaption><b>Рис. 5.</b> Два файла для твитов со слайда (p. 1244). Слева — раскладка Avro со слайда (p. 1244): целые записи в блоках, каждый блок закрыт маркером синхронизации, к которому перескакивает читатель, начавший с середины файла (оранжевый). Справа — раскладка Parquet со слайдов (pp. 1245 и 1252): row group из column chunk, каждый chunk разрезан на страницы, pages (тонкие линии), и footer, который указывает (фиолетовым) на каждый chunk.</figcaption>
+  </figure>
+
+  <p>Единицы вложены друг в друга (pp. 1245, 1251). <mark class="key">Группа строк (row group)</mark> — "a group of rows in columnar format": "max size buffered in memory while writing" (максимум, который буферизуется в памяти при записи), "one (or more) per split while reading", "roughly: 50MB &lt; row group &lt; 1 GB". <mark class="key">Фрагмент столбца (column chunk)</mark> — "the data for one column in a row group", и его "can be read independently". <mark class="key">Страница (page)</mark> — "unit of access in a column chunk", "big enough for compression to be efficient", "roughly: 8KB &lt; page &lt; 1MB". <mark class="key">footer (служебный хвост файла)</mark> (p. 1252) "contains column chunks offset and schema": для каждого column chunk — его тип, кодировки, кодек, число значений, смещения и размеры. Footer идёт последним, поэтому писатель может потоком выдавать row group и дописать индекс в конце; читатель же читает его первым и прыгает к нужным chunk.</p>
+
+  <figure class="tbl-fig" id="l40-tbl-config">
+    <figcaption>"Configurable parquet parameters" (p. 1245), как напечатано. Это значения по умолчанию библиотеки Parquet для Hadoop; сам Spark пишет Parquet со сжатием Snappy, если не сказано иное (контекст, не со слайдов).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Property name</th><th>Default value</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td><code>parquet.block.size</code></td><td class="num">128 MB</td><td>The size in bytes of a block (row group).</td></tr>
+          <tr><td><code>parquet.page.size</code></td><td class="num">1MB</td><td>The size in bytes of a page.</td></tr>
+          <tr><td><code>parquet.dictionary.page.size</code></td><td class="num">1MB</td><td>The maximum allowed size in bytes of a dictionary before falling back to plain encoding for a page.</td></tr>
+          <tr><td><code>parquet.enable.dictionary</code></td><td>true</td><td>Whether to use dictionary encoding.</td></tr>
+          <tr><td><code>parquet.compression</code></td><td>UNCOMPRESSED</td><td>The type of compression: UNCOMPRESSED, SNAPPY, GZIP &amp; LZO</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Осторожно со словом <em>block</em>: один слайд (p. 1245) называет блоком row group, а другой (p. 1260) имеет в виду HDFS-блок из <a href="l31.html#l31-hdfs">урока 31</a>. Ни одна row group не лежит сразу на двух HDFS-блоках — в блок упаковываются целые row group, а остаток заполняется пустотой, — так что задача читает свою row group с одной машины.</p>
+
+  <div class="pitfall">
+    <p>«Колоночный — значит, весь файл — это один столбец за другим». В Parquet не так: файл — последовательность row group, и только <em>внутри</em> row group столбцы лежат подряд, поэтому каждую запись можно собрать из одной row group.</p>
+  </div>
+
+  <p class="memo"><mark class="key">Avro пишет целые записи одну за другой, со схемой в заголовке; Parquet пишет каждый столбец row group вместе и индексирует файл в footer.</mark></p>
+</section>
+
+<section id="l40-skip">
+  <h2>Read less data: внутри Parquet-файла</h2>
+
+  <p>Слайд (p. 1257) перечисляет три способа "Read Less Data". <b>Columnar organization</b>: "Encoding: make the data smaller" и "Column projection: read only the columns you need". <b>Row group filtering</b>: "Use footer stats to eliminate row groups" и "Use dictionary pages to eliminate row groups". <b>Page filtering</b>: "Use page stats to eliminate pages". Другой слайд (p. 1255) называет первые приёмы <em>projection push down</em> (читать только запрошенные столбцы) и <em>predicate push down</em> (по статистике, например минимуму и максимуму каждого chunk, пропускать то, что совпасть не может): вместе ты "read only the data you need". Раскладка к тому же "minimizes CPU cache misses": значения столбца лежат рядом, и процессор подтягивает в кэш только полезные.</p>
+
+  <p>Словарь column chunk (p. 1261) "is a compact list of all the values": "Search term missing? Skip the row group" — "like a bloom filter without false positives" (как фильтр Блума, только без ложных срабатываний). Минимум и максимум исключают значение, только если оно лежит вне их диапазона; внутри диапазона они говорят «возможно». Словарь отвечает точно.</p>
+
+  <div class="widget" id="l40-w-rowgroups">
+    <h3 class="widget-title">Один файл, записанный дважды: что читает запрос</h3>
+    <p class="widget-intro">Двенадцать твитов со схемой со слайда (p. 1244), по порядку времени. Сверху — Avro-файл: по четыре записи в блоке, каждый блок закрыт маркером синхронизации (фиолетовый). Снизу — Parquet-файл: три row group по четыре строки, каждая из трёх column chunk; узкая фиолетовая ячейка — словарная страница (dictionary page) chunk с username. Размеры на картинке: username — 8 байт, tweet — 120, timestamp — 8, всего 1,632 байта. Заголовки, маркеры, словари и footer в подсчёт не входят.</p>
+    <ol class="tasks">
+      <li>Оставь первый запрос, а фильтрацию row group — выключенной. Предскажи, какую долю из 1,632 байт прочитает Avro и какую — Parquet. Потом включи статистику из footer.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Avro читает 100 %: чтобы найти timestamps, ему приходится читать каждую запись целиком. Parquet читает 192 байта (11.8 %) — chunk с username и timestamp из каждой row group; большой столбец tweet не трогается вовсе. Со статистикой — 64 байта (3.9 %): row group 1 заканчивается в 09:14, а row group 3 начинается в 09:47, так что ни одна из них не открывается. Две экономии перемножаются: 11.8 % байтов каждой row group, умноженные на 1 из 3 row group, дают 3.9 %. Ради этого вывода виджет и существует: Parquet пропускает целые column chunk и целые row group, а Avro не может пропустить ни то, ни другое.</p></details>
+      </li>
+      <li>Выбери «текст твитов eva» с включённой статистикой из footer. Предскажи, какие row group сможет пропустить min/max. Потом добавь словарные страницы.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Никакие: в каждой row group имена идут от ada до ugo или до eva, и eva попадает в каждый диапазон, так что min/max может ответить только «возможно» — 1,536 байт. Словари точны: в row group 1 и 3 есть только ada, bob и ugo, поэтому обе пропускаются и остаётся 512 байт. "Like a bloom filter without false positives" (p. 1261).</p></details>
+      </li>
+      <li>Выбери «все поля всех твитов». Сравни два файла.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Оба читают все 1,632 байта: когда фильтра нет и нужны все столбцы, колоночная раскладка ничего не экономит, а Parquet ещё и должен сшивать каждую запись обратно из трёх chunk. Строковый формат хорош для записи и чтения целых записей; колоночный — для аналитики по нескольким столбцам.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l40-w-rowgroups', function (root, ui) {
+    var ROWS = [['bob', '09:00'], ['ada', '09:04'], ['ugo', '09:09'], ['bob', '09:14'],
+                ['eva', '09:21'], ['bob', '09:27'], ['eva', '09:33'], ['ada', '09:38'],
+                ['ugo', '09:47'], ['ada', '09:52'], ['bob', '09:58'], ['ugo', '10:05']];
+    var SIZE = { u: 8, w: 120, t: 8 }, TOTAL = 12 * 136;
+    var Q = {
+      time: { label: 'авторы твитов 09:25–09:40', cols: { u: 1, t: 1 }, on: 't',
+              hit: function (r) { return r[1] >= '09:25' && r[1] <= '09:40'; } },
+      eva: { label: 'текст твитов eva', cols: { u: 1, w: 1 }, on: 'u',
+             hit: function (r) { return r[0] === 'eva'; } },
+      all: { label: 'все поля всех твитов', cols: { u: 1, w: 1, t: 1 }, on: null, hit: null }
+    };
+    var qSel = ui.select('запрос', ['time', 'eva', 'all'].map(function (k) { return { value: k, label: Q[k].label }; }), null, 'time');
+    var fSel = ui.select('фильтрация row group в Parquet', [
+      { value: 'off', label: 'выкл.: открывать каждую row group' },
+      { value: 'stats', label: 'статистика min/max из footer' },
+      { value: 'dict', label: 'статистика + словарные страницы' }
+    ], null, 'off');
+    var roA = ui.readout('Avro читает (вычислено)'), roP = ui.readout('Parquet читает (вычислено)');
+    var roG = ui.readout('открыто row group в Parquet'), roC = ui.readout('column chunk на открытую row group');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'байты, прочитанные с диска', color: 's1', mark: 'area' },
+      { label: 'пропущенные байты', color: 'muted', mark: 'dash' },
+      { label: 'строки, которые возвращает запрос', color: 's2', mark: 'line' },
+      { label: 'маркеры синхронизации, словари, footer', color: 's3', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 418, { label: 'Те же двенадцать твитов, сохранённые как Avro-файл — три блока по четыре целые записи — и как Parquet-файл — три row group из трёх column chunk, — со статистикой footer внизу. Ячейки, которые читает выбранный запрос, закрашены, пропущенные — пунктирные, возвращаемые строки подчёркнуты.' });
+
+    var G = [0, 1, 2].map(function (g) {
+      var rs = ROWS.slice(g * 4, g * 4 + 4);
+      var us = rs.map(function (r) { return r[0]; }).sort(), ts = rs.map(function (r) { return r[1]; }).sort();
+      var dict = us.filter(function (u, i) { return us.indexOf(u) === i; });
+      return { umin: us[0], umax: us[3], tmin: ts[0], tmax: ts[3], dict: dict };
+    });
+    function decide(g, q, mode) {
+      if (!q.on || mode === 'off') return { read: true, why: '' };
+      if (q.on === 't') {
+        if (g.tmax < '09:25') return { read: false, why: 'её последний твит — ' + g.tmax + ' (max)' };
+        if (g.tmin > '09:40') return { read: false, why: 'её первый твит — ' + g.tmin + ' (min)' };
+        return { read: true, why: '' };
+      }
+      if ('eva' < g.umin || 'eva' > g.umax) return { read: false, why: 'eva вне диапазона ' + g.umin + '–' + g.umax };
+      if (mode === 'dict' && g.dict.indexOf('eva') < 0) return { read: false, why: 'eva нет в её словаре' };
+      return { read: true, why: '' };
+    }
+    function state() {
+      var q = Q[qSel.value] || Q.time, mode = fSel.value || 'off';
+      var dec = G.map(function (g) { return decide(g, q, mode); });
+      var per = 0, nc = 0;
+      Object.keys(q.cols).forEach(function (c) { per += SIZE[c]; nc++; });
+      var opened = dec.filter(function (d) { return d.read; }).length;
+      return { q: q, mode: mode, dec: dec, opened: opened, bytes: opened * 4 * per, nc: nc };
+    }
+    function n(x) { return String(x).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    function cell(x, y, w, read) { S('rect', { x: x, y: y, width: w, height: 24, 'class': read ? 'fw-s1 st-s1' : 'fi-paper st-muted dash' }); }
+    function mark(x, y, w) { S('line', { x1: x + 3, y1: y + 29, x2: x + w - 3, y2: y + 29, 'class': 'st-s2 sw-3' }); }
+    function footerLine(i, q, mode) {
+      var g = G[i], head = 'RG ' + (i + 1) + ' · ';
+      if (q.on === 't') return head + 'time min ' + g.tmin + ' · max ' + g.tmax;
+      if (q.on === 'u') return head + (mode === 'dict' ? 'словарь: ' + g.dict.join(', ') : 'user min ' + g.umin + ' · max ' + g.umax);
+      return head + 'смещения и размеры 3 column chunk';
+    }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var q = st.q, b, r, g, row, x, y;
+      T(10, 16, 'Avro: запись за записью', 'tx-sm tx-bold');
+      T(94, 40, 'u', 'tx-mid tx-mono tx-sm');
+      T(134, 40, 'tweet', 'tx-mid tx-mono tx-sm');
+      T(174, 40, 't', 'tx-mid tx-mono tx-sm');
+      for (b = 0; b < 3; b++) {
+        y = 48 + b * 34;
+        T(10, y + 17, 'блок ' + (b + 1), 'tx-sm');
+        for (r = 0; r < 4; r++) {
+          row = ROWS[b * 4 + r]; x = 84 + r * 100;
+          cell(x, y, 20, true); cell(x + 20, y, 60, true); cell(x + 80, y, 20, true);
+          if (q.hit && q.hit(row)) mark(x, y, 100);
+        }
+        S('rect', { x: 486, y: y, width: 12, height: 24, 'class': 'fw-s3 st-s3' });
+      }
+      T(10, 170, 'Parquet: row groups из column chunks', 'tx-sm tx-bold');
+      T(129, 194, 'username', 'tx-mid tx-mono tx-sm');
+      T(298, 194, 'tweet', 'tx-mid tx-mono tx-sm');
+      T(462, 194, 'timestamp', 'tx-mid tx-mono tx-sm');
+      var dictUsed = st.mode === 'dict' && q.on === 'u';
+      for (g = 0; g < 3; g++) {
+        y = 202 + g * 34;
+        var d = st.dec[g];
+        T(10, y + 17, 'RG ' + (g + 1), 'tx-sm');
+        S('rect', { x: 84, y: y, width: 10, height: 24, 'class': 'fw-s3 st-s3' + (dictUsed ? ' sw-3' : '') });
+        for (r = 0; r < 4; r++) {
+          row = ROWS[g * 4 + r];
+          var xu = 94 + r * 20, xw = 178 + r * 60, xt = 422 + r * 20, hit = d.read && q.hit && q.hit(row);
+          cell(xu, y, 20, d.read && !!q.cols.u);
+          cell(xw, y, 60, d.read && !!q.cols.w);
+          cell(xt, y, 20, d.read && !!q.cols.t);
+          if (hit) {
+            if (q.cols.u) mark(xu, y, 20);
+            if (q.cols.w) mark(xw, y, 60);
+            if (q.cols.t) mark(xt, y, 20);
+          }
+        }
+        T(508, y + 17, d.read ? 'берём' : 'мимо', d.read ? 'tx-sm' : 'tx-sm tx-muted');
+      }
+      S('rect', { x: 10, y: 312, width: 540, height: 98, rx: 4, 'class': 'fw-s3 st-s3' });
+      T(20, 332, 'footer' + ((st.mode === 'off' && q.on) ? ' (фильтрация выкл.: не используется)' : ''), 'tx-sm tx-bold');
+      for (g = 0; g < 3; g++) T(20, 356 + g * 22, footerLine(g, q, st.mode), 'tx-mono tx-sm');
+    }
+    ui.onChange(function () {
+      var st = state();
+      draw(st);
+      roA.set(n(TOTAL) + ' из ' + n(TOTAL) + ' байт: каждая запись целиком');
+      roP.set(n(st.bytes) + ' из ' + n(TOTAL) + ' байт (' + Course.fmt(100 * st.bytes / TOTAL, 1) + ' %)');
+      roG.set(st.opened + ' из 3');
+      roC.set(st.nc + ' из 3');
+      var why = [];
+      st.dec.forEach(function (d, i) { if (!d.read) why.push('RG ' + (i + 1) + ' пропущена: ' + d.why); });
+      var txt;
+      if (!st.q.on) txt = 'Фильтра нет, нужны все столбцы: Parquet читает каждый chunk каждой row group.';
+      else if (st.mode === 'off') txt = 'Parquet открывает каждую row group, но читает только column chunks запроса.';
+      else if (why.length) txt = why.join(' · ') + '.';
+      else txt = 'Статистика не может исключить ни одну row group: eva попадает в диапазон username каждой из них.';
+      note.set(txt);
+    });
+  });
+  </script>
+
+  <h3>Кодировки: делаем данные меньше</h3>
+
+  <p>Ещё до того как сработает какой-либо компрессор, Parquet кодирует каждый столбец приёмом, который подходит к его содержимому (pp. 1256, 1258; примеры наши).</p>
+
+  <figure class="tbl-fig" id="l40-tbl-enc">
+    <figcaption>Кодировки со слайдов (pp. 1256 и 1258).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Кодировка</th><th>Что хранит</th><th>Для чего хороша (слайд)</th><th>Пример</th></tr></thead>
+        <tbody>
+          <tr><td>Delta</td><td>первое значение, затем разности</td><td>timestamps: соседние значения близки</td><td class="num">1000, 1003, 1004, 1009 → 1000, +3, +1, +5</td></tr>
+          <tr><td>Prefix</td><td>длину префикса, общего с предыдущей строкой, затем остаток</td><td>"delta encoding for strings"</td><td><code>Milano</code>, <code>Milazzo</code> → <code>Milano</code>, (4, <code>zzo</code>)</td></tr>
+          <tr><td>Dictionary</td><td>каждое различное значение один раз, затем маленькие целые ключи</td><td>"small set of values, e.g post code, ip addresses"</td><td>Como, Lecco, Como, Como → [Como, Lecco] + ключи 0 1 0 0</td></tr>
+          <tr><td>Run length (RLE)</td><td>значение и длину его серии</td><td>"repeating data"; definition levels разреженных столбцов</td><td class="num">0 0 0 0 0 0 1 → (0, 6) (1, 1)</td></tr>
+          <tr><td>Bit packing</td><td>маленькие целые в минимуме битов</td><td>"repetition level, definition levels and dictionary keys"</td><td>ключи 0–3 по 2 бита вместо 32</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Из "heavyweight algorithms (gzip, lzo, snappy)" со слайда (p. 1258) по-настоящему тяжёлый только gzip: Snappy и LZO жертвуют степенью сжатия ради скорости (контекст, не со слайдов).</aside>
+
+  <p>Словарное кодирование (dictionary encoding) "useful for columns with few ( &lt; 50,000 ) distinct values" и "when applicable, compresses better and faster than heavyweight algorithms". Bit packing хранит маленькие целые "in the minimum bits required": значению с максимумом \(m\) нужно \(\lceil \log_2(m+1) \rceil\) бит, так что 16 бит покрывают любой ключ меньше 65,536. Parquet 2.0 (p. 1259) добавляет "more encodings: compact storage without heavyweight compression" (delta-кодировки "for integers, strings and sorted dictionaries"), "statistics: to be used by query planners and predicate pushdown" и "new page format: to facilitate skipping ahead at a more granular level" — новый формат страниц, чтобы пропускать данные ещё мельче.</p>
+
+  <div class="pitfall">
+    <p>«Словарное кодирование всегда окупается». Только при малом числе различных значений: когда словарь перерастает 1 MB (<code>parquet.dictionary.page.size</code>, p. 1245), писатель откатывается к plain encoding, и у chunk уже нет полного словаря, по которому можно было бы пропускать.</p>
+  </div>
+
+  <h3>Вложенные записи в плоских столбцах</h3>
+
+  <p>Главная сила Parquet, его "key strength", — умение "store nested data in truly columnar format using definition and repetition levels", то есть хранить вложенные данные по-настоящему поколоночно с помощью уровней определения и повторения (p. 1254). Приём пришёл из Google Dremel; слайд (p. 1253) применяет его к схеме с одной необязательной группой и двумя повторяющимися полями.</p>
+
+  <figure class="fig fig--plain" id="l40-fig-levels">
+    <svg class="dia" viewBox="0 0 560 322" role="img" aria-label="Схема Document с обязательным полем DocId и необязательной группой Links, в которой лежат повторяющиеся поля Backward и Forward. Под каждым листом — его максимальные уровни и значения записи со слайда: DocId 20 с R 0 и D 0; Backward 10 с R 0 и D 2 и 30 с R 1 и D 2; Forward 80 с R 0 и D 2.">
+      <line x1="280" y1="40" x2="100" y2="92"/>
+      <line x1="320" y1="40" x2="410" y2="92"/>
+      <line x1="395" y1="122" x2="300" y2="176"/>
+      <line x1="425" y1="122" x2="480" y2="176"/>
+      <rect x="250" y="10" width="100" height="30" rx="8" class="fi-paper sw-2"/>
+      <text x="300" y="31" class="tx-mid">Document</text>
+      <text x="168" y="64" class="tx-mid tx-sm tx-muted halo">required</text>
+      <text x="400" y="64" class="tx-mid tx-sm tx-muted halo">optional</text>
+      <rect x="50" y="92" width="100" height="30" rx="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="100" y="113" class="tx-mid">DocId</text>
+      <rect x="360" y="92" width="100" height="30" rx="8" class="fi-paper sw-2"/>
+      <text x="410" y="113" class="tx-mid">Links</text>
+      <text x="318" y="152" class="tx-mid tx-sm tx-muted halo">repeated</text>
+      <text x="482" y="152" class="tx-mid tx-sm tx-muted halo">repeated</text>
+      <rect x="240" y="176" width="120" height="30" rx="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="300" y="197" class="tx-mid">Backward</text>
+      <rect x="420" y="176" width="120" height="30" rx="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="480" y="197" class="tx-mid">Forward</text>
+      <text x="100" y="146" class="tx-mid tx-mono tx-sm">max R 0 · D 0</text>
+      <circle cx="80" cy="172" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="80" y="177" class="tx-mid tx-mono tx-sm">20</text>
+      <text x="102" y="177" class="tx-mono tx-sm">R0 D0</text>
+      <text x="300" y="230" class="tx-mid tx-mono tx-sm">max R 1 · D 2</text>
+      <circle cx="280" cy="256" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="280" y="261" class="tx-mid tx-mono tx-sm">10</text>
+      <text x="302" y="261" class="tx-mono tx-sm">R0 D2</text>
+      <circle cx="280" cy="292" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="280" y="297" class="tx-mid tx-mono tx-sm">30</text>
+      <text x="302" y="297" class="tx-mono tx-sm">R1 D2</text>
+      <text x="480" y="230" class="tx-mid tx-mono tx-sm">max R 1 · D 2</text>
+      <circle cx="460" cy="256" r="14" class="fi-paper st-s1 sw-2"/>
+      <text x="460" y="261" class="tx-mid tx-mono tx-sm">80</text>
+      <text x="482" y="261" class="tx-mono tx-sm">R0 D2</text>
+      <text x="20" y="266" class="tx-hand">по столбцу на лист</text>
+    </svg>
+    <figcaption><b>Рис. 6.</b> Схема и запись со слайда (p. 1253) на одной картинке. Каждый лист (синий) становится столбцом; под ним — его максимальные уровни и значения записи с их уровнем повторения R и уровнем определения D. В D идут необязательные (optional) и повторяющиеся (repeated) поля, в R — только повторяющиеся.</figcaption>
+  </figure>
+
+  <p>Рядом с каждым сохранённым значением Parquet пишет два маленьких целых числа. <mark class="key">Уровень определения (definition level)</mark> D говорит, сколько необязательных или повторяющихся полей на пути к значению реально присутствует; <mark class="key">уровень повторения (repetition level)</mark> R говорит, на каком повторяющемся поле значение продолжает список, а 0 значит, что начинается новая запись. Запись со слайда, разобранная (shredded) шаг за шагом:</p>
+
+  <ol class="steps" id="l40-steps-shred">
+    <li><p>Выпиши столбцы по схеме, по одному на каждый лист: <code>DocId</code>, <code>Links.Backward</code>, <code>Links.Forward</code>. Группы <code>Document</code> и <code>Links</code> сами ничего не хранят.</p></li>
+    <li><p>Посчитай на каждом пути поля, которых может не быть:</p>
+      \[ D_{\max} = \#\ \text{optional or repeated fields} \]
+      <p>DocId обязательное (required): 0. Links необязательное, а Backward повторяющееся: 2; у Forward тоже. Значение должно сообщать, до какой глубины определён его путь.</p></li>
+    <li><p>Посчитай только повторяющиеся поля:</p>
+      \[ R_{\max} = \#\ \text{repeated fields} \]
+      <p>0 для DocId, 1 для каждого списка: на пути одно повторяющееся поле, значит, R равно 0 или 1.</p></li>
+    <li><p>Разбери <code>DocId: 20</code>: обязательное значение в начале записи даёт (20, R 0, D 0).</p></li>
+    <li><p>Разбери <code>Backward: 10, 30</code>. Первое значение начинает список записи (R 0), при этом Links и Backward присутствуют (D 2): (10, 0, 2). Второе продолжает список на Backward, первом повторяющемся поле: (30, 1, 2).</p></li>
+    <li><p>Разбери <code>Forward: 80</code>, первый Forward этой записи: (80, 0, 2). Это и есть четыре строки со слайда (p. 1253); при максимумах 1 и 2 bit packing хранит R в 1 бите, а D — в 2.</p></li>
+    <li><p>Не со слайда, но по тем же правилам: запись без Links хранит NULL в обоих столбцах Links с R 0, D 0 — путь обрывается до Links. R = 0 говорит сборщику, что начинается новая запись, поэтому он восстанавливает запись в точности.</p></li>
+  </ol>
+
+  <p class="memo"><mark class="key">Parquet пропускает на трёх уровнях — column chunks, row groups, pages — и превращает вложенность в два крошечных целых числа на значение.</mark></p>
+</section>
+
+<section id="l40-beyond">
+  <h2>За пределами запросов: расширения, JSON, конвейеры, скорость</h2>
+
+  <p>Два "Extensions" дополняют устройство (p. 1284). Новый источник данных "must implement a createRelation function that takes a set of key-value params and returns a BaseRelation object" — "E.g. CSV, Avro, Parquet, JDBC". <mark class="key">Пользовательский тип (user-defined type)</mark>, UDT, отображает "user-defined types to structures composed of Catalyst's built-in types": <code>PointUDT</code> хранит Point как struct из двух double, x и y, с <code>serialize</code> и <code>deserialize</code>. Catalyst никогда не нужно понимать, что такое Point, — только struct.</p>
+
+  <h3>Вывод схемы для JSON</h3>
+
+  <p>У JSON нет схемы, и всё же Spark SQL "automatically infers schema from a set of records, in one pass or sample" (сам выводит схему по набору записей за один проход или по выборке) (p. 1285). Каждая запись даёт "a tree of STRUCT types"; каждое поле получает "the most appropriate type … based on all data observed in that column"; схемы отдельных записей сливаются "in one reduce operation" — это возможно, потому что слияние схем ассоциативно, как пары (сумма, количество). Три твита со слайда:</p>
+
+  <figure class="tbl-fig" id="l40-tbl-json">
+    <figcaption>Три записи со слайда (p. 1285) и схема, которую слайд для них печатает.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Поле</th><th>Запись 1</th><th>Запись 2</th><th>Запись 3</th><th>Выведено (p. 1285)</th></tr></thead>
+        <tbody>
+          <tr><td><code>text</code></td><td>строка</td><td>строка</td><td>строка</td><td><code>STRING NOT NULL</code></td></tr>
+          <tr><td><code>tags</code></td><td><code>["#Spark"]</code></td><td><code>[]</code></td><td><code>["#tweet", "#location"]</code></td><td><code>ARRAY&lt;STRING NOT NULL&gt; NOT NULL</code></td></tr>
+          <tr class="is-key"><td><code>loc.lat</code></td><td class="num">45.1</td><td class="num">39</td><td>нет <code>loc</code></td><td><code>FLOAT NOT NULL</code> внутри <code>loc</code></td></tr>
+          <tr class="is-key"><td><code>loc.long</code></td><td class="num">90</td><td class="num">88.5</td><td>нет <code>loc</code></td><td><code>FLOAT NOT NULL</code> внутри <code>loc</code></td></tr>
+          <tr><td><code>loc</code></td><td>есть</td><td>есть</td><td>нет</td><td><code>STRUCT&lt;lat …, long …&gt;</code>, nullable</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Целое число в одной записи и дробное в другой дают FLOAT — самый узкий тип, вмещающий оба; <code>loc</code> нет в записи 3, поэтому он не получает NOT NULL. Spark 4.2 читает те же записи как <code>struct&lt;lat: double, long: double&gt;</code>, где каждое поле nullable (проверено запуском): рассуждение слайда, только имена типов новее. "Same trick for Python typing" — это data sampling со слайда (p. 1274), и всё это вместе — schema-on-read (схема при чтении) из <a href="l04.html#l04-shift">урока 4</a>.</p>
+
+  <h3>ML-конвейеры говорят на DataFrame</h3>
+
+  <p>Слайд (p. 1286), повторённый ещё раз (p. 1288), соединяет в цепочку три стадии библиотеки машинного обучения Spark, MLlib (кавычки выпрямлены):</p>
+
+<pre><code>from pyspark.ml import Pipeline
+from pyspark.ml.feature import Tokenizer, HashingTF
+from pyspark.ml.classification import LogisticRegression
+
+tokenizer = Tokenizer(inputCol="text", outputCol="words")
+hashingTF = HashingTF(inputCol="words", outputCol="features")
+lr = LogisticRegression(maxIter=10, regParam=0.01)
+pipeline = Pipeline(stages=[tokenizer, hashingTF, lr])
+# df: a "text" and a "label" column; returns a PipelineModel
+model = pipeline.fit(df)</code></pre>
+
+  <figure class="fig fig--plain" id="l40-fig-mllib">
+    <svg class="dia" viewBox="0 0 560 430" role="img" aria-label="Pipeline сверху вниз: датасет ds0, tokenizer, ds1, hashingTF, ds2, lr.model, ds3. Слева от каждого датасета — столбец, который он добавляет. lr стоит снаружи справа: он обучается на ds2 и выдаёт lr.model. Пунктирная рамка Pipeline Model охватывает tokenizer, ds1, hashingTF, ds2 и lr.model.">
+      <rect x="24" y="68" width="300" height="300" rx="8" class="st-muted sw-2 dots"/>
+      <text x="336" y="88" class="tx-sm tx-muted">Pipeline Model</text>
+      <line x1="200" y1="52" x2="200" y2="76" marker-end="url(#arr)"/>
+      <line x1="200" y1="110" x2="200" y2="128" marker-end="url(#arr)"/>
+      <line x1="200" y1="172" x2="200" y2="196" marker-end="url(#arr)"/>
+      <line x1="200" y1="230" x2="200" y2="248" marker-end="url(#arr)"/>
+      <line x1="200" y1="292" x2="200" y2="316" marker-end="url(#arr)"/>
+      <line x1="200" y1="350" x2="200" y2="374" marker-end="url(#arr)"/>
+      <path d="M232 266 L 370 266" class="sw-2 dash" marker-end="url(#arr)"/>
+      <path d="M430 284 C 430 330, 330 334, 264 334" class="sw-2 dash" marker-end="url(#arr)"/>
+      <path d="M168 14 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="14" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="42" class="tx-mid">ds0</text>
+      <text x="156" y="38" class="tx-end tx-mono tx-sm">text, label</text>
+      <rect x="140" y="78" width="120" height="32" rx="4" class="fi-paper sw-2"/>
+      <text x="200" y="100" class="tx-mid tx-mono">tokenizer</text>
+      <path d="M168 136 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="136" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="164" class="tx-mid">ds1</text>
+      <text x="156" y="160" class="tx-end tx-mono tx-sm">+ words</text>
+      <rect x="140" y="198" width="120" height="32" rx="4" class="fi-paper sw-2"/>
+      <text x="200" y="220" class="tx-mid tx-mono">hashingTF</text>
+      <path d="M168 256 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="256" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="284" class="tx-mid">ds2</text>
+      <text x="156" y="280" class="tx-end tx-mono tx-sm">+ features</text>
+      <rect x="374" y="250" width="112" height="32" rx="4" class="fi-paper sw-2 dash"/>
+      <text x="430" y="272" class="tx-mid tx-mono">lr</text>
+      <text x="300" y="256" class="tx-mid tx-sm halo">fit</text>
+      <text x="380" y="314" class="tx-sm halo">выдаёт</text>
+      <rect x="140" y="318" width="120" height="32" rx="4" class="fi-paper sw-2"/>
+      <text x="200" y="340" class="tx-mid tx-mono">lr.model</text>
+      <path d="M168 382 v32 a32 8 0 0 0 64 0 v-32" class="fw-s1 st-s1 sw-2"/>
+      <ellipse cx="200" cy="382" rx="32" ry="8" class="fw-s1 st-s1 sw-2"/>
+      <text x="200" y="410" class="tx-mid">ds3</text>
+      <text x="156" y="406" class="tx-end tx-mono tx-sm">+ prediction</text>
+    </svg>
+    <figcaption><b>Рис. 7.</b> Pipeline со слайда (p. 1286), нарисованный сверху вниз. Каждая стадия возвращает свой входной DataFrame с ещё одним столбцом (слева; при запуске ds3 на самом деле получает rawPrediction, probability и prediction). Estimator <code>lr</code> обучается на ds2 и выдаёт <code>lr.model</code>; обученная Pipeline Model (пунктир) содержит только transformers.</figcaption>
+  </figure>
+
+  <p><code>tokenizer</code> и <code>hashingTF</code> только преобразуют — это transformers; <code>lr</code> — estimator, чей <code>fit</code> на ds2 выдаёт transformer <code>lr.model</code>. Поэтому <code>lr</code> стоит снаружи пунктирной рамки "Pipeline Model", а <code>lr.model</code> — внутри (проверено запуском). Если ты работал с pipelines в scikit-learn, <code>fit</code> и <code>transform</code> значат здесь то же самое.</p>
+
+  <h3>Откуда двенадцать раз</h3>
+
+  <p>Слайд (p. 1287) измеряет, как выполняются обещания (рис. 8).</p>
+
+  <figure class="fig fig--plain" id="l40-fig-perf">
+    <svg class="dia" viewBox="0 0 560 282" role="img" aria-label="Два столбчатых графика. Сверху агрегация: Python API около 180 секунд, Scala API около 28, DataFrame около 15. Снизу фильтр, за которым идёт подсчёт слов: SQL плюс Spark около 565 плюс 325 секунд, одно DataFrame-задание около 405.">
+      <text x="10" y="16" class="tx-sm tx-bold">Агрегация (левый график), секунды</text>
+      <rect x="132" y="28" width="360" height="22" class="fw-s4 st-s4 sw-2"/>
+      <rect x="132" y="58" width="56" height="22" class="fw-s4 st-s4 sw-2"/>
+      <rect x="132" y="88" width="30" height="22" class="fw-s5 st-s5 sw-2"/>
+      <text x="124" y="44" class="tx-end">Python API</text>
+      <text x="124" y="74" class="tx-end">Scala API</text>
+      <text x="124" y="104" class="tx-end">DataFrame</text>
+      <text x="484" y="44" class="tx-end tx-sm">≈ 180</text>
+      <text x="196" y="74" class="tx-sm">≈ 28</text>
+      <text x="170" y="104" class="tx-sm">≈ 15</text>
+      <text x="232" y="106" class="tx-hand">в 12 раз меньше</text>
+      <line x1="132" y1="120" x2="532" y2="120" class="st-muted"/>
+      <text x="132" y="140" class="tx-mid tx-sm tx-muted">0</text>
+      <text x="232" y="140" class="tx-mid tx-sm tx-muted">50</text>
+      <text x="332" y="140" class="tx-mid tx-sm tx-muted">100</text>
+      <text x="432" y="140" class="tx-mid tx-sm tx-muted">150</text>
+      <text x="532" y="140" class="tx-mid tx-sm tx-muted">200</text>
+      <text x="10" y="176" class="tx-sm tx-bold">Фильтр, затем подсчёт слов (правый график), секунды</text>
+      <rect x="132" y="188" width="226" height="22" class="fw-s4 st-s4 sw-2"/>
+      <rect x="358" y="188" width="130" height="22" class="fw-s4 st-s4 sw-2 dash"/>
+      <rect x="132" y="218" width="162" height="22" class="fw-s5 st-s5 sw-2"/>
+      <text x="124" y="204" class="tx-end">SQL + Spark</text>
+      <text x="124" y="234" class="tx-end">DataFrame</text>
+      <text x="245" y="204" class="tx-mid tx-sm">фильтр ≈ 565</text>
+      <text x="423" y="204" class="tx-mid tx-sm">подсчёт ≈ 325</text>
+      <text x="302" y="234" class="tx-sm">≈ 405</text>
+      <text x="368" y="238" class="tx-hand">в 2 раза меньше</text>
+      <line x1="132" y1="250" x2="532" y2="250" class="st-muted"/>
+      <text x="132" y="270" class="tx-mid tx-sm tx-muted">0</text>
+      <text x="212" y="270" class="tx-mid tx-sm tx-muted">200</text>
+      <text x="292" y="270" class="tx-mid tx-sm tx-muted">400</text>
+      <text x="372" y="270" class="tx-mid tx-sm tx-muted">600</text>
+      <text x="452" y="270" class="tx-mid tx-sm tx-muted">800</text>
+      <text x="532" y="270" class="tx-mid tx-sm tx-muted">1000</text>
+    </svg>
+    <figcaption><b>Рис. 8.</b> Два графика со слайда (p. 1287) (рисунки 9 и 10 статьи о Spark SQL), перерисованные. Чисел на слайде нет: каждое значение снято с высоты столбика. Бирюзовый: RDD-код, написанный вручную, или SQL-запрос, за которым идёт отдельное задание Spark (сплошной — фильтр, штриховой — подсчёт слов); пурпурный: DataFrame.</figcaption>
+  </figure>
+
+  <p>Вернёмся к загадке из начала. Лямбды — чёрные ящики, которые Spark может только вызывать, строка за строкой, в процессе Python; однострочник — дерево, которое он может прочитать, и отсюда три ответа. Catalyst может его переписать. В Python строится только план, а работа идёт как байткод JVM: статья приписывает этому 12×, а генерации кода, которая "avoids expensive allocation of key-value pairs", — выигрыш 2× над Scala. И план называет свои столбцы и фильтры, так что у источника данных можно попросить меньше: с Parquet с диска уходят только нужные column chunks и row groups — это и есть ответ, который лежит в файле. Правый график добавляет, что одно DataFrame-задание обгоняет SQL-запрос плюс отдельное задание Spark примерно в 2 раза: между ними ничего не сохраняется в HDFS (из статьи).</p>
+
+  <p class="memo"><mark class="key">DataFrame выигрывает, потому что Spark видит весь план: он может его переписать, скомпилировать и попросить у файла меньше.</mark></p>
+</section>
+
+<section id="l40-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+
+  <p>Catalyst, устройство Spark SQL и форматы файлов — это теория: открытые вопросы, вопросы с выбором ответа и «верно/неверно» за 10–15 минут, где за неправильный ответ могут снять баллы. Упражнение SparkQL из практической части требует кода на PySpark DataFrame ("you are not allowed to use SQL syntax", экзамен 30 января 2026); последний вопрос сформулирован как в прошлых экзаменах, а их собственные задачи решает <a href="l39.html">урок 39</a>.</p>
+
+  <div class="exam" data-kind="open" id="l40-exam-phases">
+    <div class="exam-q" lang="en">
+      <p>Describe the phases of query optimization in Spark SQL's Catalyst, from a query written as SQL or with the DataFrame API to the RDDs that execute it. Which phase uses a cost model, and for what?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>An SQL string (parsed into an AST) and a DataFrame both produce an unresolved logical plan: the same pipeline serves both. Analysis resolves it with the catalog — it looks up relations by name, maps named attributes to the inputs of each operator, gives each attribute a unique id and propagates and coerces types — and yields a logical plan. Logical optimization applies rule-based rewrites such as constant folding, predicate pushdown, projection pruning, null propagation and boolean expression simplification, producing an optimized logical plan. Physical planning generates one or more physical plans made of Spark operators, and a cost model selects one (for example the join algorithm: a broadcast join for a small table). Code generation finally compiles the selected plan, using Scala quasiquotes, into code that runs as RDD operations. Only physical planning is cost-based; the other phases apply rules.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ называет четыре фазы по порядку, что входит в каждую и что из неё выходит, каталог в анализе и модель стоимости только в физическом планировании. Назови и несколько правил логической оптимизации: их пропускают легче всего.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-unresolved">
+    <div class="exam-q" lang="en">
+      <p>What is an unresolved attribute in Spark SQL? Using the query <code>SELECT col FROM sales</code>, explain what the analyzer does, and what happens when <code>sales</code> has no column <code>col</code>.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>An attribute is unresolved if its type is not known or it is not matched to an input table. After parsing, <code>col</code> is only a name and <code>sales</code> an unresolved relation. The analyzer looks up <code>sales</code> by name in the catalog, matches <code>col</code> to one of its columns, gives it a unique id so that every reference to the same value is recognised, and propagates and coerces types through expressions (in <code>1 + col</code> the literal is cast to the type of <code>col</code>). If <code>sales</code> has no column <code>col</code>, analysis fails at once with an error, before any data is read: the logical plan is analyzed eagerly, even though the query is executed lazily.</p>
+      </div>
+      <div class="exam-note"><p>Суть — определение словами слайда и поиск в каталоге. Формула «немедленный анализ, ленивое выполнение» (eager analysis, lazy execution) покажет, что ты понимаешь, почему ошибка появляется так рано.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l40-exam-rules">
+    <div class="exam-q" lang="en">
+      <p>Which of the following are rule-based optimizations of Catalyst's logical optimization phase, as listed in the lecture? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Constant folding <span class="fb">Есть в списке (p. 1280); правило со слайда (p. 1276) превращает x + (1 + 2) в x + 3.</span></li>
+      <li data-correct>Predicate pushdown <span class="fb">Есть в списке (p. 1280): фильтр движется к данным, ниже проекций и join.</span></li>
+      <li data-correct>Projection pruning <span class="fb">Есть в списке (p. 1280): остаются только столбцы, которые используются выше.</span></li>
+      <li>Choosing a broadcast join because a table is small <span class="fb">Этот выбор относится к физическому планированию, где модель стоимости выбирает среди физических планов.</span></li>
+      <li data-correct>Null propagation <span class="fb">Есть в списке стандартных правил (p. 1280).</span></li>
+      <li>Generating Java bytecode with quasiquotes <span class="fb">Это последняя фаза, генерация кода (p. 1283), а не логическая оптимизация.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Constant folding, predicate pushdown, projection pruning and null propagation (with boolean expression simplification, the list of p. 1280). The join algorithm is chosen in physical planning by the cost model; bytecode is produced by code generation.</p></div>
+      <div class="exam-note"><p>Неверные варианты — настоящая работа Catalyst, только в другой фазе. За неправильный ответ могут снять баллы, так что фазу каждой оптимизации надо знать наверняка.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l40-exam-lazy">
+    <div class="exam-q" lang="en">
+      <p>True or false: because DataFrames are evaluated lazily, a reference to a column that does not exist is reported only when an action such as <code>show()</code> or <code>collect()</code> runs.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Выполнение ленивое, но логический план анализируется немедленно (p. 1273): неверное имя столбца падает сразу, как только строка написана.</span></li>
+      <li data-correct>False <span class="fb">"Logical plan analyzed eagerly → identify code errors associated with data schema issues on the fly" (p. 1273).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. Spark SQL analyzes the logical plan eagerly: column names and types are checked against the catalog as soon as the DataFrame operation is defined, while the data is processed only when an action runs.</p></div>
+      <div class="exam-note"><p>Ловушка — растянуть «ленивость» с выполнения на анализ. Анализу нужны только метаданные, поэтому делать его сразу дёшево.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-parquet">
+    <div class="exam-q" lang="en">
+      <p>Describe the internal structure of a Parquet file and explain how it lets a query that needs two columns and a filter read less data than a row-oriented format such as Avro.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>A Parquet file is a sequence of row groups followed by a footer, with the magic number PAR1 at both ends. A row group holds a set of rows in columnar format (parquet.block.size, 128 MB by default) and never straddles two HDFS blocks; inside it each column is stored contiguously as a column chunk, and each column chunk is divided into pages, the unit of access, encoding and compression (1 MB by default). The footer stores the schema and, for every row group and column chunk, its offset, size, encodings, codec and statistics such as min and max. A reader reads the footer first. With projection pushdown it reads only the column chunks of the two requested columns. With predicate pushdown it uses the footer statistics and the dictionary pages to skip row groups that cannot contain matching rows, and page statistics to skip pages. Avro stores whole records one after another, so the same query must read every byte of every record.</p>
+      </div>
+      <div class="exam-note"><p>В полном ответе есть иерархия (row group, column chunk, page), содержимое footer и оба вида проталкивания (pushdown), каждый — в связке со структурой, которая его делает возможным.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-levels">
+    <div class="exam-q" lang="en">
+      <p>Consider the Parquet schema <code>message Document { required int64 DocId; optional group Links { repeated int64 Backward; repeated int64 Forward; } }</code>.</p>
+      <p>(a) Give the maximum repetition and definition levels of each column. (b) Shred the record <code>DocId: 10, Links { Forward: 20, Forward: 40, Forward: 60 }</code>, which has no Backward value, into (value, R, D) triples.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) DocId: max R 0, max D 0 (required, nothing optional or repeated on its path). Links.Backward and Links.Forward: max R 1 (one repeated field on the path), max D 2 (Links is optional, the field itself repeated).</p>
+        <p>(b) DocId: (10, 0, 0). Links.Backward: (NULL, 0, 1) — Links is present but Backward is not, so one of the two fields of the path is defined; R 0 because the value belongs to a new record. Links.Forward: (20, 0, 2), (40, 1, 2), (60, 1, 2) — the first value starts the record's list, the next two repeat at level 1, and both Links and Forward are defined.</p>
+      </div>
+      <div class="exam-note"><p>У записи со слайда (p. 1253) есть список Backward; у этой — нет, и NULL с D = 1 — вся суть упражнения. Max D считает необязательные и повторяющиеся поля, max R — только повторяющиеся.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l40-exam-spark">
+    <div class="exam-q" lang="en">
+      <p>Consider the following ER scenario: a city app tracks its Users (User_ID, Name, Age, City) and the Events they generate (Event_ID, Timestamp, Kind). Each user generates zero or more events (0,N); each event is generated by exactly one user (1,1). Consider the following Users and Events tables.</p>
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th>User_ID</th><th>Name</th><th>Age</th><th>City</th></tr></thead>
+          <tbody>
+            <tr><td>U1</td><td>Ada</td><td class="num">31</td><td>Melbourne</td></tr>
+            <tr><td>U2</td><td>Bob</td><td class="num">24</td><td>Sydney</td></tr>
+            <tr><td>…</td><td>…</td><td>…</td><td>…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="scroll-x">
+        <table class="tbl">
+          <thead><tr><th>Event_ID</th><th>User_ID</th><th>Timestamp</th><th>Kind</th></tr></thead>
+          <tbody>
+            <tr><td>E1</td><td>U1</td><td>2026-03-01 09:12</td><td>click</td></tr>
+            <tr><td>E2</td><td>U2</td><td>2026-03-01 09:15</td><td>view</td></tr>
+            <tr><td>…</td><td>…</td><td>…</td><td>…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>(a) Write a SparkQL query to compute the average age of the users of each city.</p>
+      <p>(b) Write a SparkQL query to return the timestamps of the "click" events generated by users living in Melbourne.</p>
+      <p>(c) Write a SparkQL query to compute the total number of events for each city, returning only the cities whose total is greater than 2.</p>
+      <p>Note that you are not allowed to use SQL syntax. Use PySpark instead.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder.appName("SMBUD").getOrCreate()
+# users and events: DataFrames with the columns of the two tables
+
+# (a) average age per city
+users.groupBy("City").agg(F.avg("Age").alias("Avg_Age")).show()
+
+# (b) timestamps of the clicks of users living in Melbourne
+(events.join(users, "User_ID")
+       .filter((F.col("City") == "Melbourne")
+               &amp; (F.col("Kind") == "click"))
+       .select("Timestamp")
+       .show())
+
+# (c) events per city, only cities above 2 (the HAVING)
+(events.join(users, "User_ID")
+       .groupBy("City")
+       .agg(F.count("Event_ID").alias("N_Events"))
+       .filter(F.col("N_Events") &gt; 2)
+       .show())</code></pre>
+        <p>Executed on four users (U1 Ada 31 and U3 Eva 27 in Melbourne, U2 Bob 24 in Sydney, U4 Ugo 45 in Perth) and seven events (E1 U1 click 2026-03-01 09:12, E2 U2 view, E3 U1 purchase, E4 U3 click 2026-03-02 18:05, E5 U2 click, E6 U3 view, E7 U4 click): (a) Melbourne 29.0, Perth 45.0, Sydney 24.0; (b) 2026-03-01 09:12 and 2026-03-02 18:05; (c) Melbourne 4.</p>
+      </div>
+      <div class="exam-note"><p>Что нужно сделать правильно: join по имени ключевого столбца, <code>join(users, "User_ID")</code>, который оставляет один столбец <code>User_ID</code>; каждое сравнение в скобках, соединённых через <code>&amp;</code>; <code>groupBy</code> вместе с <code>agg</code>; и HAVING в виде <code>filter</code> по псевдониму агрегата. В пункте (b) неважно, фильтруешь ты до join или после: Catalyst опускает оба условия ниже него, как показывает виджет этого урока.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l40-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Ты переносишь <code>.where(users.city == "Melbourne")</code> из позиции после join в позицию до него. Что происходит с оптимизированным планом?</p>
+    <ul class="options">
+      <li data-correct>Ничего: это тот же самый план <span class="fb">Catalyst в любом случае опускает фильтр ниже join; виджет показал одинаковые оптимизированные и физические планы.</span></li>
+      <li>Он становится быстрее, потому что фильтр теперь выполняется первым <span class="fb">Он выполняется первым в обоих случаях: predicate pushdown уже перенёс его туда.</span></li>
+      <li>Он становится медленнее, потому что join теряет нужные ему строки <span class="fb">Фильтр удаляет только строки, которые запрос и так бы отбросил; результат тот же.</span></li>
+      <li>Он падает, потому что в <code>users</code> нет timestamp <span class="fb">timestamp берётся из <code>events</code>; отфильтровать <code>users</code> заранее совершенно законно.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В Parquet-файле 10 одинаково больших столбцов в 8 row group. Запросу нужны 2 столбца, а статистика в footer доказывает, что подходящие строки могут быть только в 2 row group. Какую примерно долю файла прочитают?</p>
+    <ul class="options">
+      <li data-correct>5 % <span class="fb">Два пропуска перемножаются: 2/10 столбцов умножить на 2/8 row group — это 1/20.</span></li>
+      <li>20 % <span class="fb">Так учтена только проекция столбцов, а пропущенные row group забыты.</span></li>
+      <li>25 % <span class="fb">Так учтены только row group, а забыто, что 8 из 10 столбцов не читаются.</span></li>
+      <li>45 % <span class="fb">Две экономии не складываются, а перемножаются.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему Spark не может перенести фильтр в <code>rdd.map(f).filter(g)</code> ниже <code>map</code>, как Catalyst делает это с DataFrame?</p>
+    <ul class="options">
+      <li data-correct>f и g — непрозрачные функции: Spark не видит, какие поля они читают или пишут <span class="fb">Для проталкивания нужно знать, что фильтр не зависит от того, что вычисляет map; лямбда этого не сообщает.</span></li>
+      <li>Потому что RDD неизменяемы <span class="fb">DataFrame тоже неизменяемы, а Catalyst постоянно переписывает их планы.</span></li>
+      <li>Потому что операции над RDD вычисляются немедленно <span class="fb">Преобразования RDD тоже ленивые; ленивость тут не помеха.</span></li>
+      <li>Потому что Catalyst работает только с кодом на Scala <span class="fb">Catalyst оптимизирует и DataFrame-код на Python; в Python строится только план.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие утверждения о footer Parquet-файла верны?</p>
+    <ul class="options">
+      <li data-correct>Он записывается после всех row group <span class="fb">Писатель потоком выдаёт row group и дописывает footer последним, за один проход.</span></li>
+      <li data-correct>Он хранит схему и для каждого column chunk — его смещение и статистику <span class="fb">"A footer contains column chunks offset and schema" (p. 1252); статистика — это "footer stats" (p. 1257).</span></li>
+      <li data-correct>Читатель читает его раньше любого column chunk <span class="fb">Ему нужны смещения, чтобы прыгать к chunk, и статистика, чтобы пропускать row group.</span></li>
+      <li>Он хранит копию первой row group для быстрого предпросмотра <span class="fb">В footer только метаданные, никаких данных.</span></li>
+      <li>Он стоит в конце, потому что HDFS не умеет читать файлы с начала <span class="fb">HDFS читает с любого смещения; причина — запись за один проход.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Схема та же, что на слайде (p. 1253). У записи есть <code>DocId: 7</code> и нет Links вообще. Что хранит для неё столбец <code>Links.Backward</code>?</p>
+    <ul class="options">
+      <li data-correct>NULL с R = 0 и D = 0 <span class="fb">На пути ничего не определено, поэтому D = 0; значение принадлежит новой записи, поэтому R = 0.</span></li>
+      <li>Ничего <span class="fb">Тогда читатель не смог бы понять, где в этом столбце кончается одна запись: каждая запись оставляет след в каждом столбце.</span></li>
+      <li>NULL с R = 0 и D = 1 <span class="fb">D = 1 значило бы, что Links есть, а не хватает только Backward.</span></li>
+      <li>NULL с R = 1 и D = 2 <span class="fb">D = 2 означает настоящее значение Backward, а R = 1 — продолжение списка: ни то, ни другое не наш случай.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">У column chunk столбца <code>city</code> словарь {Como, Lecco, Milano}, а статистика — min Como, max Milano. Какой фильтр позволяет читателю пропустить row group благодаря словарю, хотя одних min/max для этого не хватило бы?</p>
+    <ul class="options">
+      <li data-correct><code>city == "Lodi"</code> <span class="fb">Lodi лежит между Como и Milano, так что min/max говорит «возможно»; словарь говорит, что его там нет.</span></li>
+      <li><code>city == "Monza"</code> <span class="fb">Monza идёт после Milano: одних min/max уже хватает, чтобы пропустить row group.</span></li>
+      <li><code>city == "Lecco"</code> <span class="fb">Lecco есть в словаре: row group придётся прочитать.</span></li>
+      <li><code>city &gt; "Bari"</code> <span class="fb">Все значения chunk идут после Bari: пропустить ничего нельзя.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие объекты из MLlib-pipeline со слайда (p. 1286) оказываются внутри обученной PipelineModel?</p>
+    <ul class="options">
+      <li data-correct><code>tokenizer</code> <span class="fb">Transformer: используется как есть.</span></li>
+      <li data-correct><code>hashingTF</code> <span class="fb">Тоже transformer.</span></li>
+      <li data-correct><code>lr.model</code> <span class="fb">Transformer, который выдал <code>lr.fit</code> на ds2.</span></li>
+      <li><code>lr</code> <span class="fb">Estimator используется один раз, в fit; поэтому рис. 7 рисует его снаружи пунктирной рамки.</span></li>
+      <li><code>ds0</code> <span class="fb">Входные данные — не стадия модели.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l40-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Spark SQL "is about more than SQL": один DataFrame API и один оптимизатор, Catalyst, стоят и за SQL-строками, и за DataFrame-кодом, а выполняется всё на RDD; он снял ограничения Shark (только каталог Hive, только SQL-строки, оптимизатор эпохи MapReduce).</li>
+    <li>Декларативный код короче и проверяем: <code>agg(F.avg("age"))</code> вместо пар (сумма, количество), которые носишь вручную, а немедленный анализ сообщает о неверном столбце ещё до того, как сдвинулись какие-либо данные.</li>
+    <li>Catalyst переписывает деревья правилами сопоставления с образцом до неподвижной точки, в четыре фазы: анализ с каталогом, логическая оптимизация на правилах, физическое планирование с моделью стоимости, генерация кода с квазицитатами.</li>
+    <li>Predicate pushdown и projection pruning двигают фильтры к данным и выбрасывают неиспользуемые столбцы — вплоть до <code>buildScan(requiredColumns, filters)</code> источника данных.</li>
+    <li>Avro хранит целые записи, с JSON-схемой в заголовке и маркерами синхронизации для деления на части; Parquet хранит column chunks внутри row groups, индексирует их в footer и читает только те столбцы, row groups и pages, которые нужны запросу.</li>
+    <li>Кодировки (delta, prefix, dictionary, RLE, bit packing) сжимают столбцы, а уровни определения и повторения (definition and repetition levels) хранят вложенные данные как плоские столбцы.</li>
+    <li>Расширения, вывод схемы JSON одним reduce и конвейеры MLlib — всё строится на DataFrame; на слайде (p. 1287) агрегация на DataFrame работает примерно в 12 раз быстрее, чем RDD-код на Python.</li>
+  </ul>
+  <aside class="cheat" id="l40-cheat">
+    <dl>
+      <dt>Обещания Spark SQL</dt><dd>write less code · read less data · let the optimizer do the hard work (p. 1264)</dd>
+      <dt>Среднее по группе</dt><dd><code>df.groupBy("name").agg(F.avg("age"))</code></dd>
+      <dt>Среднее на RDD</dt><dd>носи пары (сумма, количество): \((s_1, c_1) \oplus (s_2, c_2)\) складывает обе части</dd>
+      <dt>Фазы Catalyst</dt><dd>analysis (каталог) → logical optimization (правила) → physical planning (модель стоимости) → code generation (квазицитаты)</dd>
+      <dt>Unresolved attribute</dt><dd>тип неизвестен или не сопоставлен ни с одной входной таблицей</dd>
+      <dt>Constant folding</dt><dd><code>case Add(Literal(c1), Literal(c2)) => Literal(c1+c2)</code></dd>
+      <dt>Predicate pushdown</dt><dd>двигать фильтр к данным: ниже проекций и join, внутрь сканирования</dd>
+      <dt>Projection pruning</dt><dd>читать и нести дальше только столбцы, которые используются выше</dd>
+      <dt>Сканирование источника данных</dt><dd><code>buildScan(requiredColumns, filters): RDD[Row]</code></dd>
+      <dt>Avro</dt><dd>строковый (row-oriented) двоичный формат; JSON-схема в заголовке; маркеры синхронизации делают его splittable; эволюция схемы (schema evolution)</dd>
+      <dt>Единицы Parquet</dt><dd>файл ⊃ row group (128 MB) ⊃ column chunk ⊃ page (1 MB); footer: схема, смещения, статистика</dd>
+      <dt>Прочитанные байты</dt><dd>\(\approx \frac{c'}{c} \cdot \frac{g'}{g}\) файла (прочитанные столбцы и row groups)</dd>
+      <dt>Максимальные уровни</dt><dd>D: необязательные или повторяющиеся поля на пути; R: только повторяющиеся</dd>
+      <dt>Биты для уровня с максимумом m</dt><dd>\(\lceil \log_2(m+1) \rceil\)</dd>
+      <dt>Кодировки</dt><dd>delta (timestamps), prefix (строки), dictionary (&lt; 50,000 значений), RLE + bit packing (уровни, ключи)</dd>
+      <dt>Вывод схемы JSON</dt><dd>самый узкий общий тип для каждого поля; схемы сливаются одним reduce</dd>
+      <dt>MLlib</dt><dd>transformer: <code>transform</code>; estimator: <code>fit</code> → модель; <code>Pipeline.fit</code> → PipelineModel</dd>
+    </dl>
+  </aside>
+</section>
+
+<section class="resources" id="l40-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.databricks.com/blog/2015/04/13/deep-dive-into-spark-sqls-catalyst-optimizer.html" target="_blank" rel="noopener">Deep Dive into Spark SQL's Catalyst Optimizer</a>
+      <span class="res-by">Armbrust, Huai, Lian, Xin, Zaharia · блог Databricks, 2015</span>
+      <p class="res-why">Дружелюбная версия слайдов о Catalyst — с тем же деревом x + (1 + 2) и теми же четырьмя фазами. Читай её вместе со вторым разделом.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://parquet.apache.org/docs/file-format/" target="_blank" rel="noopener">Parquet documentation: File Format</a>
+      <span class="res-by">Apache Parquet</span>
+      <p class="res-why">Каноническая картинка раскладки — PAR1, row groups, column chunks, pages, footer, — которую копирует слайд (p. 1252). На странице «Nested Encoding» оба уровня определены, каждый одним абзацем.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://parquet-viewer.xiangpeng.systems/" target="_blank" rel="noopener">Parquet Viewer</a>
+      <span class="res-by">Xiangpeng Hao</span>
+      <p class="res-why">Перетащи в браузер любой .parquet-файл и увидишь его настоящие row groups, column chunks, кодировки и статистику min/max: виджет этого урока на твоём собственном файле.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://people.csail.mit.edu/matei/papers/2015/sigmod_spark_sql.pdf" target="_blank" rel="noopener">Spark SQL: Relational Data Processing in Spark</a>
+      <span class="res-by">Armbrust et al. · SIGMOD 2015</span>
+      <p class="res-why">Статья, на которой стоят слайды (pp. 1262–1287): разделы 3 и 4 — про API и Catalyst, разделы 6.2–6.3 — про два графика из загадки в начале урока.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://arrow.apache.org/blog/2022/12/26/querying-parquet-with-millisecond-latency/" target="_blank" rel="noopener">Querying Parquet with Millisecond Latency</a>
+      <span class="res-by">Raphael Taylor-Davies, Andrew Lamb · блог Apache Arrow, 2022</span>
+      <p class="res-why">Три уровня отсечения со слайда (p. 1257) — column chunks, row groups по статистике footer, pages по page index — объяснены точно, с ASCII-диаграммами.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Здесь лекции заканчиваются: предпоследний слайд отсылает к spark.apache.org (p. 1289), а последний говорит "Thanks" (p. 1290). Остаётся привычка для каждой системы этого курса: прежде чем писать запрос, спроси себя, что движок может в нём увидеть, — план, который можно переписать, схему, которую можно проверить, файл, который можно пропустить.</p>
+  <a class="bridge-link" href="index.html">Назад к карте курса</a>
+</aside>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1320 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MapReduce: фабрика соков · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local styles for the word-count widget (a text box, rows of key-value pairs that can be clicked): no component covers them; tokens only */
+.l30-wc { padding: 0.8rem 1rem 0.9rem; display: grid; gap: 0.7rem; font-family: var(--f-display); font-size: var(--t-sm); color: var(--ink); }
+.l30-row { display: grid; gap: 0.35rem; min-width: 0; }
+.l30-h { margin: 0; font-size: var(--t-xs); font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); }
+.l30-lanes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 0.5rem; }
+.l30-lane { min-width: 0; padding: 0.4rem 0.55rem 0.5rem; background: var(--paper); border: 1px solid var(--line-2); border-radius: var(--radius); }
+.l30-lane-h { margin: 0 0 0.3rem; font-size: var(--t-xs); font-weight: 600; color: var(--ink-2); }
+.l30-pairs { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.l30-pair { font: inherit; font-family: var(--f-mono); font-size: var(--t-xs); line-height: 1.35; padding: 0.06rem 0.35rem; color: var(--ink); background: color-mix(in srgb, var(--s1) 10%, var(--paper)); border: 1px solid color-mix(in srgb, var(--s1) 50%, var(--paper)); border-radius: var(--radius); cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.l30-pair.is-key { background: var(--key-bg); border-color: var(--key-line); box-shadow: 0 0 0 1.5px var(--key-line); }
+.l30-pair:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+.l30-line { margin: 0; font-family: var(--f-mono); font-size: var(--t-xs); line-height: 1.45; color: var(--ink); overflow-wrap: anywhere; }
+.l30-off { margin: 0; font-size: var(--t-xs); color: var(--ink-3); }
+.l30-text { width: 100%; box-sizing: border-box; min-height: 4.6rem; padding: 0.4rem 0.6rem; font-family: var(--f-mono); font-size: var(--t-sm); line-height: 1.45; color: var(--ink); background: var(--paper); border: 1.5px solid var(--line-2); border-radius: var(--radius); resize: vertical; }
+.l30-text:focus-visible { outline: 2px solid var(--link); outline-offset: 1px; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l30">
+
+<header class="lesson-head">
+  <h1>MapReduce: фабрика соков</h1>
+  <p class="lede">После этого урока ты сможешь вручную прогнать подсчёт слов — выход map, shuffle и сортировка, выход reduce, — назвать части задания (job) MapReduce и что делает каждая, и объяснить, как фреймворк переживает умершие и медленные машины.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Лекция начинается с бизнеса по производству соков. Разрезать одно яблоко и смешать дольки в блендере просто; а у сокового гиганта, которому приходит целый контейнер вперемешку разных фруктов и который должен разлить каждый вид в свои бутылки, задача совсем другая (pp. 777–780). Дальше (p. 781) в то же положение ставят Google: индексация и рекомендации так же "conceptually simple", как приготовление сока, "But, the data to process is HUGE!!!" — "Google processes over 50 PB of data every day".</p>
+  <p>Начнём с малого. На слайде (p. 792) считают слова одного короткого пользовательского запроса из трёх предложений: "The teacher went to the store. The store was closed; the store opens in the morning. The store opens at 9am." Посчитай, сколько раз встречается <em>store</em>. Выход редьюсера, напечатанный на слайдах (pp. 793 и 797), говорит <code>&lt;store, 3&gt;</code>.</p>
+  <p>Если у тебя получилось другое число, не отбрасывай его и спроси себя: может ли какая-то часть задания MapReduce, работающего на кластере, превратить твой счёт в 3 со слайда — умерший маппер, комбайнер, второй редьюсер? Ответ — в последнем разделе.</p>
+</div>
+
+
+<section id="l30-juice">
+  <h2>От одного яблока до контейнера фруктов</h2>
+
+  <p>В уроках про NoSQL данные и запросы распределялись по многим машинам. Первый слайд этой лекции называет то, чего всё ещё не хватает: "Scalability of computation, not only data and queries" (p. 775) — масштабируемость самих вычислений. Ответ курса — MapReduce, рассказанный как история про сок.</p>
+
+  <p>Прототипу нужны два инструмента: нож режет яблоко на дольки, блендер превращает дольки в сок (p. 778). "Next Day" рецепт встречается с "all the fruits in the fruit basket" — всё ещё один нож, один блендер, один стакан смешанного сока (p. 779). Потом "Industrialization": гигант с "whole container of fruits", который хочет "juice of different fruits separately" (p. 780), по бутылке на каждый вид. С инструментами всё в порядке; проблема в масштабе. Слайд (p. 784) называет их: нож — это <mark class="key">Map</mark>, блендер — это <mark class="key">Reduce</mark>.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l30-fig-juice">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 274" role="img" aria-label="До: одна корзина смешанных фруктов проходит через один шаг map, нож, и превращается в куски трёх видов, затем через один шаг reduce, блендер, в один стакан смешанного сока">
+        <rect x="100" y="14" width="100" height="32" rx="6" class="fi-paper sw-2"/>
+        <circle cx="126" cy="30" r="7" class="fi-s1 st-paper sw-2"/>
+        <rect x="143" y="23" width="14" height="14" class="fi-s1 st-paper sw-2"/>
+        <path d="M167,37 L174,23 L181,37 Z" class="fi-s1 st-paper sw-2"/>
+        <text x="92" y="35" class="tx-sm tx-end">корзина</text>
+        <line x1="150" y1="48" x2="150" y2="70" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="110" y="74" width="80" height="30" class="fi-paper sw-2"/>
+        <text x="150" y="94" class="tx-mono tx-mid">map</text>
+        <text x="200" y="94" class="tx-sm">нож</text>
+        <line x1="150" y1="106" x2="150" y2="128" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <circle cx="124" cy="146" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="144" y="140" width="12" height="12" class="fi-s1 st-paper sw-2"/>
+        <path d="M170,152 L176,140 L182,152 Z" class="fi-s1 st-paper sw-2"/>
+        <text x="200" y="150" class="tx-sm">куски</text>
+        <line x1="150" y1="160" x2="150" y2="182" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="110" y="186" width="80" height="30" class="fi-paper sw-2"/>
+        <text x="150" y="206" class="tx-mono tx-mid">reduce</text>
+        <text x="200" y="206" class="tx-sm">блендер</text>
+        <line x1="150" y1="218" x2="150" y2="236" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <path d="M136,240 L164,240 L160,266 L140,266 Z" class="fw-s1 st-s1 sw-2"/>
+        <text x="174" y="258" class="tx-sm">стакан смеси</text>
+      </svg>
+      <p class="fig-label">До: один нож, один блендер (p. 779)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 274" role="img" aria-label="После: контейнер разделён на пять корзин; пять шагов map работают одновременно и режут каждый фрукт на куски, помеченные их видом; пятнадцать линий несут куски каждого вида из каждой корзины в одну кучу на вид; три шага reduce наполняют по одной бутылке: яблочный, апельсиновый и ананасовый сок">
+        <rect x="100" y="6" width="100" height="24" class="fi-paper sw-2"/>
+        <text x="150" y="23" class="tx-sm tx-mid">контейнер</text>
+        <path d="M150,30 L30,44 M150,30 L90,44 M150,30 L150,44 M150,30 L210,44 M150,30 L270,44" class="st-s1"/>
+        <rect x="10" y="46" width="40" height="18" rx="4" class="fi-paper"/>
+        <rect x="70" y="46" width="40" height="18" rx="4" class="fi-paper"/>
+        <rect x="130" y="46" width="40" height="18" rx="4" class="fi-paper"/>
+        <rect x="190" y="46" width="40" height="18" rx="4" class="fi-paper"/>
+        <rect x="250" y="46" width="40" height="18" rx="4" class="fi-paper"/>
+        <path d="M30,64 V74 M90,64 V74 M150,64 V74 M210,64 V74 M270,64 V74" class="st-s1"/>
+        <rect x="8" y="76" width="44" height="20" class="fi-paper sw-2"/>
+        <rect x="68" y="76" width="44" height="20" class="fi-paper sw-2"/>
+        <rect x="128" y="76" width="44" height="20" class="fi-paper sw-2"/>
+        <rect x="188" y="76" width="44" height="20" class="fi-paper sw-2"/>
+        <rect x="248" y="76" width="44" height="20" class="fi-paper sw-2"/>
+        <text x="30" y="90" class="tx-sm tx-mono tx-mid">map</text>
+        <text x="90" y="90" class="tx-sm tx-mono tx-mid">map</text>
+        <text x="150" y="90" class="tx-sm tx-mono tx-mid">map</text>
+        <text x="210" y="90" class="tx-sm tx-mono tx-mid">map</text>
+        <text x="270" y="90" class="tx-sm tx-mono tx-mid">map</text>
+        <path d="M18,114 L50,170 M78,114 L50,170 M138,114 L50,170 M198,114 L50,170 M258,114 L50,170" class="st-s1"/>
+        <path d="M30,114 L150,170 M90,114 L150,170 M150,114 L150,170 M210,114 L150,170 M270,114 L150,170" class="st-s1"/>
+        <path d="M42,114 L250,170 M102,114 L250,170 M162,114 L250,170 M222,114 L250,170 M282,114 L250,170" class="st-s1"/>
+        <circle cx="18" cy="108" r="4" class="fi-s1"/><rect x="26" y="104" width="8" height="8" class="fi-s1"/><path d="M38,112 L42,104 L46,112 Z" class="fi-s1"/>
+        <circle cx="78" cy="108" r="4" class="fi-s1"/><rect x="86" y="104" width="8" height="8" class="fi-s1"/><path d="M98,112 L102,104 L106,112 Z" class="fi-s1"/>
+        <circle cx="138" cy="108" r="4" class="fi-s1"/><rect x="146" y="104" width="8" height="8" class="fi-s1"/><path d="M158,112 L162,104 L166,112 Z" class="fi-s1"/>
+        <circle cx="198" cy="108" r="4" class="fi-s1"/><rect x="206" y="104" width="8" height="8" class="fi-s1"/><path d="M218,112 L222,104 L226,112 Z" class="fi-s1"/>
+        <circle cx="258" cy="108" r="4" class="fi-s1"/><rect x="266" y="104" width="8" height="8" class="fi-s1"/><path d="M278,112 L282,104 L286,112 Z" class="fi-s1"/>
+        <text x="150" y="146" class="tx-sm tx-mid halo">shuffle</text>
+        <circle cx="50" cy="178" r="7" class="fi-s1 st-paper sw-2"/>
+        <rect x="143" y="171" width="14" height="14" class="fi-s1 st-paper sw-2"/>
+        <path d="M243,185 L250,171 L257,185 Z" class="fi-s1 st-paper sw-2"/>
+        <rect x="18" y="194" width="64" height="22" class="fi-paper sw-2"/>
+        <rect x="118" y="194" width="64" height="22" class="fi-paper sw-2"/>
+        <rect x="218" y="194" width="64" height="22" class="fi-paper sw-2"/>
+        <text x="50" y="209" class="tx-sm tx-mono tx-mid">reduce</text>
+        <text x="150" y="209" class="tx-sm tx-mono tx-mid">reduce</text>
+        <text x="250" y="209" class="tx-sm tx-mono tx-mid">reduce</text>
+        <path d="M45,222 h10 v6 l4,4 v20 h-18 v-20 l4,-4 z" class="fw-s1 st-s1 sw-2"/>
+        <path d="M145,222 h10 v6 l4,4 v20 h-18 v-20 l4,-4 z" class="fw-s1 st-s1 sw-2"/>
+        <path d="M245,222 h10 v6 l4,4 v20 h-18 v-20 l4,-4 z" class="fw-s1 st-s1 sw-2"/>
+        <text x="50" y="268" class="tx-sm tx-mid">яблоко</text>
+        <text x="150" y="268" class="tx-sm tx-mid">апельсин</text>
+        <text x="250" y="268" class="tx-sm tx-mid">ананас</text>
+      </svg>
+      <p class="fig-label">После: "A parallel version of the process" (p. 786)</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Два «соковых» слайда как пара «до / после». Круг, квадрат и треугольник — три вида фруктов. Слева один нож и один блендер справляются со всей корзиной и дают один стакан смешанного сока. Справа контейнер разделён на пять корзин, которые пять ножей режут одновременно; каждый кусок сохраняет свой вид, а пятнадцать линий несут каждый вид из каждой корзины к единственному блендеру для этого вида, который наполняет одну бутылку.</figcaption>
+  </figure>
+
+  <p>Читай правую панель как всю модель целиком. Контейнер — это входные данные. Пять корзин — это <mark class="key">сплиты (splits)</mark>, по одному на map-задачу. Каждый нож — маппер (mapper): он режет любой доставшийся ему фрукт и помечает каждый кусок его видом — это <em>ключ</em>. Перекрещивающиеся линии — это <mark class="key">shuffle (перераспределение по ключам)</mark>: каждый кусок яблока из каждой корзины едет в единственную яблочную кучу. Каждый блендер — редьюсер (reducer): он видит все куски одного вида и наполняет одну бутылку — выходной файл.</p>
+
+  <h3>Одна машина слишком медленная, параллельный код — сложный</h3>
+  <p>Слайд (p. 781) перечисляет простые операции — "Making juice", "Indexing", "Recommendations etc" — и выносит вердикт насчёт объёма: "Sequential execution just won't scale up". Много машин помогают, ведь "Parallel execution achieves greater efficiency", "But, parallel programming is hard" (p. 782): распараллеливание (со своими "Race Conditions" и "Debugging"), "Fault Tolerance", "Data Distribution", "Load Balancing".</p>
+
+  <div class="def">
+    <p><dfn>MapReduce</dfn> — "a programming model and an associated implementation for processing and generating large data sets" (p. 783). <em>Модель программирования</em> даёт "Abstractions to express simple computations": ты пишешь функцию map и функцию reduce. <em>Реализация</em> "Takes care of the gory stuff: Parallelization, Fault Tolerance, Data Distribution and Load Balancing" — берёт на себя всю грязную работу.</p>
+  </div>
+
+  <p>Это и есть четыре сложности со слайда (p. 782), которые забирает на себя фреймворк; ответ на экзамене называет обе половины определения. Следующий слайд (p. 785) перечисляет их как преимущества — "Automatic parallelization, distribution", "I/O scheduling" (балансировка нагрузки, оптимизация сети и передачи данных), "Fault tolerance" ("Handling of machine failures") — и заканчивает фразой "Need more power: Scale out, not up!": добавляй машины, а не покупай одну побольше, — это горизонтальное масштабирование из <a href="l03.html#l03-scale">урока 3</a>.</p>
+
+  <p class="memo"><mark class="key">MapReduce — это модель программирования (ты пишешь только map и reduce над парами ключ–значение) плюс реализация, которая запускает их на многих машинах и берёт на себя распределение, сбои и балансировку нагрузки.</mark></p>
+</section>
+
+
+<section id="l30-count">
+  <h2>Подсчёт слов: вручную и машиной</h2>
+
+  <p>У MapReduce одна структура данных: "All data is in terms of key-value pairs" (p. 788). "Mappers read in data from the filesystem, and output (typically) modified data"; "Reducers collect all of the mappers output on the keys, and output (typically) reduced data". Следующий слайд (p. 789) даёт форму "Typical problem solved by MapReduce":</p>
+  <ol>
+    <li>"Read a lot of data"</li>
+    <li>"Map: extract something you care about from each record"</li>
+    <li>"Shuffle and Sort"</li>
+    <li>"Reduce: aggregate, summarize, filter, or transform"</li>
+    <li>"Write the results"</li>
+  </ol>
+  <p>Ты пишешь шаги 2 и 4. Шаг 3 делает библиотека: она собирает вместе все значения одного ключа, отсортированные по ключу.</p>
+
+  <h3>Подсчёт слов со слайда</h3>
+  <p>Маппер со слайда (p. 792) считает "number of each word in user queries". Его входная пара — <code>&lt;queryID, QueryText&gt;</code>: ключ <code>Q1</code>, значение — текст из загадки, — и он выдаёт <code>&lt;word, 1&gt;</code> на каждое слово, без пунктуации: 21 пара, <code>&lt;The, 1&gt; &lt;teacher, 1&gt; &lt;went, 1&gt; …</code>. Маппер ничего не считает: он видит только свой вход и не может знать, сколько раз слово встречается где-то ещё. Таблица прослеживает эти 21 пару через shuffle и сортировку до редьюсера.</p>
+
+  <figure class="tbl-fig" id="l30-tbl-count">
+    <figcaption>Подсчёт слов со слайдов (pp. 792–793), сделанный правильно, ключи в нижнем регистре: вход редьюсера после shuffle и сортировки, его выход и то, что напечатано на слайде (p. 793). Выделены строки, где счёт на слайде расходится.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Вход редьюсера</th><th>Выход редьюсера</th><th>Напечатано на слайде (p. 793)</th></tr></thead>
+        <tbody>
+          <tr><td><code>&lt;9am, [1]&gt;</code></td><td><code>&lt;9am, 1&gt;</code></td><td><code>&lt;9am, 1&gt;</code></td></tr>
+          <tr><td><code>&lt;at, [1]&gt;</code></td><td><code>&lt;at, 1&gt;</code></td><td><code>&lt;at, 1&gt;</code></td></tr>
+          <tr><td><code>&lt;closed, [1]&gt;</code></td><td><code>&lt;closed, 1&gt;</code></td><td><code>&lt;closed, 1&gt;</code></td></tr>
+          <tr class="is-key"><td><code>&lt;in, [1]&gt;</code></td><td><code>&lt;in, 1&gt;</code></td><td>отсутствует</td></tr>
+          <tr><td><code>&lt;morning, [1]&gt;</code></td><td><code>&lt;morning, 1&gt;</code></td><td><code>&lt;morning, 1&gt;</code></td></tr>
+          <tr class="is-key"><td><code>&lt;opens, [1, 1]&gt;</code></td><td><code>&lt;opens, 2&gt;</code></td><td><code>&lt;opens, 1&gt;</code></td></tr>
+          <tr class="is-key"><td><code>&lt;store, [1, 1, 1, 1]&gt;</code></td><td><code>&lt;store, 4&gt;</code></td><td><code>&lt;store, 3&gt;</code></td></tr>
+          <tr><td><code>&lt;teacher, [1]&gt;</code></td><td><code>&lt;teacher, 1&gt;</code></td><td><code>&lt;teacher, 1&gt;</code></td></tr>
+          <tr><td><code>&lt;the, [1, 1, 1, 1, 1, 1]&gt;</code></td><td><code>&lt;the, 6&gt;</code></td><td><code>&lt;The, 6&gt;</code></td></tr>
+          <tr><td><code>&lt;to, [1]&gt;</code></td><td><code>&lt;to, 1&gt;</code></td><td><code>&lt;to, 1&gt;</code></td></tr>
+          <tr><td><code>&lt;was, [1]&gt;</code></td><td><code>&lt;was, 1&gt;</code></td><td><code>&lt;was, 1&gt;</code></td></tr>
+          <tr><td><code>&lt;went, [1]&gt;</code></td><td><code>&lt;went, 1&gt;</code></td><td><code>&lt;went, 1&gt;</code></td></tr>
+          <tr><td>21 значение, 12 ключей</td><td>12 пар, сумма счётчиков 21</td><td>11 пар, сумма счётчиков 18</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="793">
+    <p class="claim">"The output would be: &lt;The, 6&gt; &lt;teacher, 1&gt; &lt;went, 1&gt; &lt;to, 1&gt; &lt;store, 3&gt; &lt;was, 1&gt; &lt;closed, 1&gt; &lt;opens, 1&gt; &lt;morning, 1&gt; &lt;at, 1&gt; &lt;9am, 1&gt;"</p>
+    <p class="fix">Если сверить с выходом маппера на том же слайде, <em>store</em> встречается 4 раза, <em>opens</em> — дважды, а <code>&lt;in, 1&gt;</code> пропущено: правильный выход — <code>&lt;the, 6&gt; &lt;teacher, 1&gt; &lt;went, 1&gt; &lt;to, 1&gt; &lt;store, 4&gt; &lt;was, 1&gt; &lt;closed, 1&gt; &lt;opens, 2&gt; &lt;in, 1&gt; &lt;morning, 1&gt; &lt;at, 1&gt; &lt;9am, 1&gt;</code>, 12 пар — здесь в порядке слайда; в выходном файле они идут отсортированными по ключу, как в таблице.</p>
+    <p class="because">Проверка, которую можно сделать всегда: счётчики должны в сумме давать число пар, которые выдали мапперы, — здесь 21, а напечатанные дают 18. Красная подсветка на слайде (p. 793) отмечает только три из четырёх <code>&lt;store, 1&gt;</code> — скорее всего, отсюда и взялось 3; следующий слайд (p. 797) повторяет тот же выход. С регистром тоже небрежно: напечатанный выход маппера сохраняет первое "The" и переводит в нижний регистр две другие заглавные, так что либо маппер переводит в нижний регистр все слова (один ключ <em>the</em>, 6 — так сделано здесь), либо сохраняет регистр (два ключа, <em>The</em> и <em>the</em>, по 3). Экзамен могут проверять по напечатанному слайду: знай, что там напечатано, а пиши правильные счётчики.</p>
+  </aside>
+
+  <p>На слайде (p. 810) то же задание написано псевдокодом и запущено на документе "Sam Apple Sam Mom Sam Mom":</p>
+
+<pre><code>// emits one &lt;word, "1"&gt; per word
+map(String input_key, String input_value):
+    // input_key: document name
+    // input_value: document contents
+    for each word w in input_value:
+      EmitIntermediate(w, "1");</code></pre>
+
+<pre><code>// emits the count of one word
+reduce(String output_key, Iterator intermediate_values):
+    // output_key: a word
+    // output_values: a list of counts
+    int result = 0;
+    for each v in intermediate_values:
+      result += ParseInt(v);
+    Emit(AsString(result));</code></pre>
+
+  <p>Map выдаёт по паре на слово — <code>&lt;"Sam", "1"&gt;, &lt;"Apple", "1"&gt;, &lt;"Sam", "1"&gt;, &lt;"Mom", "1"&gt;, &lt;"Sam", "1"&gt;, &lt;"Mom", "1"&gt;</code>; библиотека группирует их в <code>&lt;"Sam", ["1","1","1"]&gt;</code>, <code>&lt;"Apple", ["1"]&gt;</code>, <code>&lt;"Mom", ["1", "1"]&gt;</code>; три вызова reduce выдают "3", "1" и "2" — каждый счёт ключа своего вызова. Значения передаются строками, отсюда <code>ParseInt</code> и <code>AsString</code>; Hadoop даёт им настоящие типы (раздел 3).</p>
+
+  <h3>Модель в символах</h3>
+  <p>"Programming Model" со слайда (p. 791): "To generate a set of output key-value pairs from a set of input key-value pairs", \(\{\langle k_i, v_i\rangle\} \to \{\langle k_o, v_o\rangle\}\), "Expressed using two abstractions":</p>
+
+  <div class="formula" data-label="p. 791">
+    \[ \begin{aligned} &\text{Map task} \\ &\quad \langle k_i, v_i\rangle \to \{\langle k_{int}, v_{int}\rangle\} \\[4pt] &\text{Reduce task} \\ &\quad \langle k_{int}, \{v_{int}\}\rangle \to \langle k_o, v_o\rangle \end{aligned} \]
+    <dl class="legend">
+      <dt>\(\langle k_i, v_i\rangle\)</dt><dd>одна входная пара, одна запись: <code>Q1</code> и его текст</dd>
+      <dt>\(\langle k_{int}, v_{int}\rangle\)</dt><dd>промежуточные пары, сколько угодно на одну входную пару: <code>&lt;store, 1&gt;</code></dd>
+      <dt>\(\{v_{int}\}\)</dt><dd>все промежуточные значения одного ключа, собранные библиотекой: <code>[1, 1, 1, 1]</code></dd>
+      <dt>\(\langle k_o, v_o\rangle\)</dt><dd>выходная пара: <code>&lt;store, 4&gt;</code></dd>
+    </dl>
+  </div>
+
+  <p>Между ними "Library" "aggregates all the all intermediate values associated with the same intermediate key" (sic) и "passes the intermediate key-value pairs to reduce function". Один вызов map может не выдать ни одной пары, выдать одну или много. Reduce на слайде выдаёт одну пару на ключ — для подсчёта слов это точно, хотя редьюсер в Hadoop может выдать сколько угодно.</p>
+
+  <div class="widget" id="l30-w-wc">
+    <h3 class="widget-title">Конвейер подсчёта слов</h3>
+    <p class="widget-intro">Подсчёт слов в MapReduce на тексте из поля, по одному этапу за шаг: сплиты, выход map, выход комбайнера, shuffle (по линии от каждой map-задачи к каждой reduce-задаче, которой она отправляет пары; чем больше пар, тем толще линия), сгруппированный вход редьюсера и выходные файлы. Нажимай <em>«Дальше»</em> или <em>«Проиграть»</em>; щёлкни по любой паре, чтобы проследить её ключ. Главное, что нужно увидеть: подсчёт происходит только после того, как shuffle свёл все копии ключа к одному редьюсеру, — а комбайнер меняет, сколько пар едет по сети, но никогда не меняет результат.</p>
+    <ol class="tasks">
+      <li>Оставь текст слайда, M = 3, R = 1, комбайнер выключен. Прежде чем нажать <em>«Дальше»</em>, предскажи, сколько пар выдадут три маппера вместе и что редьюсер запишет для <em>store</em>, <em>opens</em> и <em>in</em>. Потом пройди до конца.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>21 пара, 6 + 10 + 5: по одной на слово, ничего не посчитано. Редьюсер записывает <code>&lt;store, 4&gt;</code>, <code>&lt;opens, 2&gt;</code>, <code>&lt;in, 1&gt;</code> и <code>&lt;the, 6&gt;</code>: 12 пар, счётчики которых в сумме дают 21. <code>&lt;store, 3&gt;</code> со слайда из этих пар получиться не может.</p></details>
+      </li>
+      <li>Поставь R = 2 и щёлкни по <code>&lt;store, 1&gt;</code>. Предскажи: могут ли четыре пары <em>store</em> оказаться на разных редьюсерах?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Нет. Все четыре идут в reduce-задачу 1, потому что hash(store) mod 2 равно 1 для каждой копии: партиционер вычисляет редьюсер только по ключу. Reduce-задача 1 получает 17 пар, задача 0 — всего 4 (<em>closed</em>, <em>morning</em>, <em>teacher</em>, <em>went</em>): хеш распределяет ключи, а не значения, и <em>the</em> со <em>store</em> случайно попали на один редьюсер.</p></details>
+      </li>
+      <li>Верни R = 1. Включи комбайнер и предскажи, сколько пар уйдёт в shuffle при M = 3, а потом при M = 1. Меняется ли выход?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Без комбайнера 21; с ним 17 при M = 3 (5 + 7 + 5: каждый маппер сливает только свои повторы) и 12 при M = 1 (один маппер видит все повторы). Выходные файлы одинаковые. На 64-мегабайтном сплите настоящего текста, с тысячами <code>&lt;the, 1&gt;</code>, экономия огромная.</p></details>
+      </li>
+      <li>Выбери «только по пробелам» — токенизатор Java-задания со слайда (p. 811) — и пройди до конца. Предскажи, какие ключи изменятся.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>14 ключей вместо 12: <em>The</em> и <em>the</em> — два ключа по 3, <em>store.</em> (1) — это не <em>store</em> (3), а <em>closed;</em>, <em>morning.</em>, <em>9am.</em> сохраняют свою пунктуацию. Эта программа действительно записала бы <code>&lt;store, 3&gt;</code> — рядом с <code>&lt;store., 1&gt;</code>.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l30-w-wc', function (root, ui) {
+    var PRESET = {
+      slide: 'The teacher went to the store.\nThe store was closed; the store opens in the morning.\nThe store opens at 9am.',
+      sam: 'Sam Apple Sam Mom Sam Mom'
+    };
+    var MAXLINES = 8, MAXWORDS = 80, follow = 'store';
+    var box;
+
+    var stepper = ui.stepper({
+      steps: [
+        '<b>Split</b>: input splitter режет текст на M сплитов, по одному на map-задачу. Каждая строка — одна запись, и её никогда не режут пополам.',
+        '<b>Map</b>: каждый маппер выдаёт &lt;word, 1&gt; на каждое слово своего сплита. Он ничего не считает.',
+        '<b>Combine</b> (необязательно): при включённом комбайнере каждый маппер складывает свои пары по каждому слову, прежде чем они покинут его машину.',
+        '<b>Shuffle and sort</b>: каждая пара едет в reduce-задачу hash(word) mod R; каждая reduce-задача сортирует полученное и группирует значения каждого ключа.',
+        '<b>Reduce</b>: каждая reduce-задача складывает значения каждого ключа и пишет свой выходной файл, ключи по порядку.'
+      ],
+      play: 1500
+    });
+    var preset = ui.select('входной текст', [
+      { value: 'slide', label: 'запрос (p. 792), по строке на предложение' },
+      { value: 'sam', label: 'документ (p. 810): Sam Apple Sam Mom Sam Mom' },
+      { value: 'own', label: 'свой: введи в поле ниже' }
+    ], function (v) { if (PRESET[v]) { box.value = PRESET[v]; follow = v === 'sam' ? 'sam' : 'store'; } }, 'slide');
+    box = Course.el('textarea', { id: 'l30-w-wc-text', 'class': 'l30-text', rows: '4', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off' });
+    box.value = PRESET.slide;
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide' }, [
+      Course.el('label', { 'for': 'l30-w-wc-text' }, [Course.el('span', { 'class': 'ctl-label', text: 'вход: одна строка — одна запись (можно править)' })]),
+      box
+    ]));
+    box.addEventListener('input', function () { preset.value = 'own'; ui.changed(); });
+    var tok = ui.select('как маппер делит слова', [
+      { value: 'norm', label: 'нижний регистр, без пунктуации (p. 792)' },
+      { value: 'raw', label: 'только по пробелам (StringTokenizer, p. 811)' }
+    ], null, 'norm');
+    var mS = ui.slider({ label: 'map-задачи M (по сплиту на каждую)', min: 1, max: 3, step: 1, value: 3 });
+    var rS = ui.slider({ label: 'reduce-задачи R', min: 1, max: 3, step: 1, value: 1 });
+    var comb = ui.toggle('комбайнер: <code>setCombinerClass(Reduce.class)</code>', false);
+
+    ui.legend([
+      { label: 'пара ключ–значение: щёлкни, чтобы следить за её ключом', color: 's1', mark: 'square' },
+      { label: 'ключ, за которым ты следишь', color: 'key', mark: 'square' },
+      { label: 'пары, отправленные из map-задачи в reduce-задачу', color: 's1', mark: 'line' }
+    ]);
+    var roMap = ui.readout('пар выдали мапперы');
+    var roNet = ui.readout('пар отправлено в shuffle');
+    var roOut = ui.readout('выходные пары · сумма их счётчиков');
+    var roKey = ui.readout('ключ, за которым ты следишь');
+    var note = ui.note('');
+
+    var wrap = Course.el('div', { 'class': 'l30-wc' });
+    ui.stage.appendChild(wrap);
+    var svgEl = Course.svg('svg', { 'class': 'dia stage-svg', viewBox: '0 0 560 158', role: 'img', 'aria-label': 'Shuffle: сверху по прямоугольнику на каждую map-задачу, снизу по прямоугольнику на каждую reduce-задачу и линия от map-задачи к каждой reduce-задаче, которая получает часть её пар, тем толще, чем больше пар; линии, несущие отслеживаемый ключ, подсвечены маркером' });
+
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function canon(t) { return t.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''); }
+    function words(line) {
+      var raw = line.split(/\s+/).filter(function (t) { return t.length > 0; });
+      if (tok.value === 'raw') return raw;
+      return raw.map(canon).filter(function (t) { return t.length > 0; });
+    }
+    /* "Key.hashCode() % numOfReducers" (p. 798) with Java's String.hashCode, sign bit cleared as Hadoop's HashPartitioner does;
+       Hadoop's Text key hashes its bytes from a seed of 1, so a real job may number the reducers differently */
+    function jhash(s) { var h = 0; for (var i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
+    function part(key, r) { return (jhash(key) & 0x7fffffff) % r; }
+
+    function compute() {
+      var lines = box.value.split(/\r?\n/).map(function (l) { return l.trim(); }).filter(function (l) { return l.length > 0; });
+      var cut = false, budget = MAXWORDS, recs = [];
+      if (lines.length > MAXLINES) { lines = lines.slice(0, MAXLINES); cut = true; }
+      lines.forEach(function (l) {
+        var w = words(l);
+        if (w.length > budget) { w = w.slice(0, budget); cut = true; }
+        budget -= w.length;
+        recs.push({ text: l, words: w });
+      });
+      var m = Math.max(1, Math.min(mS.value, recs.length)), r = Math.max(1, rS.value);
+      var splits = [], base = Math.floor(recs.length / m), extra = recs.length % m, at = 0, j, q;
+      for (j = 0; j < m; j++) { var n = base + (j < extra ? 1 : 0); splits.push(recs.slice(at, at + n)); at += n; }
+      var mapOut = splits.map(function (sp) { var o = []; sp.forEach(function (rec) { rec.words.forEach(function (w) { o.push([w, 1]); }); }); return o; });
+      var sent = mapOut.map(function (o) {
+        if (!comb.value) return o;
+        var acc = Object.create(null), order = [];
+        o.forEach(function (p) { if (!(p[0] in acc)) { acc[p[0]] = 0; order.push(p[0]); } acc[p[0]] += p[1]; });
+        return order.map(function (key) { return [key, acc[key]]; });
+      });
+      var groups = [], flows = [], inCount = [];
+      for (q = 0; q < r; q++) { groups.push(Object.create(null)); inCount.push(0); }
+      sent.forEach(function (o) {
+        var f = []; for (var q2 = 0; q2 < r; q2++) f.push(0);
+        o.forEach(function (p) { var d = part(p[0], r); f[d]++; inCount[d]++; (groups[d][p[0]] = groups[d][p[0]] || []).push(p[1]); });
+        flows.push(f);
+      });
+      var reduced = groups.map(function (g) {
+        return Object.keys(g).sort().map(function (key) { var s = 0; g[key].forEach(function (v) { s += v; }); return { k: key, vals: g[key], sum: s }; });
+      });
+      var nMap = 0, nNet = 0, nOut = 0, sumOut = 0;
+      mapOut.forEach(function (o) { nMap += o.length; });
+      sent.forEach(function (o) { nNet += o.length; });
+      reduced.forEach(function (g) { nOut += g.length; g.forEach(function (e) { sumOut += e.sum; }); });
+      return { recs: recs, splits: splits, mapOut: mapOut, sent: sent, flows: flows, inCount: inCount, reduced: reduced, m: m, r: r, nMap: nMap, nNet: nNet, nOut: nOut, sumOut: sumOut, cut: cut };
+    }
+    function allKeys(st) { var ks = []; st.reduced.forEach(function (g) { g.forEach(function (e) { ks.push(e.k); }); }); return ks; }
+    function resolveFollow(st) {
+      var ks = allKeys(st);
+      if (ks.indexOf(follow) >= 0) return;
+      for (var i = 0; i < ks.length; i++) if (canon(ks[i]) === canon(follow)) { follow = ks[i]; return; }
+    }
+
+    function chip(k, v) {
+      return Course.el('button', { type: 'button', 'class': 'l30-pair' + (k === follow ? ' is-key' : ''), title: 'следить за этим ключом', text: '<' + k + ', ' + v + '>',
+        onclick: function () { follow = k; ui.changed(); } });
+    }
+    function lane(head, kids) {
+      return Course.el('div', { 'class': 'l30-lane' }, [Course.el('p', { 'class': 'l30-lane-h', text: head }), Course.el('div', { 'class': 'l30-pairs' }, kids)]);
+    }
+    function row(title, kids) {
+      return Course.el('div', { 'class': 'l30-row' }, [Course.el('p', { 'class': 'l30-h', text: title }), Course.el('div', { 'class': 'l30-lanes' }, kids)]);
+    }
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    function pos(n) { return n === 1 ? [280] : n === 2 ? [170, 390] : [100, 280, 460]; }
+    function drawShuffle(st) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      var mx = pos(st.m), rx = pos(st.r), d = part(follow, st.r);
+      st.flows.forEach(function (f, i) {
+        f.forEach(function (c, q) {
+          if (!c) return;
+          var mine = q === d && st.sent[i].some(function (p) { return p[0] === follow; });
+          if (mine) S('line', { x1: mx[i], y1: 40, x2: rx[q], y2: 100, 'class': 'hl' });
+          S('line', { x1: mx[i], y1: 40, x2: rx[q], y2: 100, 'class': 'st-s1 ' + (c >= 9 ? 'sw-4' : c >= 5 ? 'sw-3' : c >= 2 ? 'sw-2' : 'sw-1') });
+        });
+      });
+      mx.forEach(function (x, i) { S('rect', { x: x - 48, y: 10, width: 96, height: 30, 'class': 'fi-paper sw-2' }); T(x, 30, 'map ' + i, 'tx-mono tx-sm tx-mid'); });
+      rx.forEach(function (x, q) {
+        S('rect', { x: x - 48, y: 100, width: 96, height: 30, 'class': 'fi-paper sw-2' });
+        T(x, 120, 'reduce ' + q, 'tx-mono tx-sm tx-mid');
+        T(x, 150, 'на входе пар: ' + st.inCount[q], 'tx-sm tx-mid');
+      });
+    }
+    function detachSvg() { if (svgEl.parentNode) svgEl.parentNode.removeChild(svgEl); }
+
+    function render(st, k) {
+      wrap.textContent = '';
+      if (!st.nMap) { detachSvg(); wrap.appendChild(Course.el('p', { 'class': 'l30-off', text: 'Слов пока нет: введи текст в поле ниже.' })); return; }
+      wrap.appendChild(row('1 · сплиты', st.splits.map(function (sp, i) {
+        return Course.el('div', { 'class': 'l30-lane' }, [Course.el('p', { 'class': 'l30-lane-h', text: 'сплит ' + i + ', его читает map-задача ' + i })]
+          .concat(sp.map(function (rec) { return Course.el('p', { 'class': 'l30-line', text: rec.text }); })));
+      })));
+      if (k >= 1) wrap.appendChild(row('2 · выход map', st.mapOut.map(function (o, i) {
+        return lane('map-задача ' + i + ', пар: ' + o.length, o.map(function (p) { return chip(p[0], p[1]); }));
+      })));
+      if (k >= 2) wrap.appendChild(row('3 · выход комбайнера', st.sent.map(function (o, i) {
+        if (comb.value) return lane('комбайнер map-задачи ' + i + ', пар: ' + o.length, o.map(function (p) { return chip(p[0], p[1]); }));
+        return Course.el('div', { 'class': 'l30-lane' }, [Course.el('p', { 'class': 'l30-lane-h', text: 'map-задача ' + i }), Course.el('p', { 'class': 'l30-off', text: 'комбайнера нет: её пары (' + o.length + ') уходят как есть' })]);
+      })));
+      if (k >= 3) {
+        var shuf = Course.el('div', { 'class': 'l30-row' }, [Course.el('p', { 'class': 'l30-h', text: '4 · shuffle: по сети идёт пар: ' + st.nNet + ', затем сортировка' })]);
+        shuf.appendChild(svgEl);
+        drawShuffle(st);
+        wrap.appendChild(shuf);
+        wrap.appendChild(row('вход редьюсера, отсортированный и сгруппированный', st.reduced.map(function (g, q) {
+          return lane('reduce-задача ' + q + ', на входе пар: ' + st.inCount[q], g.length ? g.map(function (e) { return chip(e.k, '[' + e.vals.join(', ') + ']'); })
+            : [Course.el('span', { 'class': 'l30-off', text: 'сюда не попал ни один ключ' })]);
+        })));
+      } else detachSvg();
+      if (k >= 4) wrap.appendChild(row('5 · выходные файлы', st.reduced.map(function (g, q) {
+        return lane('выходной файл ' + q, g.length ? g.map(function (e) { return chip(e.k, e.sum); }) : [Course.el('span', { 'class': 'l30-off', text: 'пустой файл' })]);
+      })));
+    }
+
+    ui.onChange(function () {
+      var st = compute(), k = stepper.index;
+      resolveFollow(st);
+      render(st, k);
+      roMap.set(k >= 1 ? String(st.nMap) : 'с шага 2');
+      roNet.set(k >= 3 ? st.nNet + (comb.value ? ', скомбинировано из ' + st.nMap : '') : 'с шага 4');
+      if (k >= 4) roOut.set('пар: ' + st.nOut + ' · сумма счётчиков ' + st.sumOut, st.sumOut === st.nMap ? 'good' : 'bad');
+      else roOut.set('на шаге 5');
+      if (allKeys(st).indexOf(follow) < 0) roKey.set('щёлкни по паре, чтобы следить за её ключом');
+      else {
+        var d = part(follow, st.r), out = 0;
+        st.reduced[d].forEach(function (e) { if (e.k === follow) out = e.sum; });
+        roKey.set(esc(follow) + ': hash mod ' + st.r + ' = ' + d + ', значит, reduce-задача ' + d + (k >= 4 ? ', и она пишет &lt;' + esc(follow) + ', ' + out + '&gt;' : ''));
+      }
+      var msgs = [];
+      if (st.cut) msgs.push('Используются только первые ' + MAXLINES + ' строк и ' + MAXWORDS + ' слов.');
+      if (mS.value > st.recs.length && st.recs.length > 0) msgs.push('Строк в тексте: ' + st.recs.length + ', поэтому сплитов: ' + st.m + ' — запись никогда не режут пополам.');
+      if (k >= 4 && preset.value === 'slide' && tok.value === 'norm') msgs.push('Сравни: слайд печатает &lt;store, 3&gt;, &lt;opens, 1&gt; и не печатает &lt;in, 1&gt; (p. 793).');
+      if (k >= 4 && tok.value === 'raw') msgs.push('Токены по пробелам сохраняют заглавные буквы и пунктуацию: каждое написание — отдельный ключ.');
+      note.set(msgs.length ? msgs.join(' ') : 'Нажми «Дальше» или «Проиграть» и предскажи каждый этап, прежде чем его увидишь.');
+    });
+  });
+  </script>
+
+  <p>На модели держатся два инварианта. "All inputs with the same key must go to the same reducer!" (p. 797): если бы четыре <code>&lt;store, 1&gt;</code> попали на два редьюсера, в двух файлах лежали бы частичные счёты, а итога не было бы ни в одном. И "Input is typically sorted, output is output exactly as is" (p. 797): каждый редьюсер получает свои ключи по порядку, поэтому каждый выходной файл отсортирован — каждый сам по себе.</p>
+
+  <p class="memo"><mark class="key">Map помечает куски каждой записи ключом, библиотека собирает все значения ключа в одном месте, reduce их агрегирует: подсчёт происходит только после shuffle.</mark></p>
+</section>
+
+
+<section id="l30-parts">
+  <h2>Семь частей и шесть типов</h2>
+
+  <p>"MR Key Components" (pp. 794–803) разбирает задание на части. Рис. 2 выстраивает части в том порядке, в каком их встречает пара, а таблица описывает каждую словами слайдов.</p>
+
+  <figure class="fig fig--plain" id="l30-fig-parts">
+    <svg class="dia" viewBox="0 0 560 336" role="img" aria-label="Части задания по порядку. На каждом map-воркере: input splitter, mapper, combiner (необязательный, пунктиром), partitioner; затем пары пересекают сеть к каждому reduce-воркеру: shuffle and sort, reducer, output committer. Типы по пути: K1, V1 на входе маппера, K2, V2 на выходе маппера и комбайнера, K2 с множеством V2 на входе редьюсера, K3, V3 на его выходе">
+      <text x="120" y="24" class="tx-sm tx-mid tx-bold">map-воркер</text>
+      <rect x="40" y="38" width="160" height="34" class="fi-paper sw-2"/>
+      <text x="120" y="60" class="tx-mid">input splitter</text>
+      <line x1="120" y1="74" x2="120" y2="104" marker-end="url(#arr)"/>
+      <text x="132" y="94" class="tx-mono tx-sm">K1, V1</text>
+      <rect x="40" y="108" width="160" height="34" class="fi-paper sw-2"/>
+      <text x="120" y="130" class="tx-mid">mapper</text>
+      <line x1="120" y1="144" x2="120" y2="174" marker-end="url(#arr)"/>
+      <text x="132" y="164" class="tx-mono tx-sm">K2, V2</text>
+      <rect x="40" y="178" width="160" height="34" class="fi-paper sw-2 dash"/>
+      <text x="120" y="200" class="tx-mid">combiner</text>
+      <line x1="120" y1="214" x2="120" y2="244" marker-end="url(#arr)"/>
+      <text x="132" y="234" class="tx-mono tx-sm">K2, V2</text>
+      <rect x="40" y="248" width="160" height="34" class="fi-paper sw-2"/>
+      <text x="120" y="270" class="tx-mid">partitioner</text>
+      <path d="M202,265 H280 V125 H344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="280" y="200" class="tx-sm tx-mid halo">сеть</text>
+      <text x="440" y="94" class="tx-sm tx-mid tx-bold">reduce-воркер</text>
+      <rect x="350" y="108" width="180" height="34" class="fi-paper sw-2"/>
+      <text x="440" y="130" class="tx-mid">shuffle &amp; sort</text>
+      <line x1="440" y1="144" x2="440" y2="174" marker-end="url(#arr)"/>
+      <text x="452" y="164" class="tx-mono tx-sm">K2, {V2}</text>
+      <rect x="350" y="178" width="180" height="34" class="fi-paper sw-2"/>
+      <text x="440" y="200" class="tx-mid">reducer</text>
+      <line x1="440" y1="214" x2="440" y2="244" marker-end="url(#arr)"/>
+      <text x="452" y="234" class="tx-mono tx-sm">K3, V3</text>
+      <rect x="350" y="248" width="180" height="34" class="fi-paper sw-2"/>
+      <text x="440" y="270" class="tx-mid">output committer</text>
+      <text x="280" y="320" class="tx-hand tx-mid">шесть типов: K1 V1, K2 V2, K3 V3</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Путь пары ключ–значение через задание и типы, которые она несёт. Комбайнер нарисован пунктиром, потому что он необязателен; партиционер решает, к какому reduce-воркеру пойдёт пара, и только после этого она пересекает сеть. Master, который здесь не нарисован, планирует всё это. У входа и выхода по два типа, у промежуточных пар ещё два: это "six writables" со слайда (p. 803).</figcaption>
+  </figure>
+
+  <figure class="tbl-fig" id="l30-tbl-parts">
+    <figcaption>Ключевые компоненты словами слайдов, в порядке рис. 2, и зачем нужен каждый.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Часть</th><th>Что говорит слайд — и зачем</th></tr></thead>
+        <tbody>
+          <tr><td>Input splitter (p. 795)</td><td>"Is responsible for splitting your input into multiple chunks", "used as input for your mappers"; "Splits on logical boundaries. The default is 64MB per chunk" — запись никогда не разрезается пополам</td></tr>
+          <tr><td>Mapper (p. 796)</td><td>"Reads in input pair &lt;K,V&gt; (a section as split by the input splitter)", "Outputs a pair &lt;K', V'&gt;" — вызывается один раз на каждую запись своего сплита</td></tr>
+          <tr><td>Combiner (p. 799)</td><td>"Essentially an intermediate reducer", "Is optional", "Reduces output from each mapper, reducing bandwidth and sorting"</td></tr>
+          <tr><td>Partitioner, или shuffler (p. 798)</td><td>"Decides which pairs are sent to which reducer" — один ключ, один редьюсер</td></tr>
+          <tr><td>Reducer (p. 797)</td><td>"Accepts the Mapper output, and collects values on the key" — один вызов на ключ, ключи по порядку</td></tr>
+          <tr><td>Output committer (p. 800)</td><td>"Is responsible for taking the reduce output, and committing it to a file"; "needs a corresponding input splitter (so that another job can read the input)" — задания можно сцеплять в цепочку</td></tr>
+          <tr><td>Master (pp. 801–802)</td><td>"Responsible for scheduling &amp; managing jobs"; "Scheduled computation should be close to the data if possible", поскольку "Bandwidth is expensive! (and slow)"; "handled by the framework, no user code is necessary" — раздел 4</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Два числа, которые надо запомнить. 64 MB на чанк со слайда ("You can change it", добавляет слайд, p. 795) — это значение Hadoop 1, равное тогдашнему размеру блока HDFS (<a href="l31.html">урок 31</a>); Hadoop 2 и более поздние используют 128 MB. На экзамене называй 64 MB как цифру со слайда. И ещё: один сплит питает одну map-<em>задачу</em>, а map-<em>функция</em> вызывается один раз на каждую запись сплита — в Java-задании ниже один раз на строку.</p>
+
+  <h3>Партиционер</h3>
+  <p>"Default is simply: <code>Key.hashCode() % numOfReducers</code>" (p. 798); на другом слайде (p. 825) это записано как функция партиционирования по умолчанию:</p>
+
+  <div class="formula" data-label="p. 825">
+    \[ \text{partition}(k) = \text{hash}(k) \bmod R \]
+    <dl class="legend">
+      <dt>\(k\)</dt><dd>промежуточный ключ</dd>
+      <dt>\(R\)</dt><dd>число reduce-задач; результат — одно из \(0, \dots, R-1\)</dd>
+    </dl>
+  </div>
+
+  <p>У равных ключей равные хеши, поэтому они всегда попадают на один и тот же редьюсер, а разные ключи распределяются примерно равномерно. "Custom partitioning is often required" — свой партиционер часто нужен: "to produce a total order in the output" — ключи <em>a</em>–<em>m</em> на редьюсер 0, <em>n</em>–<em>z</em> на редьюсер 1, чтобы отсортированные файлы склеивались в один отсортированный список; чтобы "Provide (more) uniform distribution of load between reducers"; потому что "Some values might need to be sent to the same reducer" — "To compute the relative frequency of a pair of words &lt;W1, W2&gt; you would need to make sure all of word W1 are sent to the same reducer", ведь count(W1, W2) делится на число всех пар, начинающихся с W1; и для "Binning of results". Свой партиционер "Should implement Partitioner interface", "Set by calling <code>conf.setPartitionerClass(MyPart.class)</code>".</p>
+
+  <h3>Комбайнер</h3>
+  <p>Комбайнер (combiner) работает на стороне map, над выходом одного маппера, до shuffle: три <code>&lt;store, 1&gt;</code> из одного сплита уходят как одна <code>&lt;store, 3&gt;</code>. Он "Cannot change the type of its input" — "Input types must be the same as output types" (p. 799), — потому что редьюсер должен одинаково принимать и скомбинированные, и сырые пары. Слайд (p. 815) говорит, когда он окупается, — "When maps produce many repeated keys", с "Goal" "to decrease size of the transient data", — и что "Combiners have the same interface as Reduces, and often are the same class": "In WordCount, <code>conf.setCombinerClass(Reduce.class);</code>". И ещё один слайд (p. 826): "Mini-reduce phase before the intermediate data is sent to reduce", который "Saves network bandwidth".</p>
+
+  <div class="pitfall">
+    <p>"Combiners must not side effects, because they run an intermdiate number of times" (p. 815). Читать надо так: у комбайнеров не должно <em>быть</em> побочных эффектов, потому что фреймворк запускает их <em>неопределённое</em> (indeterminate) число раз — ноль, один или несколько раз на одних и тех же данных. Значит, результат не должен зависеть от того, запускался ли комбайнер и сколько раз. Сумма, счёт единиц, максимум или минимум этот тест проходят; среднее — нет, как ты знаешь из статистики: среднее 10 и 20 — это 15, среднее 15 и 60 — 37.5, а среднее 10, 20 и 60 — 30. Вместо этого передавай пары (sum, count) и дели в редьюсере. Если вопрос цитирует напечатанную фразу, имеется в виду именно это.</p>
+  </div>
+
+  <h3>Writables: шесть типов</h3>
+  <p>Ключи и значения пересекают границы машин и пишутся на диск, поэтому их типы "can be serialized / deserialized to a stream": это <mark class="key">Writables</mark> со слайда (p. 803). Есть готовые типы "for basic values, like Strings, Integers, Longs" и для структур вроде массивов и словарей, а "User can implement this interface". "Your application needs at least six writables": "2 for your input", "2 for your intermediate values (Map &lt;-&gt; Reduce)", "2 for your output" — K1, V1, K2, V2, K3, V3 с рис. 2. Комбайнер не добавляет ни одного.</p>
+
+  <h3>Задание целиком</h3>
+  <p>На слайде (p. 811) напечатан WordCount для Hadoop, внутри <code>public class WordCount { … }</code>, на Java API того времени. Сопоставь параметры типов с рис. 2.</p>
+
+  <aside class="margin-note">Современный Hadoop пишет то же задание через Job, context.write и waitForCompletion. На экзамене цитируй листинг со слайда.</aside>
+
+<pre><code>// the Mapper: &lt;offset, line&gt; in, &lt;word, 1&gt; out
+public static class Map extends MapReduceBase implements
+    Mapper&lt;LongWritable, Text, Text, IntWritable&gt; {
+  private final static IntWritable one = new IntWritable(1);
+  private Text word = new Text();
+
+  public void map(LongWritable key, Text value,
+      OutputCollector&lt;Text, IntWritable&gt; output,
+      Reporter reporter) throws IOException {
+    String line = value.toString();
+    StringTokenizer tokenizer = new StringTokenizer(line);
+    while (tokenizer.hasMoreTokens()) {
+      word.set(tokenizer.nextToken());
+      output.collect(word, one);
+}}}</code></pre>
+
+  <p>Входная пара маппера — одна строка текстового файла: ключ — её смещение в байтах (<code>LongWritable</code>), значение — сама строка (<code>Text</code>). Он выдаёт <code>&lt;word, one&gt;</code> через <code>output.collect</code> — это <code>EmitIntermediate</code> со слайда (p. 810). <code>StringTokenizer</code> режет только по пробельным символам, так что "store." и "store" для этой программы — два разных ключа.</p>
+
+<pre><code>// the Reducer: &lt;word, [1, 1, …]&gt; in, &lt;word, sum&gt; out
+public static class Reduce extends MapReduceBase implements
+    Reducer&lt;Text, IntWritable, Text, IntWritable&gt; {
+  public void reduce(Text key, Iterator&lt;IntWritable&gt; values,
+      OutputCollector&lt;Text, IntWritable&gt; output,
+      Reporter reporter) throws IOException {
+    int sum = 0;
+    while (values.hasNext()) { sum += values.next().get(); }
+    output.collect(key, new IntWritable(sum));
+}}</code></pre>
+
+<pre><code>// the driver: configures the job and runs it
+public static void main(String[] args) throws Exception {
+  JobConf conf = new JobConf(WordCount.class);
+  conf.setJobName("wordcount");
+  conf.setOutputKeyClass(Text.class);
+  conf.setOutputValueClass(IntWritable.class);
+  conf.setMapperClass(Map.class);
+  conf.setCombinerClass(Reduce.class);
+  conf.setReducerClass(Reduce.class);
+  conf.setInputFormat(TextInputFormat.class);
+  conf.setOutputFormat(TextOutputFormat.class);
+  FileInputFormat.setInputPaths(conf, new Path(args[0]));
+  FileOutputFormat.setOutputPath(conf, new Path(args[1]));
+
+  JobClient.runJob(conf);
+}</code></pre>
+
+  <p>В <code>main</code> роль input splitter играет входной формат, а роль output committer — выходной формат; <code>setCombinerClass(Reduce.class)</code> использует редьюсер ещё и как комбайнер — это допустимо, потому что сумма сумм — это сумма, и типы совпадают. <code>JobClient.runJob(conf)</code> — та строка, которая "Run this program as a MapReduce job". Не задано: партиционер, поэтому используется хеш по умолчанию, и R, поэтому задание работает с дефолтом Hadoop — одной reduce-задачей.</p>
+
+  <p class="memo"><mark class="key">Splitter, mapper, combiner, partitioner, shuffle and sort, reducer, committer — и Master, который их планирует: ты пишешь маппер и редьюсер, а остальное выбираешь.</mark></p>
+</section>
+
+
+<section id="l30-cluster">
+  <h2>На кластере: перемещай код, а не данные</h2>
+
+  <p>"MR: How it works" (p. 804) раскладывает задание по машинам, на рисунке со слайдов (pp. 790 и 805): "Hadoop Program" порождает (fork) Master и воркеры; map-воркеры делают "read" своих сплитов и "local write" своего выхода, уже нарезанного на по одной области на каждый редьюсер; reduce-воркеры делают "remote read, sort" своих областей и "write" выходных файлов.</p>
+
+  <p>Слайд (p. 805) предупреждает про шаг "read": "Transfer peta-scale data through network". Если сплиты лежат на одних машинах, а map-воркеры работают на других, чтение гонит весь вход через сеть. Следующий слайд (p. 806) отвечает шестью словами: "Move the code, not the data". Map-функция весит несколько килобайт, её вход — терабайты.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l30-fig-locality">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 258" role="img" aria-label="До: три входных сплита лежат на других машинах, и толстые стрелки везут каждый сплит через сеть к map-воркеру в другом месте; затем выход map через shuffle уходит к двум reduce-воркерам">
+        <rect x="240" y="6" width="44" height="28" class="fi-paper st-s6 sw-2 dash"/>
+        <path d="M247,14 H277 M247,20 H277 M247,26 H277" class="st-muted"/>
+        <text x="232" y="25" class="tx-sm tx-end">Master</text>
+        <text x="8" y="30" class="tx-hand">вход едет по сети</text>
+        <text x="8" y="70" class="tx-sm">вход</text>
+        <rect x="60" y="50" width="44" height="28" class="fi-paper"/>
+        <rect x="150" y="50" width="44" height="28" class="fi-paper"/>
+        <rect x="240" y="50" width="44" height="28" class="fi-paper"/>
+        <path d="M67,58 H97 M67,64 H97 M67,70 H97 M157,58 H187 M157,64 H187 M157,70 H187 M247,58 H277 M247,64 H277 M247,70 H277" class="st-muted"/>
+        <rect x="73" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="163" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="253" y="82" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <text x="82" y="96" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="172" y="96" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="262" y="96" class="tx-mono tx-sm tx-mid">2</text>
+        <line x1="84" y1="102" x2="166" y2="144" class="st-s1 sw-3" marker-end="url(#arr-s1)"/>
+        <line x1="174" y1="102" x2="256" y2="144" class="st-s1 sw-3" marker-end="url(#arr-s1)"/>
+        <line x1="260" y1="102" x2="88" y2="144" class="st-s1 sw-3" marker-end="url(#arr-s1)"/>
+        <text x="8" y="168" class="tx-sm">map</text>
+        <rect x="60" y="150" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="150" y="150" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="240" y="150" width="44" height="28" class="fi-paper sw-2"/>
+        <path d="M67,158 H97 M67,164 H97 M67,170 H97 M157,158 H187 M157,164 H187 M157,170 H187 M247,158 H277 M247,164 H277 M247,170 H277" class="st-muted"/>
+        <path d="M82,180 L127,220 M82,180 L217,220 M172,180 L127,220 M172,180 L217,220 M262,180 L127,220 M262,180 L217,220" class="st-s1"/>
+        <text x="8" y="240" class="tx-sm">reduce</text>
+        <rect x="105" y="222" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="195" y="222" width="44" height="28" class="fi-paper sw-2"/>
+        <path d="M112,230 H142 M112,236 H142 M112,242 H142 M202,230 H232 M202,236 H232 M202,242 H232" class="st-muted"/>
+      </svg>
+      <p class="fig-label">До: "Transfer peta-scale data through network" (p. 805)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 258" role="img" aria-label="После: Master спрашивает у NameNode HDFS, где лежат чанки входных данных, и получает их расположение; каждый map-воркер читает сплит со своего собственного диска; через сеть идёт только shuffle к двум reduce-воркерам">
+        <rect x="14" y="6" width="44" height="28" class="fi-paper st-s6 sw-2 dash"/>
+        <path d="M21,14 H51 M21,20 H51 M21,26 H51" class="st-muted"/>
+        <rect x="240" y="6" width="44" height="28" class="fi-paper st-s6 sw-2 dash"/>
+        <path d="M247,14 H277 M247,20 H277 M247,26 H277" class="st-muted"/>
+        <line x1="236" y1="14" x2="64" y2="14" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="62" y1="28" x2="234" y2="28" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="149" y="10" class="tx-sm tx-mid">where are the chunks?</text>
+        <text x="149" y="44" class="tx-sm tx-mid">locations</text>
+        <text x="36" y="50" class="tx-sm tx-mid">NameNode</text>
+        <text x="262" y="50" class="tx-sm tx-mid">Master</text>
+        <text x="60" y="118" class="tx-hand">read from local disk</text>
+        <text x="8" y="168" class="tx-sm">map</text>
+        <rect x="60" y="150" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="150" y="150" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="240" y="150" width="44" height="28" class="fi-paper sw-2"/>
+        <path d="M67,158 H97 M67,164 H97 M67,170 H97 M157,158 H187 M157,164 H187 M157,170 H187 M247,158 H277 M247,164 H277 M247,170 H277" class="st-muted"/>
+        <rect x="73" y="130" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="163" y="130" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <rect x="253" y="130" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+        <text x="82" y="144" class="tx-mono tx-sm tx-mid">0</text>
+        <text x="172" y="144" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="262" y="144" class="tx-mono tx-sm tx-mid">2</text>
+        <path d="M82,180 L127,220 M82,180 L217,220 M172,180 L127,220 M172,180 L217,220 M262,180 L127,220 M262,180 L217,220" class="st-s1"/>
+        <text x="8" y="240" class="tx-sm">reduce</text>
+        <rect x="105" y="222" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="195" y="222" width="44" height="28" class="fi-paper sw-2"/>
+        <path d="M112,230 H142 M112,236 H142 M112,242 H142 M202,230 H232 M202,236 H232 M202,242 H232" class="st-muted"/>
+      </svg>
+      <p class="fig-label">После: "MapReduce on HDFS" (p. 807)</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Одно и то же задание дважды. Квадраты 0, 1, 2 — входные сплиты; пунктиром обведены два координирующих сервера. Слева сплиты лежат на машинах, которые не запускают map-задачи, и каждый пересекает сеть. Справа Master спрашивает NameNode "Where are the chunks of input data?", получает "Location of the chunks of input data" и запускает каждую map-задачу на машине, где хранится её сплит. На обеих панелях shuffle всё равно идёт через сеть.</figcaption>
+  </figure>
+
+  <aside class="margin-note">Фразу "HDFS can replicate data to be local if necessary for scheduling" (p. 802) читай осторожно: Master выбирает узел, на котором уже лежит одна из копий блока (по умолчанию их три); задача, поставленная на другой узел, читает свой блок по сети, и HDFS не делает для неё новую копию.</aside>
+
+  <p>"MapReduce on HDFS" (p. 807) показывает, как это устроено. Master спрашивает у NameNode <abbr title="Hadoop Distributed File System">HDFS</abbr> — сервера, который знает, где хранится каждый блок каждого файла (<a href="l31.html">урок 31</a>), — "Where are the chunks of input data?" и отдаёт каждую map-задачу воркеру, который хранит её сплит: "Read from local disk". "Disk Locality" (p. 822) добавляет запасной вариант: "Map tasks are scheduled close to data", "on nodes that have input data", "if not, on nodes that are nearer to input data" — "Ex. Same network switch", — что "Conserves network bandwidth". Shuffle всё равно идёт через сеть, ведь группировка по ключу перемешивает выход всех мапперов; но по сети едут промежуточные пары, а их ужимает комбайнер.</p>
+
+  <h3>Сколько задач</h3>
+  <p>"Execution" (p. 808): "System determines" M, "no. of map tasks", поскольку "input is partitioned into M splits"; "User specifies" R, "no. of reduce tasks"; "intermediate keys are partitioned (using partitioning function) to be processed by desired reduce task". Файл в 1 GB при сплитах по 64 MB даёт M = 16. "Task Granularity" (p. 823) требует "No. of map tasks &gt; no. of worker nodes" — ради "Better load balancing" (быстрый воркер просто берёт больше задач) и "Better recovery" (мелкие задачи умершего воркера быстро перезапускаются, причём на многих машинах); "But, increases load on Master": "More scheduling decisions", "More states to be saved". "M could be chosen w.r.t to block size of the file system" "to effectively leverage locality"; "R is usually specified by users", и "Each reduce task produces one output file". Рисунок на слайде (p. 809) добавляет, что map-воркер и reduce-воркер — это роли: одни и те же три узла сначала выполняют "Mapping process", а потом "Reducing process".</p>
+
+  <h3>Ход выполнения</h3>
+  <p>Слайд (p. 812) — это рисунок из статьи Google 2004 года, Dean и Ghemawat (слайд об этом не говорит), с пронумерованными шагами.</p>
+
+  <figure class="fig fig--plain" id="l30-fig-flow">
+    <svg class="dia" viewBox="0 0 560 296" role="img" aria-label="Ход выполнения в шести пронумерованных шагах: 1 программа пользователя порождает Master и воркеры; 2 Master назначает map- и reduce-задачи; 3 map-воркеры читают входные сплиты; 4 они пишут промежуточные файлы на свои локальные диски, по две области в каждом; 5 reduce-воркеры удалённо читают свои области; 6 они пишут выходные файлы">
+      <rect x="210" y="6" width="140" height="26" rx="6" class="fi-paper sw-2"/>
+      <text x="280" y="24" class="tx-sm tx-mid">user program</text>
+      <rect x="258" y="58" width="44" height="28" class="fi-paper st-s6 sw-2 dash"/>
+      <path d="M265,66 H295 M265,72 H295 M265,78 H295" class="st-muted"/>
+      <line x1="280" y1="34" x2="280" y2="54" class="dash" marker-end="url(#arr)"/>
+      <line x1="230" y1="34" x2="166" y2="92" class="dash" marker-end="url(#arr)"/>
+      <line x1="340" y1="34" x2="396" y2="120" class="dash" marker-end="url(#arr)"/>
+      <line x1="256" y1="78" x2="188" y2="104" class="dash" marker-end="url(#arr)"/>
+      <line x1="304" y1="80" x2="374" y2="134" class="dash" marker-end="url(#arr)"/>
+      <text x="312" y="66" class="tx-sm halo">Master</text>
+      <rect x="12" y="102" width="70" height="22" class="fw-s1 st-s1"/>
+      <rect x="12" y="124" width="70" height="22" class="fw-s1 st-s1"/>
+      <rect x="12" y="146" width="70" height="22" class="fw-s1 st-s1"/>
+      <rect x="12" y="168" width="70" height="22" class="fw-s1 st-s1"/>
+      <rect x="12" y="190" width="70" height="22" class="fw-s1 st-s1"/>
+      <text x="47" y="117" class="tx-sm tx-mid">split 0</text>
+      <text x="47" y="139" class="tx-sm tx-mid">split 1</text>
+      <text x="47" y="161" class="tx-sm tx-mid">split 2</text>
+      <text x="47" y="183" class="tx-sm tx-mid">split 3</text>
+      <text x="47" y="205" class="tx-sm tx-mid">split 4</text>
+      <rect x="138" y="96" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="138" y="150" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="138" y="204" width="44" height="28" class="fi-paper sw-2"/>
+      <path d="M145,104 H175 M145,110 H175 M145,116 H175 M145,158 H175 M145,164 H175 M145,170 H175 M145,212 H175 M145,218 H175 M145,224 H175" class="st-muted"/>
+      <path d="M84,113 L134,108 M84,135 L134,116 M84,157 L134,164 M84,179 L134,214 M84,201 L134,222" class="st-s1"/>
+      <line x1="184" y1="110" x2="228" y2="110" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="184" y1="164" x2="228" y2="164" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="184" y1="218" x2="228" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="232" y="98" width="14" height="24" class="fw-s1 st-s1"/><rect x="246" y="98" width="14" height="24" class="fw-s1 st-s1"/>
+      <rect x="232" y="152" width="14" height="24" class="fw-s1 st-s1"/><rect x="246" y="152" width="14" height="24" class="fw-s1 st-s1"/>
+      <rect x="232" y="206" width="14" height="24" class="fw-s1 st-s1"/><rect x="246" y="206" width="14" height="24" class="fw-s1 st-s1"/>
+      <path d="M262,110 L374,140 M262,110 L374,192 M262,164 L374,142 M262,164 L374,194 M262,218 L374,146 M262,218 L374,196" class="st-s1"/>
+      <rect x="376" y="124" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="376" y="178" width="44" height="28" class="fi-paper sw-2"/>
+      <path d="M383,132 H413 M383,138 H413 M383,144 H413 M383,186 H413 M383,192 H413 M383,198 H413" class="st-muted"/>
+      <line x1="422" y1="138" x2="470" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="422" y1="192" x2="470" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="474" y="126" width="72" height="24" class="fi-paper sw-2"/>
+      <rect x="474" y="180" width="72" height="24" class="fi-paper sw-2"/>
+      <text x="510" y="142" class="tx-sm tx-mid">file 0</text>
+      <text x="510" y="196" class="tx-sm tx-mid">file 1</text>
+      <circle cx="302" cy="44" r="11" class="fi-paper"/><text x="302" y="49" class="tx-sm tx-mid tx-bold">1</text>
+      <circle cx="226" cy="64" r="11" class="fi-paper"/><text x="226" y="69" class="tx-sm tx-mid tx-bold">2</text>
+      <circle cx="108" cy="90" r="11" class="fi-paper"/><text x="108" y="95" class="tx-sm tx-mid tx-bold">3</text>
+      <circle cx="206" cy="164" r="11" class="fi-paper"/><text x="206" y="169" class="tx-sm tx-mid tx-bold">4</text>
+      <circle cx="318" cy="236" r="11" class="fi-paper"/><text x="318" y="241" class="tx-sm tx-mid tx-bold">5</text>
+      <circle cx="446" cy="118" r="11" class="fi-paper"/><text x="446" y="123" class="tx-sm tx-mid tx-bold">6</text>
+      <text x="47" y="262" class="tx-sm tx-mid">input</text><text x="47" y="284" class="tx-sm tx-mid">files</text>
+      <text x="160" y="262" class="tx-sm tx-mid">map</text><text x="160" y="284" class="tx-sm tx-mid">phase</text>
+      <text x="246" y="262" class="tx-sm tx-mid">local</text><text x="246" y="284" class="tx-sm tx-mid">disks</text>
+      <text x="398" y="262" class="tx-sm tx-mid">reduce</text><text x="398" y="284" class="tx-sm tx-mid">phase</text>
+      <text x="510" y="262" class="tx-sm tx-mid">output</text><text x="510" y="284" class="tx-sm tx-mid">files</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> "Execution Flow" (p. 812), перерисовано: пять сплитов, три map-воркера, два reduce-воркера и два выходных файла, R = 2. Пунктирные стрелки — управление (fork и assign), синие стрелки и линии — данные. У каждого промежуточного файла две области, по одной на reduce-задачу. Номера — это шаги ниже.</figcaption>
+  </figure>
+
+  <ol class="steps" id="l30-steps-flow">
+    <li><p><b>Fork.</b> Пользовательская программа запускает свои копии на кластере; одна становится Master, остальные — воркерами. Кто-то должен координировать; все остальные считают.</p></li>
+    <li><p><b>Assign.</b> Master даёт каждому свободному воркеру map-задачу или reduce-задачу. Воркер, который закончил, получает следующую, поэтому быстрые воркеры в итоге делают больше.</p></li>
+    <li><p><b>Read.</b> Map-воркер читает свой сплит — со своего диска, когда это возможно, — и вызывает map на каждой записи. Вход остаётся там, где хранится.</p></li>
+    <li><p><b>Local write.</b> Выход map идёт на локальный диск воркера, нарезанный партиционером на R областей, а Master записывает их размер и расположение. Эти данные временные: копировать их в распределённую файловую систему дороже, чем посчитать заново.</p></li>
+    <li><p><b>Remote read.</b> Каждый reduce-воркер забирает свою область у каждого map-воркера и сортирует её по ключу. Именно здесь промежуточные данные пересекают сеть: для группировки по ключу нужны куски от каждого map-воркера.</p></li>
+    <li><p><b>Write.</b> Каждый reduce-воркер вызывает reduce на каждом ключе по порядку и пишет один выходной файл в распределённую файловую систему, так что результат переживёт гибель любой одной машины.</p></li>
+  </ol>
+
+  <p>Бухгалтерия у Master небольшая (p. 813): "For each task" — его "State { idle, in-progress, completed }" и "Identity of the worker machine"; "For each completed map task" — "Size and location of intermediate data", те самые адреса, которые нужны шагу 5.</p>
+
+  <p>У Hadoop 1 свои имена для этих ролей (p. 832, рис. 5): <mark class="key">JobTracker</mark>, один на кластер, — это Master; <mark class="key">TaskTracker</mark> на каждом slave-узле выполняет задачи. Слайд их не определяет; <a href="l31.html">урок 31</a> показывает, что пришло им на смену.</p>
+
+  <figure class="fig fig--plain" id="l30-fig-trackers">
+    <svg class="dia" viewBox="0 0 560 222" role="img" aria-label="Hadoop 1: на master-узле работают JobTracker в слое MapReduce и NameNode в слое HDFS; на каждом из одного или нескольких slave-узлов работают TaskTracker и DataNode; JobTracker назначает задачи TaskTracker-ам, а NameNode управляет DataNode-ами">
+      <line x1="280" y1="6" x2="280" y2="216" class="st-muted dash"/>
+      <text x="140" y="24" class="tx-sm tx-mid">MapReduce layer</text>
+      <text x="420" y="24" class="tx-sm tx-mid">HDFS layer</text>
+      <rect x="16" y="34" width="528" height="64" rx="6" class="fw-ink st-none"/>
+      <text x="28" y="54" class="tx-sm tx-bold">master node</text>
+      <rect x="80" y="60" width="120" height="30" class="fi-paper st-s6 sw-2 dash"/>
+      <text x="140" y="80" class="tx-mid">JobTracker</text>
+      <rect x="360" y="60" width="120" height="30" class="fi-paper st-s6 sw-2 dash"/>
+      <text x="420" y="80" class="tx-mid">NameNode</text>
+      <rect x="64" y="152" width="448" height="68" rx="6" class="fw-ink st-none"/>
+      <rect x="56" y="144" width="448" height="68" rx="6" class="fw-ink st-none"/>
+      <text x="152" y="164" class="tx-sm tx-bold">slave node</text>
+      <rect x="80" y="176" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="140" y="196" class="tx-mid">TaskTracker</text>
+      <rect x="360" y="176" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="420" y="196" class="tx-mid">DataNode</text>
+      <line x1="140" y1="92" x2="140" y2="172" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="420" y1="92" x2="420" y2="172" class="sw-2" marker-end="url(#arr)"/>
+      <text x="152" y="130" class="tx-sm">назначает задачи</text>
+      <text x="432" y="130" class="tx-sm">управляет</text>
+      <text x="128" y="150" class="tx-sm tx-end">1..*</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Кластер Hadoop 1 со слайда (p. 832). Слайд сокращает демоны до "Name" и "Data" и пишет "HFDS layer" (читай HDFS); ещё он ставит TaskTracker и DataNode на master-узел: master-машина может одновременно работать и как slave. Стопка полос изображает "1..*" slave-узлов.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Master спрашивает у NameNode, где лежат входные блоки, и запускает каждую map-задачу там, где хранится её сплит: едет код, вход остаётся на месте, и через сеть идёт только shuffle.</mark></p>
+</section>
+
+
+<section id="l30-failures">
+  <h2>Мёртвые воркеры, медленные воркеры, плохие записи</h2>
+
+  <p>На кластере из обычных (commodity) машин что-нибудь всегда сломано. "Fault Tolerance" (p. 821) задаёт правила. "Worker failure – handled via re-execution": умерший воркер "Identified by no response to heartbeat messages"; "In-progress and Completed map tasks are re-scheduled"; "Workers executing reduce tasks are notified of re-scheduling"; "Completed reduce tasks are not re-scheduled".</p>
+
+  <figure class="fig fig--plain" id="l30-fig-fail">
+    <svg class="dia" viewBox="0 0 560 266" role="img" aria-label="Воркер B умирает. Его завершённая map-задача заново запускается на воркере D, потому что промежуточный файл B лежал на локальном диске B. Reduce-воркер Y, который ещё работает, теперь читает с воркеров A, C и D вместо B. Reduce-воркер X уже завершился: его выходной файл лежит в HDFS в трёх копиях и не перезапускается">
+      <path d="M202,44 V26 H462 V42" class="sw-2 dash" marker-end="url(#arr)"/>
+      <text x="332" y="18" class="tx-sm tx-mid halo">map-задача B, заново на D</text>
+      <rect x="60" y="46" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="180" y="46" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="300" y="46" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="440" y="46" width="44" height="28" class="fi-paper sw-2"/>
+      <path d="M67,54 H97 M67,60 H97 M67,66 H97 M187,54 H217 M187,60 H217 M187,66 H217 M307,54 H337 M307,60 H337 M307,66 H337 M447,54 H477 M447,60 H477 M447,66 H477" class="st-muted"/>
+      <text x="52" y="66" class="tx-bold tx-end">A</text>
+      <text x="172" y="66" class="tx-bold tx-end">B</text>
+      <text x="292" y="66" class="tx-bold tx-end">C</text>
+      <text x="432" y="66" class="tx-bold tx-end">D</text>
+      <rect x="68" y="82" width="14" height="22" class="fw-s1 st-s1"/><rect x="82" y="82" width="14" height="22" class="fw-s1 st-s1"/>
+      <rect x="188" y="82" width="14" height="22" class="fw-s1 st-s1"/><rect x="202" y="82" width="14" height="22" class="fw-s1 st-s1"/>
+      <rect x="308" y="82" width="14" height="22" class="fw-s1 st-s1"/><rect x="322" y="82" width="14" height="22" class="fw-s1 st-s1"/>
+      <rect x="448" y="82" width="14" height="22" class="fw-s1 st-s1"/><rect x="462" y="82" width="14" height="22" class="fw-s1 st-s1"/>
+      <path d="M174,40 L230,110 M230,40 L174,110" class="st-bad sw-3"/>
+      <path d="M89,106 L382,166 M329,106 L382,166 M469,106 L382,166" class="st-s1 sw-2"/>
+      <path d="M209,106 L382,166" class="st-bad sw-2 dash"/>
+      <rect x="120" y="168" width="44" height="28" class="fi-paper sw-2"/>
+      <rect x="360" y="168" width="44" height="28" class="fi-paper sw-2"/>
+      <path d="M127,176 H157 M127,182 H157 M127,188 H157 M367,176 H397 M367,182 H397 M367,188 H397" class="st-muted"/>
+      <text x="112" y="188" class="tx-bold tx-end">X</text>
+      <text x="352" y="188" class="tx-bold tx-end">Y</text>
+      <text x="172" y="188" class="tx-sm">готов, сохранён</text>
+      <text x="412" y="188" class="tx-sm">ещё читает</text>
+      <line x1="142" y1="198" x2="142" y2="210" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="114" y="214" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="136" y="214" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="158" y="214" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <path d="M186,222 l6,7 l12,-14" class="st-good sw-3"/>
+      <text x="142" y="254" class="tx-sm tx-mid">файл 0, в HDFS</text>
+    </svg>
+    <figcaption><b>Рис. 6.</b> Воркер B пропускает свои heartbeat-сообщения. Его завершённая map-задача запускается снова, на D, потому что её выход — промежуточный файл под ней — лежал на локальном диске B и пропал; reduce-воркер Y, который ещё читает, забирает потерянную область уже у D. Reduce-воркер X успел забрать область B и закончить: его выходной файл лежит в HDFS в трёх копиях, и ничего из него не перезапускается — как и reduce-задача, которую завершил бы сам B.</figcaption>
+  </figure>
+
+  <p>Зачем перезапускать map-задачи, которые уже закончились? Их выход лежал на локальном диске умершей машины (шаг 4) и умер вместе с ней. Завершённая reduce-задача записала свой файл в распределённую файловую систему (шаг 6), которая держит копии на других машинах. Reduce-задача, которую умерший воркер ещё выполнял, тоже стартует заново в другом месте: слайд перечисляет только сторону map, но в статье Google каждая незавершённая задача упавшего воркера возвращается в состояние idle. Перезапуск безопасен, только если задача дважды даёт один и тот же выход: "our nodes are (or at least should be) deterministic", "Nodes should have no side effects!" (p. 802) — <em>node</em> здесь означает задачу. Задача, которая ещё и вставляет строки во внешнюю базу данных, вставила бы их дважды. С молчащей задачей поступают так же: "If a task fails to report progress … it is assumed to be stuck, and is killed, and the step is re-launched (with the same input)" (p. 801).</p>
+
+  <p>"Master failure" — это "Rare"; его "Can be recovered from checkpoints", или "All tasks abort" (p. 821): два варианта устройства. Master, который сохраняет контрольные точки (checkpoints) своих таблиц, перезапускается с последней из них; тот, что не сохраняет ничего, прерывает задание, и клиент запускает его заново.</p>
+
+  <div class="pitfall">
+    <p>"Achieves fault-tolerance through replication" (p. 833, заключение). Но собственный механизм MapReduce — повторное выполнение, re-execution (p. 821); репликация — это то, что HDFS делает со входом и с итоговым выходом, и именно она делает повторное выполнение возможным. Ответ на экзамене называет оба.</p>
+  </div>
+
+  <h3>Отстающие задачи и резервные копии</h3>
+  <p>Задание заканчивается, когда заканчивается его последняя задача. "Slow workers delay completion time" (p. 824) — отстающие задачи (stragglers) — по таким скучным причинам, как "Bad disks with soft errors", "Other tasks eating up resources" или "Strange reasons like processor cache being disabled". Лекарство: "Start back-up tasks as the job nears completion"; "First task to complete is considered". В Hadoop это называется <mark class="key">спекулятивное выполнение (speculative execution)</mark> (p. 818): "The framework can run multiple instances of slow tasks", "Output from instance that finishes first is used", включается через <code>mapred.speculative.execution</code>; оно "Can dramatically bring in long tails on jobs". Проигравшую копию убивают — "First one to complete wins, then any other runs are killed" (p. 802), — а committer пропускает только файл победителя.</p>
+
+  <div class="widget" id="l30-w-strag">
+    <h3 class="widget-title">Один медленный воркер и всё задание</h3>
+    <p class="widget-intro">Диаграмма Ганта для задач одной фазы, map или reduce: по строке на воркер, по полосе на каждую копию задачи — от её старта до конца. Master отдаёт следующую свободную задачу тому воркеру, который освободился первым. При спекулятивном выполнении воркер, которому не осталось свободных задач, запускает резервную копию той выполняющейся задачи, которая закончится последней, — если она уже работает дольше обычной, — и побеждает копия, закончившая первой. Времена посчитаны этой моделью в единицах одной обычной задачи; на слайдах никаких чисел нет. Главное, что нужно увидеть: задание заканчивается, когда заканчивается его последняя задача.</p>
+    <ol class="tasks">
+      <li>Оставь 12 задач, 4 воркера, последний воркер в 5 раз медленнее, резервные копии выключены. Предскажи, когда закончится задание, потом посмотри на диаграмму.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>В момент 5. Три быстрых воркера заканчивают 11 задач к моменту 4, а воркер 4 всё ещё на своей первой задаче, T4, которая занимает 5 единиц. Одна медленная машина решает, когда закончится всё задание.</p></details>
+      </li>
+      <li>Включи спекулятивное выполнение. Предскажи новое время завершения и цену.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>4. В момент 3 свободных задач не остаётся, поэтому освободившийся воркер 3 запускает резервную копию T4; она заканчивается в 4 и побеждает, а медленную копию убивают. Цена: 1 единица лишнего машинного времени, 8 % от 12 единиц работы задания.</p></details>
+      </li>
+      <li>С включёнными резервными копиями поставь замедление 10, потом 1. Предскажи оба времени завершения.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>При 10 — по-прежнему 4, а без резервных копий было бы 10: чем длиннее хвост, тем больше экономит резервная копия. При 1 задание заканчивается в 3 и ни одна резервная копия не стартует, потому что ни одна задача не работает дольше обычной.</p></details>
+      </li>
+      <li>Выбери «задача T1: в s раз больше данных», замедление 5, резервные копии включены. Предскажи, поможет ли резервная копия.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Нет: задание всё равно заканчивается в 5. Резервной копии T1 нужно обработать те же 5 единиц данных, поэтому она не может обогнать первую копию и тратит впустую 2 единицы, прежде чем её убьют. Спекуляция лечит медленные машины, а не перекошенные данные — например, reduce-задачу, которой достался огромный ключ.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l30-w-strag', function (root, ui) {
+    var nS = ui.slider({ label: 'задачи n', min: 4, max: 24, step: 1, value: 12 });
+    var mS = ui.slider({ label: 'воркеры m', min: 2, max: 8, step: 1, value: 4 });
+    var sS = ui.slider({ label: 'замедление s', min: 1, max: 10, step: 1, value: 5, format: function (v) { return v + '×'; } });
+    var cause = ui.select('что медленное', [
+      { value: 'slow', label: 'последний воркер: плохой диск (p. 824)' },
+      { value: 'heavy', label: 'задача T1: в s раз больше данных (перекошенный ключ)' }
+    ], null, 'slow');
+    var spec = ui.toggle('спекулятивное выполнение: резервные копии под конец', false);
+    var TICKS = []; for (var t0 = 0; t0 <= 40; t0++) TICKS.push(t0);
+    var plot = ui.plot({ x: [-0.3, 6], y: [-0.6, 3.6], xLabel: 'время (обычная задача занимает 1)', aspect: 1.9, yTicks: [], xTicks: TICKS,
+      label: 'Диаграмма Ганта задания: по строке на воркер, по полосе на каждую копию задачи от её старта до конца; отмечены резервные копии, убитые копии и момент окончания задания' });
+    ui.legend([
+      { label: 'задача, первая копия', color: 's4', mark: 'square' },
+      { label: 'резервная копия', color: 's5', mark: 'square' },
+      { label: 'убита: другая копия закончила первой', color: 'muted', mark: 'dash' },
+      { label: 'конец задания', color: 'soft', mark: 'dash' }
+    ]);
+    var roT = ui.readout('время завершения задания');
+    var roC = ui.readout('сравнение');
+    var roX = ui.readout('лишнее машинное время на резервные копии');
+    var note = ui.note('');
+
+    /* n tasks of work 1 (task T1 has work s in the 'heavy' case); m workers of speed 1, except the last one, on which a
+       unit of work takes s (the 'slow' case). Idle tasks go to whichever worker is free first. With speculation, a worker
+       that finds no idle task backs up the running task that will end last (one back-up per task, once that task has run
+       longer than a normal task); the first copy to finish wins and the other copy is killed at that moment. */
+    function simulate(n, m, s, mode, specOn) {
+      var work = [], i, w;
+      for (i = 0; i < n; i++) work.push(mode === 'heavy' && i === 0 ? s : 1);
+      function dur(t, wk) { return work[t] * (mode === 'slow' && wk === m - 1 ? s : 1); }
+      var free = []; for (w = 0; w < m; w++) free.push(0);
+      var next = 0, bars = [], task = [], guard = 0;
+      while (guard++ < 2000) {
+        var bw = -1;
+        for (w = 0; w < m; w++) if (isFinite(free[w]) && (bw < 0 || free[w] < free[bw] - 1e-9)) bw = w;
+        if (bw < 0) break;
+        var t = free[bw];
+        if (next < n) {
+          var b = { task: next, w: bw, start: t, end: t + dur(next, bw), kind: 'orig', killed: false };
+          bars.push(b); task[next] = { orig: b, backup: null, done: b.end };
+          free[bw] = b.end; next++;
+          continue;
+        }
+        if (!specOn) { free[bw] = Infinity; continue; }
+        var pick = -1, wake = Infinity;
+        for (var k = 0; k < n; k++) {
+          var tk = task[k];
+          if (!tk || tk.backup || tk.orig.w === bw || tk.done <= t + 1e-9) continue;
+          if (t - tk.orig.start < 1 - 1e-9) { if (tk.orig.start + 1 < tk.done - 1e-9) wake = Math.min(wake, tk.orig.start + 1); continue; }
+          if (pick < 0 || tk.done > task[pick].done + 1e-9) pick = k;
+        }
+        if (pick < 0) { free[bw] = wake; continue; }
+        var tp = task[pick], be = t + dur(pick, bw);
+        var bb = { task: pick, w: bw, start: t, end: be, kind: 'backup', killed: false };
+        bars.push(bb); tp.backup = bb;
+        if (be < tp.orig.end - 1e-9) {
+          tp.orig.killed = true; tp.orig.cut = be; tp.done = be;
+          free[tp.orig.w] = Math.min(free[tp.orig.w], be);
+          free[bw] = be;
+        } else {
+          bb.killed = true; bb.cut = tp.orig.end; free[bw] = tp.orig.end;
+        }
+      }
+      var T = 0, extra = 0, total = 0;
+      task.forEach(function (x) { if (x.done > T) T = x.done; });
+      bars.forEach(function (x) { if (x.kind === 'backup') extra += (x.killed ? x.cut : x.end) - x.start; });
+      work.forEach(function (x) { total += x; });
+      return { T: T, extra: extra, total: total, bars: bars };
+    }
+    function state() {
+      var n = nS.value, m = mS.value, s = sS.value, mode = cause.value;
+      return { n: n, m: m, s: s, mode: mode, a: simulate(n, m, s, mode, false), b: simulate(n, m, s, mode, true) };
+    }
+    function rowY(w, m) { return m - 1 - w; }
+    function num(x) { return Course.fmt(x, Math.abs(x - Math.round(x)) < 1e-9 ? 0 : 1); }
+    function explain(st, r) {
+      var last = null;
+      r.bars.forEach(function (b) { if (!b.killed && (!last || b.end > last.end)) last = b; });
+      var txt = 'Задание заканчивается в момент ' + num(r.T) + ', когда заканчивается его последняя задача: T' + (last.task + 1) + ' на воркере ' + (last.w + 1) + '.';
+      if (spec.value) {
+        var backs = r.bars.filter(function (b) { return b.kind === 'backup'; });
+        if (!backs.length) txt += ' Ни одна резервная копия не стартовала: пока был свободный воркер, ни одна задача не работала дольше обычной.';
+        backs.slice(0, 3).forEach(function (b) {
+          txt += ' В момент ' + num(b.start) + ' воркер ' + (b.w + 1) + ' запустил резервную копию T' + (b.task + 1) +
+            (b.killed ? ', которая не смогла закончить первой и была убита в момент ' + num(b.cut) + '.' : ', которая закончилась в момент ' + num(b.end) + ' и победила; первую копию убили.');
+        });
+        if (backs.length > 3) txt += ' И ещё: ' + (backs.length - 3) + '.';
+      }
+      return txt;
+    }
+    ui.onChange(function () {
+      var st = state(), r = spec.value ? st.b : st.a;
+      var tMax = Math.max(st.a.T, st.b.T);
+      plot.setView({ x: [-0.3, tMax + Math.max(0.8, 0.16 * tMax)], y: [-0.6, st.m - 0.4] });   // room for the "job ends" label on a phone
+      function units(x) { return num(x) + ' ед.'; }
+      roT.set(units(r.T) + ' времени');
+      roC.set(spec.value ? 'без резервных копий ' + num(st.a.T) + ' · с ними ' + num(st.b.T) : 'включи спекулятивное выполнение, чтобы сравнить');
+      roX.set(spec.value ? units(r.extra) + ', ' + Math.round(100 * r.extra / r.total) + ' % от ' + num(r.total) + ' ед. работы' : 'нет: резервных копий нет');
+      note.set(explain(st, r));
+    });
+    plot.draw(function (g) {
+      var st = state(), r = spec.value ? st.b : st.a, m = st.m;
+      var unit = Math.abs(g.px(1) - g.px(0));
+      if (st.mode === 'slow' && st.s > 1) { var ys = rowY(m - 1, m); g.rect(-0.3, ys - 0.5, r.T + 50, ys + 0.5, { color: 'muted', alpha: 0.08, stroke: false }); }
+      r.bars.forEach(function (b) {
+        var y = rowY(b.w, m), y0 = y - 0.36, y1 = y + 0.06, end = b.killed ? b.cut : b.end;
+        if (end > b.start) g.rect(b.start, y0, end, y1, { color: b.kind === 'backup' ? 's5' : 's4', alpha: 0.45, width: 1.5 });
+        if (b.killed && b.end > b.cut) g.rect(b.cut, y0, b.end, y1, { color: 'muted', fill: false, dash: true, width: 1.5 });
+        if ((end - b.start) * unit >= 24) g.text((b.start + end) / 2, (y0 + y1) / 2, 'T' + (b.task + 1), { align: 'center', baseline: 'middle', size: 10, font: 'mono' });
+      });
+      for (var w = 0; w < m; w++) {
+        var lab = 'воркер ' + (w + 1) + (st.mode === 'slow' && w === m - 1 && st.s > 1 ? ' · ' + st.s + '× медленнее' : '');
+        g.text(0.02, rowY(w, m) + 0.26, lab, { size: 11, color: 'soft', baseline: 'middle', align: 'left' });
+      }
+      g.vline(r.T, { color: 'soft', dash: true, label: 'конец задания' });
+    });
+  });
+  </script>
+
+  <p>Резервные копии лечат медленные машины, а не тяжёлые задачи. Редьюсер, который получил намного больше значений, чем остальные, медленный на любой машине, и его копия тоже. Одна из причин — функция партиционирования: по умолчанию "hash(key) mod R", она должна быть "well-balanced" — "If not, reduce tasks may delay completion time" (p. 825), — потому что может свалить несколько больших ключей на один редьюсер. Другая — один огромный ключ, который никакая функция партиционирования не разделит, ведь все его значения должны попасть на один редьюсер; тут комбайнер, если reduce-функция его допускает, ужимает ключ ещё на стороне map.</p>
+
+  <h3>Пропуск плохих записей</h3>
+  <p>Некоторые падения повторяются: "Map/Reduce tasks may fail on certain records due to bugs" (p. 827). "Ideally, debug and fix" — "Not possible if third-party code is buggy". Поэтому "When worker dies, Master is notified of the record", и "If more than one worker dies on the same record", то "Master re-schedules the task and asks to skip the record". Потерять одну запись из миллиардов — нормально для статистики, но не для банковского баланса.</p>
+
+  <p class="memo"><mark class="key">Сбои обрабатываются перезапуском детерминированных задач — в том числе завершённых map-задач, потому что их выход лежал на диске умершей машины, — а медленные задачи ближе к концу получают резервную копию: побеждает копия, закончившая первой.</mark></p>
+</section>
+
+
+<section id="l30-tools">
+  <h2>Инструменты, планировщики и конец локальности диска</h2>
+
+  <p>Слайд (p. 814) перечисляет "Some further handy tools": "Combiners", "Compression", "Counters", "Speculation". С двумя ты уже знаком. <b>Compression</b> (p. 816): "Compressing the outputs and intermediate data will often yield huge performance gains", и его "Can be specified via a configuration file or set programmatically". Сжатие выхода map ужимает ровно то, что перевозит shuffle.</p>
+
+  <figure class="tbl-fig" id="l30-tbl-compress">
+    <figcaption>Настройки сжатия со слайда (p. 816) (имена свойств Hadoop 1). <code>mapred(.map)?</code> на слайде означает: с <code>.map</code> — для выхода map, без него — для выхода задания.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Что</th><th>Свойство</th><th>Варианты</th></tr></thead>
+        <tbody>
+          <tr><td>выход задания</td><td><code>mapred.output.compress</code></td><td><code>true</code></td></tr>
+          <tr><td>выход map</td><td><code>mapred.compress.map.output</code></td><td><code>true</code></td></tr>
+          <tr><td>тип</td><td><code>mapred(.map)?.output.compression.type</code></td><td>"block": "Group of keys and values are compressed together" — "almost always best"; "record": "Each value is compressed individually"</td></tr>
+          <tr><td>кодек</td><td><code>mapred(.map)?.output.compression.codec</code></td><td>"Default (zlib) - slower, but more compression"; "LZO - faster, but less compression"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p><b>Counters</b> (p. 817): "Often Map/Reduce applications have countable events"; "framework counts records in to and out of Mapper and Reducer", а ты можешь добавить свои счётчики — битые строки, пропущенные записи — через <code>Reporter</code>, который получают <code>map</code> и <code>reduce</code>, с "nice names in a MyClass_Counter.properties file". Каждая задача считает локально; итоги складывает фреймворк.</p>
+
+<pre><code>// declare two user counters, then add 1 to the first
+static enum Counter {EVENT1, EVENT2};
+reporter.incrCounter(Counter.EVENT1, 1);</code></pre>
+
+  <p><b>Zero reduces</b> (p. 820): "Frequently, we only need to run a filter on the input data", при этом "No sorting or shuffling required by the job". "Set the number of reduces to 0", и "Output from maps will go directly to OutputFormat and disk": по файлу на каждую map-задачу и никакого shuffle.</p>
+
+  <h3>Чьё задание запускается первым</h3>
+  <p>На общем кластере работает много заданий, и что-то должно решать, чьи задачи получат свободные слоты. "By default, Hadoop uses FIFO to schedule jobs" (p. 829): кто первым отправил, того первым и обслужили, так что одно длинное задание задерживает все короткие за ним. "Alternate scheduler options: capacity and fair".</p>
+
+  <figure class="tbl-fig" id="l30-tbl-sched">
+    <figcaption>Две альтернативы FIFO словами слайдов (pp. 830–831).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Capacity scheduler</th><th>Fair scheduler</th></tr></thead>
+        <tbody>
+          <tr><td>кем</td><td>"Developed by Yahoo"</td><td>"Developed by Facebook"</td></tr>
+          <tr><td>куда идут задания</td><td>"queues"; "Jobs can be prioritized"</td><td>"Pools"; задания без категории — в "a default pool"</td></tr>
+          <tr><td>гарантия</td><td>"Queues are allocated a fraction of the total resource capacity"</td><td>"Each pool assigned a guaranteed minimum share"</td></tr>
+          <tr><td>свободные ресурсы</td><td>"Free resources are allocated to queues beyond their total capacity"</td><td>"Excess capacity split between jobs"</td></tr>
+          <tr><td>ещё</td><td>"No preemption once a job is running"</td><td>"Provides fast response times for small jobs"; пулы задают минимум map-слотов, reduce-слотов и лимит на число работающих заданий</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Capacity даёт каждой организации свой кусок кластера и одалживает его, пока он простаивает, но одолженный слот не забирают обратно, пока на нём работает задача. Fair даёт каждому работающему заданию его долю во времени, так что маленькое задание, отправленное после большого, получает слоты, как только работающие задачи их освобождают, а не ждёт, пока большое задание закончится.</p>
+
+  <h3>Конец локальности диска</h3>
+  <p>"New Trend: Disk-locality Irrelevant" (p. 828). Перемещение кода к диску "Assumes disk bandwidth exceeds network bandwidth". Но "Network speeds fast improving", "Disk speeds have stagnated": удалённый диск теперь стоит примерно столько же, сколько локальный. "Next step: attain memory-locality" — держать данные в RAM между шагами, это идея Spark из <a href="l38.html">урока 38</a>. "Conclusion" (p. 833) подводит итог: "Easy to use scalable programming model for large-scale data processing on clusters", которая "Hides issues of parallelization, fault tolerance, data partitioning &amp; load balancing" и "Achieves efficiency through disk-locality".</p>
+
+  <h3>Снова о <code>&lt;store, 3&gt;</code></h3>
+  <p>Может ли кластер превратить четыре вхождения <em>store</em> в 3? Не потерей пары: пары умершего маппера заново производит повторное выполнение. Не комбайнером: <code>&lt;store, 2&gt;</code> и две <code>&lt;store, 1&gt;</code> всё равно дают в сумме 4. Не двумя редьюсерами: партиционер отправляет каждую пару <em>store</em> на один и тот же. Фреймворк только перемещает и группирует то, что выдали мапперы; его единственное исключение — плохая запись, пропущенная после того, как она уронила больше одного воркера (p. 827), — выбрасывает целую запись, а не одно слово. Так что счёт может измениться только в твоём собственном коде — и Java-маппер со слайда (p. 811) его действительно меняет: <code>StringTokenizer</code> сохраняет точку, и задание пишет <code>&lt;store, 3&gt;</code> рядом с <code>&lt;store., 1&gt;</code>, как показывает первый виджет. А выход маппера на самом слайде содержит четыре <code>&lt;store, 1&gt;</code>, так что его 3 — просто описка.</p>
+</section>
+
+
+<section id="l30-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Правила 2026/27 не включают MapReduce в темы практической части (Neo4j, MongoDB, Elasticsearch, Redis и SparkQL), так что жди его в теоретической части: открытые ответы, «верно/неверно» и вопросы с выбором ответа, где неправильный ответ может стоить баллов. Ни в одном прошлом экзамене нет задачи на MapReduce, но в лекции с правилами экзамена перечислены "map-reduce basics (be able to exemplify it)" и "Hadoop simple examples": первые два вопроса именно такого типа, на ER-диаграмме экзамена от 12 сентября 2025.</p>
+
+  <div class="exam" data-kind="open" id="l30-exam-wc">
+    <div class="exam-q" lang="en">
+      <p>Consider the scenario of the exam of 12 Sep 2025, which tracks farmers and their sales at local markets: Product (Product ID, Name, Quantity, Expiration Date) is sold at Market (Name, Location, Opening Time, Closing Time, Size) through the relationship Sell, with cardinality (1, N) on both sides. Each market stall logs the name of every product it sells, one word per sale, in a text file. Two stalls produced the files "milk cheese milk" and "cheese milk eggs", and each file is one input split.</p>
+      <p>Exemplify MapReduce with a word count over these files: give the output of each mapper, the input of the reducer after shuffle and sort (one reducer), and the output of the job. Then say how many pairs cross the network with and without a combiner.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Mapper 1 (split "milk cheese milk") emits one pair per word: &lt;milk, 1&gt; &lt;cheese, 1&gt; &lt;milk, 1&gt;. Mapper 2 (split "cheese milk eggs"): &lt;cheese, 1&gt; &lt;milk, 1&gt; &lt;eggs, 1&gt;.</p>
+        <p>Shuffle and sort: all pairs with the same key go to the same reducer, which receives them sorted by key and grouped: &lt;cheese, [1, 1]&gt; &lt;eggs, [1]&gt; &lt;milk, [1, 1, 1]&gt;.</p>
+        <p>Reduce (sum of the values of each key): &lt;cheese, 2&gt; &lt;eggs, 1&gt; &lt;milk, 3&gt;. Check: the counts add up to 6, the number of words, and there is one output pair per distinct word.</p>
+        <p>Without a combiner, 6 pairs cross the network. With the reducer used as combiner, mapper 1 sends &lt;milk, 2&gt; &lt;cheese, 1&gt; and mapper 2 sends &lt;cheese, 1&gt; &lt;milk, 1&gt; &lt;eggs, 1&gt;: 5 pairs. The reducer then receives &lt;milk, [2, 1]&gt; and still outputs &lt;milk, 3&gt;.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ показывает три этапа, каждый в своей форме: одна &lt;word, 1&gt; на каждое вхождение (в маппере никакого подсчёта), группы &lt;word, [values]&gt; после shuffle и сортировки, одна сумма на ключ. Записать &lt;milk, 2&gt; как выход map — классическая ошибка: это выход комбайнера.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l30-exam-farm">
+    <div class="exam-q" lang="en">
+      <p>Consider the scenario of the exam of 12 Sep 2025: People (Personal ID, Name, Surname, Age, Address, State) buy Products (Product ID, Name, Quantity, Expiration Date) through the relationship Buy, with attributes Buy Date and Amount. The purchases are exported as a large text file with one line per purchase: "PersonalID,ProductID,BuyDate,Amount".</p>
+      <p>Using the pseudo-code notation of the lecture, write map and reduce functions that compute, for each product, the total amount bought and the average amount per purchase. Can the reduce function also be used as the combiner? If not, write a combiner.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>map(String key, String line):
+    // key: offset of the line
+    // line: "PersonalID,ProductID,BuyDate,Amount"
+    (person, product, date, amount) = split(line, ",")
+    EmitIntermediate(product, (ParseFloat(amount), 1));
+
+combine(String product, Iterator pairs):
+    // pairs: (partial sum, partial count)
+    s = 0; c = 0
+    for each (a, n) in pairs:
+      s += a; c += n
+    EmitIntermediate(product, (s, c));
+
+reduce(String product, Iterator pairs):
+    s = 0; c = 0
+    for each (a, n) in pairs:
+      s += a; c += n
+    Emit(product, (s, s / c));</code></pre>
+        <p>The map emits, for every purchase, the product as key and the pair (amount, 1) as value. The reduce adds up amounts and counts and emits the total and the average. The reduce cannot be the combiner: its output (total, average) has another meaning than its input (sum, count), and an average of partial averages is wrong when the parts differ in size — the average of 10 and 20 is 15, the average of 15 and 60 is 37.5, while the average of 10, 20 and 60 is 30. The combiner above emits partial (sum, count) pairs of the same type as the map output, so the framework may run it zero, one or several times without changing the result.</p>
+      </div>
+      <div class="exam-note"><p>"Hadoop simple example" в стиле слайда (p. 810): ключ — атрибут группировки, значение несёт то, что нужно редьюсеру. Ловушка с комбайнером — средние не комбинируются — и есть суть вопроса; для одной только суммы комбайнером мог бы быть сам редьюсер.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l30-exam-fail">
+    <div class="exam-q" lang="en">
+      <p>True or false: when a worker fails, the map tasks it had already completed must be executed again, while the reduce tasks it had already completed are not re-executed.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>True <span class="fb">Выход завершённой map-задачи лежит на локальном диске упавшего воркера и теряется; выход завершённой reduce-задачи уже в распределённой файловой системе (p. 821).</span></li>
+      <li>False <span class="fb">Асимметрия настоящая: "In-progress and Completed map tasks are re-scheduled", "Completed reduce tasks are not re-scheduled" (p. 821).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>True. A failure is detected by missing heartbeats. The completed map tasks of the failed worker stored their output on its local disk, which is no longer reachable, so they are re-scheduled together with the in-progress ones, and the workers executing reduce tasks are notified to read from the new location. Completed reduce tasks wrote their output to the distributed file system, so they are not re-executed.</p></div>
+      <div class="exam-note"><p>Всё «почему» — в том, где лежит выход: на локальном диске для выхода map, в реплицированной файловой системе для выхода reduce. Вопрос «верно/неверно» провоцирует небрежное «неверно» у всех, кто рассуждает «завершена — значит, в безопасности».</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l30-exam-part">
+    <div class="exam-q" lang="en">
+      <p>Which component of a MapReduce job decides to which reducer an intermediate key-value pair is sent?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>The combiner <span class="fb">Комбайнер предварительно агрегирует выход одного маппера; редьюсер он не выбирает.</span></li>
+      <li>The input splitter <span class="fb">Он режет вход на чанки для мапперов — ещё до того, как появилась хоть одна промежуточная пара.</span></li>
+      <li data-correct>The partitioner <span class="fb">Он "Decides which pairs are sent to which reducer", по умолчанию через Key.hashCode() % numOfReducers, то есть hash(key) mod R (pp. 798, 825).</span></li>
+      <li>The output committer <span class="fb">Он записывает выход reduce в файл — уже после того, как отработали редьюсеры.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The partitioner (also called the shuffler): by default it computes hash(key) mod R, so all pairs with the same key reach the same reducer. It can be replaced, for example to obtain a total order of the output or a more uniform load.</p></div>
+      <div class="exam-note"><p>Каждый неверный вариант — настоящий компонент, но не на своём месте в конвейере: знай порядок splitter, mapper, combiner, partitioner, reducer, committer.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l30-exam-comb">
+    <div class="exam-q" lang="en">
+      <p>What is a combiner in MapReduce? Why does it save network bandwidth, and which conditions must it satisfy to be used safely? Give one reduce function that can serve as a combiner and one that cannot.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>A combiner is an optional "intermediate reducer" that runs on the output of each mapper, on the map side, before the shuffle. When the map output contains many repeated keys — in a word count, thousands of &lt;the, 1&gt; — it merges the values of each key locally, so far fewer pairs are written, sorted and sent over the network to the reducers. Conditions: its input and output types must be the same as the map output types, because the reducer must accept both combined and uncombined pairs; it must have no side effects, because the framework may run it zero, one or several times; and the aggregation must give the same final result however the values are grouped, as for sums, counts of ones, maximum and minimum. The word-count reducer can be the combiner (conf.setCombinerClass(Reduce.class)); a reducer that computes an average cannot, unless the values travel as (sum, count) pairs and the division happens only in the reducer.</p>
+      </div>
+      <div class="exam-note"><p>Три условия — те же типы, никаких побочных эффектов, агрегация, которой всё равно, как сгруппированы значения, — и два примера. Формулировка самого слайда "intermdiate number of times" означает неопределённое число раз: пиши "zero, one or more times".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l30-exam-local">
+    <div class="exam-q" lang="en">
+      <p>Explain the principle "move the code, not the data" in MapReduce. How does the Master use HDFS to schedule map tasks, and which data still crosses the network?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Transferring a peta-scale input from where it is stored to the machines that run the map function would saturate the network, while the map code is tiny; so the framework sends the code to the machines that store the data. The Master asks the HDFS NameNode where the chunks (blocks) of the input are and assigns each map task to a worker that holds a copy of its split, which then reads from its local disk; if no such worker is free, it uses one close to the data, for example on the same network switch. The number of map tasks follows the block size, one split per block, to exploit this locality. The input then does not cross the network, but the intermediate data still does, in the shuffle: every reducer reads its partition from every map worker. Combiners and compression of the map output reduce this traffic.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ даёт механизм (Master спрашивает у NameNode расположение блоков), запасной вариант (тот же свитч) и честное ограничение (shuffle); если остановиться на лозунге, все три пропадут.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l30-exam-multi">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about MapReduce agree with the lecture? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>The number of map tasks M is specified by the user, while the number of reduce tasks R is determined by the system. <span class="fb">Наоборот: система определяет M по сплитам, пользователь задаёт R (p. 808).</span></li>
+      <li data-correct>Speculative execution runs extra copies of slow tasks near the end of a job, and the output of the copy that finishes first is used. <span class="fb">pp. 818 и 824: резервные задачи, когда задание близко к завершению, побеждает первая закончившая.</span></li>
+      <li>By default, Hadoop schedules jobs with the Fair scheduler, developed by Facebook. <span class="fb">По умолчанию — FIFO (p. 829); Fair и Capacity — альтернативы.</span></li>
+      <li data-correct>Each reduce task produces one output file. <span class="fb">Так сказано на слайде (p. 823), и поэтому R задаёт ещё и число выходных файлов.</span></li>
+      <li>A combiner may change the types of the mapper output, since the reducer converts them back. <span class="fb">"Cannot change the type of its input": его входные и выходные типы должны совпадать (p. 799).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The second and the fourth statements.</p></div>
+      <div class="exam-note"><p>Вопрос «выбери все верные», где лишняя галочка может стоить баллов. Неверные варианты меняют местами две роли (M и R), называют не тот дефолт (FIFO, а не Fair) и нарушают правило типов комбайнера.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l30-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Маппер подсчёта слов получает строку "the store the store". Что он выдаёт?</p>
+    <ul class="options">
+      <li><code>&lt;the, 2&gt; &lt;store, 2&gt;</code> <span class="fb">Это выход комбайнера или редьюсера: маппер ничего не складывает.</span></li>
+      <li data-correct><code>&lt;the, 1&gt; &lt;store, 1&gt; &lt;the, 1&gt; &lt;store, 1&gt;</code> <span class="fb">По паре на каждое вхождение, в порядке текста: маппер только помечает (p. 792).</span></li>
+      <li><code>&lt;store, 2&gt;</code> <span class="fb">Выдаётся каждое слово, <em>the</em> тоже; и считать — не работа маппера.</span></li>
+      <li>Ничего, пока редьюсер не попросит <span class="fb">Маппер выдаёт пары по мере чтения и пишет их на свой локальный диск; редьюсеры забирают выход позже.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">При R = 2 reduce-задачах куда пойдут четыре пары <code>&lt;store, 1&gt;</code> из предложения со слайда?</p>
+    <ul class="options">
+      <li>По две на каждый редьюсер, чтобы сбалансировать нагрузку <span class="fb">Тогда в двух файлах лежали бы частичные счёты, а 4 не было бы ни в одном.</span></li>
+      <li>На редьюсер на машине того маппера, который их выдал <span class="fb">Партиционер смотрит только на ключ и никогда — на то, где пара появилась.</span></li>
+      <li data-correct>Все четыре — в reduce-задачу hash(store) mod 2 <span class="fb">Партиция зависит только от ключа: "All inputs with the same key must go to the same reducer!" (p. 797).</span></li>
+      <li>На тот редьюсер, который освободится первым <span class="fb">Тогда один ключ мог бы оказаться в двух местах; функция партиционирования фиксирует редьюсер заранее.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие reduce-функции могут без изменений служить ещё и комбайнерами? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Сумма значений <span class="fb">Сумма частичных сумм — это сумма, и типы не меняются.</span></li>
+      <li data-correct>Максимум значений <span class="fb">Максимум частичных максимумов — это максимум.</span></li>
+      <li>Среднее значений <span class="fb">Среднее частичных средних неверно, когда части разного размера: 37.5 вместо 30 для 10, 20 и 60, разбитых как (10, 20) и (60).</span></li>
+      <li>Число полученных значений <span class="fb">В роли комбайнера она превратила бы три пары в одно значение 3, а редьюсер посчитал бы это 3 как одно значение. Вместо этого выдавай единицы и суммируй их, как делает подсчёт слов.</span></li>
+    </ul>
+    <p class="q-fb">Тест такой: применить функцию к группам значений, а потом ещё раз к результатам — и получить тот же ответ, с теми же типами.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Воркер W завершил map-задачу 3 и reduce-задачу 1, а потом перестал отвечать на heartbeat-сообщения. Что Master запустит заново?</p>
+    <ul class="options">
+      <li data-correct>Только map-задачу 3; редьюсерам, которым ещё нужен её выход, сообщат, откуда его забирать <span class="fb">Её выход лежал на локальном диске W; файл reduce-задачи 1 уже в распределённой файловой системе (p. 821).</span></li>
+      <li>Ничего: обе задачи были завершены <span class="fb">Выход завершённой map-задачи умирает вместе с диском машины.</span></li>
+      <li>Обе задачи <span class="fb">Завершённые reduce-задачи не перезапускаются: их выход в безопасности в распределённой файловой системе.</span></li>
+      <li>Только reduce-задачу 1 <span class="fb">Как раз наоборот.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Задание замедляется в конце, потому что на один ключ приходится половина всех промежуточных значений. Поможет ли спекулятивное выполнение?</p>
+    <ul class="options">
+      <li>Да: резервная копия на быстрой машине закончит первой <span class="fb">Копии нужно обработать ту же половину значений: она точно так же медленна.</span></li>
+      <li>Да, если медленный редьюсер получит две резервные копии <span class="fb">Больше копий той же работы не делают ни одну из них короче.</span></li>
+      <li>Нет, потому что резервные задачи бывают только для map-задач <span class="fb">Резервные копии применяются к любой медленной последней задаче, map или reduce (p. 802: "If a node is the last step").</span></li>
+      <li data-correct>Нет: медленность в данных, а не в машине; поможет комбайнер, который ужимает ключ на стороне map, а новая функция партиционирования — нет <span class="fb">Все значения одного ключа должны попасть на один редьюсер (p. 797), какой бы ни была функция партиционирования; комбайнер, если reduce-функция его допускает, сливает их до shuffle. Хорошо сбалансированная функция партиционирования (p. 825) помогает, когда несколько больших ключей попадают на один редьюсер, но не против одного огромного ключа.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Фильтр работает как задание с нулём reduce-задач и M = 40 map-задачами. Сколько выходных файлов он пишет и сколько пар проходит через shuffle?</p>
+    <ul class="options">
+      <li>1 файл, все пары <span class="fb">Без редьюсера нет никого, кто собрал бы выход в один файл.</span></li>
+      <li>Ни файлов, ни пар <span class="fb">Выход map и есть результат: "Output from maps will go directly to OutputFormat and disk" (p. 820).</span></li>
+      <li data-correct>40 файлов, ни одной пары <span class="fb">По файлу на map-задачу и "No sorting or shuffling required by the job" (p. 820).</span></li>
+      <li>40 файлов, все пары <span class="fb">Map-задачи пишут свои файлы сами; через shuffle не проходит ничего.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему слайд (p. 828) называет локальность диска "irrelevant" как новый тренд?</p>
+    <ul class="options">
+      <li>Потому что HDFS теперь держит копию каждого блока на каждом узле <span class="fb">Репликация по-прежнему в несколько копий; изменилась скорость сети.</span></li>
+      <li data-correct>Потому что сети стали намного быстрее, а диски — нет, так что удалённый диск почти так же быстр, как локальный; следующий шаг — локальность в памяти <span class="fb">Строки слайда: "Network speeds fast improving", "Disk speeds have stagnated", "Next step: attain memory-locality".</span></li>
+      <li>Потому что map-задачи теперь читают свой вход через Master <span class="fb">Master никогда не касается данных; он только планирует.</span></li>
+      <li>Потому что диски стали быстрее сетей <span class="fb">Наоборот: локальность окупалась, пока пропускная способность диска превышала пропускную способность сети.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l30-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>MapReduce — это "a programming model and an associated implementation for processing and generating large data sets" (p. 783): ты пишешь map и reduce над парами ключ–значение, фреймворк берёт на себя parallelization, fault tolerance, data distribution и load balancing — и масштабируешься ты наружу, а не вверх (scale out, not up).</li>
+    <li>Map выдаёт пары из каждой записи, ничего не агрегируя; shuffle и сортировка приводят все значения ключа к одному редьюсеру в порядке ключей; reduce их агрегирует. В подсчёте слов со слайда <code>&lt;store, [1, 1, 1, 1]&gt;</code> превращается в <code>&lt;store, 4&gt;</code>, а не в напечатанное 3: счётчики должны в сумме давать число map-пар.</li>
+    <li>Части задания: input splitter (чанки по 64 MB на слайде, сегодня 128 MB), mapper, необязательный combiner (одинаковые типы на входе и выходе, без побочных эффектов, запускается ноль или больше раз), partitioner (hash(key) mod R), reducer, output committer и Master; нужно минимум шесть Writables.</li>
+    <li>На кластере едет код, а не данные: Master спрашивает у NameNode HDFS, где лежат чанки, и запускает каждую map-задачу на узле, который хранит её сплит, или рядом с ним; через сеть идёт только shuffle. Система задаёт M по сплитам, пользователь задаёт R, и каждая reduce-задача пишет один выходной файл.</li>
+    <li>У умершего воркера перезапускаются незавершённые и завершённые map-задачи, но не завершённые reduce-задачи, потому что выход map лежит на локальном диске воркера, а выход reduce — в реплицированной файловой системе; медленные задачи ближе к концу получают резервные копии, и побеждает первая закончившая копия; запись, которая уронила больше одного воркера, пропускается. Резервные копии лечат медленные машины, а не перекошенные ключи.</li>
+    <li>Сжатие, счётчики и zero reduces — остальные инструменты; FIFO — планировщик заданий по умолчанию, Capacity (Yahoo) и Fair (Facebook) — альтернативы; а быстрые сети делают локальность диска менее важной — следующий шаг — локальность в памяти (memory locality).</li>
+  </ul>
+  <aside class="cheat" id="l30-cheat">
+    <dl>
+      <dt>MapReduce (p. 783)</dt><dd>модель программирования + реализация для обработки и генерации больших наборов данных</dd>
+      <dt>Programming model (p. 791)</dt><dd>map: &lt;k<sub>i</sub>, v<sub>i</sub>&gt; → {&lt;k<sub>int</sub>, v<sub>int</sub>&gt;} · reduce: &lt;k<sub>int</sub>, {v<sub>int</sub>}&gt; → &lt;k<sub>o</sub>, v<sub>o</sub>&gt;</dd>
+      <dt>Пять шагов (p. 789)</dt><dd>read · map · shuffle and sort · reduce · write</dd>
+      <dt>Подсчёт слов</dt><dd>map выдаёт <code>&lt;w, 1&gt;</code> на каждое слово; reduce суммирует: <code>&lt;store, [1, 1, 1, 1]&gt;</code> → <code>&lt;store, 4&gt;</code></dd>
+      <dt>Partitioner (pp. 798, 825)</dt><dd><code>Key.hashCode() % numOfReducers</code> = hash(key) mod R; один ключ — один редьюсер</dd>
+      <dt>Combiner (pp. 799, 815, 826)</dt><dd>необязательный mini-reduce на стороне map; типы на входе = на выходе; без побочных эффектов; <code>conf.setCombinerClass(Reduce.class)</code></dd>
+      <dt>Input splitter (p. 795)</dt><dd>чанки по логическим границам, по умолчанию 64 MB на слайде (128 MB в Hadoop 2+)</dd>
+      <dt>Output committer (p. 800)</dt><dd>записывает выход reduce в файл; в паре с input splitter, чтобы задания сцеплялись</dd>
+      <dt>Writables (p. 803)</dt><dd>сериализуемые типы; минимум шесть: вход K1 V1, промежуточные K2 V2, выход K3 V3</dd>
+      <dt>M и R (pp. 808, 823)</dt><dd>M = число сплитов, задаёт система; R задаёт пользователь; один выходной файл на reduce-задачу</dd>
+      <dt>Локальность (pp. 806–807, 822)</dt><dd>move the code, not the data: Master спрашивает у NameNode, где лежат чанки; тот же узел, иначе тот же свитч</dd>
+      <dt>Данные Master (p. 813)</dt><dd>на задачу: состояние idle / in-progress / completed + воркер; на завершённую map-задачу: размер и расположение промежуточных данных</dd>
+      <dt>Worker failure (p. 821)</dt><dd>нет heartbeat → перезапустить незавершённые и завершённые map-задачи (выход на локальном диске); завершённые reduce-задачи остаются (выход в HDFS)</dd>
+      <dt>Stragglers (pp. 818, 824)</dt><dd>резервные задачи ближе к завершению, побеждает первая закончившая; <code>mapred.speculative.execution</code></dd>
+      <dt>Плохие записи (p. 827)</dt><dd>больше одного воркера умирает на одной записи → Master её пропускает</dd>
+      <dt>Zero reduces (p. 820)</dt><dd>R = 0: только map, без shuffle, без сортировки, один выходной файл на map-задачу</dd>
+      <dt>Compression (p. 816)</dt><dd><code>mapred.output.compress</code>, <code>mapred.compress.map.output</code>; block (лучше) или record; zlib или LZO</dd>
+      <dt>Планировщики (pp. 829–831)</dt><dd>FIFO по умолчанию · Capacity (Yahoo: очереди, у каждой своя доля, без вытеснения) · Fair (Facebook: пулы, минимальная доля, быстрые маленькие задания)</dd>
+      <dt>Hadoop 1 (p. 832)</dt><dd>JobTracker = Master; TaskTracker = воркер на каждом slave-узле</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l30-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=VEh91xTIEIU" target="_blank" rel="noopener">The MapReduce Computational Model</a>
+      <span class="res-by">Mining of Massive Datasets (Leskovec, Rajaraman, Ullman)</span><span class="res-dur">22 мин</span>
+      <p class="res-why">Модель, нарисованная на доске на уровне этого урока, — map-задачи, группировка по ключу, reduce-задачи, подсчёт слов: спокойное первое знакомство перед «фабрикой соков» со слайдов.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://systemdesignsimulator.org/internals/mapreduce" target="_blank" rel="noopener">MapReduce Explained: Interactive Simulator</a>
+      <span class="res-by">Rahul Kumar</span>
+      <p class="res-why">Прогони подсчёт слов по шагам через map, shuffle и reduce и посмотри, как двигаются пары; открой рядом с первым виджетом. Пользуйся симулятором и его WordCount; текст про подготовку к собеседованиям вокруг него пропусти.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://mrjob.readthedocs.io/en/latest/guides/writing-mrjobs.html" target="_blank" rel="noopener">mrjob: Writing jobs</a>
+      <span class="res-by">the mrjob project</span>
+      <p class="res-why">Подсчёт слов с маппером, комбайнером и редьюсером в дюжине строк Python, который запускается на твоём ноутбуке без Hadoop. Комбайнер и редьюсер — это одни и те же две строки, как и говорит слайд (p. 815).</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/" target="_blank" rel="noopener">MapReduce: Simplified Data Processing on Large Clusters</a>
+      <span class="res-by">Jeffrey Dean, Sanjay Ghemawat, OSDI 2004</span>
+      <p class="res-why">Источник большей части этих слайдов: в его разделах 3 и 4 есть рисунок хода выполнения со слайда (p. 812), отказоустойчивость, локальность, гранулярность задач, резервные задачи и доработки — в том же порядке и под теми же заголовками.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=cQP8WApzIQQ" target="_blank" rel="noopener">Lecture 1: Introduction (MapReduce)</a>
+      <span class="res-by">Robert Morris, MIT 6.824 Distributed Systems</span>
+      <p class="res-why">Лектор рисует подсчёт слов, а потом спрашивает, что будет, если умрёт воркер, если умрёт мастер, если задача медленная, — вопросы раздела 5, разобранные вслух.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Каждая map-задача в этом уроке читала "from local disk", потому что NameNode знал, где лежит каждый блок. Кто хранит эту карту, как файл превращается в блоки по три копии в каждом и что происходит, когда этот один очень важный сервер падает?</p>
+</aside>
+
+</main>
+</body>
+</html>

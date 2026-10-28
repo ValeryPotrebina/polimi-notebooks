@@ -1,0 +1,1374 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Внутри Cassandra: кольцо, gossip, реплики, кворумы; HBase · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l22">
+
+<header class="lesson-head">
+  <h1>Внутри Cassandra: кольцо, gossip, реплики, кворумы; HBase</h1>
+  <p class="lede">После этого урока ты сможешь провести ключ от его хеша до узлов, которые хранят его копии, проследить запись и чтение внутри узла Cassandra, сказать, какие уровни согласованности гарантируют свежее чтение, и объяснить, что HBase делает иначе.</p>
+</header>
+
+<div class="hook" data-label="Две загадки">
+  <p>На слайде "Vs. SQL" (p. 459) напечатаны четыре числа, измеренные "On &gt; 50 GB data". MySQL: запись 300 ms, чтение 350 ms в среднем — примерно одинаково. Cassandra: запись 0.12 ms, чтение 15 ms. Cassandra пишет в 125 раз быстрее, чем читает. Чем она пожертвовала, чтобы запись стала такой дешёвой?</p>
+  <p>Вторая загадка — от компании, которая сама создала Cassandra. В ноябре 2010 года Facebook выбрал для своей новой системы Messages не Cassandra, а HBase: «модель eventual consistency в Cassandra оказалось трудно совместить с нашей новой инфраструктурой Messages» (Facebook Engineering). При этом HBase пишет на том же механизме — лог, таблица в памяти, отсортированные файлы на диске. Откуда тогда другая согласованность?</p>
+  <p>Держи оба вопроса в голове. Раздел 3 отвечает на первый, раздел 5 — на второй.</p>
+</div>
+
+
+<section id="l22-ring">
+  <h2>Где живёт ключ: хеш-кольцо</h2>
+
+  <p>Возьми экзамен от 12 сентября 2025 года: продажи фермеров, "large-scale, continuously increasing", идут в Cassandra, и запрашивать их будут "by market location or product name". Партиционируй их по рынку: каждая продажа в Милане попадает в партицию 'Milano'. Хранят их восемь равноправных машин: "NO MASTER", "NO SLAVE", "PEER TO PEER" (p. 440). Так кто же отвечает на вопрос со слайда (p. 439): "How do you decide which server(s) a key-value resides on?"</p>
+
+  <p>Каждый узел — сам, одной и той же арифметикой. <mark class="key">Партиционер (partitioner)</mark> превращает ключ в число, его <mark class="key">токен (token)</mark>: "system will use MD5(key) to distribute data across nodes" (p. 457). Токены лежат на окружности; каждый узел владеет одним токеном, а ключ принадлежит первому узлу по часовой стрелке от собственного токена ключа. <mark class="key">Фактор репликации (replication factor)</mark> N — это число копий, и Simple Strategy размещает остальные N − 1 по правилу "Clockwise placement to the next node(s)" (p. 442). Клиент может отправить запрос любому узлу, и тот становится <mark class="key">координатором (coordinator)</mark> этого запроса (p. 443).</p>
+
+  <p>Почему окружность, а не хеш по модулю числа узлов? При модуле 8 девятая машина меняет остаток почти у каждого ключа: переезжают почти все данные. На кольце новый узел забирает одну дугу у одного соседа. Это <mark class="key">консистентное хеширование (consistent hashing)</mark> (контекст: слайды рисуют кольцо, но так его не называют).</p>
+
+  <div class="widget" id="l22-w-ring">
+    <h3 class="widget-title">Кольцо: кто владеет ключом и что переезжает, когда узел присоединяется</h3>
+    <p class="widget-intro">Двенадцать рынков захешированы на кольцо токенов 0–99, отсчёт по часовой стрелке от верхней точки. Узлы присоединяются в порядке A1, B1, A2, B2, A3, B3, A4, B4; буква узла — его стойка (rack). Выбери ключ: узлы с его копиями закрашиваются, а дуга идёт по часовой стрелке от ключа к ним. Ключи, сменившие узел при последнем изменении кольца, подсвечены.</p>
+    <ol class="tasks">
+      <li>Оставь N = 1 и 3 узла. Предскажи, сколько из 12 ключей сменят узел, когда присоединится четвёртый. Потом поставь «узлов в кольце» на 4 и сравни с табло «то же изменение при hash mod n».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Четыре ключа — Varese, Como, Cremona, Mantova, — и все четыре уходят от A1. B2 (токен 81) попадает на дугу, которой владел A1, — от токена 56 у A2 по кругу до 6 у A1 — и забирает её часть до 81. При hash mod n узел сменили бы 11 ключей из 12. В этом и вывод виджета: новый узел забирает одну дугу у одного соседа, и больше ничего не двигается.</p></details>
+      </li>
+      <li>Поставь 8 узлов, потом верни 7. Какие ключи переезжают теперь и куда?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Удаление B4 (токен 93) перемещает только его собственный ключ, Padova (87), к соседу B4 по часовой стрелке — A1. Уход узла — то же движение в обратную сторону: дугу наследует следующий узел по часовой стрелке.</p></details>
+      </li>
+      <li>Поставь 8 узлов, N = 3 и ключ Varese. На каких стойках лежат три его копии? Предскажи, что изменит Network Topology Strategy, потом включи её.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Varese (токен 62) принадлежит B3; Simple Strategy добавляет два следующих узла по часовой стрелке, B2 и B4, — все три в стойке B, так что отказ одной стойки теряет ключ. С включённым переключателем три копии должны поделить две стойки: обход оставляет B3 и первый встреченный повтор, B2, потом пропускает B4 и идёт дальше до A1, первого узла стойки A. Теперь после отказа стойки остаётся хотя бы одна копия.</p></details>
+      </li>
+      <li>Поставь 3 узла и N = 3. Какую долю данных хранит каждый узел? Почему слайд (p. 458) требует "&gt;= three servers"?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Каждый узел хранит каждый ключ: трём копиям нужны три разные машины. Когда узлов больше, каждый хранит примерно 3/n ключей — поэтому кольцо и масштабируется горизонтально.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l22-w-ring', function (root, ui) {
+    function fnv(s) { var h = 0x811c9dc5; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; }
+    function fmix(h) { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16; return h >>> 0; }
+    var KEYS = ['Milano', 'Treviso', 'Ravenna', 'Monza', 'Novara', 'Lodi', 'Varese', 'Como', 'Cremona', 'Mantova', 'Padova', 'Rimini'].map(function (name) {
+      var h = fmix(fnv(name));
+      return { name: name, h: h, t: Math.floor(h / 4294967296 * 100) };     // token 0..99
+    });
+    /* the order in which the nodes join; the letter is the rack */
+    var JOIN = [{ id: 'A1', t: 6 }, { id: 'B1', t: 31 }, { id: 'A2', t: 56 }, { id: 'B2', t: 81 },
+                { id: 'A3', t: 19 }, { id: 'B3', t: 68 }, { id: 'A4', t: 43 }, { id: 'B4', t: 93 }];
+    function ring(n) { return JOIN.slice(0, n).sort(function (a, b) { return a.t - b.t; }); }
+    function ownerAt(r, t) { for (var i = 0; i < r.length; i++) if (r[i].t >= t) return i; return 0; }
+    function copies(r, t, N, nts) {
+      var start = ownerAt(r, t), want = Math.min(N, r.length), out = [], i, x;
+      if (!nts) { for (i = 0; i < want; i++) out.push(r[(start + i) % r.length]); return out; }
+      /* Network Topology Strategy inside one datacenter: a rack without a copy first; when there are fewer racks
+         than copies, the first nodes met in an already used rack fill the difference */
+      var racks = {}, seen = {}, nr = 0;
+      r.forEach(function (nd) { if (!racks[nd.id[0]]) { racks[nd.id[0]] = true; nr++; } });
+      var repeats = N - nr;
+      for (i = 0; i < r.length && out.length < want; i++) {
+        x = r[(start + i) % r.length];
+        if (!seen[x.id[0]]) { seen[x.id[0]] = true; out.push(x); }
+        else if (repeats > 0) { repeats--; out.push(x); }
+      }
+      return out;
+    }
+
+    var sNodes = ui.slider({ label: 'узлов в кольце', min: 3, max: 8, step: 1, value: 3 });
+    var sN = ui.slider({ label: 'фактор репликации N', min: 1, max: 3, step: 1, value: 1 });
+    var selKey = ui.select('ключ (рынок)', KEYS.map(function (k) { return k.name; }), null, 'Milano');
+    var tNTS = ui.toggle('Network Topology Strategy: сначала новая стойка', false);
+    var roTok = ui.readout('ключ → токен');
+    var roCop = ui.readout('копии, владелец первым');
+    var roRack = ui.readout('если откажет одна стойка');
+    var roMove = ui.readout('последнее изменение кольца');
+    var roMod = ui.readout('то же изменение при hash mod n');
+    ui.note('Здесь токены идут от 0 до 99 — замена 128-битным токенам MD5 со слайда. Хеш вычисляется по-настоящему; токены узлов и названия рынков выбраны для демонстрации, а не взяты со слайдов.');
+    ui.legend([
+      { label: 'ключ, захешированный на кольцо', color: 's3', mark: 'dot' },
+      { label: 'узел с первой копией (владелец)', color: 's1', mark: 'square' },
+      { label: 'узел с другой копией', color: 's1', mark: 'area' },
+      { label: 'обход по часовой стрелке до копий', color: 's1', mark: 'line' },
+      { label: 'ключ, переехавший при последнем изменении', color: 'ink', mark: 'hl' }
+    ]);
+
+    var CX = 280, CY = 196, R = 136;
+    var svgEl = ui.svg(560, 392, { label: 'Кольцо токенов от 0 до 99: узлы — квадраты, ключи — точки; узлы с выбранным ключом закрашены и соединены с ним дугой по часовой стрелке' });
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    function P(t, r) { var a = 2 * Math.PI * t / 100; return { x: CX + r * Math.sin(a), y: CY - r * Math.cos(a) }; }
+    function f1(v) { return v.toFixed(1); }
+
+    function draw(st) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      S('circle', { cx: CX, cy: CY, r: R, 'class': 'st-muted dash' });
+      var z0 = P(0, R - 8), z1 = P(0, R + 8), zl = P(0, R - 24);
+      S('line', { x1: f1(z0.x), y1: f1(z0.y), x2: f1(z1.x), y2: f1(z1.y), 'class': 'st-muted' });
+      S('text', { x: f1(zl.x), y: f1(zl.y + 4), 'class': 'tx-sm tx-mid tx-muted', text: '0' });
+      /* the clockwise walk from the key to its last copy */
+      var tk = st.key.t, last = st.cps[st.cps.length - 1].t, span = (last - tk + 100) % 100, RA = 158;
+      var a0 = P(tk, RA), a1 = P(last, RA), c0 = P(tk, R + 6);
+      S('line', { x1: f1(c0.x), y1: f1(c0.y), x2: f1(a0.x), y2: f1(a0.y), 'class': 'st-s1 sw-2' });
+      S('path', { d: 'M' + f1(a0.x) + ',' + f1(a0.y) + ' A' + RA + ',' + RA + ' 0 ' + (span > 50 ? 1 : 0) + ',1 ' + f1(a1.x) + ',' + f1(a1.y), 'class': 'st-s1 sw-3', 'marker-end': 'url(#arr-s1)' });
+      st.moved.forEach(function (k) { var p = P(k.t, R); S('circle', { cx: f1(p.x), cy: f1(p.y), r: 9, 'class': 'hl' }); });
+      st.ring.forEach(function (nd) {
+        var p = P(nd.t, R), idx = st.cps.indexOf(nd);
+        S('rect', { x: f1(p.x - 7), y: f1(p.y - 7), width: 14, height: 14, 'class': idx === 0 ? 'fi-s1 st-s1 sw-2' : idx > 0 ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        var l = P(nd.t, 184);
+        S('text', { x: f1(l.x), y: f1(l.y + 5), 'class': 'tx-sm tx-mid', text: nd.id });
+      });
+      KEYS.forEach(function (k) {
+        var p = P(k.t, R), sel = k === st.key;
+        S('circle', { cx: f1(p.x), cy: f1(p.y), r: sel ? 7 : 5, 'class': sel ? 'fi-s3 sw-2' : 'fi-s3 st-paper sw-1' });
+      });
+      S('text', { x: CX, y: CY - 2, 'class': 'tx-lg tx-mid', text: st.key.name });
+      S('text', { x: CX, y: CY + 22, 'class': 'tx-mono tx-sm tx-mid tx-muted', text: 'токен ' + st.key.t });
+    }
+
+    var cur = sNodes.value, prev = sNodes.value;
+    ui.onChange(function () {
+      if (sNodes.value !== cur) { prev = cur; cur = sNodes.value; }
+      var r = ring(cur), key = KEYS.filter(function (k) { return k.name === selKey.value; })[0] || KEYS[0];
+      var cps = copies(r, key.t, sN.value, tNTS.value);
+      var moved = [], movedMod = [];
+      if (prev !== cur) {
+        var a = ring(prev);
+        moved = KEYS.filter(function (k) { return a[ownerAt(a, k.t)].id !== r[ownerAt(r, k.t)].id; });
+        movedMod = KEYS.filter(function (k) { return JOIN[k.h % prev].id !== JOIN[k.h % cur].id; });
+      }
+      roTok.set(key.name + ' → ' + key.t);
+      roCop.set(cps.map(function (nd) { return nd.id; }).join(', '));
+      var byRack = {}, worst = 0, wr = '';
+      cps.forEach(function (nd) { byRack[nd.id[0]] = (byRack[nd.id[0]] || 0) + 1; });
+      Object.keys(byRack).forEach(function (k) { if (byRack[k] > worst) { worst = byRack[k]; wr = k; } });
+      if (cps.length === 1) roRack.set('копия только одна: отказ стойки ' + wr + ' теряет ключ', 'bad');
+      else if (worst === cps.length) roRack.set('все ' + cps.length + ' копии в стойке ' + wr + ': отказ одной стойки теряет ключ', 'bad');
+      else roRack.set('теряется не больше ' + worst + ' из ' + cps.length + ' копий (стойка ' + wr + '): копия уцелеет', 'good');
+      if (prev === cur) { roMove.set('подвигай ползунок «узлов в кольце»'); roMod.set('—'); }
+      else {
+        var added = cur > prev, diff = added ? JOIN.slice(prev, cur) : JOIN.slice(cur, prev);
+        roMove.set((added ? (diff.length > 1 ? 'добавлены ' : 'добавлен ') : (diff.length > 1 ? 'удалены ' : 'удалён ')) + diff.map(function (nd) { return nd.id; }).join(', ') + ': узел сменили ' + moved.length + ' из 12 ключей' +
+          (moved.length ? ' (' + moved.map(function (k) { return k.name; }).join(', ') + ')' : ''));
+        roMod.set('узел сменили бы ' + movedMod.length + ' из 12 ключей');
+      }
+      draw({ ring: r, key: key, cps: cps, moved: moved });
+    });
+  });
+  </script>
+
+  <h3>Два партиционера</h3>
+  <aside class="margin-note">"Random Preserving" со слайда ничего не сохраняет: класс назывался RandomPartitioner. Сегодняшний хеш по умолчанию — Murmur3 (контекст).</aside>
+  <p>Слайд "partitioner smack-down" (p. 457) ставит их рядом (табл. 1). Сохраняя ключи по порядку, order-preserving партиционер может сканировать диапазон ключей, но платит за это "'scrabble' distribution": настоящие ключи распределены так же неравномерно, как буквы в «Эрудите», и узлу с ключами на M достаётся куда больше строк, чем узлу с ключами на X. Хеш — вариант по умолчанию (контекст): Cassandra отказывается от сканирования диапазонов по ключам партиции и вместо этого держит порядок внутри партиции — с помощью clustering key из <a href="l21.html">урока 21</a>.</p>
+
+  <figure class="tbl-fig" id="l22-tbl-part">
+    <figcaption>Табл. 1. "partitioner smack-down" (p. 457) словами слайда. CF — это column family слайдов, то есть таблица.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Random (хеш)</th><th>Order preserving</th></tr></thead>
+        <tbody>
+          <tr><td>токен</td><td>"system will use MD5(key) to distribute data across nodes"</td><td>"key distribution determined by token"; "can specify the token for this node to use"</td></tr>
+          <tr><td>порядок строк</td><td>порядок хешей</td><td>"lexicographical ordering"</td></tr>
+          <tr><td>диапазон ключей</td><td>не сканируется</td><td>"required for range queries": "scan over rows like cursor in index"</td></tr>
+          <tr class="is-key"><td>нагрузка</td><td>"even distribution of keys from one CF across ranges/nodes"</td><td>"'scrabble' distribution": горячие точки (hot spots)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Куда идут копии</h3>
+  <p>Слайд "data replication" (p. 456) требует "configurable replication factor" и "replica placement strategy". Старые названия были нагляднее: rack unaware → Simple Strategy; rack aware → Old Network Topology Strategy (с тех пор удалена, контекст); data center shard → Network Topology Strategy. Simple Strategy обслуживает "Single datacenter" (p. 442) и не смотрит на стойки. <mark class="key">Network Topology Strategy</mark> обслуживает "Multiple datacenters", "Supporting local queries": свой фактор репликации на каждый датацентр, а внутри каждого обход пропускает узлы стойки, где копия уже есть (рис. 1).</p>
+
+  <aside class="margin-note">На слайде (p. 444) обе стойки датацентра 2 подписаны Rack 1. Нижний прямоугольник — вторая стойка: поэтому R4 идёт туда.</aside>
+  <figure class="fig fig--pair fig--plain" id="l22-fig-nts">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 222" role="img" aria-label="Simple Strategy с четырьмя копиями на кольце со слайда (p. 444): узлы 2, 8, 3 и 9, так что стойка 1 каждого датацентра держит две копии">
+        <text x="77" y="16" class="tx-sm tx-mid tx-bold">data center 1</text>
+        <text x="223" y="16" class="tx-sm tx-mid tx-bold">data center 2</text>
+        <rect x="8" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="154" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="14" y="32" width="126" height="84" class="st-line"/>
+        <rect x="14" y="124" width="126" height="84" class="st-line"/>
+        <rect x="160" y="32" width="126" height="84" class="st-line"/>
+        <rect x="160" y="124" width="126" height="84" class="st-line"/>
+        <text x="20" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="20" y="138" class="tx-sm tx-muted">rack 2</text>
+        <text x="166" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="166" y="138" class="tx-sm tx-muted">rack 2</text>
+        <rect x="20" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="60" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="100" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="20" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="60" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="100" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="166" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="206" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="246" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="166" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="206" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="246" y="148" width="34" height="26" class="fi-paper"/>
+        <text x="37" y="74" class="tx-mono tx-mid">1</text>
+        <text x="77" y="74" class="tx-mono tx-mid">2</text>
+        <text x="117" y="74" class="tx-mono tx-mid">3</text>
+        <text x="37" y="166" class="tx-mono tx-mid">4</text>
+        <text x="77" y="166" class="tx-mono tx-mid">5</text>
+        <text x="117" y="166" class="tx-mono tx-mid">6</text>
+        <text x="183" y="74" class="tx-mono tx-mid">7</text>
+        <text x="223" y="74" class="tx-mono tx-mid">8</text>
+        <text x="263" y="74" class="tx-mono tx-mid">9</text>
+        <text x="183" y="166" class="tx-mono tx-mid">10</text>
+        <text x="223" y="166" class="tx-mono tx-mid">11</text>
+        <text x="263" y="166" class="tx-mono tx-mid">12</text>
+        <text x="77" y="100" class="tx-sm tx-mid tx-bold">R1</text>
+        <text x="117" y="100" class="tx-sm tx-mid tx-bold">R3</text>
+        <text x="223" y="100" class="tx-sm tx-mid tx-bold">R2</text>
+        <text x="263" y="100" class="tx-sm tx-mid tx-bold">R4</text>
+      </svg>
+      <p class="fig-label">Simple Strategy, N = 4 (вычислено)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 222" role="img" aria-label="Network Topology Strategy с двумя копиями на датацентр на том же кольце: узлы 2, 4, 8 и 10, по одной копии в каждой стойке, как на слайде (p. 444)">
+        <text x="77" y="16" class="tx-sm tx-mid tx-bold">data center 1</text>
+        <text x="223" y="16" class="tx-sm tx-mid tx-bold">data center 2</text>
+        <rect x="8" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="154" y="24" width="138" height="192" class="st-muted"/>
+        <rect x="14" y="32" width="126" height="84" class="st-line"/>
+        <rect x="14" y="124" width="126" height="84" class="st-line"/>
+        <rect x="160" y="32" width="126" height="84" class="st-line"/>
+        <rect x="160" y="124" width="126" height="84" class="st-line"/>
+        <text x="20" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="20" y="138" class="tx-sm tx-muted">rack 2</text>
+        <text x="166" y="46" class="tx-sm tx-muted">rack 1</text>
+        <text x="166" y="138" class="tx-sm tx-muted">rack 2</text>
+        <rect x="20" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="60" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="100" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="20" y="148" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="60" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="100" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="166" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="206" y="56" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="246" y="56" width="34" height="26" class="fi-paper"/>
+        <rect x="166" y="148" width="34" height="26" class="fw-s1 st-s1 sw-2"/>
+        <rect x="206" y="148" width="34" height="26" class="fi-paper"/>
+        <rect x="246" y="148" width="34" height="26" class="fi-paper"/>
+        <text x="37" y="74" class="tx-mono tx-mid">1</text>
+        <text x="77" y="74" class="tx-mono tx-mid">2</text>
+        <text x="117" y="74" class="tx-mono tx-mid">3</text>
+        <text x="37" y="166" class="tx-mono tx-mid">4</text>
+        <text x="77" y="166" class="tx-mono tx-mid">5</text>
+        <text x="117" y="166" class="tx-mono tx-mid">6</text>
+        <text x="183" y="74" class="tx-mono tx-mid">7</text>
+        <text x="223" y="74" class="tx-mono tx-mid">8</text>
+        <text x="263" y="74" class="tx-mono tx-mid">9</text>
+        <text x="183" y="166" class="tx-mono tx-mid">10</text>
+        <text x="223" y="166" class="tx-mono tx-mid">11</text>
+        <text x="263" y="166" class="tx-mono tx-mid">12</text>
+        <text x="77" y="100" class="tx-sm tx-mid tx-bold">R1</text>
+        <text x="37" y="192" class="tx-sm tx-mid tx-bold">R2</text>
+        <text x="223" y="100" class="tx-sm tx-mid tx-bold">R3</text>
+        <text x="183" y="192" class="tx-sm tx-mid tx-bold">R4</text>
+      </svg>
+      <p class="fig-label">Network Topology Strategy, 2 + 2 (p. 444)</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Кольцо со слайда (p. 444) идёт по часовой стрелке 1, 7, 2, 8, 3, 9, 4, 10, 5, 11, 6, 12, и токен ключа попадает чуть раньше узла 2. Simple Strategy берёт четыре следующих узла, 2, 8, 3, 9: обе копии каждого датацентра оказываются в стойке 1. Network Topology Strategy, по две копии на датацентр, пропускает 3 и 9 и даёт R1–R4 со слайда на узлах 2, 4, 8, 10 — по одной на стойку.</figcaption>
+  </figure>
+
+  <p>Скрипт Cassandra начинается с создания keyspace, как на практическом занятии (p. 1553):</p>
+  <pre><code>-- three copies of every row
+CREATE KEYSPACE population
+  WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3};</code></pre>
+  <p>С разбивкой по датацентрам, в синтаксисе документации Cassandra (на слайдах этого нет), для рис. 1:</p>
+  <pre><code>-- two copies in each datacenter
+CREATE KEYSPACE population
+  WITH replication = {
+    'class':
+      'NetworkTopologyStrategy',
+    'DC1': 2, 'DC2': 2};</code></pre>
+
+  <p class="memo"><mark class="key">Хеш выбирает первый узел по часовой стрелке; стратегия выбирает остальные N − 1: следующие узлы или следующие стойки каждого датацентра.</mark></p>
+</section>
+
+
+<section id="l22-gossip">
+  <h2>Никто не главный: gossip и обнаружение отказов</h2>
+
+  <p>Узел B3 ночью перезагружается. Мастера нет, и никто не ведёт список живых: каждый узел держит свой и поправляет его, общаясь с другими. Новость — "I'm online!" — расходится от узла к узлу, как слух: "gossip" (p. 440).</p>
+
+  <p>"Gossip protocol" (p. 441) работает раундами. "Each node picks its discussants (up to 3)", каким бы большим ни был кластер, и каждый разговор — рукопожатие из трёх сообщений (рис. 2). После него оба знают объединение того, что знали, так что представления узлов сходятся ("converge"): это <mark class="key">anti-entropy</mark> со слайда, где энтропия — беспорядок узлов, которые не согласны друг с другом. Мало собеседников за раунд — значит "Always a constant amount of network traffic (except for gossip storms)", то есть кроме случаев, когда состояние меняют сразу много узлов.</p>
+
+  <figure class="fig fig--plain" id="l22-fig-handshake">
+    <svg class="dia" viewBox="0 0 560 330" role="img" aria-label="Узел X обменивается gossip с узлом Y в три сообщения: SYN с версиями, которые знает X, ACK с тем, чего не хватает X и что нужно Y, ACK2 с тем, что просил Y">
+      <rect x="36" y="14" width="44" height="28" class="fi-paper sw-2"/>
+      <line x1="44" y1="22" x2="72" y2="22" class="st-muted"/>
+      <line x1="44" y1="28" x2="72" y2="28" class="st-muted"/>
+      <line x1="44" y1="34" x2="72" y2="34" class="st-muted"/>
+      <rect x="480" y="14" width="44" height="28" class="fi-paper sw-2"/>
+      <line x1="488" y1="22" x2="516" y2="22" class="st-muted"/>
+      <line x1="488" y1="28" x2="516" y2="28" class="st-muted"/>
+      <line x1="488" y1="34" x2="516" y2="34" class="st-muted"/>
+      <text x="58" y="62" class="tx-sm tx-mid">узел X</text>
+      <text x="502" y="62" class="tx-sm tx-mid">узел Y</text>
+      <line x1="58" y1="72" x2="58" y2="320" class="st-muted dash"/>
+      <line x1="502" y1="72" x2="502" y2="320" class="st-muted dash"/>
+      <line x1="62" y1="112" x2="494" y2="112" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="498" y1="200" x2="66" y2="200" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="62" y1="288" x2="494" y2="288" class="sw-2" marker-end="url(#arr)"/>
+      <text x="280" y="96" class="tx-mono tx-mid halo">1. GossipDigestSynMessage</text>
+      <text x="280" y="184" class="tx-mono tx-mid halo">2. GossipDigestAckMessage</text>
+      <text x="280" y="272" class="tx-mono tx-mid halo">3. GossipDigestAck2Message</text>
+      <text x="280" y="140" class="tx-sm tx-mid tx-muted">вот версии, которые я знаю</text>
+      <text x="280" y="228" class="tx-sm tx-mid tx-muted">вот чего нет у тебя; пришли то, чего нет у меня</text>
+      <text x="280" y="316" class="tx-sm tx-mid tx-muted">вот то, что ты просил</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Один раунд gossip между двумя узлами, с названиями сообщений со слайда (p. 441). Что несёт каждое сообщение — версии, потом недостающие части, — это контекст из реализации Cassandra.</figcaption>
+  </figure>
+
+  <div class="pitfall"><p>«"Up to 3" собеседника и "three messages for each round" — одна и та же тройка». Нет, это две разные тройки: собеседники за раунд и сообщения за разговор. И gossip переносит состояние узлов — heartbeat, токены, версии, — но никогда не строки: записи идут от координатора к репликам (p. 445).</p></div>
+
+  <h3>Список членства</h3>
+  <p>"Cluster Membership" (p. 451): каждый узел хранит по строке на каждый узел — Address, Heartbeat Counter, Time (local) — и увеличивает только свой счётчик. "Nodes periodically gossip their membership list"; "On receipt, the local membership list is updated": для каждого адреса побеждает больший счётчик, и строка получает отметку по часам самого получателя, потому что часы "asynchronous". Рис. 3 воспроизводит слайд.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l22-fig-members">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="До: узел 1 посылает свой список членства узлу 2, в собственном списке которого у узлов 1 и 3 счётчики меньше">
+        <text x="65" y="18" class="tx-sm tx-mid tx-bold">узел 1 посылает</text>
+        <text x="235" y="18" class="tx-sm tx-mid tx-bold">у узла 2</text>
+        <rect x="8" y="28" width="114" height="20" class="fw-s3 st-none"/>
+        <rect x="8" y="28" width="114" height="116"/>
+        <line x1="38" y1="28" x2="38" y2="144" class="st-muted"/>
+        <line x1="92" y1="28" x2="92" y2="144" class="st-muted"/>
+        <line x1="8" y1="48" x2="122" y2="48" class="st-muted"/>
+        <line x1="8" y1="72" x2="122" y2="72" class="st-muted"/>
+        <line x1="8" y1="96" x2="122" y2="96" class="st-muted"/>
+        <line x1="8" y1="120" x2="122" y2="120" class="st-muted"/>
+        <text x="23" y="42" class="tx-sm tx-mid">node</text>
+        <text x="65" y="42" class="tx-sm tx-mid">counter</text>
+        <text x="107" y="42" class="tx-sm tx-mid">time</text>
+        <text x="23" y="64" class="tx-mono tx-sm tx-mid">1</text><text x="65" y="64" class="tx-mono tx-sm tx-mid">10120</text><text x="107" y="64" class="tx-mono tx-sm tx-mid">66</text>
+        <text x="23" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="65" y="88" class="tx-mono tx-sm tx-mid">10103</text><text x="107" y="88" class="tx-mono tx-sm tx-mid">62</text>
+        <text x="23" y="112" class="tx-mono tx-sm tx-mid">3</text><text x="65" y="112" class="tx-mono tx-sm tx-mid">10098</text><text x="107" y="112" class="tx-mono tx-sm tx-mid">63</text>
+        <text x="23" y="136" class="tx-mono tx-sm tx-mid">4</text><text x="65" y="136" class="tx-mono tx-sm tx-mid">10111</text><text x="107" y="136" class="tx-mono tx-sm tx-mid">65</text>
+        <rect x="178" y="28" width="114" height="20" class="fw-s3 st-none"/>
+        <rect x="178" y="28" width="114" height="116"/>
+        <line x1="208" y1="28" x2="208" y2="144" class="st-muted"/>
+        <line x1="262" y1="28" x2="262" y2="144" class="st-muted"/>
+        <line x1="178" y1="48" x2="292" y2="48" class="st-muted"/>
+        <line x1="178" y1="72" x2="292" y2="72" class="st-muted"/>
+        <line x1="178" y1="96" x2="292" y2="96" class="st-muted"/>
+        <line x1="178" y1="120" x2="292" y2="120" class="st-muted"/>
+        <text x="193" y="42" class="tx-sm tx-mid">node</text>
+        <text x="235" y="42" class="tx-sm tx-mid">counter</text>
+        <text x="277" y="42" class="tx-sm tx-mid">time</text>
+        <text x="193" y="64" class="tx-mono tx-sm tx-mid">1</text><text x="235" y="64" class="tx-mono tx-sm tx-mid">10118</text><text x="277" y="64" class="tx-mono tx-sm tx-mid">64</text>
+        <text x="193" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="235" y="88" class="tx-mono tx-sm tx-mid">10110</text><text x="277" y="88" class="tx-mono tx-sm tx-mid">64</text>
+        <text x="193" y="112" class="tx-mono tx-sm tx-mid">3</text><text x="235" y="112" class="tx-mono tx-sm tx-mid">10090</text><text x="277" y="112" class="tx-mono tx-sm tx-mid">58</text>
+        <text x="193" y="136" class="tx-mono tx-sm tx-mid">4</text><text x="235" y="136" class="tx-mono tx-sm tx-mid">10111</text><text x="277" y="136" class="tx-mono tx-sm tx-mid">65</text>
+        <line x1="130" y1="96" x2="170" y2="96" class="sw-2" marker-end="url(#arr)"/>
+        <text x="150" y="84" class="tx-sm tx-mid">gossip</text>
+        <text x="150" y="170" class="tx-sm tx-mid tx-muted">часы узла 2 показывают 70</text>
+      </svg>
+      <p class="fig-label">До: приходит список узла 1</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="После: узел 2 взял большие счётчики для узлов 1 и 3 и поставил им своё время 70; его собственная строка и совпадающая строка остались">
+        <rect x="38" y="48" width="84" height="24" class="fw-key st-none"/>
+        <rect x="38" y="96" width="84" height="24" class="fw-key st-none"/>
+        <rect x="8" y="28" width="114" height="20" class="fw-s3 st-none"/>
+        <rect x="8" y="28" width="114" height="116"/>
+        <line x1="38" y1="28" x2="38" y2="144" class="st-muted"/>
+        <line x1="92" y1="28" x2="92" y2="144" class="st-muted"/>
+        <line x1="8" y1="48" x2="122" y2="48" class="st-muted"/>
+        <line x1="8" y1="72" x2="122" y2="72" class="st-muted"/>
+        <line x1="8" y1="96" x2="122" y2="96" class="st-muted"/>
+        <line x1="8" y1="120" x2="122" y2="120" class="st-muted"/>
+        <text x="65" y="18" class="tx-sm tx-mid tx-bold">узел 2 после</text>
+        <text x="23" y="42" class="tx-sm tx-mid">node</text>
+        <text x="65" y="42" class="tx-sm tx-mid">counter</text>
+        <text x="107" y="42" class="tx-sm tx-mid">time</text>
+        <text x="23" y="64" class="tx-mono tx-sm tx-mid">1</text><text x="65" y="64" class="tx-mono tx-sm tx-mid">10120</text><text x="107" y="64" class="tx-mono tx-sm tx-mid">70</text>
+        <text x="23" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="65" y="88" class="tx-mono tx-sm tx-mid">10110</text><text x="107" y="88" class="tx-mono tx-sm tx-mid">64</text>
+        <text x="23" y="112" class="tx-mono tx-sm tx-mid">3</text><text x="65" y="112" class="tx-mono tx-sm tx-mid">10098</text><text x="107" y="112" class="tx-mono tx-sm tx-mid">70</text>
+        <text x="23" y="136" class="tx-mono tx-sm tx-mid">4</text><text x="65" y="136" class="tx-mono tx-sm tx-mid">10111</text><text x="107" y="136" class="tx-mono tx-sm tx-mid">65</text>
+        <text x="132" y="64" class="tx-sm">больше: копия, метка 70</text>
+        <text x="132" y="88" class="tx-sm">своя новее: оставить</text>
+        <text x="132" y="112" class="tx-sm">больше: копия, метка 70</text>
+        <text x="132" y="136" class="tx-sm">равны: всё оставить</text>
+        <text x="150" y="172" class="tx-hand tx-mid">счётчики едут, время — нет</text>
+      </svg>
+      <p class="fig-label">После: узел 2 в момент 70</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Слияние списков членства со слайда (p. 451), строка за строкой. 10120 бьёт 10118, а 10098 бьёт 10090: обе строки копируются и получают собственное время узла 2, 70. Собственная строка узла 2, 10110, новее услышанного 10103. Строка 4 совпадает, поэтому даже её время остаётся 65.</figcaption>
+  </figure>
+
+  <h3>От молчания к подозрению</h3>
+  <p>Молчащий узел может быть мёртв, а может просто тормозить, и фиксированный таймаут ошибается то в одну, то в другую сторону. <mark class="key">Накопительный детектор отказов (accrual failure detector)</mark> со слайда (p. 452) "outputs a value (PHI) representing suspicion", "Apps set an appropriate threshold", и "PHI = 5 =&gt; 10-15 sec detection time". PHI, φ, растёт вместе с молчанием, которое меряют относительно "Inter-arrival times for gossip messages" — промежутков между приходами gossip-сообщений:</p>
+
+  <aside class="margin-note">На языке статистики: \(P_{\text{later}}\) — это p-value молчания при гипотезе, что узел жив, а \(\varphi\) — то же p-value в шкале минус логарифма.</aside>
+  <ol class="steps" id="l22-steps-phi">
+    <li><p>Пусть \(\Delta t = t_{now} - t_{last}\) — длительность молчания, а F — распределение прошлых промежутков. Живой узел молчит так долго с вероятностью хвоста</p> \[ P_{\text{later}}(\Delta t) = 1 - F(\Delta t) \]</li>
+    <li><p>φ = 1 значит 10 % шанс, что живой узел опоздает настолько; 2 — 1 %, 5 — 0.001 %:</p> \[ \varphi = -\log_{10} P_{\text{later}}(\Delta t) \]</li>
+    <li><p>Контекст: Cassandra считает промежутки экспоненциальными со средним μ, поэтому \(P_{\text{later}} = e^{-\Delta t / \mu}\) и</p> \[ \varphi = \frac{\Delta t}{\mu \ln 10} \]</li>
+    <li><p>Если gossip приходит примерно раз в секунду (μ ≈ 1 s, контекст), φ = 5 через 5 ln 10 ≈ 11.5 s — в пределах 10–15 s со слайда. У более медленной сети μ больше, и тревога позже: это и есть "sensitive to actual inter-arrival time variations" со слайда.</p></li>
+  </ol>
+
+  <aside class="redpen" data-page="452">
+    <p class="claim">"PHI(t) = - log(CDF or Probability(t_now – t_last))/log 10"</p>
+    <p class="fix">\(\varphi = -\log_{10}(1 - F(\Delta t))\): вероятность хвоста, единица минус CDF, — а не сама CDF.</p>
+    <p class="because">С самой CDF φ был бы максимальным сразу после heartbeat и падал бы до 0 по мере роста молчания — противоположность подозрению ("/log 10" просто превращает логарифм в \(\log_{10}\)). Экзамен может сверяться с напечатанной строкой: знай её, а в ответе пиши хвост.</p>
+  </aside>
+</section>
+
+
+<section id="l22-write">
+  <h2>Запись — это дописывание; чтение — это слияние</h2>
+
+  <p>Приходит продажа для 'Milano'. "Writes" (p. 445): клиент "sends write to one front-end node in Cassandra cluster (Coordinator)", "Which (via Partitioning function) sends it to all replica nodes responsible for key".</p>
+
+  <aside class="margin-note">Час — это настройка: сегодня окно для хинтов настраивается, по умолчанию три часа (контекст).</aside>
+  <p>"Always writable: Hinted Handoff": "If any replica is down, the coordinator writes to all other replicas, and keeps the write until down replica comes back up" — сохранённая запись называется <mark class="key">хинт (hint)</mark>, — и "When all replicas are down, the Coordinator (front end) buffers writes (for up to an hour)". Слайд добавляет "Atomicity for a given key (i.e., within ColumnFamily)": одна запись в одну партицию применяется целиком, транзакций по нескольким ключам нет. И "One ring per datacenter": координатор "can also send write to one replica per remote datacenter".</p>
+
+  <h3>На реплике: commit log, memtable, SSTable</h3>
+  <p>Записи "Need to be lock-free and fast (no reads or disk seeks)". На реплике (p. 446): "1. log it in disk commit log" — это дописывание в конец, без перемещения головки (seek), и запись переживёт падение; "2. Make changes to appropriate memtables" — <mark class="key">memtable</mark> — это "In-memory representation of multiple key-value pairs", отсортированное по ключу. После этого реплика подтверждает запись (рис. 4).</p>
+
+  <figure class="fig fig--plain" id="l22-fig-write">
+    <svg class="dia" viewBox="0 0 560 320" role="img" aria-label="Путь записи на реплике: запись дописывается в commit log на диске, добавляется в отсортированный memtable в памяти и подтверждается; позже memtable сбрасывается в неизменяемую SSTable с файлом индекса и фильтром Блума">
+      <rect x="14" y="40" width="72" height="26" rx="6" class="fi-paper"/>
+      <text x="50" y="57" class="tx-sm tx-mid">клиент</text>
+      <line x1="90" y1="53" x2="192" y2="53" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="136" y="36" class="tx-sm tx-mid halo">запись Milano</text>
+      <text x="204" y="30" class="tx-sm">1 · commit log (диск)</text>
+      <rect x="200" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="212" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="224" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="236" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="248" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="260" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="272" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="284" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="296" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="308" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="320" y="43" width="12" height="20" class="fi-paper sw-1"/>
+      <rect x="332" y="43" width="12" height="20" class="fw-s1 st-s1 sw-2"/>
+      <line x1="272" y1="66" x2="272" y2="104" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="282" y="90" class="tx-sm halo">2 · значение в memtable</text>
+      <rect x="212" y="108" width="120" height="66" class="fi-paper sw-2"/>
+      <line x1="212" y1="130" x2="332" y2="130" class="st-muted"/>
+      <line x1="212" y1="152" x2="332" y2="152" class="st-muted"/>
+      <rect x="213" y="153" width="118" height="20" class="fw-s1 st-none"/>
+      <text x="222" y="124" class="tx-mono tx-sm">Como 7</text>
+      <text x="222" y="146" class="tx-mono tx-sm">Lodi 9</text>
+      <text x="222" y="168" class="tx-mono tx-sm">Milano 41</text>
+      <text x="200" y="124" class="tx-sm tx-end">memtable</text>
+      <text x="200" y="146" class="tx-sm tx-end tx-muted">память, по порядку</text>
+      <path d="M208,166 H50 V72" class="dash" marker-end="url(#arr)"/>
+      <text x="38" y="124" class="tx-sm tx-end">ack</text>
+      <text x="456" y="136" class="tx-hand tx-mid">ни чтения, ни seek,</text>
+      <text x="456" y="164" class="tx-hand tx-mid">ни блокировок</text>
+      <line x1="272" y1="176" x2="272" y2="226" class="sw-2" marker-end="url(#arr)"/>
+      <text x="282" y="206" class="tx-sm halo">потом: flush</text>
+      <rect x="56" y="230" width="420" height="82" class="fw-ink st-none"/>
+      <path d="M72,238 H102 L112,248 V288 H72 Z" class="fi-paper sw-2"/>
+      <path d="M102,238 V248 H112 Z" class="fi-soft"/>
+      <path d="M162,238 H192 L202,248 V288 H162 Z" class="fi-paper sw-2"/>
+      <path d="M192,238 V248 H202 Z" class="fi-soft"/>
+      <path d="M252,238 H282 L292,248 V288 H252 Z" class="fi-paper sw-2"/>
+      <path d="M282,238 V248 H292 Z" class="fi-soft"/>
+      <rect x="116" y="244" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="116" y="262" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="206" y="244" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="206" y="262" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="296" y="244" width="14" height="12" class="fw-s3 st-s3"/>
+      <rect x="296" y="262" width="14" height="12" class="fw-s3 st-s3"/>
+      <line x1="314" y1="259" x2="330" y2="259" class="st-muted"/>
+      <text x="336" y="254" class="tx-sm">файл индекса +</text>
+      <text x="336" y="276" class="tx-sm">Bloom filter</text>
+      <text x="92" y="304" class="tx-sm tx-mid">SSTable 1</text>
+      <text x="182" y="304" class="tx-sm tx-mid">SSTable 2</text>
+      <text x="272" y="304" class="tx-sm tx-mid">SSTable 3</text>
+      <text x="468" y="304" class="tx-sm tx-end tx-muted">диск</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> "write op" со слайда (p. 454) с шагами со слайда (p. 446). Запись стоит одного дописывания в commit log и одной вставки в memtable; сброс (flush) в SSTable происходит позже, раз на каждый заполненный memtable, и снова одной последовательной записью.</figcaption>
+  </figure>
+
+  <p>"Later, when memtable is full or old, flush to disk": один раз, в порядке ключей, в виде <mark class="key">SSTable</mark> ("Sorted String Table – list of key value pairs, sorted by key"), с индексом из <span class="nw">"(key, position</span> in data sstable) pairs" "And a Bloom filter". SSTable никогда не изменяются: новые версии 'Milano' попадают в новые файлы, а <mark class="key">уплотнение (compaction)</mark> сливает SSTable, оставляя для каждого ключа самую новую версию ("Merge key updates, etc.").</p>
+
+  <h3>Фильтр Блума: дешёвое «нет»</h3>
+  <p>Чтобы пропускать SSTable, в которых ключа точно нет, у каждой есть <mark class="key">фильтр Блума (Bloom filter)</mark> (p. 447), "Compact way of representing a set of items": битовый массив и k хеш-функций. "On insert, set all hashed bits." "On check-if-present, return true if all hashed bits set." Один 0 доказывает отсутствие; все 1 не доказывают ничего — их могли выставить другие ключи. Отсюда "Some probability of false positives", но "Never false negatives".</p>
+
+  <div class="widget" id="l22-w-bloom">
+    <h3 class="widget-title">Фильтр Блума на 32 бита</h3>
+    <p class="widget-intro">Двенадцать ключей-рынков вставляются в фиксированном порядке (первым Milano, последним Rimini). Каждый ключ выставляет свои k битов. Выбери проверяемый ключ: стрелки показывают его k битов; 0 среди них, подчёркнутый, доказывает, что ключа нет. График показывает, как часто фильтр говорит «может быть» для ключей, которые никогда не вставлялись, по мере заполнения.</p>
+    <ol class="tasks">
+      <li>При k = 3 и n = 4 проверь Roma, который никогда не вставляется. Предскажи ответ, прежде чем посмотреть.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>«Точно нет»: биты Roma — 27, 13 и 6, и биты 27 и 6 всё ещё 0. Одного нуля достаточно — чтение даже не открывает эту SSTable.</p></details>
+      </li>
+      <li>Проверь Milano, потом другие вставленные ключи, при любом k и любом n, при котором они уже вставлены. Можно ли когда-нибудь получить «точно нет»?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Никогда. Вставленный ключ выставил все свои биты, а биты никогда не сбрасываются: ложноотрицательных ответов нет. В этом вывод виджета. Ключ, который ещё не вставлен, — Rimini при k = 3 и n = 4 — справедливо получает «точно нет».</p></details>
+      </li>
+      <li>Проверь Napoli при k = 3 и двигай n от 8 до 12. Предскажи, когда ответ изменится.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>До n = 8 хотя бы один бит Napoli равен 0. При n = 9 Cremona выставляет биты 0 и 24, а бит 10 уже выставил Varese, так что все три бита — 1: «может быть» для ключа, который никогда не вставлялся, — ложноположительный ответ (false positive). Чем полнее фильтр, тем чаще он так ошибается; формула доходит примерно до 31 % при n = 12.</p></details>
+      </li>
+      <li>Оставь n = 12 и попробуй k от 1 до 6. Всегда ли больше хеш-функций — лучше?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Нет. Табло формулы показывает 31.3, 27.8, 30.8, 36.4, 43.5 и 51.3 %: при 32 битах на 12 ключей лишние хеш-функции заполняют массив быстрее, чем помогают (измеренные крестики пляшут вокруг кривой). У фильтра со слайда 32 бита на ключ, и там k = 4 даёт 0.02 %.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l22-w-bloom', function (root, ui) {
+    var M = 32;
+    function fnvS(s, seed) { var h = (0x811c9dc5 ^ Math.imul(seed + 1, 0x9e3779b9)) >>> 0; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; }
+    function fmix(h) { h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16; return h >>> 0; }
+    function bitsOf(s, k) { var out = []; for (var i = 0; i < k; i++) out.push(fmix(fnvS(s, i)) % M); return out; }
+    var KEYS = ['Milano', 'Treviso', 'Ravenna', 'Monza', 'Novara', 'Lodi', 'Varese', 'Como', 'Cremona', 'Mantova', 'Padova', 'Rimini'];
+    var ABSENT = ['Bergamo', 'Brescia', 'Pavia', 'Napoli', 'Roma', 'Torino'];
+    var TEST = []; for (var t = 0; t < 1000; t++) TEST.push('probe-' + t);
+    function filterOf(n, k) { var f = [], i, j; for (i = 0; i < M; i++) f.push(0); for (j = 0; j < n; j++) bitsOf(KEYS[j], k).forEach(function (p) { f[p] = 1; }); return f; }
+    function maybe(f, s, k) { var b = bitsOf(s, k); for (var i = 0; i < b.length; i++) if (!f[b[i]]) return false; return true; }
+    var cache = {};
+    function measured(k) {          // share of 1,000 never-inserted keys that the filter calls "maybe", for n = 0..12
+      if (cache[k]) return cache[k];
+      var out = [];
+      for (var n = 0; n <= 12; n++) { var f = filterOf(n, k), c = 0; for (var i = 0; i < TEST.length; i++) if (maybe(f, TEST[i], k)) c++; out.push([n, 100 * c / TEST.length]); }
+      cache[k] = out;
+      return out;
+    }
+    function formula(n, k) { return 100 * Math.pow(1 - Math.exp(-k * n / M), k); }
+
+    var sK = ui.slider({ label: 'хеш-функций k', min: 1, max: 6, step: 1, value: 3 });
+    var sN = ui.slider({ label: 'вставлено ключей n', min: 0, max: 12, step: 1, value: 4 });
+    var opts = KEYS.map(function (s, i) { return { value: s, label: s + ' (ключ ' + (i + 1) + ')' }; })
+      .concat(ABSENT.map(function (s) { return { value: s, label: s + ' (не вставляется)' }; }));
+    var selP = ui.select('проверяемый ключ', opts, null, 'Roma');
+    var roAns = ui.readout('ответ фильтра');
+    var roBits = ui.readout('биты проверяемого ключа');
+    var roSet = ui.readout('выставлено битов');
+    var roF = ui.readout('ложноположительные, формула');
+    var roM = ui.readout('ложноположительные, измерено');
+    ui.note('Вычислено: k хеш-функций с разными seed на m = 32 битах; «измерено» — проверка 1,000 ключей, которые никогда не вставлялись. Две хеш-функции могут попасть в один и тот же бит. Фильтр со слайда, k = 4, n = 100, m = 3,200 битов, даёт (1 − e^(−0.125))^4 = 0.019 %, напечатано как 0.02 %.');
+    ui.legend([
+      { label: 'бит, выставленный в 1', color: 's3', mark: 'square' },
+      { label: 'проверяемый ключ и его k битов', color: 's2', mark: 'line' },
+      { label: 'бит 0: доказательство отсутствия', color: 'ink', mark: 'hl' },
+      { label: 'формула (1 − e^(−kn/m))^k', color: 's3', mark: 'line' },
+      { label: 'измерено', color: 's2', mark: 'cross' }
+    ]);
+
+    var svgEl = ui.svg(560, 172, { label: 'Ряд из 32 битов; выставленные биты закрашены; стрелки ведут от проверяемого ключа к его k битам, а 0 среди них подчёркнут' });
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+    var X0 = 40, CW = 15, Y = 96;
+    function draw(name, f, b) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      S('text', { x: 280, y: 24, 'class': 'tx-mono tx-mid', text: name });
+      b.forEach(function (p) {
+        var xc = X0 + p * CW + CW / 2;
+        S('path', { d: 'M280,34 C280,64 ' + xc + ',58 ' + xc + ',90', 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+      });
+      for (var i = 0; i < M; i++) S('rect', { x: X0 + i * CW, y: Y, width: CW, height: 26, 'class': f[i] ? 'fi-s3 st-s3' : 'fi-paper' });
+      var done = {};
+      b.forEach(function (p) {
+        if (done[p]) return;
+        done[p] = true;
+        S('rect', { x: X0 + p * CW, y: Y, width: CW, height: 26, 'class': 'fi-none st-s2 sw-3' });
+        if (!f[p]) S('line', { x1: X0 + p * CW + 3, y1: Y + 34, x2: X0 + p * CW + CW - 3, y2: Y + 34, 'class': 'hl' });
+      });
+      [0, 5, 10, 15, 20, 25, 31].forEach(function (i) { S('text', { x: X0 + i * CW + CW / 2, y: Y + 66, 'class': 'tx-sm tx-mid tx-muted', text: String(i) }); });
+    }
+
+    var plot = ui.plot({ x: [0, 12], y: [0, 65], xLabel: 'вставлено ключей n', yLabel: 'ложноположительные (%)', aspect: 2.2, xTicks: 7,
+      label: 'Доля ложноположительных ответов в зависимости от числа вставленных ключей: формула — линией, измеренная доля — крестиками, текущее n — пунктиром' });
+    plot.draw(function (g) {
+      var k = sK.value;
+      g.line(function (n) { return formula(n, k); }, { color: 's3', width: 2.5, domain: [0, 12] });
+      g.points(measured(k), { color: 's2', shape: 'cross' });
+      g.vline(sN.value, { color: 'soft', dash: true, label: 'n сейчас' });
+    });
+
+    ui.onChange(function () {
+      var k = sK.value, n = sN.value, s = selP.value, f = filterOf(n, k), b = bitsOf(s, k);
+      var idx = KEYS.indexOf(s), inserted = idx >= 0 && idx < n;
+      var zeros = b.filter(function (p) { return !f[p]; }).filter(function (p, i, a) { return a.indexOf(p) === i; });
+      if (zeros.length) roAns.set('точно нет: бит' + (zeros.length > 1 ? 'ы ' : ' ') + zeros.join(' и ') + (zeros.length > 1 ? ' равны' : ' равен') + ' 0', 'good');
+      else if (inserted) roAns.set('может быть — и он есть (ключ ' + (idx + 1) + ')', 'good');
+      else roAns.set('может быть — но его не вставляли: ложноположительный ответ', 'bad');
+      roBits.set(b.join(', '));
+      var set = 0; for (var i = 0; i < M; i++) set += f[i];
+      roSet.set(set + ' из 32 (' + Math.round(100 * set / M) + ' %)');
+      roF.set(Course.fmt(formula(n, k), 1) + ' %');
+      roM.set(Course.fmt(measured(k)[n][1], 1) + ' % из 1,000 отсутствующих ключей');
+      draw(s, f, b);
+    });
+  });
+  </script>
+
+  <p>Пример со слайда — "k=4 hash functions", "100 items", "3200 bits", "FP rate = 0.02%" — сходится со стандартной формулой (контекст): бит остаётся 0 с вероятностью примерно \(e^{-kn/m}\), поэтому</p>
+  <div class="formula">
+    \[ p_{FP} \approx \left(1 - e^{-kn/m}\right)^{k} \]
+    \[ \left(1 - e^{-400/3200}\right)^{4} = 0.1175^{4} \]
+    \[ 0.1175^{4} \approx 0.019\,\% \]
+    <dl class="legend">
+      <dt>\(m\)</dt><dd>битов в массиве (3200)</dd>
+      <dt>\(n\)</dt><dd>вставленных ключей (100)</dd>
+      <dt>\(k\)</dt><dd>хеш-функций (4)</dd>
+    </dl>
+  </div>
+  <p>32 бита на ключ, каким бы ни был ключ: «нет» стоит k проверок битов в памяти, а не чтения с диска.</p>
+
+  <h3>Удаление пишет tombstone</h3>
+  <p>Неизменяемые файлы не могут стереть строку. "Delete: don't delete item right away" — "add a tombstone to the log"; "Compaction will remove tombstone and delete item" (p. 448). <mark class="key">Надгробие (tombstone)</mark> — это маркер удаления с временной меткой, который пишется как любая запись; он скрывает от чтений более старые значения (рис. 5). До уплотнения удаление добавляет данные (контекст: tombstone живёт дольше grace period, по умолчанию десять дней, чтобы о нём узнали и реплики, которые были недоступны).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l22-fig-compact">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 244" role="img" aria-label="До уплотнения: в трёх SSTable лежат две версии Milano и tombstone для Bergamo">
+        <rect x="14" y="10" width="272" height="60" class="fi-paper sw-2"/>
+        <rect x="15" y="11" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="50" x2="286" y2="50" class="st-muted"/>
+        <text x="22" y="25" class="tx-sm tx-bold">SSTable 1 · самая старая</text>
+        <text x="22" y="45" class="tx-mono tx-sm">Bergamo</text><text x="150" y="45" class="tx-mono tx-sm">12</text><text x="250" y="45" class="tx-mono tx-sm tx-muted">t1</text>
+        <text x="22" y="65" class="tx-mono tx-sm">Milano</text><text x="150" y="65" class="tx-mono tx-sm">40</text><text x="250" y="65" class="tx-mono tx-sm tx-muted">t2</text>
+        <rect x="14" y="78" width="272" height="60" class="fi-paper sw-2"/>
+        <rect x="15" y="79" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="118" x2="286" y2="118" class="st-muted"/>
+        <text x="22" y="93" class="tx-sm tx-bold">SSTable 2</text>
+        <text x="22" y="113" class="tx-mono tx-sm">Como</text><text x="150" y="113" class="tx-mono tx-sm">7</text><text x="250" y="113" class="tx-mono tx-sm tx-muted">t3</text>
+        <text x="22" y="133" class="tx-mono tx-sm">Milano</text><text x="150" y="133" class="tx-mono tx-sm">41</text><text x="250" y="133" class="tx-mono tx-sm tx-muted">t4</text>
+        <rect x="14" y="146" width="272" height="60" class="fi-paper sw-2"/>
+        <rect x="15" y="147" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="186" x2="286" y2="186" class="st-muted"/>
+        <text x="22" y="161" class="tx-sm tx-bold">SSTable 3 · самая новая</text>
+        <text x="22" y="181" class="tx-mono tx-sm">Bergamo</text><text x="150" y="181" class="tx-mono tx-sm">tombstone</text><text x="250" y="181" class="tx-mono tx-sm tx-muted">t5</text>
+        <text x="22" y="201" class="tx-mono tx-sm">Lodi</text><text x="150" y="201" class="tx-mono tx-sm">9</text><text x="250" y="201" class="tx-mono tx-sm tx-muted">t6</text>
+        <text x="150" y="234" class="tx-hand tx-mid">версии копятся</text>
+      </svg>
+      <p class="fig-label">До: три SSTable</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 244" role="img" aria-label="После уплотнения: одна SSTable с Como, Lodi и самой новой версией Milano; старая Milano, Bergamo и его tombstone исчезли">
+        <rect x="14" y="10" width="272" height="80" class="fi-paper sw-2"/>
+        <rect x="15" y="11" width="270" height="19" class="fw-s3 st-none"/>
+        <line x1="14" y1="50" x2="286" y2="50" class="st-muted"/>
+        <line x1="14" y1="70" x2="286" y2="70" class="st-muted"/>
+        <text x="22" y="25" class="tx-sm tx-bold">SSTable 4 · после уплотнения</text>
+        <text x="22" y="45" class="tx-mono tx-sm">Como</text><text x="150" y="45" class="tx-mono tx-sm">7</text><text x="250" y="45" class="tx-mono tx-sm tx-muted">t3</text>
+        <text x="22" y="65" class="tx-mono tx-sm">Lodi</text><text x="150" y="65" class="tx-mono tx-sm">9</text><text x="250" y="65" class="tx-mono tx-sm tx-muted">t6</text>
+        <text x="22" y="85" class="tx-mono tx-sm">Milano</text><text x="150" y="85" class="tx-mono tx-sm">41</text><text x="250" y="85" class="tx-mono tx-sm tx-muted">t4</text>
+        <text x="22" y="122" class="tx-sm tx-muted">выброшено: Milano 40, старая версия</text>
+        <text x="22" y="142" class="tx-sm tx-muted">выброшено: Bergamo 12 и его tombstone</text>
+        <text x="150" y="234" class="tx-hand tx-mid">читать один файл</text>
+      </svg>
+      <p class="fig-label">После: одна SSTable</p>
+    </div>
+    <figcaption><b>Рис. 5.</b> Уплотнение сливает отсортированные файлы за один проход, оставляя для каждого ключа самую новую временную метку; tombstone и скрытое им значение выбрасываются, когда его grace period истёк. До уплотнения чтение Milano открывает два файла, а чтение Bergamo должно заметить, что tombstone (t5) новее значения (t1).</figcaption>
+  </figure>
+
+  <h3>Чтения сливают</h3>
+  <p>Чтение сливает 'Milano' из memtable и из тех SSTable, чей фильтр говорит «может быть», оставляя самую новую временную метку: чтения "May be slower than writes" (p. 446).</p>
+
+  <aside class="redpen" data-page="446">
+    <p class="claim">"Reads need to touch log and multiple SSTables"</p>
+    <p class="fix">Чтения затрагивают memtable и несколько SSTable; commit log проигрывается заново только при перезапуске узла, чтобы восстановить потерянные memtable.</p>
+    <p class="because">Всё, что есть в логе, есть и в memtable или, после сброса, в SSTable. Экзамен может сверяться с напечатанной строкой: знай её, а в ответе пиши "the memtable and several SSTables (the commit log only at restart)".</p>
+  </aside>
+
+  <p>Следующий слайд (p. 455) добавляет "Staged Event-Driven Architecture": "A general-purpose framework for high concurrency &amp; load conditioning", собранный из "stages separated by queues". Связь слайд оставляет неявной (контекст): в узле Cassandra запись, чтение, gossip и уплотнение — как раз такие стадии, так что перегрузка видна как растущая очередь, а медленное уплотнение не останавливает gossip.</p>
+
+  <h3>Назад к первой загадке</h3>
+  <p>Итак, 0.12 ms против 15 ms (p. 459): запись — это одно дописывание в лог и одна вставка в память, без чтения, seek и блокировок; чтение сливает несколько файлов, часто на нескольких репликах. Cassandra отказалась от дешёвых чтений и обновлений на месте и платит позже: сбросы, уплотнения, tombstone. Слайд не называет ни железо, ни нагрузку: читай это как соотношение, а не как бенчмарк.</p>
+
+</section>
+
+
+<section id="l22-quorum">
+  <h2>Сколько копий должны ответить: кворумы</h2>
+
+  <p>Три копии 'Milano': сколько из них должны ответить на запись и сколько на чтение? Выбирает клиент (p. 449): "R = read replica count, W = write replica count", "N = total number of replicas for this key".</p>
+
+  <p>Чтения "Wait for R replicas (R specified by clients)" и проверяют "remaining N-R replicas" в фоне. Координатор "can contact closest replica (e.g., in same rack)", "also fetches from multiple replicas" и запускает <mark class="key">read repair (восстановление при чтении)</mark>, "if any two values are different" (p. 448). Записи "come in two flavors": "Block until quorum is reached" или "Async: Write to any node". <mark class="key">Кворум (quorum)</mark> — это большинство из N копий.</p>
+
+  <aside class="redpen" data-page="448">
+    <p class="claim">"Read repair: uses gossip"</p>
+    <p class="fix">Read repair выполняет координатор чтения: он сравнивает ответы реплик и записывает самое новое значение обратно в устаревшие. Gossip переносит состояние узлов, а не строки.</p>
+    <p class="because">Gossip со слайдов (pp. 441 и 451) обменивается счётчиками heartbeat и версиями состояния; слайд употребляет слово вольно. Экзамен может сверяться с напечатанной строкой: знай её, а если вопрос её цитирует, скажи, что восстановлением управляет координатор.</p>
+  </aside>
+
+  <div class="formula">
+    \[ Q = \left\lfloor \frac{N}{2} \right\rfloor + 1 \]
+    <dl class="legend">
+      <dt>\(N\)</dt><dd>фактор репликации: число копий ключа</dd>
+      <dt>\(\lfloor \cdot \rfloor\)</dt><dd>округление вниз</dd>
+    </dl>
+  </div>
+
+  <div class="pitfall"><p>«При N = 3 "Quorum Q = N/2 + 1" со слайда (p. 449) — это 2.5 реплики». Нет: деление округляется вниз, как в документации Cassandra, — 2 из 3, 3 из 4, 3 из 5, — и так же "(N /2) + 1" на слайде (p. 453). Пиши floor.</p></div>
+
+  <h3>Почему W + R &gt; N достаточно</h3>
+  <p>Слайд: "If W+R &gt; N and W &gt; N/2, you have consistency" и "Allowed (W=1, R=N) or (W=N, R=1) or (W=Q, R=Q)". Всю работу делает первая половина:</p>
+
+  <ol class="steps" id="l22-steps-quorum">
+    <li><p>Запись подтвердило множество A из W реплик; более позднее чтение слышит множество B из R реплик, из тех же N:</p> \[ |A \cup B| \le N \]</li>
+    <li><p>Значит, у двух множеств общих как минимум</p> \[ |A \cap B| = W + R - |A \cup B| \] \[ |A \cap B| \ge W + R - N \]</li>
+    <li><p>Если W + R &gt; N, какая-то реплика, ответившая на чтение, хранит запись, а координатор возвращает самую новую временную метку: "Return most recent TS" (p. 453).</p></li>
+    <li><p>Угловые варианты со слайда проходят: 1 + N, N + 1 и 2⌊N/2⌋ + 2 — все больше N.</p></li>
+  </ol>
+
+  <p>Платят углы по-разному: у (1, N) быстрые записи, но чтению нужна каждая реплика; у (N, 1) быстрые чтения, но одна упавшая реплика останавливает записи; (Q, Q) уравновешивает обе стороны и переживает N − Q отказов — один из трёх, два из пяти.</p>
+
+  <div class="pitfall"><p>«W &gt; N/2 тоже обязательно». Нет, если верить собственному списку слайда: (W=1, R=N) — "Allowed", а 1 не больше N/2. W &gt; N/2 не даёт двум записям быть принятыми непересекающимися множествами; Cassandra разрешает конкурирующие записи по временной метке, и её документация формулирует правило просто как W + R &gt; N.</p></div>
+
+  <div class="widget" id="l22-w-quorum">
+    <h3 class="widget-title">Исследователь кворумов: запись, потом чтение</h3>
+    <p class="widget-intro">Клиент записывает v2 поверх старого v1, потом читает. Закрашенные реплики подтвердили запись; пунктирные контуры — реплики, которых спрашивает чтение. Нарисован худший случай — чтение спрашивает те реплики, до которых запись дошла последней, — так что подсвеченная реплика — та, которую неравенство заставляет попасть в оба множества.</p>
+    <ol class="tasks">
+      <li>Начни с N = 3, запись ONE, чтение ONE. Предскажи: может ли чтение сразу после записи её не увидеть?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Да. 1 + 1 = 2 ≤ 3: запись подтвердила r1, чтение спрашивает r3, где всё ещё v1, и координатор возвращает v1. Read repair чинит r3 только потом.</p></details>
+      </li>
+      <li>Подними до QUORUM только чтение. Хватит? Потом подними до QUORUM и запись.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>1 + 2 = 3 — всё ещё не больше 3: множество чтения r2, r3 промахивается мимо r1. С QUORUM с обеих сторон 2 + 2 = 4 &gt; 3, и r2 есть в обоих множествах. Вот вывод: когда W + R &gt; N, места для двух непересекающихся множеств не остаётся.</p></details>
+      </li>
+      <li>Оставь QUORUM и QUORUM и поставь N = 5. Скольких реплик ждёт каждая операция, сколько могут быть недоступны и чего это стоит по сравнению с N = 3?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>⌊5/2⌋ + 1 = 3 для обеих; 3 + 3 = 6 &gt; 5. Недоступны могут быть две реплики вместо одной, зато каждая операция ждёт третьего по скорости ответа (9 ms) вместо второго (6 ms) — времена условные.</p></details>
+      </li>
+      <li>Попробуй запись ALL с чтением ONE, потом запись ANY с чтением ALL. Что даёт каждый вариант и чего стоит?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>ALL/ONE: чтения быстрые и всегда свежие (3 + 1 &gt; 3), но запись ждёт самую медленную реплику и падает, если любая реплика недоступна. ANY/ALL: запись может существовать только как хинт на координаторе, так что даже чтение всех реплик может её не увидеть — никаких гарантий. ANY покупает доступность, а не согласованность.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l22-w-quorum', function (root, ui) {
+    var LAT = [4, 6, 9, 15, 25, 40, 70];          // illustrative response times of the replicas, fastest first (ms)
+    var sN = ui.slider({ label: 'реплик N', min: 1, max: 7, step: 1, value: 3 });
+    var selW = ui.select('уровень записи', ['ANY', 'ONE', 'QUORUM', 'ALL'], null, 'ONE');
+    var selR = ui.select('уровень чтения', ['ONE', 'QUORUM', 'ALL', 'ANY'], null, 'ONE');
+    function need(level, N) { return level === 'ONE' ? 1 : level === 'QUORUM' ? Math.floor(N / 2) + 1 : level === 'ALL' ? N : 0; }
+    function plural(n) { var m10 = n % 10, m100 = n % 100; return n + ' ' + (m10 === 1 && m100 !== 11 ? 'реплика' : (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) ? 'реплики' : 'реплик'); }
+    var roW = ui.readout('W: запись ждёт');
+    var roR = ui.readout('R: чтение ждёт');
+    var roG = ui.readout('увидит ли чтение запись наверняка?');
+    var roD = ui.readout('сколько реплик может лежать');
+    var roL = ui.readout('время ожидания (условное)');
+    ui.note('Нарисован худший случай: запись сначала дошла до реплик слева, а чтение спрашивает реплики справа. Времена ответа реплик условные, не со слайдов, — 4, 6, 9, 15, 25, 40, 70 ms, — и операция ждёт W-го (R-го) по скорости ответа.');
+    ui.legend([
+      { label: 'подтвердила запись: хранит v2', color: 's1', mark: 'square' },
+      { label: 'её спрашивает чтение (худший случай)', color: 's2', mark: 'dash' },
+      { label: 'в обоих множествах', color: 'ink', mark: 'hl' }
+    ]);
+    var svgEl = ui.svg(560, 232, { label: 'Клиент, координатор и N реплик: реплики, подтвердившие запись, хранят v2, чтение спрашивает R реплик, а реплики из обоих множеств подсвечены' });
+    function S(tag, a) { return Course.svg(tag, a, svgEl); }
+
+    function draw(N, W, R, any) {
+      while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+      S('rect', { x: 20, y: 16, width: 64, height: 28, rx: 6, 'class': 'fi-paper' });
+      S('text', { x: 52, y: 35, 'class': 'tx-sm tx-mid', text: 'клиент' });
+      S('line', { x1: 88, y1: 30, x2: 250, y2: 30, 'class': 'sw-2', 'marker-end': 'url(#arr)' });
+      S('rect', { x: 258, y: 16, width: 44, height: 28, 'class': 'fi-paper st-s6 dash sw-2' });
+      [24, 30, 36].forEach(function (y) { S('line', { x1: 266, y1: y, x2: 294, y2: y, 'class': 'st-muted' }); });
+      S('text', { x: 312, y: 35, 'class': 'tx-sm', text: 'координатор' });
+      if (any) {
+        S('rect', { x: 436, y: 16, width: 54, height: 28, 'class': 'fw-s1 st-s1 dash' });
+        S('text', { x: 463, y: 35, 'class': 'tx-sm tx-mid', text: 'хинт' });
+      }
+      if (R > 0) S('text', { x: 168, y: 60, 'class': 'tx-sm tx-mid halo', text: 'чтение вернёт ' + (W + R > N ? 'v2' : 'v1') });
+      var sp = 74, x0 = 280 - (N - 1) * sp / 2, i, cx, inW, inR;
+      for (i = 0; i < N; i++) {
+        cx = x0 + i * sp; inW = i < W; inR = R > 0 && i >= N - R;
+        if (inW && inR) S('rect', { x: cx - 31, y: 147, width: 62, height: 42, 'class': 'hl' });
+        S('line', { x1: 280, y1: 48, x2: cx, y2: 138, 'class': inW ? 'st-s1 sw-2' : 'st-muted dash', 'marker-end': inW ? 'url(#arr-s1)' : 'url(#arr-muted)' });
+      }
+      for (i = 0; i < N; i++) {
+        cx = x0 + i * sp; inW = i < W; inR = R > 0 && i >= N - R;
+        S('rect', { x: cx - 26, y: 152, width: 52, height: 32, 'class': inW ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        S('text', { x: cx, y: 174, 'class': 'tx-mono tx-mid', text: inW ? 'v2' : 'v1' });
+        if (inR) S('rect', { x: cx - 33, y: 144, width: 66, height: 48, 'class': 'st-s2 sw-2 dash' });
+        S('text', { x: cx, y: 218, 'class': 'tx-sm tx-mid', text: 'r' + (i + 1) });
+      }
+    }
+
+    ui.onChange(function () {
+      var N = sN.value, wl = selW.value, rl = selR.value;
+      var W = need(wl, N), R = rl === 'ANY' ? -1 : need(rl, N);
+      roW.set(wl === 'ANY' ? 'ANY → один узел, возможно, лишь хинт на координаторе: наверняка 0 реплик'
+        : wl + ' → ' + (wl === 'QUORUM' ? '⌊' + N + '/2⌋ + 1 = ' : '') + plural(W));
+      if (R < 0) roR.set('ANY — не уровень для чтения (p. 453): "Try ONE instead"', 'bad');
+      else roR.set(rl + ' → ' + (rl === 'QUORUM' ? '⌊' + N + '/2⌋ + 1 = ' : '') + plural(R));
+      if (R < 0) roG.set('—');
+      else if (W + R > N) roG.set('да: ' + W + ' + ' + R + ' = ' + (W + R) + ' > ' + N + ', в обоих множествах хотя бы ' + plural(W + R - N), 'good');
+      else roG.set('нет: ' + W + ' + ' + R + ' = ' + (W + R) + ' ≤ ' + N + ', это чтение может вернуть v1', 'bad');
+      roD.set('для записи: ' + (wl === 'ANY' ? 'все ' + N + ' (хинт тоже считается)' : (N - W)) + ' · для чтения: ' + (R < 0 ? '—' : (N - R)));
+      roL.set('запись ≈ ' + (wl === 'ANY' ? LAT[0] : LAT[W - 1]) + ' ms · чтение ≈ ' + (R < 0 ? '—' : LAT[R - 1] + ' ms'));
+      draw(N, W, R, wl === 'ANY');
+    });
+  });
+  </script>
+
+  <h3>Уровни согласованности</h3>
+  <p>"In reality, a client can choose one of these levels for a read/write operation" (p. 450; табл. 2). Более старые таблицы на слайде (p. 453) используют старые названия: ZERO ("Good luck with that") исчез, а "DCQ for RackAware" — это сегодняшний <code>LOCAL_QUORUM</code>. В cqlsh уровень задаётся для последующих команд (синтаксис документации, на слайдах его нет):</p>
+  <pre><code>-- next statements: wait for a majority
+CONSISTENCY QUORUM</code></pre>
+
+  <figure class="tbl-fig" id="l22-tbl-levels">
+    <figcaption>Табл. 2. Уровни со слайда (p. 450), рядом — более старые таблицы со слайда (p. 453).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Уровень</th><th>Ждёт (p. 450)</th><th>Запись (p. 453)</th><th>Чтение (p. 453)</th></tr></thead>
+        <tbody>
+          <tr><td><code>ANY</code></td><td>"any node (may not be replica)"</td><td>"1 replica (hints count)"</td><td>"Try ONE instead"</td></tr>
+          <tr><td><code>ONE</code></td><td>"at least one replica"</td><td>"1 replica. read repair in bkgnd"</td><td>"1 replica"</td></tr>
+          <tr class="is-key"><td><code>QUORUM</code></td><td>"quorum across all replicas in all datacenters"</td><td>"(N /2) + 1"</td><td>"Return most recent TS after (N /2) + 1 report"</td></tr>
+          <tr><td><code>LOCAL_QUORUM</code></td><td>"in coordinator's DC"</td><td colspan="2">"DCQ for RackAware" в старых таблицах</td></tr>
+          <tr><td><code>EACH_QUORUM</code></td><td>"quorum in every DC"</td><td colspan="2">—</td></tr>
+          <tr><td><code>ALL</code></td><td>"all replicas all DCs"</td><td>"N = replication factor"</td><td>"N = replication factor"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>«Уровень <code>ANY</code> работает и для чтений». Слайд (p. 450) перечисляет его для "a read/write operation", но хинт прочитать нельзя: на чтение с <code>ANY</code> слайд (p. 453) отвечает "Try ONE instead".</p></div>
+
+  <p>При трёх копиях в каждом из двух датацентров (вычислено): <code>QUORUM</code> ждёт 4 из 6, где бы они ни были; <code>LOCAL_QUORUM</code> — 2 в датацентре координатора, без похода в другой, — именно это и покупает "Supporting local queries"; <code>EACH_QUORUM</code> — по 2 в каждом, самый строгий и самый медленный.</p>
+
+  <h3>Компромисс, и когда он окупается</h3>
+  <aside class="margin-note">Ссылки лекции (p. 461): гайд на Medium о Cassandra в Docker и книга «Cassandra: The Definitive Guide» (O'Reilly).</aside>
+  <p>"Cassandra Summary" (p. 460): BASE, "Basically Available Soft-state Eventual Consistency"; Cassandra "Prefers Availability over Consistency", HBase "Prefers (strong) Consistency over Availability" — это углы CAP из <a href="l05.html">урока 5</a>. Но выбор делается для каждой операции: <code>ONE</code> и <code>ANY</code> продолжают принимать записи, пока реплики лежат, а <code>QUORUM</code> и <code>ALL</code> скорее откажут, чем ответят устаревшим, — "Eventual consistency, tunable per query" (p. 1550). Табл. 3 говорит, когда это окупается.</p>
+
+  <figure class="tbl-fig" id="l22-tbl-fit">
+    <figcaption>Табл. 3. "is cassandra a good fit?" (p. 458): две колонки слайда.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Окупается, когда…</th><th>…и команда готова принять</th></tr></thead>
+        <tbody>
+          <tr><td>"you need really fast writes"</td><td>"your programmers can deal": документация, сложность, модель согласованности, изменения, инструменты наблюдения</td></tr>
+          <tr><td>"you need durability"</td><td>"your operations can deal": требования к железу, умение переносить данные, мониторинг через JMX</td></tr>
+          <tr><td>"you have lots of data": &gt; GBs, &gt;= three servers</td><td></td></tr>
+          <tr><td>"your app is evolving": режим стартапа, подвижная структура данных</td><td></td></tr>
+          <tr><td>"loose domain data": "points of interest"</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">Чтение гарантированно видит последнюю подтверждённую запись, когда W + R &gt; N; кворум — это ⌊N/2⌋ + 1, и выбирается он для каждой операции.</mark></p>
+</section>
+
+
+<section id="l22-hbase">
+  <h2>HBase: тот же движок, один владелец на строку</h2>
+
+  <p>"HBase" (p. 463) переносит в Hadoop дизайн Bigtable от Google: "Major Apache project today, part of Hadoop"; "Facebook uses HBase internally". Её API (p. 464): <code>Get(row)</code>, <code>Put(row)</code>, <code>Scan(row range, filter)</code> ("range queries") и <code>MultiPut(rows)</code>. Scan — первое отличие: строки хранятся отсортированными по ключу строки (row key), как у order-preserving партиционера, так что диапазон строк — это одно последовательное чтение. (Модель данных — <a href="l32.html">урок 32</a>.)</p>
+
+  <aside class="redpen" data-page="463">
+    <p class="claim">"Yahoo! Open-sourced it -&gt; HBase"</p>
+    <p class="fix">Google так и не выпустил код Bigtable: он опубликовал дизайн в виде статьи (OSDI 2006). HBase — это open-source реализация этого дизайна, написанная в рамках проекта Hadoop.</p>
+    <p class="because">HBase воссоздала дизайн по статье — отсюда "SSTable from Google's BigTable" на слайде (p. 466). Экзамен может сверяться с напечатанной строкой: знай её, а если спросят, откуда взялась HBase, пиши "an open-source implementation of Google's Bigtable design".</p>
+  </aside>
+
+  <p>Архитектура со слайда (p. 465, рис. 6) — двухэтажная. Наверху HBase: клиент спрашивает у ZooKeeper, какой <mark class="key">HRegionServer</mark> обслуживает его строки, а потом говорит с ним напрямую; <mark class="key">HMaster</mark> назначает регионы и присматривает за серверами. Внизу Hadoop: каждый байт живёт в DataNode-ах HDFS, которые и хранят копии.</p>
+
+  <figure class="fig fig--plain" id="l22-fig-hbase">
+    <svg class="dia" viewBox="0 0 560 424" role="img" aria-label="Архитектура HBase: клиент спрашивает ZooKeeper, где его регион, и затем говорит с region server; HMaster назначает регионы; region server держит регионы, в каждом по одному Store на column family из MemStore и HFile-ов, плюс один HLog; все файлы хранятся реплицированными блоками на DataNode-ах HDFS">
+      <rect x="12" y="16" width="72" height="28" rx="6" class="fi-paper"/>
+      <text x="48" y="35" class="tx-sm tx-mid">клиент</text>
+      <rect x="200" y="16" width="120" height="28" class="fw-s3 st-s3"/>
+      <text x="260" y="35" class="tx-sm tx-mid">ZooKeeper</text>
+      <rect x="430" y="16" width="110" height="28" class="fi-paper st-s6 dash sw-2"/>
+      <text x="485" y="35" class="tx-sm tx-mid">HMaster</text>
+      <line x1="88" y1="30" x2="194" y2="30" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="141" y="14" class="tx-sm tx-mid">какой сервер?</text>
+      <line x1="426" y1="30" x2="326" y2="30" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="48" y1="46" x2="48" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="58" y="68" class="tx-sm">get / put / scan</text>
+      <line x1="485" y1="46" x2="485" y2="80" class="dash" marker-end="url(#arr)"/>
+      <text x="476" y="68" class="tx-sm tx-end">назначает регионы</text>
+      <rect x="16" y="84" width="528" height="216" class="fi-paper sw-2"/>
+      <text x="28" y="104" class="tx-sm tx-bold">HRegionServer</text>
+      <rect x="28" y="114" width="406" height="132" class="st-muted"/>
+      <text x="40" y="132" class="tx-sm">HRegion · строки A–M</text>
+      <rect x="40" y="142" width="382" height="44" class="st-line"/>
+      <text x="50" y="169" class="tx-sm">Store · family 1</text>
+      <rect x="194" y="151" width="100" height="26" rx="13" class="fi-paper"/>
+      <text x="244" y="169" class="tx-sm tx-mid">MemStore</text>
+      <rect x="304" y="152" width="54" height="24" class="fw-s1 st-s1"/>
+      <text x="331" y="168" class="tx-sm tx-mid">HFile</text>
+      <rect x="364" y="152" width="54" height="24" class="fw-s1 st-s1"/>
+      <text x="391" y="168" class="tx-sm tx-mid">HFile</text>
+      <rect x="40" y="194" width="382" height="44" class="st-line"/>
+      <text x="50" y="221" class="tx-sm">Store · family 2</text>
+      <rect x="194" y="203" width="100" height="26" rx="13" class="fi-paper"/>
+      <text x="244" y="221" class="tx-sm tx-mid">MemStore</text>
+      <rect x="304" y="204" width="54" height="24" class="fw-s1 st-s1"/>
+      <text x="331" y="220" class="tx-sm tx-mid">HFile</text>
+      <rect x="442" y="114" width="92" height="132" class="st-muted dash"/>
+      <text x="488" y="174" class="tx-sm tx-mid">ещё</text>
+      <text x="488" y="194" class="tx-sm tx-mid">HRegions</text>
+      <text x="28" y="280" class="tx-sm">HLog · один на сервер</text>
+      <rect x="226" y="264" width="300" height="22" class="fw-s1 st-s1 sw-1"/>
+      <line x1="238" y1="264" x2="238" y2="286" class="st-s1 sw-1"/>
+      <line x1="250" y1="264" x2="250" y2="286" class="st-s1 sw-1"/>
+      <line x1="262" y1="264" x2="262" y2="286" class="st-s1 sw-1"/>
+      <line x1="274" y1="264" x2="274" y2="286" class="st-s1 sw-1"/>
+      <line x1="286" y1="264" x2="286" y2="286" class="st-s1 sw-1"/>
+      <line x1="298" y1="264" x2="298" y2="286" class="st-s1 sw-1"/>
+      <line x1="310" y1="264" x2="310" y2="286" class="st-s1 sw-1"/>
+      <line x1="322" y1="264" x2="322" y2="286" class="st-s1 sw-1"/>
+      <line x1="334" y1="264" x2="334" y2="286" class="st-s1 sw-1"/>
+      <line x1="346" y1="264" x2="346" y2="286" class="st-s1 sw-1"/>
+      <line x1="358" y1="264" x2="358" y2="286" class="st-s1 sw-1"/>
+      <line x1="370" y1="264" x2="370" y2="286" class="st-s1 sw-1"/>
+      <line x1="382" y1="264" x2="382" y2="286" class="st-s1 sw-1"/>
+      <line x1="394" y1="264" x2="394" y2="286" class="st-s1 sw-1"/>
+      <line x1="406" y1="264" x2="406" y2="286" class="st-s1 sw-1"/>
+      <line x1="418" y1="264" x2="418" y2="286" class="st-s1 sw-1"/>
+      <line x1="430" y1="264" x2="430" y2="286" class="st-s1 sw-1"/>
+      <line x1="442" y1="264" x2="442" y2="286" class="st-s1 sw-1"/>
+      <line x1="454" y1="264" x2="454" y2="286" class="st-s1 sw-1"/>
+      <line x1="466" y1="264" x2="466" y2="286" class="st-s1 sw-1"/>
+      <line x1="478" y1="264" x2="478" y2="286" class="st-s1 sw-1"/>
+      <line x1="490" y1="264" x2="490" y2="286" class="st-s1 sw-1"/>
+      <line x1="502" y1="264" x2="502" y2="286" class="st-s1 sw-1"/>
+      <line x1="514" y1="264" x2="514" y2="286" class="st-s1 sw-1"/>
+      <line x1="16" y1="318" x2="544" y2="318" class="st-muted dash"/>
+      <text x="544" y="342" class="tx-sm tx-end tx-muted">HDFS</text>
+      <line x1="120" y1="302" x2="96" y2="344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="300" y1="302" x2="270" y2="344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="460" y1="302" x2="440" y2="344" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="30" y="348" width="130" height="44" class="fi-paper sw-2"/>
+      <rect x="205" y="348" width="130" height="44" class="fi-paper sw-2"/>
+      <rect x="378" y="348" width="122" height="44" class="fi-paper sw-2"/>
+      <rect x="40" y="359" width="30" height="22" class="fw-s1 st-s1"/><text x="55" y="375" class="tx-mono tx-sm tx-mid">h1</text>
+      <rect x="80" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="95" y="375" class="tx-mono tx-sm tx-mid">l1</text>
+      <rect x="120" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="135" y="375" class="tx-mono tx-sm tx-mid">h2</text>
+      <rect x="215" y="359" width="30" height="22" class="fw-s1 st-s1"/><text x="230" y="375" class="tx-mono tx-sm tx-mid">l1</text>
+      <rect x="255" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="270" y="375" class="tx-mono tx-sm tx-mid">h1</text>
+      <rect x="295" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="310" y="375" class="tx-mono tx-sm tx-mid">h2</text>
+      <rect x="386" y="359" width="30" height="22" class="fw-s1 st-s1"/><text x="401" y="375" class="tx-mono tx-sm tx-mid">h2</text>
+      <rect x="424" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="439" y="375" class="tx-mono tx-sm tx-mid">h1</text>
+      <rect x="462" y="359" width="30" height="22" class="fw-s1 st-s1 dash"/><text x="477" y="375" class="tx-mono tx-sm tx-mid">l1</text>
+      <text x="95" y="414" class="tx-sm tx-mid">DataNode</text>
+      <text x="270" y="414" class="tx-sm tx-mid">DataNode</text>
+      <text x="439" y="414" class="tx-sm tx-mid">DataNode</text>
+    </svg>
+    <figcaption><b>Рис. 6.</b> HBase, перерисовано со слайда (p. 465). Каждым регионом владеет один сервер; внутри — по одному Store на column family, каждый из MemStore и HFile-ов; один HLog на сервер. Файлы пишутся в HDFS блоками (h — HFile, l — HLog), и HDFS держит по несколько копий каждого, по умолчанию три: сплошная — первая, пунктирные — остальные.</figcaption>
+  </figure>
+
+  <p>"HBase Storage hierarchy" (p. 466), снаружи внутрь: таблица делится на <mark class="key">регионы (regions)</mark> — диапазоны ключей строк; у региона "One Store per ColumnFamily (subset of columns with similar query patterns)" — колонки, которые читают вместе, делят одно семейство и хранятся и читаются как один Store; у Store есть "Memstore" ("in-memory updates to Store; flushed to disk when full") и "StoreFiles … where the data lives", поблочно. StoreFile — это <mark class="key">HFile</mark>, "SSTable from Google's BigTable": блоки данных, индексы и трейлер, и каждая запись key-value несёт свой ключ целиком (p. 467, табл. 4).</p>
+
+  <aside class="redpen" data-page="466">
+    <p class="claim">"Split it into multiple regions: replicated across servers"</p>
+    <p class="fix">Регионы распределены по серверам, и каждый в любой момент обслуживает ровно один HRegionServer; реплицируются файлы, и делает это HDFS (рис. 6).</p>
+    <p class="because">Один владелец на регион — именно поэтому HBase может обещать строгую согласованность (p. 460); если бы за регион отвечали несколько серверов, вернулся бы вопрос Cassandra: какая копия свежая. Экзамен может сверяться с напечатанной строкой: знай её, а в ответе пиши "distributed across region servers, replicated by HDFS".</p>
+  </aside>
+
+  <figure class="tbl-fig" id="l22-tbl-hfile">
+    <figcaption>Табл. 4. Одна запись key-value в HFile (p. 467), с примером переписи (census) со слайда.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Поле</th><th>Пример переписи</th></tr></thead>
+        <tbody>
+          <tr><td>Key Length, Value Length</td><td>длины двух частей</td></tr>
+          <tr class="is-key"><td>Row Length, Row</td><td><code>SSN:000-00-0000</code> (15 символов)</td></tr>
+          <tr class="is-key"><td>Column Family Length, Column Family</td><td><code>Demographic</code> (11 символов)</td></tr>
+          <tr class="is-key"><td>Column Qualifier</td><td><code>Ethnicity</code></td></tr>
+          <tr class="is-key"><td>Time Stamp, Key Type</td><td>версия ячейки; значение или маркер удаления (контекст)</td></tr>
+          <tr><td>Value</td><td>сами хранимые байты</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <h3>Write-ahead log и его проигрывание</h3>
+  <p>"Strong Consistency: HBase Write-Ahead Log" (p. 468): клиентские <code>put()</code>, <code>delete()</code> и <code>incr()</code> идут "to HLog before writing to MemStore", поэтому сервер "Can recover from failure". <mark class="key">HLog</mark> — это commit log HBase; на диск его принудительно сбрасывает Log Flusher (<code>sync()</code>), а на файлы режет Log Roller (<code>rollWriter()</code>). "Log Replay" (p. 469): "After recovery from failure, or upon bootup", "Replay any stale logs (use timestamps to find out where the database is w.r.t. the logs)" — "add edits to the MemStore". Один HLog на HRegionServer, а не на регион: это "Avoids many concurrent writes, which on the local file system may involve many disk seeks".</p>
+
+  <h3>Между датацентрами</h3>
+  <p>"Cross-data center replication" (p. 470) снова использует лог: каждый region server master-кластера отправляет свои правки из HLog пачками в slave-кластеры ("Synchronous Call"). ZooKeeper, "actually a file system for control information", хранит <code>/hbase/replication/state</code>, <code>/hbase/replication/peers/&lt;peer cluster number&gt;</code> и <code>/hbase/replication/rs/&lt;hlog&gt;</code>: для каждого region server — HLog-и, которые надо отправить, и достигнутое смещение.</p>
+
+  <div class="pitfall"><p>«"Synchronous Call" значит, что запись клиента ждёт другой датацентр». Нет: каждый вызов отправки синхронный, но репликация идёт позади клиента — запись подтверждается, как только она попала в локальные HLog и MemStore (контекст: HBase Reference Guide называет репликацию асинхронной).</p></div>
+
+  <h3>Назад ко второй загадке</h3>
+  <figure class="tbl-fig" id="l22-tbl-vs">
+    <figcaption>Табл. 5. Тот же движок, два разных владельца.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Cassandra</th><th>HBase</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>кто обслуживает строку</td><td>N равноправных реплик, мастера нет</td><td>один HRegionServer на регион</td></tr>
+          <tr><td>как её найти</td><td>хеш-кольцо, которое все знают благодаря gossip</td><td>ZooKeeper; регионы назначает HMaster</td></tr>
+          <tr><td>лог, память, диск</td><td>commit log, memtable, SSTable</td><td>HLog, MemStore, HFile</td></tr>
+          <tr><td>копии</td><td>N реплик на N узлах</td><td>копии файлов в HDFS</td></tr>
+          <tr><td>порядок строк</td><td>порядок хешей; порядок внутри партиции</td><td>отсортированы по row key: <code>Scan(row range)</code></td></tr>
+          <tr class="is-key"><td>p. 460</td><td>"Prefers Availability over Consistency"</td><td>"Prefers (strong) Consistency over Availability"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+  <p>Движок тот же, владелец разный. Cassandra позволяет принять запись любой из N равноправных реплик, поэтому записи никогда не ждут одну конкретную машину, а реплики какое-то время могут расходиться. HBase даёт каждой строке один сервер, поэтому чтение видит каждую подтверждённую запись этой строки, без всякой арифметики кворумов; зато пока регионы упавшего сервера переназначаются, а его HLog проигрывается, эти строки обслуживать некому. Facebook выбрал для Messages эту более простую согласованность.</p>
+</section>
+
+
+<section id="l22-columns">
+  <h2>Другая «колоночность»: каждая колонка хранится отдельно</h2>
+
+  <p>Лекция заканчивается слайдом "Other Columnar DBs" (p. 471) — это другое значение слова "columnar". Cassandra и HBase держат колонки строки вместе (HBase — внутри каждого column family); MonetDB и LucidDB хранят каждую колонку отдельно — это колоночное хранение (column storage) из <a href="l20.html">урока 20</a>, для запросов, которые читают несколько колонок у множества строк.</p>
+
+  <p>"MonetDB" (p. 472) запускает SQL-фронтенд (реляционная модель), ODMG-фронтенд (объектно-ориентированная модель), OLAP-инструмент и инструмент data mining поверх одного "Monet back-end" через язык MIL, с "full vertical fragmentation": на слайде (p. 473, рис. 7) Order(id, day, discount) превращается в order_id, order_day и order_discount, где каждая таблица связывает идентификатор объекта, oid, с одним значением.</p>
+
+  <figure class="fig fig--plain" id="l22-fig-monet">
+    <svg class="dia" viewBox="0 0 560 420" role="img" aria-label="Full vertical fragmentation в MonetDB: таблица Order с id, day и discount превращается в три таблицы order_id, order_day и order_discount, в каждой oid и одно значение; запрос по discount читает только order_discount">
+      <text x="280" y="22" class="tx-sm tx-mid tx-bold">Order</text>
+      <rect x="182" y="30" width="196" height="22" class="fw-s3 st-none"/>
+      <rect x="182" y="30" width="196" height="154"/>
+      <line x1="222" y1="30" x2="222" y2="184" class="st-muted"/>
+      <line x1="298" y1="30" x2="298" y2="184" class="st-muted"/>
+      <line x1="182" y1="52" x2="378" y2="52" class="st-muted"/>
+      <text x="202" y="46" class="tx-sm tx-mid">id</text>
+      <text x="260" y="46" class="tx-sm tx-mid">day</text>
+      <text x="338" y="46" class="tx-sm tx-mid">discount</text>
+      <text x="202" y="69" class="tx-mono tx-sm tx-mid">10</text><text x="260" y="69" class="tx-mono tx-sm tx-mid">4/4/98</text><text x="338" y="69" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="202" y="91" class="tx-mono tx-sm tx-mid">11</text><text x="260" y="91" class="tx-mono tx-sm tx-mid">9/4/98</text><text x="338" y="91" class="tx-mono tx-sm tx-mid">0.065</text>
+      <text x="202" y="113" class="tx-mono tx-sm tx-mid">12</text><text x="260" y="113" class="tx-mono tx-sm tx-mid">1/2/98</text><text x="338" y="113" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="202" y="135" class="tx-mono tx-sm tx-mid">13</text><text x="260" y="135" class="tx-mono tx-sm tx-mid">9/4/98</text><text x="338" y="135" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="202" y="157" class="tx-mono tx-sm tx-mid">14</text><text x="260" y="157" class="tx-mono tx-sm tx-mid">7/2/98</text><text x="338" y="157" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="202" y="179" class="tx-mono tx-sm tx-mid">15</text><text x="260" y="179" class="tx-mono tx-sm tx-mid">1/2/98</text><text x="338" y="179" class="tx-mono tx-sm tx-mid">0.065</text>
+      <line x1="240" y1="190" x2="84" y2="212" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="280" y1="190" x2="216" y2="212" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="320" y1="190" x2="386" y2="212" class="sw-2" marker-end="url(#arr)"/>
+      <text x="60" y="230" class="tx-mono tx-sm tx-mid">order_id</text>
+      <text x="216" y="230" class="tx-mono tx-sm tx-mid">order_day</text>
+      <text x="390" y="230" class="tx-mono tx-sm tx-mid">order_discount</text>
+      <rect x="334" y="245" width="112" height="165" class="hl"/>
+      <rect x="20" y="250" width="80" height="154" class="fi-paper"/>
+      <rect x="20" y="250" width="80" height="22" class="fw-s3 st-none"/>
+      <rect x="20" y="250" width="80" height="154" class="fi-none"/>
+      <line x1="60" y1="250" x2="60" y2="404" class="st-muted"/>
+      <line x1="20" y1="272" x2="100" y2="272" class="st-muted"/>
+      <text x="40" y="266" class="tx-sm tx-mid">oid</text><text x="80" y="266" class="tx-sm tx-mid">int</text>
+      <text x="40" y="289" class="tx-mono tx-sm tx-mid">100</text><text x="80" y="289" class="tx-mono tx-sm tx-mid">10</text>
+      <text x="40" y="311" class="tx-mono tx-sm tx-mid">101</text><text x="80" y="311" class="tx-mono tx-sm tx-mid">11</text>
+      <text x="40" y="333" class="tx-mono tx-sm tx-mid">102</text><text x="80" y="333" class="tx-mono tx-sm tx-mid">12</text>
+      <text x="40" y="355" class="tx-mono tx-sm tx-mid">103</text><text x="80" y="355" class="tx-mono tx-sm tx-mid">13</text>
+      <text x="40" y="377" class="tx-mono tx-sm tx-mid">104</text><text x="80" y="377" class="tx-mono tx-sm tx-mid">14</text>
+      <text x="40" y="399" class="tx-mono tx-sm tx-mid">105</text><text x="80" y="399" class="tx-mono tx-sm tx-mid">15</text>
+      <rect x="160" y="250" width="112" height="154" class="fi-paper"/>
+      <rect x="160" y="250" width="112" height="22" class="fw-s3 st-none"/>
+      <rect x="160" y="250" width="112" height="154" class="fi-none"/>
+      <line x1="200" y1="250" x2="200" y2="404" class="st-muted"/>
+      <line x1="160" y1="272" x2="272" y2="272" class="st-muted"/>
+      <text x="180" y="266" class="tx-sm tx-mid">oid</text><text x="236" y="266" class="tx-sm tx-mid">date</text>
+      <text x="180" y="289" class="tx-mono tx-sm tx-mid">100</text><text x="236" y="289" class="tx-mono tx-sm tx-mid">4/4/98</text>
+      <text x="180" y="311" class="tx-mono tx-sm tx-mid">101</text><text x="236" y="311" class="tx-mono tx-sm tx-mid">9/4/98</text>
+      <text x="180" y="333" class="tx-mono tx-sm tx-mid">102</text><text x="236" y="333" class="tx-mono tx-sm tx-mid">1/2/98</text>
+      <text x="180" y="355" class="tx-mono tx-sm tx-mid">103</text><text x="236" y="355" class="tx-mono tx-sm tx-mid">9/4/98</text>
+      <text x="180" y="377" class="tx-mono tx-sm tx-mid">104</text><text x="236" y="377" class="tx-mono tx-sm tx-mid">7/2/98</text>
+      <text x="180" y="399" class="tx-mono tx-sm tx-mid">105</text><text x="236" y="399" class="tx-mono tx-sm tx-mid">1/2/98</text>
+      <rect x="340" y="250" width="100" height="154" class="fi-paper"/>
+      <rect x="340" y="250" width="100" height="22" class="fw-s3 st-none"/>
+      <rect x="340" y="250" width="100" height="154" class="fi-none"/>
+      <line x1="380" y1="250" x2="380" y2="404" class="st-muted"/>
+      <line x1="340" y1="272" x2="440" y2="272" class="st-muted"/>
+      <text x="360" y="266" class="tx-sm tx-mid">oid</text><text x="410" y="266" class="tx-sm tx-mid">float</text>
+      <text x="360" y="289" class="tx-mono tx-sm tx-mid">100</text><text x="410" y="289" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="360" y="311" class="tx-mono tx-sm tx-mid">101</text><text x="410" y="311" class="tx-mono tx-sm tx-mid">0.065</text>
+      <text x="360" y="333" class="tx-mono tx-sm tx-mid">102</text><text x="410" y="333" class="tx-mono tx-sm tx-mid">0.175</text>
+      <text x="360" y="355" class="tx-mono tx-sm tx-mid">103</text><text x="410" y="355" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="360" y="377" class="tx-mono tx-sm tx-mid">104</text><text x="410" y="377" class="tx-mono tx-sm tx-mid">0.000</text>
+      <text x="360" y="399" class="tx-mono tx-sm tx-mid">105</text><text x="410" y="399" class="tx-mono tx-sm tx-mid">0.065</text>
+      <text x="458" y="304" class="tx-sm">запрос по</text>
+      <text x="458" y="326" class="tx-sm">discount</text>
+      <text x="458" y="348" class="tx-sm">читает это</text>
+    </svg>
+    <figcaption><b>Рис. 7.</b> Таблица Order со слайда (p. 473), разрезанная по колонкам. Шесть заказов получают oid 100–105 в каждом куске, так что строка собирается взятием одной и той же позиции в каждом куске; запрос по скидке трогает одну узкую таблицу вместо трёх колонок.</figcaption>
+  </figure>
+
+  <p>"LucidDB" (pp. 474–476) держит "column store tables" в одном файле, db.dat. Таблица "consists of set of clusters", по умолчанию по одному на колонку ("Each column maps to single cluster"), а страница кластера "stores the values for a specific set of rowIDs". B-дерево на каждый кластер "maps rid values to pageIds" по первому rid каждой страницы: страница 49 начинается с rid 984, а страница 50 — с 1248, значит, на странице 49 лежат rid 984–1247. Внутри страницы (p. 477) LucidDB хранит "just the unique column values", каждое с "a bit-encoded vector" (табл. 6).</p>
+
+  <figure class="tbl-fig" id="l22-tbl-lucid">
+    <figcaption>Табл. 6. Скидки со слайда (p. 473) как одна страница, сохранённая по-LucidDB-шному (вычислено): каждое различное значение один раз, по биту на строку.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>Различное значение</th><th>rid 0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr></thead>
+        <tbody>
+          <tr><td class="num">0.175</td><td class="num">1</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">0</td></tr>
+          <tr><td class="num">0.065</td><td class="num">0</td><td class="num">1</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td></tr>
+          <tr class="is-key"><td class="num">0.000</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num">1</td><td class="num">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Отсюда "Conclusion" (p. 478): "Column architecture doesn't read unnecessary columns"; "Avoids decompression costs and performs operations faster" — на discount = 0.000 отвечает вектор 0 0 0 1 1 0, без всякой распаковки; "Use of compression schemes allow us to lower our disk space requirements".</p>
+</section>
+
+
+<section id="l22-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Пять теоретических вопросов в формате теоретической части — открытые ответы в несколько предложений и закрытые, где за неправильную галочку могут снять баллы, — а затем две задачи: расчёт кворума и вопрос о развёртывании на ER-сценарии из прошлого экзамена.</p>
+
+  <div class="exam" data-kind="open" id="l22-exam-write">
+    <div class="exam-q" lang="en">
+      <p>Describe step by step what a Cassandra replica node does when it receives a write, and explain why reads can be slower than writes.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>The replica first appends the write to the commit log on disk, a sequential append that makes it durable, and then applies it to the memtable, an in-memory structure of key-value pairs sorted by key; then it can acknowledge. No read, no disk seek and no lock are needed. When the memtable is full or old, it is flushed to disk as an SSTable (Sorted String Table): an immutable file of key-value pairs sorted by key, with an index file of (key, position) pairs and a Bloom filter. Because SSTables are never modified, new versions and deletes (tombstones) accumulate in newer SSTables, and compaction periodically merges them, keeping the newest version of each key and removing deleted items. A read, instead, must look in the memtable and possibly in several SSTables — skipping those whose Bloom filter says the key is absent — and merge the versions by timestamp; the coordinator may also contact several replicas and start a read repair. This is why reads may be slower than writes.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ называет порядок (сначала commit log, потом memtable), слова SSTable, flush, compaction и Bloom filter и причину асимметрии. Слайд (p. 446) говорит, что чтения "touch log and multiple SSTables": пиши memtable, а лог упоминай только для перезапусков.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l22-exam-pairs">
+    <div class="exam-q" lang="en">
+      <p>A keyspace has replication factor N = 3. Which write/read consistency-level pairs guarantee that a read returns the most recent acknowledged write? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>W = ONE, R = ONE <span class="fb">1 + 1 = 2 ≤ 3: чтение может спросить реплику, до которой запись ещё не дошла.</span></li>
+      <li data-correct>W = QUORUM, R = QUORUM <span class="fb">2 + 2 = 4 &gt; 3: два большинства делят хотя бы одну реплику.</span></li>
+      <li>W = ANY, R = ALL <span class="fb">ANY может удовлетворить хинт на координаторе, который сам не реплика: пока хинт не доставлен, значения нет ни у одной реплики, так что даже чтение всех трёх может его не увидеть.</span></li>
+      <li data-correct>W = ALL, R = ONE <span class="fb">3 + 1 = 4 &gt; 3: значение есть у каждой реплики.</span></li>
+      <li data-correct>W = ONE, R = ALL <span class="fb">1 + 3 = 4 &gt; 3: чтение спрашивает каждую реплику, включая ту, что подтвердила запись.</span></li>
+      <li>W = ONE, R = QUORUM <span class="fb">1 + 2 = 3, не больше 3: обе прочитанные реплики могут оказаться устаревшими.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>QUORUM/QUORUM, ALL/ONE and ONE/ALL. The condition is W + R &gt; N (here 2 + 2, 3 + 1 and 1 + 3, all greater than 3): it forces the replicas that acknowledged the write and the replicas that answer the read to overlap in at least one node, and the coordinator returns the value with the most recent timestamp. ONE/ONE and ONE/QUORUM fail the inequality; ANY guarantees no replica at all, because a hint stored on the coordinator counts as a successful write.</p></div>
+      <div class="exam-note"><p>Три верных варианта из шести. ANY/ALL — ловушка: похоже на угол «прочитать всё», но W считает только настоящие реплики. За неверные галочки могут штрафовать, так что отмечай только то, что доказывает неравенство.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l22-exam-bloom">
+    <div class="exam-q" lang="en">
+      <p>True or false: a Bloom filter may report that a key is absent from an SSTable although the key is stored in it.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Это был бы ложноотрицательный ответ, а фильтр Блума их никогда не даёт: биты, выставленные при вставке ключа, никогда не сбрасываются.</span></li>
+      <li data-correct>False <span class="fb">Ложноотрицательных ответов нет; бывают только ложноположительные — отсутствующий ключ, все биты которого выставили другие ключи.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. When a key is inserted, all its k hashed bits are set, and bits are never reset, so a stored key always finds its bits set and the filter answers "maybe present". The filter can only err the other way: an absent key may find all its bits set by other keys (a false positive). The rate is low; the lecture's example has k = 4 hash functions, 100 items and 3200 bits, with a false-positive rate of 0.02 %.</p></div>
+      <div class="exam-note"><p>Вопрос «верно/неверно», который проверяет направление ошибки. Пиши причину, а не только слово: "bits are never cleared".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l22-exam-gossip">
+    <div class="exam-q" lang="en">
+      <p>Explain how the nodes of a Cassandra cluster learn which nodes are alive without a master. Describe the membership list and how a node decides that another node is down.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Cassandra is peer to peer: no master knows the membership, so each node keeps its own membership list with, for every node, its address, the latest heartbeat counter heard and the local time at which that counter was received. Each node increments its own counter and periodically gossips its list to a few peers (up to three per round), with a three-message exchange (GossipDigestSyn, GossipDigestAck, GossipDigestAck2). On receipt, for every address the node keeps the larger counter and stamps it with its own local time, because the clocks are not synchronised: node 2 at local time 70 receives 10120 and 10098 for nodes 1 and 3, larger than its 10118 and 10090, and stores (10120, 70) and (10098, 70), while it keeps its own entry and the equal one. The traffic per node stays constant and the views converge (anti-entropy). A node whose counter stops increasing becomes suspect: the accrual failure detector computes a suspicion value PHI, minus the base-10 logarithm of the probability that a heartbeat arrives later than the silence observed so far, from the past inter-arrival times; the application sets the threshold (on the slide, PHI = 5 gives a detection time of 10–15 seconds).</p></div>
+      <div class="exam-note"><p>В полном ответе три части: нет мастера, и gossip идёт с немногими собеседниками; правило слияния с локальным временем; подозрение как величина с порогом вместо фиксированного таймаута. Числа со слайда (p. 451) делают правило слияния конкретным.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l22-exam-hbase">
+    <div class="exam-q" lang="en">
+      <p>Cassandra "prefers availability over consistency", while HBase "prefers (strong) consistency over availability". Explain where this difference comes from in the two architectures.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>In Cassandra every row has N equal replicas on a masterless ring. Any node can coordinate a write and sends it to all replicas; with levels such as ONE or ANY, and with hinted handoff, a write is accepted even while replicas are down, so the replicas may hold different versions for a while; they are reconciled later by timestamps, read repair and compaction (eventual consistency, BASE). In HBase a table is split into regions, and each region is served by exactly one HRegionServer at a time, assigned by the HMaster through ZooKeeper. Every write of a row goes through that single server, which appends it to its write-ahead log (HLog) before applying it to the MemStore, so every read of the row sees the latest write. The copies of the data are kept by HDFS at the file level, not by several servers answering for the same row. When a region server fails, its regions are unavailable until the HMaster reassigns them and the HLog is replayed into the new MemStores: HBase gives up availability during recovery to keep strong consistency.</p></div>
+      <div class="exam-note"><p>Суть — "N equal replicas" против "one owner per region". Сам по себе write-ahead log даёт только долговечность (durability); согласованность берётся из единственного владельца. Упомяни BASE для Cassandra и недоступность во время восстановления для HBase.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="2" data-tol="0" id="l22-exam-num">
+    <div class="exam-q" lang="en">
+      <p>A keyspace uses the Simple Strategy with replication factor 4. Writes are performed at consistency level QUORUM. What is the smallest number of replicas a read must wait for, so that it is guaranteed to return the latest acknowledged write?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>QUORUM with N = 4 is ⌊4/2⌋ + 1 = 3 replicas, so W = 3. A fresh read needs W + R &gt; N, that is R &gt; 4 − 3 = 1, so R = 2 replicas. Of the lecture's levels, ONE is not enough and QUORUM (3) is more than needed.</p></div>
+      <div class="exam-note"><p>Два шага — размер кворума и неравенство. При N = 4 формула N/2 + 1 со слайда даёт 3 с округлением и без; при нечётном N целое число получается только с округлением вниз, так что всегда пиши floor.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l22-exam-keyspace">
+    <div class="exam-q" lang="en">
+      <p><b>ER scenario of the exam of 12 Sep 2025</b> (the exercise itself is exam-style, not from the paper): a data structure for tracking farmers and their sales at local markets. Market (Name, Location, Opening Time, Closing Time, Size) and Product (Product ID, Name, Quantity, Expiration Date) are linked by the relationship Sell, with cardinality (1, N) on both sides.</p>
+      <p>The sales are stored in Cassandra, partitioned by market location, on one datacenter of six nodes n1–n6 with tokens 10, 25, 40, 55, 70 and 85; the token of the partition 'Milano' is 62. Write the CQL statement that creates the keyspace markets so that every row is stored three times. Say which nodes hold the copies of 'Milano', and choose consistency levels for writes and reads so that a read always returns the latest acknowledged sale while one replica may be down.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE KEYSPACE markets
+  WITH replication = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3};</code></pre>
+        <p>With the Simple Strategy the first copy goes to the first node clockwise from the token 62, that is n5 (token 70), and the other two to the next nodes clockwise, n6 (85) and n1 (10, after wrapping around the ring). Writes and reads at QUORUM wait for ⌊3/2⌋ + 1 = 2 replicas each: 2 + 2 &gt; 3, so every read overlaps the last acknowledged write, and either operation still succeeds with one replica down. (ONE/ALL or ALL/ONE would also be consistent, but a single replica down would block the reads or the writes.)</p>
+      </div>
+      <div class="exam-note"><p>Строка с keyspace открывает каждый скрипт Cassandra на практическом занятии (p. 1553); здесь она соединена с правилами размещения и кворума из этого урока. Переход по кругу от n6 к n1 — то место, где ответы обычно спотыкаются.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l22-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">В виджете с кольцом пять узлов хранят ключи при N = 1. Присоединяется B3 с токеном 68, между A2 (56) и B2 (81). Какие ключи сменят узел?</p>
+    <ul class="options">
+      <li>Около пяти шестых всех ключей, потому что изменилось число узлов <span class="fb">Так ведёт себя хеш по модулю n. На кольце ключ меняет владельца, только если новый токен теперь первый по часовой стрелке от него.</span></li>
+      <li data-correct>Только ключи с токенами от 57 до 68 — Varese и Como, — которые переходят от B2 к B3 <span class="fb">B3 забирает ту часть дуги B2, которая теперь кончается на его собственном токене; все остальные ключи остаются у своих владельцев. Проверь: с 5 до 6 узлов.</span></li>
+      <li>Шестая часть ключей каждого узла, чтобы нагрузка снова стала равномерной <span class="fb">Размазать нагрузку по всем узлам — это то, что добавляют виртуальные узлы (virtual nodes, контекст); на кольце со слайдов переезжает одна дуга от одного соседа.</span></li>
+      <li>Никакие, до следующего уплотнения <span class="fb">Уплотнение сливает SSTable внутри узла; какой узел владеет ключом, решают токены.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие утверждения о gossip в Cassandra верны? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>В каждом раунде узел говорит с несколькими собеседниками, не больше трёх <span class="fb">"Each node picks its discussants (up to 3)" (p. 441).</span></li>
+      <li>Gossip доставляет репликам строки, записанные клиентами <span class="fb">Записи идут от координатора к репликам напрямую (p. 445); gossip переносит heartbeat и состояние узлов.</span></li>
+      <li data-correct>Сетевой трафик на узел остаётся примерно тем же по мере роста кластера <span class="fb">"Always a constant amount of network traffic": число собеседников за раунд не растёт вместе с кластером.</span></li>
+      <li data-correct>Полученная запись заменяет локальную, только если её счётчик heartbeat больше <span class="fb">Правило слияния со слайда (p. 451); время при этом ставится собственное, получателя.</span></li>
+      <li>Узел-мастер решает, какие узлы мертвы, и сообщает остальным <span class="fb">Мастера нет: собственный накопительный детектор каждого узла превращает молчание в подозрение.</span></li>
+    </ul>
+    <p class="q-fb">Gossip распространяет состояние узлов — дёшево и многократно; а решения — мёртв или жив — каждый узел принимает сам.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">У узла 3 локальное время 42. В его списке есть строка 1: (счётчик 500, время 30). Gossip-сообщение от узла 4 несёт 1: (498, 41). Что узел 3 хранит для узла 1 после этого?</p>
+    <ul class="options">
+      <li>(498, 41) <span class="fb">Полученный счётчик меньше: это более старая новость об узле 1. А время узла 4 ничего не значит по часам узла 3.</span></li>
+      <li>(500, 42) <span class="fb">Время переставляется, только когда приходит больший счётчик; здесь ничего не изменилось.</span></li>
+      <li data-correct>(500, 30) <span class="fb">Побеждает больший счётчик, а он уже есть у узла 3: строка остаётся как была, включая время.</span></li>
+      <li>(498, 42) <span class="fb">Здесь взят более старый счётчик и помечен как новый — неверны обе половины.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Ты удаляешь партицию 'Lodi' и сразу смотришь на диск реплики. Что ты там найдёшь?</p>
+    <ul class="options">
+      <li data-correct>Больше данных: записан tombstone, а старые строки остаются до уплотнения <span class="fb">"Delete: don't delete item right away"; "add a tombstone to the log" (p. 448). SSTable с 'Lodi' неизменяемы.</span></li>
+      <li>Меньше данных: строки 'Lodi' удалены из SSTable <span class="fb">SSTable никогда не изменяются; на месте ничего не стирается.</span></li>
+      <li>Те же данные, минус запись 'Lodi' в commit log <span class="fb">В commit log можно только дописывать: удаление дописывается туда, как любая другая запись.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">N = 3. Клиент записывает новую цену с ONE, а через миллисекунду другой клиент читает её с ONE. Что может произойти?</p>
+    <ul class="options">
+      <li>Чтение всегда вернёт новую цену, потому что сначала срабатывает read repair <span class="fb">Read repair чинит устаревшие реплики после того, как чтение их заметило, а при R = 1 чтению вообще не с чем сравнивать.</span></li>
+      <li data-correct>Чтение может вернуть старую цену; устаревшая реплика исправится позже <span class="fb">1 + 1 не больше 3: два множества могут не пересечься. Eventual consistency, как в первом задании виджета.</span></li>
+      <li>Чтение упадёт, потому что ONE нельзя использовать для чтений <span class="fb">ONE — уровень для чтения ("1 replica", p. 453); не подходит для чтения как раз ANY.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие утверждения об HBase верны? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Каждый регион в любой момент обслуживает один HRegionServer <span class="fb">Единственный владелец — источник строгой согласованности HBase.</span></li>
+      <li data-correct>Каждая правка дописывается в HLog до того, как попадёт в MemStore <span class="fb">"Write to HLog before writing to MemStore" (p. 468): лог позволяет правке пережить падение.</span></li>
+      <li>Каждый регион обслуживают три region server, как три реплики в Cassandra <span class="fb">Именно к такому прочтению подталкивает "replicated across servers" на слайде (p. 466), и оно неверно: копии держит HDFS, на уровне файлов.</span></li>
+      <li data-correct>HDFS хранит несколько копий HFile-ов и HLog <span class="fb">Нижний этаж слайда (p. 465): блоки на нескольких DataNode.</span></li>
+      <li>Scan не может прочитать диапазон строк, потому что строки хешируются <span class="fb">HBase держит строки отсортированными по row key: <code>Scan(row range, filter)</code> есть в API (p. 464).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В B-дереве LucidDB из rid в pageId (p. 476) страница 49 начинается с rid 984, а страница 50 — с rid 1248. На какой странице rid 1247?</p>
+    <ul class="options">
+      <li>Страница 50 <span class="fb">Страница 50 начинается с 1248; 1247 — последний rid перед ней.</span></li>
+      <li>Без чтения страниц этого не узнать <span class="fb">Избавлять от этого — как раз работа B-дерева: оно сопоставляет первый rid каждой страницы с самой страницей.</span></li>
+      <li data-correct>Страница 49 <span class="fb">B-дерево находит наибольший начальный rid, не превышающий 1247, — 984, — значит, страница 49, где лежат rid 984–1247.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l22-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Партиционер превращает ключ в токен — на слайде это MD5 (p. 457), — и владеет ключом первый узел по часовой стрелке на кольце. Фактор репликации N задаёт число копий; Simple Strategy кладёт их на следующие узлы по часовой стрелке, Network Topology Strategy — по датацентрам на разные стойки (pp. 442–444, 456). Order-preserving партиционер позволяет диапазоны ключей, но даёт "'scrabble' distribution".</li>
+    <li>Мастера нет, и узлы обмениваются gossip с не более чем тремя собеседниками за раунд, рукопожатием из трёх сообщений (p. 441). Списки членства сливаются по большему счётчику heartbeat, с отметкой собственного времени получателя (p. 451); накопительный детектор выдаёт подозрение φ = −log₁₀ вероятности более позднего heartbeat, которое сравнивают с порогом, заданным приложением (p. 452).</li>
+    <li>Координатор отправляет запись всем репликам и хранит хинты для недоступных (p. 445). Реплика дописывает в commit log и обновляет memtable; заполненные memtable сбрасываются в неизменяемые отсортированные SSTable с индексом и фильтром Блума; уплотнение их сливает; удаление пишет tombstone (pp. 446–448, 454).</li>
+    <li>Чтение сливает memtable и те SSTable, которые не отсеяли их фильтры Блума, — но никогда не commit log, — поэтому чтения медленнее записей (pp. 446, 459). У фильтра Блума бывают ложноположительные ответы, но никогда — ложноотрицательные (p. 447).</li>
+    <li>Q = ⌊N/2⌋ + 1, и чтение гарантированно видит последнюю подтверждённую запись, когда W + R &gt; N (p. 449). Уровни — <code>ANY</code> (только запись), <code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>, <code>EACH_QUORUM</code> и <code>ALL</code> (pp. 450, 453); read repair выполняет координатор.</li>
+    <li>HBase делит таблицы на регионы, каждый обслуживает один HRegionServer, с одним Store на column family (MemStore плюс HFile-ы) и одним HLog на сервер, который пишется до MemStore и проигрывается после падения; файлы реплицирует HDFS (pp. 463–470). Один владелец на регион даёт строгую согласованность; N равноправных реплик Cassandra дают доступность (p. 460).</li>
+    <li>MonetDB и LucidDB — колоночные хранилища в другом смысле: MonetDB выносит каждую колонку в собственную таблицу (oid, value), LucidDB хранит колонки в кластерах страниц с различными значениями и битовыми векторами (pp. 471–478).</li>
+  </ul>
+  <aside class="cheat" id="l22-cheat">
+    <dl>
+      <dt>Токен</dt><dd>MD5(key) у random-партиционера; сам ключ у order-preserving (pp. 433, 457)</dd>
+      <dt>Владелец ключа</dt><dd>первый узел по часовой стрелке от токена ключа</dd>
+      <dt>Simple Strategy</dt><dd>один датацентр; копии на следующих N − 1 узлах по часовой стрелке (p. 442)</dd>
+      <dt>Network Topology Strategy</dt><dd>несколько датацентров; свой фактор репликации на каждый, копии на разных стойках (p. 444)</dd>
+      <dt>Keyspace</dt><dd><code>CREATE KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};</code></dd>
+      <dt>Gossip</dt><dd>до 3 собеседников за раунд; GossipDigestSyn, Ack, Ack2; постоянный трафик (p. 441)</dd>
+      <dt>Слияние членства</dt><dd>побеждает больший счётчик heartbeat, с отметкой локального времени получателя (p. 451)</dd>
+      <dt>PHI</dt><dd>\(\varphi = -\log_{10}\big(1 - F(\Delta t)\big)\); порог задаёт приложение (p. 452)</dd>
+      <dt>Hinted handoff</dt><dd>координатор хранит запись для недоступной реплики и доставляет её позже (p. 445)</dd>
+      <dt>Путь записи</dt><dd>commit log (дописывание) → memtable → flush → SSTable + индекс + фильтр Блума → compaction (p. 446)</dd>
+      <dt>Фильтр Блума</dt><dd>k битов на ключ; ложноотрицательных нет; \(p_{FP} \approx (1 - e^{-kn/m})^k\) (контекст)</dd>
+      <dt>Tombstone</dt><dd>маркер удаления с временной меткой, убирается при уплотнении (p. 448)</dd>
+      <dt>Кворум</dt><dd>\(Q = \lfloor N/2 \rfloor + 1\)</dd>
+      <dt>Свежее чтение</dt><dd>\(W + R \gt N\), потому что \(|A \cap B| \ge W + R - N\)</dd>
+      <dt>Уровни согласованности</dt><dd><code>ANY</code> (только запись), <code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>, <code>EACH_QUORUM</code>, <code>ALL</code> (p. 450)</dd>
+      <dt>Read repair</dt><dd>координатор записывает самое новое значение обратно в устаревшие реплики (p. 448)</dd>
+      <dt>Иерархия HBase</dt><dd>таблица → регионы (по одному серверу на каждый) → Store на column family → MemStore + StoreFiles (HFile) → блоки (p. 466)</dd>
+      <dt>HLog</dt><dd>write-ahead log, один на HRegionServer; пишется до MemStore, проигрывается после падения (pp. 468–469)</dd>
+      <dt>MonetDB</dt><dd>full vertical fragmentation: одна таблица (oid, value) на колонку (p. 473)</dd>
+      <dt>LucidDB</dt><dd>кластеры страниц; B-дерево из первого rid в pageId; различные значения + битовые векторы (pp. 474–477)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l22-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=uNxl3BFcKSA" target="_blank" rel="noopener">Distributed Systems 5.2: Quorums</a>
+      <span class="res-by">Martin Kleppmann, University of Cambridge</span>
+      <p class="res-why">Кворумы чтения и записи на трёх репликах и почему r + w &gt; n заставляет чтение встретить последнюю запись, — пересечение из виджета с кворумами, нарисованное на доске.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://www.jasondavies.com/bloomfilter/" target="_blank" rel="noopener">Bloom Filters</a>
+      <span class="res-by">Jason Davies</span>
+      <p class="res-why">Фильтр на 50 битов с тремя хеш-функциями: добавляй слова, проверяй слова и смотри, как появляется ложноположительный ответ, — вторая песочница рядом с той, что в разделе 3.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://tzach.github.io/compaction-viz/" target="_blank" rel="noopener">Compaction visualizer</a>
+      <span class="res-by">Tzach Livyatan (ScyllaDB)</span>
+      <p class="res-why">Клиент, commit log, memtable, flush, SSTable и уплотнение — в анимации, с живыми показателями space и read amplification. Сделано для ScyllaDB, близнеца Cassandra; стратегии leveled, time-window и size-tiered у Cassandra такие же, а incremental — собственная стратегия ScyllaDB.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://cassandra.apache.org/doc/latest/architecture/dynamo.html" target="_blank" rel="noopener">Dynamo</a>
+      <span class="res-by">Apache Cassandra documentation</span>
+      <p class="res-why">Официальная версия разделов 1, 2 и 4: кольцо токенов и виртуальные узлы, обе стратегии, gossip, Phi accrual detector, hinted handoff, уровни согласованности и правило W + R &gt; RF.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://engineering.fb.com/2010/11/15/core-infra/the-underlying-technology-of-messages/" target="_blank" rel="noopener">The Underlying Technology of Messages</a>
+      <span class="res-by">Facebook Engineering, 2010</span>
+      <p class="res-why">Источник второй загадки: почему компания, создавшая Cassandra, выбрала для Messages HBase с её «более простой моделью согласованности».</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Cassandra и HBase построены, чтобы быстро писать и отдавать строки по ключу. Колоночные хранилища в конце лекции отвечают на противоположную потребность: прочитать несколько колонок у миллиардов строк ради одного бизнес-вопроса — а это работа хранилища данных (data warehouse).</p>
+</aside>
+
+</main>
+</body>
+</html>

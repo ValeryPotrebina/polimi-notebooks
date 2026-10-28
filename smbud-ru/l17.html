@@ -1,0 +1,1233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>База данных без запросов: key-value хранилища и Redis · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l17">
+
+<header class="lesson-head">
+  <h1>База данных без запросов: key-value хранилища и Redis</h1>
+  <p class="lede">После этого урока ты сможешь объяснить, зачем существует база данных, которая отвечает только на вопрос «что лежит под этим ключом?», сказать, что Redis добавляет к этой идее и чем он не является, объяснить, почему один поток делает каждую команду атомарной и при этом быстрой, и выбрать под задачу нужный из семи типов данных.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>"Every 1/10 second delay resulted in 1% loss of sales." Это цифра Amazon (p. 343): каждая десятая доля секунды задержки стоит 1 % продаж; на том же слайде Google теряет 20 % трафика за полсекунды задержки. Скорость — это деньги.</p>
+  <p>В 2009 году Сальваторе Санфилиппо пытался масштабировать LLOOGG — анализатор веб-логов в реальном времени, продукт его итальянского стартапа, — и традиционные системы баз данных не справлялись с частью его нагрузок. Он написал собственную базу данных и отказался почти от всего, что даёт реляционная: никакого SQL, никаких join, никаких вторичных индексов, всё хранится в памяти, и один поток выполняет по одной команде за раз. Он назвал её Redis.</p>
+  <p>Два из этих решений звучат шиворот-навыворот. Как база данных, которая отвечает только на один вопрос — «что хранится под этим ключом?», — может быть спасением, когда реляционная база слишком медленная? И как сервер, который использует одно ядро процессора и выполняет по одной команде за раз, может обходиться вообще без блокировок и всё равно успевать? К концу урока ты ответишь на оба вопроса словами слайдов.</p>
+</div>
+
+
+<section id="l17-kv">
+  <h2>Один ключ, одно значение, один шаг</h2>
+
+  <p>Лекция открывается картой (p. 342), "Overview – NoSQL Family": "Data stored in 4 types: Document, Graph, Key-value, Wide-column", и в клетке key-value стоят Redis, Amazon DynamoDB, Aerospike и Riak (четыре семейства — в <a href="l05.html">уроке 5</a>). Key-value — самое простое из четырёх, а следующий слайд, "Why is performance important?" (p. 343), объясняет, зачем оно кому-то нужно: ради скорости. Кроме 1 % продаж Amazon и "20% drop in traffic" у Google, там сказано, что при "1-second delay in page-load time" некая "Industrial Group" насчитала "11% fewer page views", "16% decrease in customer satisfaction" и "7% loss in conversions".</p>
+
+  <p>Возьми пример с самого слайда — базу данных блога (p. 346, рис. 1). Чтобы показать страницу поста 101, нужны его текст из таблицы <code>blog</code>, имя автора из <code>users</code> и категория из <code>category</code>: три таблицы, связанные внешними ключами. Хранилище ключ-значение держит всю страницу — текст, автора, категорию — как одно значение под одним ключом, <code>post:101</code>, и отдаёт её за один шаг.</p>
+
+  <div class="def">
+    <p><dfn>Хранилище ключ-значение (key-value store)</dfn> — база данных, которая хранит каждое значение под уникальным ключом и добирается до него только через этот ключ: "(Business) Key -&gt; Value" (p. 345). Весь её интерфейс: положить значение под ключ, получить значение по ключу, удалить ключ. Значение непрозрачно: хранилище никогда не заглядывает внутрь.</p>
+  </div>
+
+  <p>Примеры со слайда (p. 345) — это ключи, которые у бизнеса уже есть: "(twitter.com) tweet id -&gt; information about tweet", "(kayak.com) Flight number -&gt; information about flight", номер счёта в банке, номер товара на Amazon. Большинство запросов к сайту начинается с одного из них — отсюда последняя строка слайда: "Search by ID is usually built on top of a key-value store". В терминах Python хранилище — это <code>dict</code>: <code>d[key] = value</code>, <code>d[key]</code>, <code>del d[key]</code> — и никакого цикла по значениям.</p>
+
+  <div class="story" data-year="2004–2007">
+    <p>«Всё началось в 2004 году, когда Amazon работал на Oracle enterprise edition с кластеризацией и репликацией», — вспоминал в 2017 году Вернер Фогельс, CTO Amazon. База данных не могла «выдержать требования бизнеса к доступности, масштабируемости и производительности», а «подробный разбор того, как мы используем наши базы данных, показал, что их реляционные возможности часто вообще не использовались»: «около 70 процентов операций были вида ключ-значение — использовался только первичный ключ, и возвращалась одна строка». Это было «начало базы данных Amazon Dynamo», опубликованной в 2007 году; Riak из клетки key-value на карте (p. 342) — один из её клонов (p. 411), а в 2012 году появилась DynamoDB от Amazon.</p>
+  </div>
+
+  <p>Слайд (p. 346) задаёт очевидный вопрос, "Isn't that just a database?", и перечисляет, что такое реляционная база данных: "Queried using SQL", "Key-based", "Foreign keys", "Indexes", "Joins". Читай этот список как два столбца: у реляционной базы есть все пять пунктов, у хранилища ключ-значение остаётся один — key-based. Ключи есть и там и там, но играют они разные роли. В реляционном блоге первичные и внешние ключи связывают таблицы, индексы позволяют SQL искать по любому столбцу — запрос со слайда, <code>SELECT user_id from users WHERE username = "jbellis"</code>, находит пользователя по имени, а не по ключу, — а join собирают страницу обратно. Конспект курса говорит это одной строкой: в хранилище ключ-значение "keys are just used to retrieve a specific value, unlike relational databases where primary and foreign keys are means to do searches and mapping between tables" — ключи только достают конкретное значение, а в реляционной базе первичные и внешние ключи служат для поиска и связи таблиц.</p>
+
+  <figure class="fig fig--pair" id="l17-fig-blog">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 270" role="img" aria-label="Реляционная база данных блога со слайда 6 лекции 8: четыре таблицы, users, blog, subscriber и category, связанные стрелками внешних ключей; SQL-запрос сверху ищет пользователя с username jbellis, и столбец username обведён как столбец, по которому идёт поиск">
+        <text x="10" y="14" class="tx-mono tx-sm">SELECT user_id FROM users</text>
+        <text x="10" y="29" class="tx-mono tx-sm">WHERE username = 'jbellis'</text>
+        <line x1="60" y1="34" x2="60" y2="52" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <rect x="10" y="56" width="118" height="70" class="fi-paper"/>
+        <rect x="10" y="56" width="118" height="18" class="fw-s3 st-s3"/>
+        <rect x="14" y="94" width="110" height="14" class="fi-none st-s2 dash"/>
+        <text x="18" y="69" class="tx-mono tx-sm tx-bold">users</text>
+        <text x="18" y="89" class="tx-mono tx-sm">user_id</text>
+        <text x="18" y="104" class="tx-mono tx-sm">username</text>
+        <text x="18" y="119" class="tx-mono tx-sm">state</text>
+        <rect x="172" y="56" width="118" height="86" class="fi-paper"/>
+        <rect x="172" y="56" width="118" height="18" class="fw-s3 st-s3"/>
+        <text x="180" y="69" class="tx-mono tx-sm tx-bold">blog</text>
+        <text x="180" y="89" class="tx-mono tx-sm">blog_id</text>
+        <text x="180" y="104" class="tx-mono tx-sm">user_id</text>
+        <text x="180" y="119" class="tx-mono tx-sm">blog_entry</text>
+        <text x="180" y="134" class="tx-mono tx-sm">categoryid</text>
+        <rect x="10" y="166" width="118" height="70" class="fi-paper"/>
+        <rect x="10" y="166" width="118" height="18" class="fw-s3 st-s3"/>
+        <text x="18" y="179" class="tx-mono tx-sm tx-bold">subscriber</text>
+        <text x="18" y="199" class="tx-mono tx-sm">subscriber</text>
+        <text x="18" y="214" class="tx-mono tx-sm">blogger</text>
+        <text x="18" y="229" class="tx-mono tx-sm">row_id</text>
+        <rect x="172" y="182" width="118" height="54" class="fi-paper"/>
+        <rect x="172" y="182" width="118" height="18" class="fw-s3 st-s3"/>
+        <text x="180" y="195" class="tx-mono tx-sm tx-bold">category</text>
+        <text x="180" y="215" class="tx-mono tx-sm">category</text>
+        <text x="180" y="230" class="tx-mono tx-sm">categoryid</text>
+        <line x1="170" y1="100" x2="133" y2="87" marker-end="url(#arr)"/>
+        <line x1="69" y1="164" x2="69" y2="131" marker-end="url(#arr)"/>
+        <line x1="231" y1="144" x2="231" y2="177" marker-end="url(#arr)"/>
+        <text x="150" y="262" class="tx-hand tx-mid">спрашивай по любому столбцу</text>
+      </svg>
+      <p class="fig-label">До: реляционный путь (p. 346)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 270" role="img" aria-label="Тот же блог в хранилище ключ-значение: четыре ключа, post 101, 102 и 103 и user 1, каждый указывает на одно непрозрачное значение; запрос GET post:101 доходит до своего значения за один шаг, а вопрос о постах jbellis перечёркнут">
+        <text x="10" y="22" class="tx-mono tx-sm">GET post:101</text>
+        <line x1="40" y1="28" x2="40" y2="51" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <rect x="6" y="54" width="288" height="34" class="fi-none st-s2 dash"/>
+        <rect x="10" y="58" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="58" width="192" height="26" class="fi-paper"/>
+        <rect x="10" y="96" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="96" width="192" height="26" class="fi-paper"/>
+        <rect x="10" y="134" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="134" width="192" height="26" class="fi-paper"/>
+        <rect x="10" y="172" width="88" height="26" class="fw-s3 st-s3"/>
+        <rect x="98" y="172" width="192" height="26" class="fi-paper"/>
+        <text x="16" y="75" class="tx-mono tx-sm">post:101</text>
+        <text x="104" y="75" class="tx-mono tx-sm">{entry, author, category}</text>
+        <text x="16" y="113" class="tx-mono tx-sm">post:102</text>
+        <text x="104" y="113" class="tx-mono tx-sm">{entry, author, category}</text>
+        <text x="16" y="151" class="tx-mono tx-sm">post:103</text>
+        <text x="104" y="151" class="tx-mono tx-sm">{entry, author, category}</text>
+        <text x="16" y="189" class="tx-mono tx-sm">user:1</text>
+        <text x="104" y="189" class="tx-mono tx-sm">{username, state}</text>
+        <text x="10" y="226" class="tx-mono tx-sm">посты jbellis?</text>
+        <line x1="134" y1="215" x2="146" y2="227" class="st-bad sw-3"/>
+        <line x1="146" y1="215" x2="134" y2="227" class="st-bad sw-3"/>
+        <text x="150" y="258" class="tx-hand tx-mid">только по ключу</text>
+      </svg>
+      <p class="fig-label">После: путь ключ-значение</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Слева — база данных блога со слайда (p. 346): четыре таблицы, связанные внешними ключами (стрелки). SQL может спрашивать по любому столбцу — здесь по username, — потому что движок поддерживает индексы и соединяет таблицы. Справа — тот же блог в хранилище ключ-значение: страница каждого поста — одно значение под одним ключом, которое достаётся за один шаг командой <code>GET post:101</code>. У вопроса о том, что внутри значений, — например, все посты jbellis, — входа нет.</figcaption>
+  </figure>
+
+  <p>Итак, хранилище ключ-значение от многого отказывается: нет запросов по содержимому значений, нет join, нет вторичных индексов, нет схемы для проверки. Взамен оно покупает стоимость. Поиск по ключу в хеш-таблице занимает один шаг при любом числе ключей, и ничего не нужно разбирать, планировать или собирать. Гонка ниже ставит на это числа.</p>
+
+  <div class="widget" id="l17-w-race">
+    <h3 class="widget-title">Гонка поиска: один ключ против дерева и join</h3>
+    <p class="widget-intro">Одна и та же запись достаётся тремя способами, пока таблицы растут от тысячи до миллиарда строк. Каждая кривая считает шаги одного поиска и умножает их на стоимость одного шага. Стоимости — принятые порядки величин, а не числа со слайдов: случайный доступ к памяти около 0.1 µs, случайное чтение страницы около 0.1 ms на SSD и 10 ms на вращающемся диске; B-дерево держит 100 ключей на страницу; ничего не кэшируется, если не выбрать RAM. Закрашенная полоса сверху — всё, что медленнее 100 ms, той задержки, которой слайд (p. 343) назначает цену. Обе оси логарифмические: каждая линия сетки в десять раз больше предыдущей.</p>
+    <ol class="tasks">
+      <li>Оставь «вращающийся диск» и N = 1 млн. Прежде чем что-то трогать: какая кривая останется плоской, когда N вырастет до миллиарда, и сколько чтений страниц понадобится там B-дереву? Потом перетащи ползунок до правого края.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Плоской остаётся только линия ключ-значение: один шаг при любом N, потому что хеш-таблица прыгает прямо в ячейку ключа. B-дерево получает новый уровень каждый раз, когда N вырастает в сто раз: 4 чтения страниц при миллионе, 6 при миллиарде (5 уровней индекса и страница данных), 60 ms; join платит это трижды, 18 чтений, 180 ms. Ради этого виджет и существует: стоимость поиска по ключу не растёт вместе с данными, а любого другого пути — растёт.</p></details>
+      </li>
+      <li>Всё ещё на вращающемся диске предскажи: при 1 000 строк в таблице попадает ли join трёх таблиц в закрашенную полосу, то есть медленнее ли он, чем 100 ms со слайда (p. 343)? Потом найди наименьшее N, при котором он входит в полосу.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Пока нет: 9 чтений страниц, 90 ms. В полосу он входит сразу после 10 000 строк (12,589 на ползунке): у B-дерева появляется третий уровень, каждому поиску нужно 4 чтения, а join — 12, итого 120 ms — в этой модели, где ничего не кэшируется.</p></details>
+      </li>
+      <li>Переключись на «RAM, всё в кэше». Предскажи: выигрывает ли хранилище ключ-значение и при миллиарде записей, и насколько?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Да, но с куда меньшим отрывом: 100 ns против 600 ns у B-дерева и 1.8 µs у join, в 6 и 18 раз. В памяти разница — только в числе шагов; на диске её задаёт носитель, от трёх до шести порядков величины. Хранилище ключ-значение убирает и то и другое — один шаг, в памяти, — а настоящая база данных ещё и разбирает и планирует каждую SQL-команду и берёт блокировки, чего эта модель не учитывает.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l17-w-race', function (root, ui) {
+    var STEP_RAM = 1e-7;                                   // one random access to memory: about 0.1 µs (assumed)
+    var MEDIA = {
+      hdd: { t: 1e-2, read: 'чтений страниц', note: 'На вращающемся диске каждое чтение страницы — это перемещение головки, здесь около 10 ms: порядок величины решает носитель, а не алгоритм.' },
+      ssd: { t: 1e-4, read: 'чтений страниц', note: 'У SSD нет головки, которую надо двигать, здесь около 0.1 ms на случайное чтение: реляционные кривые падают в сто раз, но остаются в тысячи раз выше поиска по ключу.' },
+      ram: { t: 1e-7, read: 'посещений страниц', note: 'Всё в памяти: остаётся только разница в числе шагов — 1 против числа уровней дерева или втрое больше для join.' }
+    };
+    var SUP = ['', '', '', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    var YL = ['1 s', '100 ms', '10 ms', '1 ms', '100 µs', '10 µs', '1 µs', '100 ns'];
+
+    function fmtInt(v) { return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function fmtN(v) {
+      var r = Math.round(v);
+      if (r < 1e6) return fmtInt(r);
+      if (r < 1e9) { var m = r / 1e6; return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + ' млн'; }
+      return (r / 1e9).toFixed(1) + ' млрд';
+    }
+    function fmtT(t) {
+      if (t < 1e-6) return Math.round(t * 1e9) + ' ns';
+      if (t < 1e-3) return +(t * 1e6).toPrecision(2) + ' µs';
+      if (t < 1) return +(t * 1e3).toPrecision(2) + ' ms';
+      return +t.toPrecision(2) + ' s';
+    }
+    function levels(x) { return Math.max(1, Math.ceil(x / 2 - 1e-9)); }    // B-tree height with 100 keys per page: log100 N = x / 2
+    function lg(t) { return Math.log(t) / Math.LN10; }
+
+    var n = ui.slider({ label: 'записей в каждой таблице, N', min: 3, max: 9, step: 0.1, value: 6,
+      format: function (v) { return fmtN(Math.pow(10, v)); } });
+    var where = ui.select('реляционные страницы читаются с', [
+      { value: 'hdd', label: 'вращающийся диск (≈10 ms на стр.)' },
+      { value: 'ssd', label: 'SSD (≈0.1 ms на стр.)' },
+      { value: 'ram', label: 'RAM, всё в кэше (≈0.1 µs на стр.)' }
+    ], null, 'hdd');
+    var roKV = ui.readout('ключ-значение, хеш-поиск');
+    var roBT = ui.readout('B-дерево, поиск по первичному ключу');
+    var roJN = ui.readout('join трёх таблиц');
+    var roX = ui.readout('медленнее поиска по ключу');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'ключ-значение: один хеш-поиск в RAM', color: 's5', mark: 'line' },
+      { label: 'реляционная: поиск по B-дереву в одной таблице', color: 's4', mark: 'line' },
+      { label: 'реляционная: тот же поиск в трёх таблицах с join', color: 's4', mark: 'dash' },
+      { label: 'медленнее 100 ms — задержка, которую слайд (p. 343) оценивает в 1% продаж Amazon', color: 'muted', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 336, { label: 'Время поиска одной записи на логарифмических осях в зависимости от числа записей в каждой таблице, от тысячи до миллиарда: плоская линия для хеш-поиска ключ-значение в памяти, растущая лесенка для поиска по B-дереву, лесенка выше для join трёх таблиц и закрашенная полоса для всего, что медленнее 100 миллисекунд' });
+
+    function X(x) { return 84 + (x - 3) * 76; }
+    function Y(L) { return 40 - L * 32; }                // L = log10 of seconds: 0 (1 s) at the top, -7.5 at the bottom
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+
+    function state() {
+      var x = n.value, h = levels(x), m = MEDIA[where.value];
+      return { x: x, h: h, bt: h + 1, jn: 3 * (h + 1), tbt: (h + 1) * m.t, tjn: 3 * (h + 1) * m.t, m: m };
+    }
+    function stairs(mult, t) {
+      var cuts = [3, 4, 6, 8, 9], pts = [];
+      for (var i = 0; i < cuts.length - 1; i++) {
+        var y = Y(lg(mult * (levels((cuts[i] + cuts[i + 1]) / 2) + 1) * t)).toFixed(1);
+        pts.push(X(cuts[i]) + ',' + y, X(cuts[i + 1]) + ',' + y);
+      }
+      return pts.join(' ');
+    }
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var k, L;
+      for (k = 3; k <= 9; k++) S('line', { x1: X(k), y1: 40, x2: X(k), y2: 280, 'class': 'st-grid' });
+      for (L = 0; L >= -7; L--) S('line', { x1: 84, y1: Y(L), x2: 540, y2: Y(L), 'class': 'st-grid' });
+      S('rect', { x: 84, y: 40, width: 456, height: 240, 'class': 'st-line fi-none' });
+      for (L = 0; L >= -7; L--) S('text', { x: 76, y: Y(L) + 5, 'class': 'tx-sm tx-end', text: YL[-L] });
+      for (k = 3; k <= 9; k++) S('text', { x: X(k), y: 302, 'class': 'tx-sm tx-mid', text: '10' + SUP[k] });
+      S('text', { x: 10, y: 22, 'class': 'tx-sm', text: 'время поиска одной записи' });
+      S('text', { x: 312, y: 328, 'class': 'tx-sm tx-mid', text: 'записей в каждой таблице, N' });
+      S('rect', { x: 84, y: 40, width: 456, height: Y(-1) - 40, 'class': 'fw-ink st-none' });
+      S('line', { x1: 84, y1: Y(-1), x2: 540, y2: Y(-1), 'class': 'st-muted sw-2' });
+      S('line', { x1: X(s.x), y1: 42, x2: X(s.x), y2: 278, 'class': 'hl' });
+      S('line', { x1: X(s.x), y1: 40, x2: X(s.x), y2: 280, 'class': 'st-ink sw-1' });
+      S('line', { x1: 84, y1: Y(-7), x2: 540, y2: Y(-7), 'class': 'st-s5 sw-3' });
+      S('polyline', { points: stairs(1, s.m.t), 'class': 'st-s4 sw-3 fi-none' });
+      S('polyline', { points: stairs(3, s.m.t), 'class': 'st-s4 sw-3 dash fi-none' });
+      S('circle', { cx: X(s.x), cy: Y(-7), r: 6, 'class': 'fi-s5 st-paper sw-2' });
+      S('circle', { cx: X(s.x), cy: Y(lg(s.tbt)), r: 6, 'class': 'fi-s4 st-paper sw-2' });
+      var yj = Y(lg(s.tjn));
+      S('rect', { x: X(s.x) - 6, y: yj - 6, width: 12, height: 12, 'class': 'fi-s4 st-paper sw-2' });
+    }
+    ui.onChange(function () {
+      var s = state();
+      roKV.set('1 шаг в памяти · ' + fmtT(STEP_RAM));
+      roBT.set('уровней индекса: ' + s.h + ' + 1 страница данных = ' + s.bt + ' ' + s.m.read + ' · ' + fmtT(s.tbt));
+      roJN.set('3 × ' + s.bt + ' = ' + s.jn + ' ' + s.m.read + ' · ' + fmtT(s.tjn), s.tjn > 0.1 ? 'key' : undefined);
+      roX.set('B-дерево ×' + fmtInt(s.tbt / STEP_RAM) + ' · join ×' + fmtInt(s.tjn / STEP_RAM));
+      note.set(s.m.note + ' Каждое показанное время посчитано этой моделью; со слайда (p. 343) взята только граница закрашенной полосы, 100 ms.');
+      draw(s);
+    });
+  });
+  </script>
+
+  <p>Один шаг в памяти — в этом вся суть. Реляционный поиск, как бы хорошо он ни был проиндексирован, карабкается по дереву, высота которого растёт вместе с данными, и на диске платит за позиционирование головки на каждом уровне; join платит это за каждую таблицу.</p>
+
+  <p class="memo"><mark class="key">Хранилище ключ-значение отвечает на один вопрос — что лежит под этим ключом? — и отказывается от всех остальных вопросов, чтобы отвечать на этот за один шаг.</mark></p>
+
+  <p>Есть и второй подарок (контекст, не с этих слайдов). Раз каждый запрос называет свой ключ, ключи можно разложить по многим машинам, хешируя их, и любой клиент может вычислить, где живёт ключ. Dynamo размещала ключи и машины на кольце — это консистентное хеширование (consistent hashing), придуманное в MIT в 1997 году для веб-кэшей. Собственные способы Redis делить ключи появятся в <a href="l19.html">уроке 19</a>; само кольцо вернётся вместе с Cassandra в <a href="l22.html">уроке 22</a>.</p>
+
+  <div class="pitfall"><p>«Хранилище ключ-значение — это реляционная таблица с двумя столбцами, key и value». Нет: таблицу можно искать по столбцу значений, индексировать и соединять. У хранилища ключ-значение ничего этого нет; единственный эффективный вопрос — точный ключ. Redis добавляет операции над значением (следующий раздел), но никогда — запрос по значениям.</p></div>
+</section>
+
+
+<section id="l17-redis">
+  <h2>Redis: словарь, который обслуживают по сети</h2>
+
+  <p>Титульный слайд раздела (p. 347) расшифровывает название: <b>RE</b>mote <b>DI</b>ctionary <b>S</b>erver. Словарь — хеш-таблица из ключей в значения, — который живёт на сервере и отвечает по сети. Слайд "What is REDIS ?" (p. 348) даёт определение:</p>
+
+  <div class="def">
+    <p><dfn>Redis</dfn> — "Redis is an advanced key-value store, where keys can contain data structures such as strings, hashes, lists, sets, and sorted sets. Supporting a set of atomic operations on these data types." Слайд выделяет следующую фразу: "Redis is a different evolution path in the key-value databases where values are complex data types that are closely related to fundamental data structures and are exposed to the programmer as such, without additional abstraction layers." Иначе говоря, значения в Redis — сложные типы, близкие к базовым структурам данных, и программист работает с ними напрямую, без лишних слоёв абстракции.</p>
+  </div>
+
+  <p>Здесь три идеи, которые надо различать. Это хранилище ключ-значение: доступ по ключу, и больше никак. Значение под ключом может быть <mark class="key">структурой данных (data structure)</mark>, которую сервер понимает, — string, hash, list, set, sorted set. И операции над этими структурами атомарны. Средняя идея — это и есть смысл слова "advanced". Для простого хранилища ключ-значение список — такая же строка байтов, как любая другая; для Redis это список, поэтому ты отправляешь операцию, а не значение (рис. 2).</p>
+
+  <figure class="fig fig--pair" id="l17-fig-value">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Простое хранилище ключ-значение: клиент читает всё значение ключа jobs, дописывает baz в своём коде и записывает всё новое значение обратно через SET, а хранилище подтверждает это ответом OK">
+        <rect x="22" y="12" width="56" height="26" rx="6" class="fi-paper"/>
+        <text x="50" y="29" class="tx-sm tx-mid">клиент</text>
+        <rect x="160" y="12" width="44" height="26" class="fw-s3 st-s3"/>
+        <text x="182" y="29" class="tx-mono tx-sm tx-mid">jobs</text>
+        <rect x="204" y="12" width="88" height="26" class="fi-paper"/>
+        <text x="248" y="29" class="tx-mono tx-sm tx-mid">[bar,foo]</text>
+        <line x1="50" y1="38" x2="50" y2="224" class="st-muted dash"/>
+        <line x1="230" y1="38" x2="230" y2="224" class="st-muted dash"/>
+        <line x1="52" y1="70" x2="226" y2="70" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="140" y="63" class="tx-mono tx-sm tx-mid halo">GET jobs</text>
+        <line x1="228" y1="104" x2="54" y2="104" class="st-s1 sw-2 dash" marker-end="url(#arr-s1)"/>
+        <text x="140" y="97" class="tx-mono tx-sm tx-mid halo">[bar,foo]</text>
+        <rect x="12" y="124" width="76" height="26" class="fi-soft"/>
+        <text x="50" y="141" class="tx-sm tx-mid">допиши baz</text>
+        <line x1="52" y1="178" x2="226" y2="178" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="140" y="171" class="tx-mono tx-sm tx-mid halo">SET jobs [bar,foo,baz]</text>
+        <line x1="228" y1="210" x2="54" y2="210" class="dash" marker-end="url(#arr)"/>
+        <text x="140" y="203" class="tx-mono tx-sm tx-mid halo">OK</text>
+      </svg>
+      <p class="fig-label">До: простое хранилище ключ-значение</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 240" role="img" aria-label="Redis: ключ jobs хранит список bar, foo; клиент отправляет одну команду, RPUSH jobs baz, сервер сам дописывает baz в список и отвечает новой длиной, 3">
+        <rect x="22" y="12" width="56" height="26" rx="6" class="fi-paper"/>
+        <text x="50" y="29" class="tx-sm tx-mid">клиент</text>
+        <rect x="150" y="12" width="44" height="26" class="fw-s3 st-s3"/>
+        <text x="172" y="29" class="tx-mono tx-sm tx-mid">jobs</text>
+        <rect x="200" y="12" width="36" height="26" class="fi-paper"/>
+        <text x="218" y="29" class="tx-mono tx-sm tx-mid">bar</text>
+        <text x="246" y="29" class="tx-sm tx-mid">↔</text>
+        <rect x="256" y="12" width="36" height="26" class="fi-paper"/>
+        <text x="274" y="29" class="tx-mono tx-sm tx-mid">foo</text>
+        <line x1="50" y1="38" x2="50" y2="140" class="st-muted dash"/>
+        <line x1="230" y1="38" x2="230" y2="140" class="st-muted dash"/>
+        <line x1="52" y1="70" x2="226" y2="70" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="140" y="63" class="tx-mono tx-sm tx-mid halo">RPUSH jobs "baz"</text>
+        <line x1="228" y1="104" x2="54" y2="104" class="dash" marker-end="url(#arr)"/>
+        <text x="140" y="97" class="tx-mono tx-sm tx-mid halo">(integer) 3</text>
+        <text x="10" y="167" class="tx-sm tx-muted">после</text>
+        <rect x="58" y="150" width="44" height="26" class="fw-s3 st-s3"/>
+        <text x="80" y="167" class="tx-mono tx-sm tx-mid">jobs</text>
+        <rect x="112" y="150" width="36" height="26" class="fi-paper"/>
+        <text x="130" y="167" class="tx-mono tx-sm tx-mid">bar</text>
+        <text x="158" y="167" class="tx-sm tx-mid">↔</text>
+        <rect x="168" y="150" width="36" height="26" class="fi-paper"/>
+        <text x="186" y="167" class="tx-mono tx-sm tx-mid">foo</text>
+        <text x="214" y="167" class="tx-sm tx-mid">↔</text>
+        <rect x="224" y="150" width="36" height="26" class="fw-s1 st-s1 sw-2"/>
+        <text x="242" y="167" class="tx-mono tx-sm tx-mid">baz</text>
+        <text x="150" y="216" class="tx-hand tx-mid">одна команда, на сервере</text>
+      </svg>
+      <p class="fig-label">После: Redis</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Добавляем одну задачу в список. Слева: для простого хранилища ключ-значение список — непрозрачное значение, поэтому клиент читает его целиком, дописывает элемент в своём коде и записывает всё обратно — всё значение дважды проходит по сети, а <code>SET</code> другого клиента может вклиниться между двумя шагами. Справа: Redis знает, что значение — список, "exposed to the programmer as such" (p. 348), поэтому одна атомарная команда дописывает элемент на сервере и возвращает новую длину.</figcaption>
+  </figure>
+
+  <p>Практическое занятие говорит то же простыми словами: "The stored values can be simple types (e.g., numbers) or complex structures (e.g., lists)" (p. 1581). Values, значения, — держи это слово в голове, когда перечитываешь первую фразу слайда (p. 348).</p>
+
+  <div class="pitfall"><p>«В Redis ключ может быть списком или хешем». Нет: ключ — это всегда строка (binary-safe); string, hash, list, set или sorted set — это значение, которое под ним хранится. "Keys can contain data structures" со слайда — старый собственный слоган Redis, и означает он, что ключ содержит такое значение, как и говорит следующая фраза: "values are complex data types" (так же и таблица на слайде (p. 354), и занятие (p. 1581)). Проверь на команде: в <code>HSET user:1 name John</code> ключ <code>user:1</code> — обычная строка, хеш с полем <code>name</code> — его значение, а <code>TYPE user:1</code> отвечает <code>hash</code>, то есть тип значения. Если вопрос «верно/неверно» цитирует фразу слайда, это собственное определение слайда: считай его верным, а в своих ответах пиши "the value of a key can be".</p></div>
+
+  <p>Последняя строка слайда (p. 348): "Can be used as Database, a Caching layer or a Message broker", и у каждой роли своя причина. <b>База данных</b> — потому что "Redis can persist data to the disk": он умеет писать снимки и журналы и загружать их после перезапуска (<a href="l19.html#l19-axes">урок 19</a>). <b>Слой кэширования</b> — потому что "Redis is fast": копии данных, которые дорого достать или вычислить, отдаются из памяти. <b>Брокер сообщений</b> — потому что "Redis is not only a key-value store": клиенты публикуют сообщения в каналы, на которые подписаны другие клиенты, или передают работу через список, которого ждёт обработчик.</p>
+
+  <p>Слайд "What is not REDIS" (p. 349) проводит границы:</p>
+  <ul>
+    <li>"Redis is not a replacement for Relational Databases nor Document Stores."</li>
+    <li>"It might be used complementary to a SQL relational store, and/or NoSQL document store."</li>
+    <li>"Even when Redis offers configurable mechanisms for persistency, increased persistency will tend to increase latency and decrease throughput."</li>
+    <li>"Best used for rapidly changing data with a foreseeable database size (should fit mostly in memory)."</li>
+  </ul>
+
+  <p>Каждая граница следует из того, где живут данные. Раз в памяти, набор данных должен влезть в RAM, которую ты можешь себе позволить, так что его размер должен быть предсказуемым. Персистентность — это регулятор: чем чаще Redis пишет на диск, прежде чем ответить, тем дольше каждая запись ждёт диска — та самая цена, что ты видел в гонке. Поэтому основная система учёта (system of record) остаётся в другом месте, а Redis держит то, что маленькое, горячее и быстро меняется (рис. 3).</p>
+
+  <figure class="fig fig--plain" id="l17-fig-beside">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="Приложение работает с двумя хранилищами: слева SQL- или документное хранилище, основная система учёта, с заказами, платежами и медицинскими картами; справа Redis с сессиями, корзинами, счётчиками, закэшированными страницами, очередями и каналами pub/sub">
+      <rect x="200" y="14" width="160" height="36" rx="8" class="fi-paper"/>
+      <text x="280" y="38" class="tx-mid">приложение</text>
+      <line x1="240" y1="52" x2="162" y2="106" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="320" y1="52" x2="398" y2="106" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="186" y="80" class="tx-sm tx-end">истина</text>
+      <text x="374" y="80" class="tx-sm">горячие данные</text>
+      <rect x="20" y="110" width="240" height="122" class="fi-paper st-s4 sw-2"/>
+      <text x="36" y="138" class="tx-bold">SQL / document store</text>
+      <text x="36" y="164" class="tx-sm">заказы, платежи,</text>
+      <text x="36" y="186" class="tx-sm">медицинские карты</text>
+      <text x="36" y="212" class="tx-sm tx-bold">основная система учёта</text>
+      <rect x="300" y="110" width="240" height="122" class="fi-paper st-s5 sw-2"/>
+      <text x="316" y="138" class="tx-bold">Redis</text>
+      <text x="316" y="164" class="tx-sm">сессии, корзины,</text>
+      <text x="316" y="186" class="tx-sm">счётчики, кэш страниц,</text>
+      <text x="316" y="212" class="tx-sm">очереди, pub/sub</text>
+      <text x="280" y="266" class="tx-hand tx-mid">рядом, а не вместо</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Где стоит Redis, по слайду (p. 349): не "a replacement for Relational Databases nor Document Stores", а "complementary" к ним. То, что нельзя потерять никогда, приложение держит в основной системе учёта, а маленькие, горячие, быстро меняющиеся данные — в Redis.</figcaption>
+  </figure>
+
+  <p>Сценарии использования со слайда (p. 350) — это роли в деле; таблица ставит рядом с каждым то, что делает работу в Redis. (Если ты когда-нибудь будешь обслуживать обученную нейросеть в приложении, признаки, которые она читает в момент предсказания, живут в таком же хранилище: лекция про feature store говорит, что они "typically stored in low-latency databases like Redis" (p. 735, <a href="l29.html">урок 29</a>).)</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Сценарии со слайда (p. 350) и то, что обслуживает каждый из них.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Сценарий (p. 350)</th><th>Роль</th><th>Что делает работу</th></tr></thead>
+        <tbody>
+          <tr><td>Caching; MVC Output Cache provider</td><td>слой кэширования</td><td>значение под ключом, обычно со временем жизни (<a href="l19.html">урок 19</a>)</td></tr>
+          <tr><td>Counting things</td><td>база данных</td><td>string с целым числом, которое увеличивается на сервере</td></tr>
+          <tr><td>Blocking queues</td><td>брокер сообщений</td><td>list: push с одного конца, pop с ожиданием — с другого</td></tr>
+          <tr><td>Pub/Sub (service bus); Backplane for SignalR; "Any real-time, cross-platform, cross-application communication"</td><td>брокер сообщений</td><td>каналы: издатели отправляют, каждый подписчик получает</td></tr>
+          <tr><td>ASP.NET Session State provider; Online user data (shopping cart, …)</td><td>база данных или кэш</td><td>hash на сессию, пользователя или корзину, часто со временем жизни</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Слайд "When to consider Redis" (p. 351) сжимает всё это в четыре условия — две причины выбрать Redis, потом два ограничения, которые нужно соблюдать:</p>
+  <ul>
+    <li>"Speed is critical" — данные в памяти, и большинство команд занимает один шаг.</li>
+    <li>"More than just key-value pairs" — тебе нужны структуры данных и атомарные операции над ними; для простых непрозрачных значений справится кэш попроще (memcached, <a href="l19.html#l19-memcached">урок 19</a>).</li>
+    <li>"Dataset can fit in memory" — граница со слайда (p. 349).</li>
+    <li>"Dataset is not critical" — ты можешь позволить себе потерять последние изменения, если сервер упадёт, потому что сделать каждую запись долговечной стоит той самой скорости, ради которой ты пришёл.</li>
+  </ul>
+
+  <div class="pitfall"><p>Если повторяешь по конспекту курса: на с. 20 конспекта сказано, что "being in-memory means that a single shutdown will cost you all your data" — раз всё в памяти, одно выключение стоит всех данных. Слайды говорят иначе — "Redis can persist data to the disk" (p. 348). Падение может стоить самых последних записей, в зависимости от настройки персистентности (<a href="l19.html">урок 19</a>); именно этот риск и принимает "Dataset is not critical".</p></div>
+
+  <p class="memo"><mark class="key">Redis — хранилище ключ-значение, значения которого — понятные серверу структуры данных: ты отправляешь операцию, а не всё значение.</mark></p>
+</section>
+
+
+<section id="l17-thread">
+  <h2>Один поток, одна команда за раз</h2>
+
+  <p>Слайд "Redis Architecture" (p. 352) — это список фактов. Сначала простые: Redis "Written in ANSI C by Salvatore Sanfilippo (@antirez)", "Works in most POSIX systems like Linux, BSD and OS X", "Linux is the recommended", и "No official support for Windows" (слайд добавляет порт под Win-64, который поддерживает Microsoft). Ещё две строки несут на себе экзамен.</p>
+
+  <p>Начнём со случая. Планшеты двух медсестёр в один и тот же момент записывают посещение одного отделения: оба отправляют <code>INCR visits</code>, а в <code>visits</code> лежит 10. Внутри сервера Redis «одного и того же момента» не бывает: две команды ждут в очереди и выполняются одна за другой, 10 → 11 → 12 (рис. 4).</p>
+
+  <figure class="fig fig--plain" id="l17-fig-thread">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Три клиента A, B и C отправляют команды в одну очередь; один поток выполняет их одну за другой вдоль оси времени: INCR visits от A даёт 11, INCR visits от C даёт 12, LPUSH jobs x от B даёт 1, GET visits от A даёт 12">
+      <text x="20" y="30" class="tx-sm">клиенты</text>
+      <rect x="20" y="46" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="38" y="63" class="tx-mid">A</text>
+      <rect x="20" y="116" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="38" y="133" class="tx-mid">B</text>
+      <rect x="20" y="186" width="36" height="24" rx="6" class="fi-paper"/>
+      <text x="38" y="203" class="tx-mid">C</text>
+      <line x1="58" y1="60" x2="168" y2="98" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="58" y1="128" x2="168" y2="128" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="58" y1="196" x2="168" y2="158" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <rect x="172" y="84" width="30" height="22" class="fi-paper"/>
+      <rect x="172" y="106" width="30" height="22" class="fi-paper"/>
+      <rect x="172" y="128" width="30" height="22" class="fi-paper"/>
+      <rect x="172" y="150" width="30" height="22" class="fi-paper"/>
+      <text x="187" y="194" class="tx-sm tx-mid">очередь</text>
+      <line x1="204" y1="128" x2="234" y2="128" marker-end="url(#arr)"/>
+      <text x="240" y="30" class="tx-sm">один поток</text>
+      <rect x="240" y="46" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="66" class="tx-mono tx-sm">A  INCR visits</text>
+      <text x="462" y="66" class="tx-mono tx-sm">→ 11</text>
+      <rect x="240" y="86" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="106" class="tx-mono tx-sm">C  INCR visits</text>
+      <text x="462" y="106" class="tx-mono tx-sm">→ 12</text>
+      <rect x="240" y="126" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="146" class="tx-mono tx-sm">B  LPUSH jobs x</text>
+      <text x="462" y="146" class="tx-mono tx-sm">→ 1</text>
+      <rect x="240" y="166" width="210" height="30" class="fi-paper sw-2"/>
+      <text x="250" y="186" class="tx-mono tx-sm">A  GET visits</text>
+      <text x="462" y="186" class="tx-mono tx-sm">→ "12"</text>
+      <line x1="544" y1="46" x2="544" y2="196" class="st-muted" marker-end="url(#arr-muted)"/>
+      <text x="536" y="30" class="tx-sm tx-end">время</text>
+      <text x="345" y="248" class="tx-hand tx-mid">никаких двух одновременно</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Три клиента, один поток. Команды со всех соединений ждут в одной очереди и выполняются по одной, каждая до конца, прежде чем начнётся следующая, — "no two commands can run at the same time" (p. 352). Два инкремента от A и C не могут перемешаться: <code>visits</code> идёт от 10 к 11 и к 12, и нигде нет ни одной блокировки.</figcaption>
+  </figure>
+
+  <p>Слайд: "Redis is a single-threaded server, not designed to benefit from multiple CPU cores. Several Redis instances can be launched to scale out on several cores." Однопоточный сервер не выигрывает от многих ядер; чтобы занять несколько ядер, запускают несколько экземпляров. И следствие, пунктом ниже: "All operations are atomic (no two commands can run at the same time)."</p>
+
+  <div class="def">
+    <p><dfn>Атомарная команда (atomic command)</dfn> — команда, которая выполняется от начала до конца без какой-либо другой команды посередине: ни один клиент не увидит её сделанной наполовину, и она происходит либо целиком, либо никак.</p>
+  </div>
+
+  <p>Однопоточный — значит атомарный, и нигде никаких блокировок: блокировка (lock) существует, чтобы не пустить два потока к одним данным, а здесь поток только один. Два клиента, которые одновременно отправляют <code>INCR</code>, всегда насчитают два; <code>LPUSH</code> никогда не наткнётся на наполовину построенный список.</p>
+
+  <div class="pitfall"><p>«Все операции атомарны, так что всё, что я отправлю, безопасно». Атомарна каждая <em>команда</em>. <code>GET</code>, за которым идёт <code>SET</code>, — это две команды, и между ними может выполниться команда другого клиента — потерянное обновление (lost update), которое рисует практическое занятие, и причина, по которой существует <code>INCR</code> (<a href="l18.html#l18-w-race">урок 18</a> проигрывает это заново). Несколько команд становятся одним атомарным блоком только внутри транзакции (<code>MULTI</code> … <code>EXEC</code>) или Lua-скрипта: слайд с преимуществами называет "Atomic operations and Transactions" и "LUA scripting support" (p. 365), но не объясняет их — это контекст за пределами экзаменационных команд.</p></div>
+
+  <p>Один поток звучит медленно. Но он быстрый, и на то четыре причины:</p>
+  <ul>
+    <li>Данные в памяти: на пути запроса нет диска, если только ты не заставишь каждую запись его ждать (регулятор со слайда (p. 349)), — гонка из раздела 1.</li>
+    <li>Шаги короткие: "It executes most commands in O(1) complexity and with minimal lines of code" (p. 352).</li>
+    <li>Никто ничего не ждёт: не нужно брать блокировки, не нужно переключаться между потоками.</li>
+    <li>Один поток обслуживает тысячи соединений: он следит за всеми сразу и обслуживает то, где команда уже готова (цикл событий, event loop; контекст).</li>
+  </ul>
+
+  <p>Клеппман в <i>Designing Data-Intensive Applications</i> добавляет причину потоньше (контекст): «преимущество in-memory баз данных в производительности не в том, что им не нужно читать с диска… скорее они могут быть быстрее, потому что избегают накладных расходов на кодирование структур данных из памяти в форму, которую можно записать на диск». Список Redis — это список в памяти, а не формат страницы, который надо переводить туда и обратно.</p>
+
+  <p>У такого устройства есть цена. Пока выполняется одна команда, все остальные клиенты ждут, поэтому команда над огромным значением — все элементы set на миллион записей — задерживает всех; очередь движется как раз благодаря "most commands in O(1)". И один поток использует одно ядро: чтобы задействовать восемь ядер, запускают восемь экземпляров, у каждого часть ключей, — зародыш партиционирования (<a href="l19.html">урок 19</a>).</p>
+
+  <details class="why">
+    <summary>Redis до сих пор однопоточный?</summary>
+    <p>В основном да. С Redis 6.0 (2020) чтение и запись сетевого трафика можно разнести по дополнительным потокам, а сохранение на диск идёт в отдельном дочернем процессе. Сами команды по-прежнему выполняются по одной в одном потоке — именно это и имеет в виду слайд, именно это делает их атомарными, и именно это экзамен ждёт от тебя услышать.</p>
+  </details>
+
+  <p>Следующий слайд (p. 353) рисует весь сервер на одной картинке, и она же служит картой этого урока и двух следующих (рис. 5).</p>
+
+  <figure class="fig fig--plain" id="l17-fig-map">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="Карта архитектуры со слайда 13 лекции 8: слева структуры данных string, hash, list, set, sorted set, HLL и bitmap; в центре пятиугольник с надписью REDIS; справа персистентность: journal (text) и snapshot (binary) над persist / restore над OS; внизу replication, networking и clients, а под ними sentinel и cluster">
+      <text x="14" y="22" class="tx-sm">структуры данных · уроки 17–18</text>
+      <text x="546" y="22" class="tx-sm tx-end">персистентность · урок 19</text>
+      <rect x="14" y="32" width="212" height="152" class="fw-s1 st-none"/>
+      <rect x="24" y="42" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="60" class="tx-sm tx-mid">string</text>
+      <rect x="24" y="78" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="96" class="tx-sm tx-mid">hash</text>
+      <rect x="24" y="114" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="132" class="tx-sm tx-mid">list</text>
+      <rect x="24" y="150" width="84" height="26" class="fi-paper st-s1"/>
+      <text x="66" y="168" class="tx-sm tx-mid">set</text>
+      <rect x="118" y="42" width="100" height="26" class="fi-paper st-s1"/>
+      <text x="168" y="60" class="tx-sm tx-mid">sorted set</text>
+      <rect x="118" y="78" width="100" height="26" class="fi-paper st-s1"/>
+      <text x="168" y="96" class="tx-sm tx-mid">HLL</text>
+      <rect x="118" y="114" width="100" height="26" class="fi-paper st-s1"/>
+      <text x="168" y="132" class="tx-sm tx-mid">bitmap</text>
+      <polygon points="288,64 334,97 316,152 260,152 242,97" class="fi-paper sw-2"/>
+      <text x="288" y="121" class="tx-bold tx-mid">REDIS</text>
+      <rect x="352" y="36" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="54" class="tx-sm tx-mid">journal (text)</text>
+      <rect x="352" y="70" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="88" class="tx-sm tx-mid">snapshot (binary)</text>
+      <rect x="352" y="104" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="122" class="tx-sm tx-mid">persist / restore</text>
+      <rect x="352" y="138" width="194" height="26" class="fi-paper"/>
+      <text x="449" y="156" class="tx-sm tx-mid">OS</text>
+      <rect x="40" y="198" width="130" height="26" class="fi-paper"/>
+      <text x="105" y="216" class="tx-sm tx-mid">replication</text>
+      <rect x="210" y="198" width="130" height="26" class="fi-paper"/>
+      <text x="275" y="216" class="tx-sm tx-mid">networking</text>
+      <rect x="380" y="198" width="110" height="26" class="fi-paper"/>
+      <text x="435" y="216" class="tx-sm tx-mid">clients</text>
+      <rect x="150" y="240" width="110" height="26" class="fi-paper"/>
+      <text x="205" y="258" class="tx-sm tx-mid">sentinel</text>
+      <rect x="300" y="240" width="110" height="26" class="fi-paper"/>
+      <text x="355" y="258" class="tx-sm tx-mid">cluster</text>
+      <text x="424" y="258" class="tx-sm tx-muted">урок 19</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Карта архитектуры со слайда (p. 353) с уроками, которые разбирают каждую часть. Слева — структуры данных (HLL, то есть HyperLogLog, и bitmap построены на строках); справа — персистентность; внизу — репликация, сеть и клиенты, а также два дополнения на случай, когда одного сервера мало, — Sentinel и Cluster.</figcaption>
+  </figure>
+
+  <p>Читай её как оглавление. Слева — структуры данных: следующий раздел, потом команды <a href="l18.html">урока 18</a>. Справа — персистентность: "journal (text)" — это журнал всех записей, <abbr title="append-only file">AOF</abbr>, а "snapshot (binary)" — снимок всего набора данных, файл <abbr title="Redis database snapshot">RDB</abbr>, — два механизма со слайда (p. 359). Внизу — механика для нескольких серверов: репликация держит slaves как "exact copies of the master" (p. 359), Sentinel повышает slave, когда master умирает, а Cluster вдобавок раскладывает ключи по нескольким masters (<a href="l19.html">урок 19</a>).</p>
+
+  <p class="memo"><mark class="key">Один поток выполняет одну команду за раз: каждая команда атомарна без блокировок и быстра, потому что каждая — короткий шаг в памяти.</mark></p>
+</section>
+
+
+<section id="l17-types">
+  <h2>Семь форм для значения</h2>
+
+  <p>Слайд "Redis data types" (p. 354) перечисляет, чем может быть значение под ключом: семь типов, у каждого — что он "Contains" и его "Read/write ability". Сначала посмотри на картинки (рис. 6); текст слайда для каждого типа — во вкладках под ними.</p>
+
+  <figure class="fig fig--plain" id="l17-fig-types">
+    <svg class="dia" viewBox="0 0 560 330" role="img" aria-label="Семь типов данных Redis со слайда 14 лекции 8, каждый как значение под одним ключом: string с представлением bitmap, hash с полями name и visits, list A C B C с повторами, set D B C A, sorted set в порядке score от B 0.1 до C 250, geospatial-элемент с широтой и долготой и HyperLogLog из битов">
+      <text x="10" y="31" class="tx-sm">String</text>
+      <rect x="130" y="12" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="31" class="tx-mono tx-sm">greeting</text>
+      <line x1="222" y1="26" x2="236" y2="26" class="st-muted"/>
+      <rect x="236" y="12" width="144" height="28" class="fi-paper"/>
+      <text x="242" y="31" class="tx-mono tx-sm">I'm a string!</text>
+      <rect x="390" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="408" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="426" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="444" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="462" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="480" y="12" width="18" height="28" class="fi-paper"/>
+      <rect x="498" y="12" width="18" height="28" class="fi-paper"/>
+      <text x="399" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="417" y="31" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="435" y="31" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="453" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="471" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="489" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="507" y="31" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="524" y="31" class="tx-sm">…</text>
+
+      <text x="10" y="77" class="tx-sm">Hash</text>
+      <rect x="130" y="58" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="77" class="tx-mono tx-sm">user:1</text>
+      <line x1="222" y1="72" x2="236" y2="72" class="st-muted"/>
+      <rect x="236" y="58" width="54" height="28" class="fi-soft"/>
+      <rect x="290" y="58" width="54" height="28" class="fi-paper"/>
+      <rect x="354" y="58" width="74" height="28" class="fi-soft"/>
+      <rect x="428" y="58" width="30" height="28" class="fi-paper"/>
+      <text x="242" y="77" class="tx-mono tx-sm">name</text>
+      <text x="296" y="77" class="tx-mono tx-sm">John</text>
+      <text x="360" y="77" class="tx-mono tx-sm">visits</text>
+      <text x="443" y="77" class="tx-mono tx-sm tx-mid">1</text>
+
+      <text x="10" y="123" class="tx-sm">List</text>
+      <rect x="130" y="104" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="123" class="tx-mono tx-sm">jobs</text>
+      <line x1="222" y1="118" x2="236" y2="118" class="st-muted"/>
+      <rect x="236" y="104" width="32" height="28" class="fi-paper"/>
+      <rect x="292" y="104" width="32" height="28" class="fi-paper"/>
+      <rect x="348" y="104" width="32" height="28" class="fi-paper"/>
+      <rect x="404" y="104" width="32" height="28" class="fi-paper"/>
+      <text x="252" y="123" class="tx-mono tx-sm tx-mid">A</text>
+      <text x="280" y="123" class="tx-sm tx-mid">↔</text>
+      <text x="308" y="123" class="tx-mono tx-sm tx-mid">C</text>
+      <text x="336" y="123" class="tx-sm tx-mid">↔</text>
+      <text x="364" y="123" class="tx-mono tx-sm tx-mid">B</text>
+      <text x="392" y="123" class="tx-sm tx-mid">↔</text>
+      <text x="420" y="123" class="tx-mono tx-sm tx-mid">C</text>
+
+      <text x="10" y="169" class="tx-sm">Set</text>
+      <rect x="130" y="150" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="169" class="tx-mono tx-sm">users</text>
+      <line x1="222" y1="164" x2="236" y2="164" class="st-muted"/>
+      <rect x="236" y="150" width="32" height="28" class="fi-paper"/>
+      <rect x="278" y="150" width="32" height="28" class="fi-paper"/>
+      <rect x="320" y="150" width="32" height="28" class="fi-paper"/>
+      <rect x="362" y="150" width="32" height="28" class="fi-paper"/>
+      <text x="252" y="169" class="tx-mono tx-sm tx-mid">D</text>
+      <text x="294" y="169" class="tx-mono tx-sm tx-mid">B</text>
+      <text x="336" y="169" class="tx-mono tx-sm tx-mid">C</text>
+      <text x="378" y="169" class="tx-mono tx-sm tx-mid">A</text>
+
+      <text x="10" y="215" class="tx-sm">Sorted set</text>
+      <rect x="130" y="196" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="215" class="tx-mono tx-sm">scores</text>
+      <line x1="222" y1="210" x2="236" y2="210" class="st-muted"/>
+      <rect x="236" y="196" width="64" height="28" class="fi-paper"/>
+      <rect x="306" y="196" width="64" height="28" class="fi-paper"/>
+      <rect x="376" y="196" width="64" height="28" class="fi-paper"/>
+      <rect x="446" y="196" width="64" height="28" class="fi-paper"/>
+      <text x="268" y="215" class="tx-mono tx-sm tx-mid">B 0.1</text>
+      <text x="338" y="215" class="tx-mono tx-sm tx-mid">D 0.3</text>
+      <text x="408" y="215" class="tx-mono tx-sm tx-mid">A 250</text>
+      <text x="478" y="215" class="tx-mono tx-sm tx-mid">C 250</text>
+
+      <text x="10" y="254" class="tx-sm">Geospatial</text>
+      <text x="10" y="273" class="tx-sm tx-muted">lat, lon</text>
+      <rect x="130" y="242" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="261" class="tx-mono tx-sm">places</text>
+      <line x1="222" y1="256" x2="236" y2="256" class="st-muted"/>
+      <rect x="236" y="242" width="64" height="28" class="fi-paper"/>
+      <rect x="306" y="242" width="96" height="28" class="fi-paper"/>
+      <rect x="408" y="242" width="116" height="28" class="fi-paper"/>
+      <text x="268" y="261" class="tx-mono tx-sm tx-mid">Value</text>
+      <text x="354" y="261" class="tx-mono tx-sm tx-mid">20.63373</text>
+      <text x="466" y="261" class="tx-mono tx-sm tx-mid">-103.55328</text>
+
+      <text x="10" y="307" class="tx-sm">HyperLogLog</text>
+      <rect x="130" y="288" width="92" height="28" class="fw-s3 st-s3"/>
+      <text x="135" y="307" class="tx-mono tx-sm">visitors</text>
+      <line x1="222" y1="302" x2="236" y2="302" class="st-muted"/>
+      <rect x="236" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="254" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="272" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="290" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="308" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="326" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="344" y="288" width="18" height="28" class="fi-paper"/>
+      <rect x="362" y="288" width="18" height="28" class="fi-paper"/>
+      <text x="245" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="263" y="307" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="281" y="307" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="299" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="317" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="335" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="353" y="307" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="371" y="307" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="390" y="307" class="tx-sm">…</text>
+      <text x="410" y="307" class="tx-sm tx-muted">всегда 12 KB</text>
+    </svg>
+    <figcaption><b>Рис. 6.</b> Семь типов со слайда (p. 354), каждый нарисован как значение под одним ключом (фиолетовым). Картинки — со слайда, только у hash добавлены конкретные поля: list хранит порядок и повторы (C дважды), set — ни то ни другое; sorted set упорядочен по score, у A и C поровну, 250; geospatial index хранит элемент с его широтой и долготой; HyperLogLog хранит одни биты. Строку можно также читать и писать побитово — строка bitmap.</figcaption>
+  </figure>
+
+  <aside class="margin-note">Занятие называет sorted set «ordered set» (p. 1602): это тот же тип.</aside>
+
+  <p>Читай картинки парами. List и set оба хранят строки, но list хранит порядок вставки и повторы — C встречается дважды, — а set ни того ни другого: каждая строка один раз, без порядка. Практическое занятие даёт причину выбрать set: "SETS are useful as it is very quick to test the existence of a value, which is not as easy when it comes to lists" (p. 1600) — проверить, есть ли значение, в set очень быстро, а в list — нет. <mark class="key">Sorted set (упорядоченное множество)</mark> — это set, элементы которого несут число, <mark class="key">score (вес)</mark>, и держатся в порядке score; у A и C поровну, 250, и они упорядочены по имени (Redis разрешает ничьи по алфавиту; контекст). <mark class="key">Hash</mark> — маленький словарь внутри значения: его внутренние ключи называются <mark class="key">полями (fields)</mark> (<code>HSET user:1 name John</code>), так что ключ Redis называет объект, а поля — его атрибуты.</p>
+
+  <aside class="margin-note">На слайде напечатано 12Kb: читай 12 KB, килобайт.</aside>
+
+  <p>Последние два построены на других. Geospatial index — это "Sorted set implementation using geospatial information as the score": позиция упаковывается в одно число, так что близкие точки в основном получают близкие score, и поиск в радиусе превращается в несколько диапазонов score (контекст), — <code>TYPE</code> для такого ключа отвечает <code>zset</code>. HyperLogLog отвечает только на один вопрос: сколько разных элементов было добавлено, — приблизительно и не больше чем в 12 KB; сами элементы он никогда не возвращает.</p>
+
+  <div class="tabs" id="l17-tabs-types">
+    <div data-tab="String">
+      <p><b>Contains:</b> "Binary-safe strings (up to 512 MB), Integers or Floating point values, Bitmaps." <b>Read/write ability:</b> "Operate on the whole string, parts, increment/decrement the integers and floats, get/set bits by position."</p>
+      <p>Binary-safe значит «любые байты»: слово, JSON-текст, целый JPEG. Строку, в которой лежит число, можно увеличивать на сервере — счётчик из "Counting things". В Python: <code>str</code>, <code>bytes</code> или <code>int</code>, если там число. Используй её для одного значения: закэшированная страница, счётчик, флаг.</p>
+<pre><code># p. 355: bar held 223; returns (integer) 1223
+INCRBY bar 1000</code></pre>
+    </div>
+    <div data-tab="Hash">
+      <p><b>Contains:</b> "Unordered hash table of keys to string values". <b>Read/write ability:</b> "Add, fetch, or remove individual items by key, fetch the whole hash."</p>
+      <p>«Ключи» внутри hash — это его поля. В Python: <code>dict</code> из строк в строки. Используй его для одного объекта с именованными атрибутами — пользователь, пациент, газовый котёл, — чтобы читать одно поле или все сразу.</p>
+<pre><code># p. 357: returns (integer) 1, the number of fields added to user:1
+HSET user:1 name John</code></pre>
+    </div>
+    <div data-tab="List">
+      <p><b>Contains:</b> "Doubly linked list of strings". <b>Read/write ability:</b> "Push or pop items from both ends, trim based on offsets, read individual or multiple items, find or remove items by value."</p>
+      <p>Порядок вставки, повторы разрешены, дёшево с обоих концов. В Python: <code>collections.deque</code>. Используй его для очередей, стеков и «последних N».</p>
+<pre><code># p. 357: returns (integer) 1, the new length of the list jobs
+RPUSH jobs "foo"</code></pre>
+    </div>
+    <div data-tab="Set">
+      <p><b>Contains:</b> "Unordered collection of unique strings". <b>Read/write ability:</b> "Add, fetch, or remove individual items, check membership, intersect, union, difference, fetch random items."</p>
+      <p>Без порядка, без повторов, быстрое «а оно там есть?». В Python: <code>set</code>. Используй его для тегов, членства и «что общего у этих двоих».</p>
+<pre><code># p. 358: returns (integer) 2, the number of new members
+SADD users "John" "Peter"</code></pre>
+    </div>
+    <div data-tab="Sorted set">
+      <p><b>Contains:</b> "Ordered mapping of string members to floating-point scores, ordered by score". <b>Read/write ability:</b> "Add, fetch, or remove individual items, fetch items based on score ranges or member value."</p>
+      <p>Уникальные элементы, у каждого score, хранятся в порядке score. Встроенного близнеца в Python нет: представь <code>dict</code> из элемента в score, который всегда отсортирован по score. Используй его для рейтингов, таблиц лидеров и всего, что «отсортировано по году».</p>
+<pre><code># p. 358: the score comes before the member; returns (integer) 3
+ZADD scores 50 "Peter" 200 "Charles" 1000 "Mary"</code></pre>
+    </div>
+    <div data-tab="Geospatial">
+      <p><b>Contains:</b> "Sorted set implementation using geospatial information as the score". <b>Read/write ability:</b> "Add, fetch or remove individual items, search by coordinates and radius, calculate distance."</p>
+      <p>Используй его для «что рядом с этой точкой». Команды принимают долготу первой.</p>
+<pre><code># the point of p. 354, longitude first; returns (integer) 1
+GEOADD places -103.55328 20.63373 "Value"</code></pre>
+    </div>
+    <div data-tab="HyperLogLog">
+      <p><b>Contains:</b> "Probabilistic data structure to count unique things using 12Kb of memory". <b>Read/write ability:</b> "Add individual or multiple items, get the cardinality."</p>
+      <p>Мощность (cardinality) — это число разных элементов. В терминах Python: <code>len(set(items))</code>, приблизительно и без хранения самого множества. Используй его для уникальных посетителей или различных поисковых запросов, когда небольшая ошибка допустима.</p>
+<pre><code># returns (integer) 1: the structure changed
+PFADD visitors "u17" "u03" "u17"</code></pre>
+<pre><code># returns (integer) 2: about two different visitors
+PFCOUNT visitors</code></pre>
+    </div>
+  </div>
+
+  <details class="why">
+    <summary>Как 12 KB могут сосчитать миллиард разных посетителей?</summary>
+    <p>Контекст, не со слайдов: идея HyperLogLog с двумя числами из документации Redis — 16,384 регистра и 12 KB.</p>
+    <ol class="steps" id="l17-steps-hll">
+      <li><p>Захешируй каждый элемент. Хороший хеш выглядит как ряд честных подбрасываний монеты, а вернувшийся посетитель даёт ровно тот же ряд, так что повторы ничего не меняют.</p></li>
+      <li><p>Посмотри, как начинается каждый ряд. Серия из \(k\) нулей в начале встречается примерно один раз на \(2^{k}\) разных рядов: если самая длинная серия, увиденная до сих пор, — 20, то мимо прошло, вероятно, около миллиона разных элементов. Это одно маленькое число, а не сами элементы.</p></li>
+      <li><p>Одна самая длинная серия — шумная догадка, поэтому 14 бит хеша отправляют каждый элемент в одну из \(2^{14} = 16\,384\) групп; каждая группа хранит свою самую длинную серию в регистре, и регистры объединяются в одну оценку.</p></li>
+      <li><p>Регистр хранит только длину серии, а 6 бит считают до 63, так что у памяти есть фиксированный потолок, что бы ни приходило:</p>
+        \[ \begin{aligned} 16\,384 \times 6 &amp;= 98\,304 \text{ bits} \\ &amp;= 12\,288 \text{ bytes} \end{aligned} \]
+        <p>— те самые 12 KB со слайда (p. 354), максимум, который он когда-либо займёт, хоть для тысячи элементов, хоть для миллиарда.</p></li>
+      <li><p>Цена — ошибка. При \(m = 16\,384\) регистрах стандартная ошибка равна</p>
+        \[ \frac{1.04}{\sqrt{m}} = \frac{1.04}{128} \approx 0.81\,\% \]
+        <p>— и, как стандартная ошибка среднего в статистике, она убывает как единица, делённая на квадратный корень из того, что усредняешь.</p></li>
+    </ol>
+  </details>
+
+  <p>Семь типов слайда — классические. Новые версии добавляют Streams (с Redis 5.0, 2018) — журнал сообщений для очередей — и модули вроде JSON; это контекст, не со слайдов. Выбрать тип — значит выбрать, какие команды ты получишь бесплатно: спроси, что нужно вопросу, — порядок, уникальность, score, именованные поля, позиция, число разных элементов, — и тип найдётся сам. Попробуй на восьми случаях.</p>
+
+  <div class="widget" id="l17-w-pick">
+    <h3 class="widget-title">Выбери структуру</h3>
+    <p class="widget-intro">Восемь задач из миров прошлых экзаменов. Выбери сценарий, потом нажми тип, в котором ты бы его хранил. Картинка показывает, что лежало бы под ключом в этом типе, вердикт объясняет, почему тип подходит или нет, а для правильного типа показаны команды, которые делают работу на сервере (их подробности — в <a href="l18.html">уроке 18</a>). Главный вывод: тип решает вопрос, который ты будешь задавать.</p>
+    <ol class="tasks">
+      <li>Открой «Уникальные посетители». Предскажи, что List сообщит о шести визитах, потом по очереди нажми List, Set и HyperLogLog.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>List хранит каждый визит, поэтому его длина — 6 для 4 человек. Set хранит каждый id один раз, ровно 4, — но хранит каждый id, а в загруженный день их миллионы. HyperLogLog говорит «около 4» и никогда не вырастает больше 12 KB: правильный ответ, когда ошибка около 1 % допустима.</p></details>
+      </li>
+      <li>Открой «Самые быстрые круги», потом «Очередь ожидания» и в обоих нажми Sorted set. Сначала предскажи: где он подходит и почему в другом случае только «работает, но»?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Для кругов подходит: время круга — естественный score, и Redis держит самого быстрого первым, в каком бы порядке ни приходили времена. Для очереди score (номер регистрации) пришлось бы придумывать самому, а list хранит порядок прихода бесплатно.</p></details>
+      </li>
+      <li>Найди два сценария, где List — правильный тип. Что общего у их вопросов?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>«Очередь ожидания» и «Последние десять показаний»: оба зависят от порядка прихода, оба хранят повторы и оба работают на концах списка — push с одного конца, pop или trim с другого.</p></details>
+      </li>
+      <li>Открой «Скорые рядом с оползнем» и нажми Sorted set. Почему вердикт говорит «почти»?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Потому что geospatial index — это sorted set, score которого кодирует позицию (p. 354). С обычными командами sorted set тебе пришлось бы самому вычислять этот score и расстояния; команды GEO делают и то и другое.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l17-w-pick', function (root, ui) {
+    var TYPES = [['string', 'String'], ['hash', 'Hash'], ['list', 'List'], ['set', 'Set'], ['zset', 'Sorted set'], ['geo', 'Geospatial'], ['hll', 'HyperLogLog']];
+    var NAME = {};
+    TYPES.forEach(function (t) { NAME[t[0]] = t[1]; });
+    var GENERIC = {
+      string: 'String хранит одно значение: каждое новое поступление заменило бы предыдущее (<code>SET</code> перезаписывает), так что выживает только последнее.',
+      hash: 'Hash именует поля одного объекта; здесь нет одного объекта с именованными атрибутами.',
+      list: 'List хранит строки в порядке поступления, включая повторы; этому вопросу нужно не это.',
+      set: 'Set хранит уникальные строки без порядка; он не умеет ранжировать, считать повторы или именовать поля.',
+      zset: 'Sorted set упорядочивает элементы по числу, score; здесь ничего не упорядочено по числу.',
+      geo: 'Geospatial index нужны долгота и широта для каждого элемента; здесь ни у чего нет позиции.',
+      hll: 'HyperLogLog только оценивает, сколько разных элементов он видел; вернуть отдельный элемент он не может.'
+    };
+    var BITS = [0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0];
+    var SC = [
+      { id: 'views', title: 'Просмотры фильма', key: 'film:42:views', best: 'string', ok: ['hash', 'zset'],
+        text: '<b>Просмотры страницы фильма.</b> Каждый раз, когда кто-то открывает страницу фильма 42, счётчик растёт на единицу; страница показывает итог ("Counting things", p. 350). Сейчас там 1,017.',
+        v: {
+          string: 'Верно. String хранит и целое число (p. 354: "increment/decrement the integers and floats"), а <code>INCR</code> прибавляет единицу на сервере, атомарно: два зрителя в один и тот же момент оба засчитываются.',
+          hash: 'Работает, но: поле внутри hash тоже умеет считать (<code>HINCRBY</code>), однако объекта здесь нет, есть только одно число; string проще.',
+          zset: 'Работает, но: <code>ZINCRBY</code> может поднять score одного элемента, однако sorted set существует, чтобы ранжировать много элементов; с одним элементом это переодетый счётчик.',
+          list: 'List рос бы на один элемент за каждый просмотр: память на каждый просмотр, чтобы ответить одним числом.',
+          set: 'Set хранит каждую строку один раз: каждый просмотр — это одно и то же "view", так что счёт останавливается на 1.',
+          hll: 'HyperLogLog считает разные вещи: тысяча просмотров одной и той же страницы считается за один.' },
+        cmds: ['INCR film:42:views', 'GET film:42:views'],
+        view: {
+          string: { style: 'one', cells: ['1018'], cap: 'после INCR film:42:views: (integer) 1018' },
+          hash: { style: 'pairs', cells: [['views', '1018']], cap: 'одно поле ради одного числа' },
+          zset: { style: 'loose', cells: ['film:42 1018'], cap: 'один элемент, один score' },
+          list: { style: 'linked', cells: ['view', 'view', 'view', 'view', '…'], cap: 'LLEN = 1018: по элементу на просмотр' },
+          set: { style: 'loose', cells: ['view'], cap: 'SCARD = 1: повторы исчезают' },
+          hll: { style: 'bits', cap: '≈ 1 разный элемент' } } },
+      { id: 'profile', title: 'Профиль пациента', key: 'patient:7', best: 'hash', ok: ['string'],
+        text: '<b>Профиль пациента.</b> Имя, e-mail и число визитов пациента 7. Экраны читают по одному атрибуту за раз, а каждый визит прибавляет единицу к счётчику.',
+        v: {
+          hash: 'Верно. Один ключ на объект, одно поле на атрибут ("keys to string values" со слайда (p. 354) называются полями): <code>HGET</code> читает одно, <code>HGETALL</code> — все, а <code>HINCRBY</code> засчитывает визит, не трогая остального.',
+          string: 'Работает, но: весь профиль становится одним текстом, скажем JSON. Чтение e-mail достаёт всё, а визит означает <code>GET</code>, правку в твоём коде и <code>SET</code> всего обратно — пока другой клиент может записать посередине.',
+          list: 'List хранит значения по позиции, а не по имени: элемент 1 — это e-mail или визиты? И засчитать визит — значит переписать элемент.',
+          set: 'Set хранит безымянные строки без порядка: "Ada", "ada@x.it" и "3" теряют свои имена, а второе "3" исчезло бы.',
+          zset: 'Sorted set нужен номер для каждого элемента; имя и e-mail — не score.' },
+        cmds: ['HSET patient:7 name "Ada" email "ada@x.it" visits 3', 'HINCRBY patient:7 visits 1', 'HGET patient:7 email'],
+        view: {
+          hash: { style: 'pairs', cells: [['name', 'Ada'], ['email', 'ada@x.it'], ['visits', '3']], cap: 'одно поле на атрибут' },
+          string: { style: 'one', cells: ['{"name":"Ada","email":…}'], cap: 'один непрозрачный текст: читай и переписывай целиком' },
+          list: { style: 'linked', cells: ['Ada', 'ada@x.it', '3'], cap: 'на какой позиции e-mail?' },
+          set: { style: 'loose', cells: ['3', 'Ada', 'ada@x.it'], cap: 'ни имён, ни порядка' } } },
+      { id: 'queue', title: 'Очередь ожидания', key: 'queue:triage', best: 'list', ok: ['zset'],
+        text: '<b>Очередь сортировки.</b> Пациенты регистрируются у стойки приёмного отделения один за другим — Bob, Carla, Dan; следующая свободная медсестра берёт того, кто ждёт дольше всех, а медсестра, к которой никого нет, ждёт, пока кто-нибудь придёт ("Blocking queues", p. 350).',
+        v: {
+          list: 'Верно. List хранит порядок прихода и открыт с обоих концов: <code>RPUSH</code> добавляет в хвост, <code>LPOP</code> берёт из головы, а <code>BLPOP</code> заставляет свободную медсестру ждать, пока кто-нибудь придёт, — "Blocking queues" со слайда (p. 350).',
+          zset: 'Работает, но: с номером регистрации в качестве score первым идёт самый ранний пациент, однако этот score нужно придумать и передать самому; list хранит порядок прихода бесплатно.',
+          set: 'У set нет порядка: <code>SPOP</code> берёт случайного пациента, а не того, кто ждёт дольше всех.',
+          hash: 'Hash потребовал бы по полю на пациента, и порядка у него всё равно нет.' },
+        cmds: ['RPUSH queue:triage "Dan"', 'LPOP queue:triage', 'BLPOP queue:triage 0'],
+        view: {
+          list: { style: 'linked', cells: ['Bob', 'Carla', 'Dan'], cap: 'LPOP берёт Bob из головы; RPUSH добавляет в хвост' },
+          zset: { style: 'loose', cells: ['Bob 1', 'Carla 2', 'Dan 3'], cap: 'score — номер регистрации, который даёшь ты' },
+          set: { style: 'loose', cells: ['Dan', 'Bob', 'Carla'], cap: 'без порядка: кто пришёл первым?' },
+          string: { style: 'one', cells: ['Dan'], cap: 'выживает только последняя регистрация' },
+          hll: { style: 'bits', cap: '≈ 3 разных пациента, но кто?' } } },
+      { id: 'last10', title: 'Последние десять показаний', key: 'heater:HS1:last', best: 'list', ok: [],
+        text: '<b>Последние десять показаний.</b> Система отопления раз в минуту присылает показание температуры; дашборд показывает десять самых свежих, новые первыми, а старые показания можно выбрасывать. Пока пришло двенадцать показаний, два из них 21.0 и два 21.4.',
+        v: {
+          list: 'Верно. List хранит порядок и повторы (21.0 дважды — это два показания). <code>LPUSH</code> кладёт каждое новое показание в голову, а <code>LTRIM</code> с 0 9 отрезает всё после десятого — "trim based on offsets" со слайда (p. 354).',
+          set: 'Set выбрасывает повторные 21.0 и 21.4, и порядка у него нет: «десять самых свежих» даже не спросить.',
+          zset: 'Sorted set хранит каждый элемент один раз, так что два показания 21.0 сливаются в одно, и упорядочивает по score, а не по приходу: пришлось бы придумать уникальный элемент (время и значение) и использовать время как score, тогда как list хранит порядок и повторы бесплатно.',
+          hash: 'Поле на каждую минуту сохранило бы показания, но ничто не держит их в порядке и не выбрасывает старые.' },
+        cmds: ['LPUSH heater:HS1:last 22.0', 'LTRIM heater:HS1:last 0 9', 'LRANGE heater:HS1:last 0 9'],
+        view: {
+          list: { style: 'linked', cells: ['22.0', '21.9', '21.8', '21.6', '21.3', '21.4', '21.4', '21.2', '21.0', '21.0'], cap: 'новые первыми, обрезано до десяти: 20.5 и 20.7 ушли' },
+          set: { style: 'loose', cells: ['21.4', '20.5', '22.0', '21.0', '21.9', '20.7', '21.2', '21.8', '21.3', '21.6'], cap: 'SCARD = 10: двенадцать показаний, повторы ушли, порядка нет' },
+          string: { style: 'one', cells: ['22.0'], cap: 'выживает только последнее показание' },
+          hll: { style: 'bits', cap: '≈ 10 разных значений, но каких?' } } },
+      { id: 'allergens', title: 'Аллергены блюда', key: 'dish:risotto:allergens', best: 'set', ok: [],
+        text: '<b>Аллергены блюда.</b> Каждый ингредиент ризотто приносит свои аллергены: milk, gluten, снова milk, celery. Официант спрашивает «есть ли там орехи (nuts)?», а кухня хочет знать, какие аллергены у ризотто общие с лазаньей.',
+        v: {
+          set: 'Верно. Set хранит каждый аллерген один раз, <code>SISMEMBER</code> отвечает на «nuts?», не читая остального, а <code>SINTER</code> даёт то, что общее у двух блюд. Занятие так и говорит: с set "very quick to test the existence of a value, which is not as easy when it comes to lists" (p. 1600).',
+          list: 'List хранит milk дважды, а «есть ли nuts?» означает чтение всего списка в твоём коде.',
+          hash: 'Hash потребовал бы фиктивное значение для каждого аллергена, и пересечения у него нет: <code>SINTER</code> существует для set.',
+          zset: 'Sorted set тоже хранит уникальные элементы, но каждому нужен score, а у аллергенов нет числа, по которому их упорядочить.',
+          hll: 'HyperLogLog мог бы сказать «около 3 разных аллергенов», но не каких и не входят ли туда nuts.' },
+        cmds: ['SADD dish:risotto:allergens "milk" "gluten" "milk" "celery"', 'SISMEMBER dish:risotto:allergens "nuts"', 'SINTER dish:risotto:allergens dish:lasagna:allergens'],
+        view: {
+          set: { style: 'loose', cells: ['gluten', 'celery', 'milk'], cap: 'каждый аллерген один раз; nuts? 0' },
+          list: { style: 'linked', cells: ['milk', 'gluten', 'milk', 'celery'], cap: 'milk дважды; найти nuts — значит просмотреть всё' },
+          string: { style: 'one', cells: ['celery'], cap: 'выживает только последнее значение' },
+          hll: { style: 'bits', cap: '≈ 3 разных, но каких?' } } },
+      { id: 'laps', title: 'Самые быстрые круги', key: 'race:monza:laps', best: 'zset', ok: [],
+        text: '<b>Самые быстрые круги.</b> Во время гонки лучшее время круга каждого пилота сохраняется и заменяется, когда он едет быстрее; экран показывает десять самых быстрых пилотов, самого быстрого первым. Времена приходили в порядке LEC, VER, NOR, HAM.',
+        v: {
+          zset: 'Верно. Каждый пилот — элемент, его лучшее время — score; Redis держит элементы в порядке score, поэтому <code>ZRANGE</code> от 0 до 9 возвращает десять самых быстрых, самого быстрого первым, а новый <code>ZADD</code> для того же пилота просто передвигает его.',
+          list: 'List хранит порядок прихода, а не порядок по времени: чтобы показать десять самых быстрых, пришлось бы читать и сортировать всё в твоём коде, а старый круг пилота остаётся в списке, когда он улучшает время.',
+          hash: 'Пилот → время находит время одного пилота, но не может вернуть десять самых быстрых, не прочитав все поля и не отсортировав их самому.',
+          set: 'У set нет ни score, ни порядка.' },
+        cmds: ['ZADD race:monza:laps 83.456 "LEC"', 'ZRANGE race:monza:laps 0 9 WITHSCORES'],
+        view: {
+          zset: { style: 'loose', cells: ['VER 83.102', 'LEC 83.456', 'NOR 83.611', 'HAM 83.950'], cap: 'в порядке score: самый быстрый всегда первый' },
+          list: { style: 'linked', cells: ['LEC 83.456', 'VER 83.102', 'NOR 83.611', 'HAM 83.950'], cap: 'порядок прихода: VER быстрее всех, но второй' },
+          hash: { style: 'pairs', cells: [['LEC', '83.456'], ['VER', '83.102'], ['NOR', '83.611'], ['HAM', '83.950']], cap: 'без порядка: сортировать — твоя забота' },
+          set: { style: 'loose', cells: ['NOR 83.611', 'LEC 83.456', 'HAM 83.950', 'VER 83.102'], cap: 'без порядка' },
+          string: { style: 'one', cells: ['HAM 83.950'], cap: 'выживает только последнее значение' } } },
+      { id: 'ambulances', title: 'Скорые рядом с оползнем', key: 'ambulances', best: 'geo', ok: ['zset'],
+        text: '<b>Скорые рядом с оползнем.</b> Каждая скорая сообщает свою позицию; когда приходит сообщение об оползне на долготе 9.200, широте 45.470, диспетчеру нужны скорые в радиусе 5 km, ближайшие первыми.',
+        v: {
+          geo: 'Верно. <code>GEOADD</code> сохраняет каждую скорую с её долготой и широтой, а <code>GEOSEARCH</code> с <code>BYRADIUS 5 km ASC</code> возвращает те, что в пределах 5 km, ближайшие первыми, — "search by coordinates and radius, calculate distance" (p. 354).',
+          zset: 'Почти: geospatial index — это sorted set, score которого кодирует позицию (p. 354). С обычными командами sorted set тебе пришлось бы самому вычислять этот score и поиск в радиусе.',
+          hash: 'Хранить "lon,lat" для каждой скорой — это сработает как хранение, но «в пределах 5 km» означает читать каждую позицию и считать каждое расстояние в твоём коде.',
+          list: 'List из имён ничего не знает о позициях.',
+          set: 'Set из имён ничего не знает о позициях.' },
+        cmds: ['GEOADD ambulances 9.190 45.464 "AMB1"', 'GEOSEARCH ambulances FROMLONLAT 9.200 45.470 BYRADIUS 5 km ASC'],
+        view: {
+          geo: { style: 'loose', cells: ['AMB1 1.0 km', 'AMB2 2.2 km', 'AMB3 9.3 km'], hit: [0, 1], cap: 'в пределах 5 km, ближайшие первыми: AMB1, AMB2' },
+          zset: { style: 'loose', cells: ['AMB1 ?', 'AMB2 ?', 'AMB3 ?'], cap: 'score пришлось бы сделать кодом позиции' },
+          hash: { style: 'pairs', cells: [['AMB1', '9.190,45.464'], ['AMB2', '9.225,45.480'], ['AMB3', '9.105,45.520']], cap: 'позиции хранятся, расстояния — нет' },
+          list: { style: 'linked', cells: ['AMB1', 'AMB2', 'AMB3'], cap: 'только имена' },
+          set: { style: 'loose', cells: ['AMB2', 'AMB3', 'AMB1'], cap: 'только имена' },
+          string: { style: 'one', cells: ['AMB3'], cap: 'выживает только последнее значение' } } },
+      { id: 'visitors', title: 'Уникальные посетители', key: 'home:visitors:today', best: 'hll', ok: ['set'],
+        text: '<b>Уникальные посетители.</b> Сколько разных людей открыли главную страницу сегодня? Визитов миллионы, один и тот же человек возвращается много раз, и ответа с точностью около 1 % достаточно. Первые шесть визитов пришли от u17, u03, u17, u42, u03, u99.',
+        v: {
+          hll: 'Верно. <code>PFADD</code> скармливает внутрь id каждого посетителя, <code>PFCOUNT</code> отвечает «примерно сколько разных?». Структура никогда не вырастает больше 12 KB, сколько бы людей ни пришло (p. 354: "count unique things using 12Kb of memory"), ценой небольшой ошибки, около 0.81 % по документации Redis, — и перечислить, кто приходил, она не может.',
+          set: 'Работает, и точно: <code>SADD</code> игнорирует повторы, а <code>SCARD</code> считает элементы. Но set хранит каждый id: миллионы посетителей стоят мегабайты каждый день, тогда как HyperLogLog остаётся на 12 KB.',
+          list: 'List хранит каждый визит: его длина — 6 для 4 человек. А повторы — это ровно то, что этот вопрос должен игнорировать.',
+          hash: 'Посетитель → визиты работает как set (<code>HLEN</code> считает поля) и растёт как set, храня каждый id.',
+          zset: 'Sorted set хранит каждый id как элемент, как set, плюс score, который этому вопросу не нужен.' },
+        cmds: ['PFADD home:visitors:today "u17" "u03" "u17" "u42" "u03" "u99"', 'PFCOUNT home:visitors:today'],
+        view: {
+          hll: { style: 'bits', cap: '≈ 4 разных посетителя, не больше чем в 12 KB' },
+          set: { style: 'loose', cells: ['u42', 'u17', 'u99', 'u03'], cap: 'SCARD = 4, точно; хранится каждый id' },
+          list: { style: 'linked', cells: ['u17', 'u03', 'u17', 'u42', 'u03', 'u99'], cap: 'LLEN = 6 для 4 человек' },
+          string: { style: 'one', cells: ['u99'], cap: 'выживает только последнее значение' },
+          hash: { style: 'pairs', cells: [['u17', '2'], ['u03', '2'], ['u42', '1'], ['u99', '1']], cap: 'HLEN = 4; хранится каждый id' } } }
+    ];
+    var picks = {};
+
+    var scn = ui.select('сценарий', SC.map(function (s, i) { return { value: String(i), label: (i + 1) + '. ' + s.title }; }), null, '0');
+    TYPES.forEach(function (t) {
+      ui.button(t[1], function () { picks[SC[+scn.value].id] = t[0]; });
+    });
+    var roPick = ui.readout('твой выбор');
+    var roFound = ui.readout('решено сценариев');
+    var noteVerdict = ui.note('');      // each note is inserted right after the readouts: create the lower one first
+    var noteScn = ui.note('');
+    var svg = ui.svg(560, 164, { label: 'Ключ выбранного сценария фиолетовым, а под ним значение, которое этот ключ хранил бы в выбранном типе данных, в виде ряда ячеек с короткой подписью' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function wCell(s) { return Math.max(30, Math.round(12 + 10.2 * s.length)); }
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var sc = SC[+scn.value], pick = picks[sc.id];
+      S('rect', { x: 14, y: 10, width: wCell(sc.key), height: 26, 'class': 'fw-s3 st-s3' });
+      S('text', { x: 20, y: 28, 'class': 'tx-mono tx-sm', text: sc.key });
+      S('line', { x1: 30, y1: 36, x2: 30, y2: 55, 'class': 'st-ink', 'marker-end': 'url(#arr)' });
+      var v = pick ? sc.view[pick] : null;
+      if (!v) {
+        S('rect', { x: 14, y: 60, width: 60, height: 26, 'class': 'fi-paper st-muted dash' });
+        S('text', { x: 44, y: 78, 'class': 'tx-mono tx-sm tx-mid', text: '?' });
+        S('text', { x: 14, y: 116, 'class': 'tx-sm tx-muted', text: pick ? 'в ' + NAME[pick] + ' этим данным нет места' : 'выбери тип для значения' });
+        return;
+      }
+      var x = 14, y = 60, H = 26, items = [];
+      function place(w, gap) {
+        if (x + w > 546 && x > 14) { x = 14; y += 36; }
+        var at = { x: x, y: y, w: w };
+        x += w + gap;
+        return at;
+      }
+      if (v.style === 'bits') {
+        BITS.forEach(function (b) {
+          var at = place(18, 0);
+          S('rect', { x: at.x, y: at.y, width: 18, height: H, 'class': 'fi-paper' });
+          S('text', { x: at.x + 9, y: at.y + 18, 'class': 'tx-mono tx-sm tx-mid', text: String(b) });
+        });
+      } else if (v.style === 'pairs') {
+        v.cells.forEach(function (p) {
+          var wf = wCell(p[0]), wv = wCell(p[1]), at = place(wf + wv, 12);
+          S('rect', { x: at.x, y: at.y, width: wf, height: H, 'class': 'fi-soft' });
+          S('rect', { x: at.x + wf, y: at.y, width: wv, height: H, 'class': 'fi-paper' });
+          S('text', { x: at.x + 6, y: at.y + 18, 'class': 'tx-mono tx-sm', text: p[0] });
+          S('text', { x: at.x + wf + 6, y: at.y + 18, 'class': 'tx-mono tx-sm', text: p[1] });
+        });
+      } else {
+        var gap = v.style === 'linked' ? 24 : 10;
+        v.cells.forEach(function (c, i) {
+          var at = place(wCell(c), gap);
+          items.push(at);
+          var hit = v.hit && v.hit.indexOf(i) >= 0;
+          S('rect', { x: at.x, y: at.y, width: at.w, height: H, 'class': 'fi-paper' });
+          if (hit) S('rect', { x: at.x - 3, y: at.y - 3, width: at.w + 6, height: H + 6, 'class': 'fi-none st-s2 sw-2 dash' });
+          S('text', { x: at.x + at.w / 2, y: at.y + 18, 'class': 'tx-mono tx-sm tx-mid', text: c });
+        });
+        if (v.style === 'linked') {
+          for (var i = 1; i < items.length; i++) {
+            if (items[i].y === items[i - 1].y) S('text', { x: items[i].x - 12, y: items[i].y + 18, 'class': 'tx-sm tx-mid', text: '↔' });
+          }
+        }
+      }
+      S('text', { x: 14, y: y + H + 24, 'class': 'tx-sm', text: v.cap });
+    }
+
+    ui.onChange(function () {
+      var sc = SC[+scn.value], pick = picks[sc.id];
+      var solved = SC.filter(function (s) { return picks[s.id] === s.best; }).length;
+      noteScn.set(sc.text);
+      if (!pick) {
+        roPick.set('—');
+        noteVerdict.set('В каком типе ты бы это хранил? Нажми одну из семи кнопок.');
+      } else {
+        var tone = pick === sc.best ? 'good' : sc.ok.indexOf(pick) >= 0 ? 'key' : 'bad';
+        roPick.set(NAME[pick] + (tone === 'good' ? ': верно' : tone === 'key' ? ': работает, но' : ': не подходит'), tone);
+        var html = sc.v[pick] || GENERIC[pick];
+        if (pick === sc.best) html += '<br>Что это даёт: ' + sc.cmds.map(function (c) { return '<code>' + c + '</code>'; }).join(' · ');
+        noteVerdict.set(html);
+      }
+      roFound.set(solved + ' из ' + SC.length, solved === SC.length ? 'good' : undefined);
+      draw();
+    });
+  });
+  </script>
+
+  <div class="tip"><p>В экзаменационном упражнении перед командами напиши в одну строку выбранный тип и причину — «a hash: one key for the object, one field per attribute». Экзамен 30 января 2026 года просил "a single key-value pair to store all the data of one Gas Heater" и тип не называл: там выбор и есть суть вопроса (<a href="l18.html#l18-exam-heating">урок 18</a> решает этот экзамен; упражнение ниже тренирует те же выборы на ER-модели другого экзамена).</p></div>
+
+  <p class="memo"><mark class="key">Выбирай тип по вопросу, который будешь задавать: порядок и повторы — list; уникальность — set; порядок по числу — sorted set; именованные поля — hash; одно значение или счётчик — string; позиция — geospatial index; сколько разных — HyperLogLog.</mark></p>
+</section>
+
+
+<section id="l17-solved">
+  <h2>Разгадка</h2>
+
+  <p>Вернёмся к двум решениям 2009 года, которые звучали шиворот-навыворот. База данных, которая отвечает только на «что лежит под этим ключом?», спасает, когда реляционная слишком медленная, потому что этот вопрос стоит одного шага в памяти при любом объёме данных, и ничего не нужно разбирать, планировать или соединять, — плоская линия из гонки. А Redis возвращает многое из того, что теряет простое хранилище ключ-значение: значение — это структура данных, так что push, инкремент или проверка членства — всё равно одна команда над одним ключом.</p>
+
+  <p>Одному потоку не нужна блокировка, потому что он не может состязаться сам с собой: команды выполняются одна за другой, каждая атомарно. Он успевает, потому что каждый шаг короткий и в памяти, а когда одного ядра мало, запускают ещё один экземпляр. Цена — на слайде (p. 349): данные должны влезать в память, и чем надёжнее ты их хранишь на диске, тем медленнее всё работает.</p>
+
+  <p>Введение в курс говорит, что каждая категория систем "is covered along 5 dimensions" — разбирается по пяти измерениям: модель данных, "(declarative vs. imperative) query languages", распределение данных, нефункциональные аспекты и архитектурные решения. Теоретический вопрос о свойствах Redis ложится на эту сетку:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Redis по пяти измерениям из плана курса.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Измерение</th><th>Redis</th></tr></thead>
+        <tbody>
+          <tr><td>Модель данных</td><td>ключ → значение: ключ — строка, значение — одна из семи структур данных (pp. 348, 354)</td></tr>
+          <tr><td>Язык запросов</td><td>ничего декларативного: нет SQL, нет запросов по значениям; императивные команды, каждая — одна операция над одним ключом (<a href="l18.html">урок 18</a>)</td></tr>
+          <tr><td>Распределение данных</td><td>несколько экземпляров "to scale out on several cores" (p. 352); репликация и партиционирование, которое разбивает данные "across different hosts in a cluster" (p. 359, <a href="l19.html">урок 19</a>)</td></tr>
+          <tr><td>Нефункциональные аспекты</td><td>быстрый, потому что в памяти и большинство команд O(1); каждая команда атомарна; набор данных должен влезать в память; больше персистентности — больше задержка и меньше пропускная способность (pp. 349, 352)</td></tr>
+          <tr><td>Архитектура</td><td>однопоточный сервер на ANSI C; вокруг структур данных — персистентность, репликация, сеть, клиенты, Sentinel и Cluster (pp. 352–353)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="tip"><p>Когда таблица экзамена на один балл спрашивает, какая технология БД подходит каким сущностям (<a href="l05.html">урок 5</a>), обосновывай строку key-value так: данные, к которым обращаются только по ID, которые очень часто читают и пишут, достаточно маленькие для памяти и некритичные, — сессии, корзины, счётчики, закэшированные результаты, живые рейтинги — в Redis.</p></div>
+</section>
+
+
+<section id="l17-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Теоретические вопросы в тех формах, что встречаются в теоретической части, — короткие открытые ответы, «верно/неверно» и выбор вариантов, где за неправильную галочку могут снять баллы, — и одно практическое упражнение в стиле экзаменов на ER-модели прошлого экзамена. Сами упражнения по Redis из прошлых экзаменов решены в <a href="l18.html">уроке 18</a>.</p>
+
+  <div class="exam" data-kind="open" id="l17-exam-kv">
+    <div class="exam-q" lang="en">
+      <p>What is a key-value store? Explain why search by ID is usually built on top of a key-value store, and what a key-value store gives up compared with a relational database.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>A key-value store is a dictionary: every value is stored under a unique key, typically a business key such as a tweet id, a flight number, an account number or an item number, and the only way to reach a value is through its key. The store does not interpret the value; its operations are put, get and delete by key. Search by ID is built on top of a key-value store because a lookup by key is the cheapest possible access: with a hash table in memory it takes constant time whatever the size of the data, and it needs no query parsing, planning or join. Compared with a relational database, which is queried using SQL and is key-based with foreign keys, indexes and joins, a key-value store keeps only the key: no queries on the content of the values, no foreign keys, no secondary indexes, no joins. Keys are used only to retrieve a value, not to search or to map tables to each other. In exchange the store is very fast and easy to split across machines by key.</p>
+      </div>
+      <div class="exam-note"><p>Ответ полон, когда в нём три вещи: определение (один ключ, одно непрозрачное значение, доступ только по ключу), причина (поиск за константное время без разбора, планирования и join) и компромисс, сопоставленный с пятью пунктами слайда (p. 346). Один пример со слайда (p. 345) покажет, что ты знаешь слайд.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l17-exam-redis">
+    <div class="exam-q" lang="en">
+      <p>What is Redis? Explain its definition, the three roles it can play, and what Redis is not.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Redis (REmote DIctionary Server) is an advanced key-value store in which the value stored under a key can be a data structure — a string, a hash, a list, a set or a sorted set — with a set of atomic operations on these data types. Unlike a plain key-value store, the values are complex data types close to the fundamental data structures and are exposed to the programmer as such, without additional abstraction layers, so the client sends an operation (append this element, add this member) and the server applies it. Redis can be used as a database, because it can persist data to disk; as a caching layer, because it is fast, the data being in memory; and as a message broker, because it is not only a key-value store (publish/subscribe, blocking queues). It is not a replacement for relational databases or document stores: it is used next to them. Increasing persistency increases latency and decreases throughput, and the dataset should fit in memory, so Redis is best used for rapidly changing data with a foreseeable size.</p>
+      </div>
+      <div class="exam-note"><p>Три части слайда (p. 348), три роли, каждая со своей причиной, и границы со слайда (p. 349). Предпочитай "the value of a key can be a list" формулировке слайда "keys can contain data structures" (ловушка в разделе 2), но узнавай напечатанную фразу, если вопрос её цитирует.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l17-exam-atomic">
+    <div class="exam-q" lang="en">
+      <p>True or false: since all operations in Redis are atomic, a client that reads a counter with <code>GET</code> and then writes the incremented value back with <code>SET</code> performs one indivisible operation.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Каждая из двух команд атомарна сама по себе, но слайд (p. 352) гарантирует только, что никакие две команды не выполняются одновременно: между <code>GET</code> и <code>SET</code> может выполниться команда другого клиента.</span></li>
+      <li data-correct>False <span class="fb">Атомарна каждая отдельная команда. <code>GET</code> и <code>SET</code> — две команды; <code>SET</code> другого клиента может вклиниться между ними, и инкремент потеряется. <code>INCR</code> делает чтение и запись одной командой.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. Redis is single-threaded, so no two commands run at the same time and every single command is atomic. A <code>GET</code> followed by a <code>SET</code> is two commands: another client's command can be executed between them, so an update can be lost. A single <code>INCR</code> (or <code>INCRBY</code>) is atomic.</p></div>
+      <div class="exam-note"><p>Ловушка — слово "all". <a href="l18.html">Урок 18</a> проигрывает эту гонку шаг за шагом. За неправильные ответы может быть штраф (правило объявляют прямо перед экзаменом): ставь галочку только там, где можешь обосновать.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l17-exam-thread">
+    <div class="exam-q" lang="en">
+      <p>Redis is a single-threaded server. Explain why this makes every command atomic, why Redis is nevertheless fast, and how it can use more than one CPU core.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Redis executes commands on a single thread: the commands of all clients are queued and executed one at a time, each from start to end, so no two commands can run at the same time and no client can observe or interleave with a half-executed command. Every command is therefore atomic, and no locks are needed. Redis is nevertheless fast because the data is in memory, so no disk access is on the path of a request; because most commands run in O(1) and take very little time; because a single thread spends nothing on locks or on switching between threads; and because one event loop serves many connections. The cost is that a slow command, such as an O(N) operation on a large structure, delays every other client. Redis is not designed to benefit from multiple CPU cores: to use several cores, several Redis instances are launched, each holding part of the data.</p>
+      </div>
+      <div class="exam-note"><p>Три вопроса, три ответа; цепочка «один поток, значит атомарность, значит никаких блокировок» — ядро ответа. Как контекст можно добавить, что с Redis 6.0 сетевой ввод-вывод может использовать вспомогательные потоки, а команды по-прежнему выполняются в одном потоке.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l17-exam-types">
+    <div class="exam-q" lang="en">
+      <p>Which statements about the Redis data types are correct? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>A list may contain the same string more than once, in insertion order. <span class="fb">List — это "Doubly linked list of strings"; list на рис. 6 содержит A, C, B, C.</span></li>
+      <li>A set returns its members in the order in which they were inserted. <span class="fb">Set — это "Unordered collection of unique strings".</span></li>
+      <li data-correct>The members of a sorted set are ordered by a floating-point score. <span class="fb">"Ordered mapping of string members to floating-point scores, ordered by score" (p. 354).</span></li>
+      <li data-correct>A geospatial index is implemented as a sorted set. <span class="fb">"Sorted set implementation using geospatial information as the score" (p. 354).</span></li>
+      <li>A HyperLogLog returns the list of the unique items it has seen. <span class="fb">Он только оценивает их число, мощность (cardinality), не больше чем в 12 KB; сами элементы не хранятся.</span></li>
+      <li data-correct>A string can hold an integer that Redis increments on the server. <span class="fb">Strings содержат "Integers or Floating point values" и умеют "increment/decrement the integers and floats" (p. 354).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Correct: the statements on the list, the sorted set, the geospatial index and the string. A set is unordered; a HyperLogLog only estimates the number of distinct items and cannot return them.</p></div>
+      <div class="exam-note"><p>Вопрос «выбери все верные», где за неправильные галочки могут снять баллы: два неверных утверждения — классические путаницы, list против set и подсчёт против хранения.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l17-exam-puzzle">
+    <div class="exam-q" lang="en">
+      <p><b>Exam-style exercise, written for this notebook</b> on the ER model of the exam of 30 May 2025 (its header prints June 30, 2025), tracking puzzles' production and sales; that paper has no Redis exercise. The part used: Puzzle (Puzzle ID, Name, Collection Name (e.g., Museum Collection), Number of Pieces, Width, Height, Description), produced by one Company (Produce, with Production Date: Company (1, N) – Puzzle (1, 1)); User (Personal ID, Name, Surname, Age, Birth Date, City, Country), who buys puzzles (Buy, with Buy Date: Puzzle (0, N) – User (0, N)). N.B. All sizes are in cm.</p>
+      <p>Exercise – Redis. For each request, state the Redis data type you use and why, in one line, then write the commands.</p>
+      <p>(1) Create a single key-value pair to store all the data of one Puzzle, with all the attributes describing the object.</p>
+      <p>(2) Store the puzzles of the "Museum Collection" sorted by their number of pieces. Then, query them to get the puzzle with the most pieces.</p>
+      <p>(3) Store the countries of the users who bought the puzzle "P1", each country only once. Then, check whether "Italy" is one of them.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>(1) A hash: one key for the puzzle and one field for each of its attributes, so a single attribute can be read or changed on its own. The values are examples, and the attribute names are written with underscores (a field name with spaces would need double quotes).</p>
+<pre><code>HSET puzzle:P1 Puzzle_ID "P1" Name "Starry Night" Collection_Name "Museum Collection" Number_of_Pieces 1000 Width 70 Height 50 Description "Van Gogh, 1889"</code></pre>
+        <p>The reply is <code>(integer) 7</code>, the number of fields created. One string holding the whole puzzle as JSON would also be a single key-value pair, but reading one attribute would then mean reading the whole text.</p>
+        <p>(2) A sorted set: the number of pieces is the score, so Redis keeps the puzzles in that order whatever the order of insertion. The highest score is the last element, at index -1, so the second command returns "P3".</p>
+<pre><code>ZADD museum:by_pieces 1000 "P1" 500 "P2" 2000 "P3"
+ZRANGE museum:by_pieces -1 -1</code></pre>
+        <p>(3) A set: each country is kept once, however many users from it bought the puzzle, and the membership test is one command. <code>SADD</code> replies <code>(integer) 3</code>, because the second "Italy" is ignored; <code>SISMEMBER</code> replies <code>(integer) 1</code>.</p>
+<pre><code>SADD puzzle:P1:countries "Italy" "France" "Italy" "Spain"
+SISMEMBER puzzle:P1:countries "Italy"</code></pre>
+      </div>
+      <div class="exam-note"><p>Написано для этой тетради формулировками экзаменов; официального решения к нему нет, как нет его и ни к одному прошлому экзамену. Оно тренирует тот же выбор, который экзамен 30 января 2026 года, упражнение 5, требует на своей больничной ER-модели (решено в <a href="l18.html#l18-exam-heating">уроке 18</a>). Что делает каждый ответ полным: (1) все атрибуты Puzzle под одним ключом — hash или JSON в string; (2) структура, которая сама держит порядок, score записан перед элементом, и читается нужный конец: индекс 0 — наименьший score, -1 — наибольший; list потребовал бы класть головоломки уже в нужном порядке; (3) уникальность и проверка членства — две вещи, которые set даёт бесплатно, а list нет ("very quick to test the existence of a value", p. 1600).</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l17-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Хранилище ключ-значение держит каждый пост блога под ключами вида <code>post:101</code>, а значение — вся страница. На какой запрос оно само по себе ответить не может?</p>
+    <ul class="options">
+      <li>Вернуть пост 101 <span class="fb">Это и есть единственный вопрос, на который хранилище ключ-значение отвечает, за один шаг: получить по ключу.</span></li>
+      <li data-correct>Перечислить посты, написанные jbellis <span class="fb">Автор — внутри значений, а хранилище никогда не заглядывает внутрь; без второго ключа, который связывает jbellis с id его постов, входа нет.</span></li>
+      <li>Удалить пост 102 <span class="fb">Удаление по ключу — одна из трёх его операций.</span></li>
+      <li>Заменить страницу поста 103 <span class="fb">Положить новое значение под тот же ключ.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В гонке поиска выбери «RAM, всё в кэше» и увеличь N от миллиона до миллиарда. Что происходит?</p>
+    <ul class="options">
+      <li>Все три кривые остаются плоскими: в памяти каждый поиск занимает константное время <span class="fb">Память делает каждый шаг дешёвым, но шагов не становится меньше: B-дерево всё так же спускается на уровень глубже каждый раз, когда N вырастает в сто раз.</span></li>
+      <li data-correct>Хеш-поиск остаётся на 1 шаге; B-дерево растёт с 4 до 6 посещений страниц, а join — с 12 до 18 <span class="fb">Стоимость одного шага упала с миллисекунд до 0.1 µs; число шагов не изменилось.</span></li>
+      <li>Растёт только join: одиночный поиск по B-дереву от N не зависит <span class="fb">Join растёт, потому что растёт каждый из трёх его поисков: 3 × (уровни + 1).</span></li>
+      <li>Хеш-поиск тоже растёт, потому что большей таблице нужно больше проб <span class="fb">Хеш-таблица прыгает прямо в ячейку ключа; её ожидаемая стоимость не зависит от числа ключей.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему <code>RPUSH jobs "baz"</code> в Redis лучше, чем <code>GET</code>, дописывание и <code>SET</code> в простом хранилище ключ-значение (рис. 2)?</p>
+    <ul class="options">
+      <li data-correct>Redis знает, что значение — список, и дописывает один элемент на сервере одной атомарной командой; с <code>GET</code> и <code>SET</code> всё значение дважды проходит по сети, и другой клиент может записать посередине <span class="fb">Сервер понимает структуру, поэтому ты отправляешь операцию, а не значение.</span></li>
+      <li><code>RPUSH</code> пишет список на диск, а <code>GET</code> и <code>SET</code> работают только в памяти <span class="fb">Обе работают со значением в памяти; персистентность — отдельный вопрос.</span></li>
+      <li>Redis выполняет команды над списками в нескольких потоках параллельно <span class="fb">Redis выполняет команды в одном потоке (p. 352).</span></li>
+      <li>Никакой реальной разницы нет: для сервера и то и другое — один шаг <span class="fb"><code>GET</code> плюс <code>SET</code> — две команды с работой в клиенте между ними, и всё значение путешествует дважды.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Что из этого следует из того, что Redis выполняет команды в одном потоке? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Каждая отдельная команда атомарна <span class="fb">Никакие две команды не выполняются одновременно (p. 352).</span></li>
+      <li data-correct>Не нужна блокировка, чтобы не пустить две команды к одному ключу <span class="fb">Нет второго потока, которого надо не пускать.</span></li>
+      <li data-correct>Одна медленная команда над огромным значением заставляет ждать всех остальных клиентов <span class="fb">Поток занят, пока она не закончится; вот почему важно "most commands in O(1)".</span></li>
+      <li>Redis сам использует все ядра машины <span class="fb">"not designed to benefit from multiple CPU cores" (p. 352): запускают несколько экземпляров.</span></li>
+      <li><code>GET</code>, за которым идёт <code>SET</code> от одного клиента, выполняется без прерывания <span class="fb">Это две команды: между ними может выполниться команда другого клиента.</span></li>
+    </ul>
+    <p class="q-fb">Атомарность на команду, а не на разговор: эта черта отделяет теорию этого урока от <code>INCR</code> из урока 18.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В <code>HSET user:1 name John</code> какая часть — та структура данных, которую слайд (p. 348) имеет в виду под "keys can contain data structures"?</p>
+    <ul class="options">
+      <li data-correct>Значение, хранящееся под ключом <code>user:1</code>, — hash с полем <code>name</code> <span class="fb">Ключ — обычная строка; hash — его значение: <code>TYPE user:1</code> отвечает <code>hash</code>.</span></li>
+      <li>Сам ключ <code>user:1</code>, который становится хешем <span class="fb">Ключи — всегда (binary-safe) строки; типы есть только у значений.</span></li>
+      <li>Поле <code>name</code>, то есть ключ внутри ключа <span class="fb"><code>name</code> — поле хеша: собственный внутренний ключ хеша, часть значения.</span></li>
+      <li>Строка <code>John</code> <span class="fb"><code>John</code> — значение одного поля внутри хеша.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Экран показывает здания больницы от самого нового к самому старому по году постройки, а новые записи со временем добавляются в любом порядке. Какой тип держит их в этом порядке без сортировки в твоём коде?</p>
+    <ul class="options">
+      <li>List, куда каждое здание добавляется при записи <span class="fb">List хранит порядок вставки: здание, записанное позже, но построенное раньше, окажется не на своём месте.</span></li>
+      <li data-correct>Sorted set с годом в качестве score <span class="fb">Redis держит элементы в порядке score; чтение от наибольшего score вниз даёт самые новые первыми, в каком бы порядке их ни вставляли.</span></li>
+      <li>Set из id зданий <span class="fb">У set вообще нет порядка.</span></li>
+      <li>Hash из id здания в год <span class="fb">Hash хранит годы, но возвращает поля без определённого порядка.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Больница собирается хранить все медицинские карты пациентов — 60 TB, растущие каждый год, и по закону их нельзя терять никогда — только в Redis. Какие условия со слайда (p. 351) этот план явно нарушает? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Dataset can fit in memory <span class="fb">60 TB, да ещё растущие, — гораздо больше памяти одного сервера и не предсказуемый размер: Redis "Best used for rapidly changing data with a foreseeable database size (should fit mostly in memory)" (p. 349).</span></li>
+      <li data-correct>Dataset is not critical <span class="fb">Эти карты критичны, а сделать каждую запись долговечной стоит задержки и пропускной способности (p. 349) — той самой скорости, ради которой выбирают Redis.</span></li>
+      <li>Speed is critical <span class="fb">В плане ничто этому не противоречит; скорость здесь просто не проблема.</span></li>
+      <li>More than just key-value pairs <span class="fb">Карта вполне может быть хешем; типы данных — не проблема.</span></li>
+    </ul>
+    <p class="q-fb">Место Redis — рядом с основной системой учёта (рис. 3), а не вместо неё.</p>
+  </div>
+</section>
+
+
+<section class="recap" id="l17-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Хранилище ключ-значение отображает бизнес-ключ в значение и отвечает только на «что лежит под этим ключом?» операциями put, get и delete; поиск по ID обычно строят на нём, потому что поиск по ключу в памяти занимает один шаг при любом объёме данных.</li>
+    <li>Реляционную базу данных опрашивают на SQL, она key-based, с внешними ключами, индексами и join; хранилище ключ-значение оставляет только ключ, отказывается от запросов по значениям, join и вторичных индексов и получает скорость и лёгкое распределение ключей по машинам.</li>
+    <li>Redis, REmote DIctionary Server, — продвинутое хранилище ключ-значение, значения которого — структуры данных, доступные программисту как есть, с атомарными операциями над ними; он служит базой данных, слоем кэширования или брокером сообщений — рядом с реляционным или документным хранилищем и никогда вместо него.</li>
+    <li>Redis стоит рассматривать, когда скорость критична, тебе нужно больше, чем пары ключ-значение, набор данных влезает в память, а данные некритичны; больше персистентности — значит больше задержка и меньше пропускная способность.</li>
+    <li>Redis, написанный на ANSI C, выполняет команды в одном потоке: никакие две команды не выполняются одновременно, поэтому каждая атомарна без блокировок, а быстрым он остаётся, потому что каждый шаг короткий и в памяти; больше ядер — значит больше экземпляров.</li>
+    <li>Семь типов: string (байты, числа, bitmaps), hash (поля в значения), list (порядок, повторы, оба конца), set (уникальные, без порядка, членство и операции над множествами), sorted set (элементы в порядке score), geospatial index (sorted set со score по позиции) и HyperLogLog (приблизительное число разных элементов в 12 KB) — выбирай по вопросу, который будешь задавать.</li>
+  </ul>
+  <aside class="cheat" id="l17-cheat">
+    <dl>
+      <dt>Хранилище ключ-значение</dt><dd>бизнес-ключ → непрозрачное значение; put, get, delete только по ключу</dd>
+      <dt>p. 345</dt><dd>"Search by ID is usually built on top of a key-value store"</dd>
+      <dt>Реляционная (p. 346)</dt><dd>queried using SQL · key-based · foreign keys · indexes · joins</dd>
+      <dt>Redis</dt><dd>REmote DIctionary Server: advanced key-value store; значения — структуры данных; атомарные операции</dd>
+      <dt>Роли (p. 348)</dt><dd>database (пишет на диск) · caching layer (быстрый) · message broker (не только key-value)</dd>
+      <dt>Чем не является (p. 349)</dt><dd>не замена реляционным и документным хранилищам; больше persistency = больше latency, меньше throughput; должен влезать в память</dd>
+      <dt>Когда рассматривать (p. 351)</dt><dd>speed is critical · more than key-value pairs · fits in memory · not critical</dd>
+      <dt>Архитектура (p. 352)</dt><dd>ANSI C · однопоточный → каждая команда атомарна · больше ядер = больше экземпляров · большинство команд O(1)</dd>
+      <dt>String</dt><dd>binary-safe, до 512 MB; integers, floats, bitmaps — <code>SET</code>, <code>GET</code>, <code>INCR</code></dd>
+      <dt>Hash</dt><dd>поля → строковые значения — <code>HSET key field value</code>, <code>HGET</code>, <code>HGETALL</code></dd>
+      <dt>List</dt><dd>двусвязный, упорядоченный, с повторами — <code>LPUSH</code> / <code>RPUSH</code>, <code>LPOP</code> / <code>RPOP</code>, <code>LRANGE</code></dd>
+      <dt>Set</dt><dd>уникальные, без порядка — <code>SADD</code>, <code>SISMEMBER</code>, <code>SINTER</code> / <code>SUNION</code> / <code>SDIFF</code></dd>
+      <dt>Sorted set</dt><dd>элементы в порядке float score — <code>ZADD key score member</code>, <code>ZRANGE</code></dd>
+      <dt>Geospatial index</dt><dd>sorted set со score по позиции — <code>GEOADD key lon lat member</code>, <code>GEOSEARCH</code></dd>
+      <dt>HyperLogLog</dt><dd>приблизительное число разных элементов, 12 KB, ошибка около 0.81 % — <code>PFADD</code>, <code>PFCOUNT</code></dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l17-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=G1rOthIU-uo" target="_blank" rel="noopener">Redis in 100 Seconds</a>
+      <span class="res-by">Fireship</span>
+      <p class="res-why">Очень короткий обзор in-memory хранилища ключ-значение, у значений которого есть типы, — загадка этого урока в движении.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://redis.io/docs/latest/develop/data-types/" target="_blank" rel="noopener">Redis data types</a>
+      <span class="res-by">Redis documentation</span>
+      <p class="res-why">По странице на тип, с командами и их сложностью; открой рядом с вкладками раздела 4, а страницу про sorted set прочитай целиком.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="after">
+      <a class="res-title" href="https://redis.io/try/sandbox/" target="_blank" rel="noopener">Redis Sandbox</a>
+      <span class="res-by">Redis</span>
+      <p class="res-why">Консоль Redis в браузере, без установки: набирай команды из вкладок и из виджета и сравнивай ответы. Записи идут во временную сессию, ключи которой должны начинаться с <code>pg:</code>, так что набирай <code>HSET pg:user:1 name John</code>. "Online Demo: http://try.redis.io" со слайда больше не открывается; это его официальная замена.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.allthingsdistributed.com/2017/10/a-decade-of-dynamo.html" target="_blank" rel="noopener">A Decade of Dynamo</a>
+      <span class="res-by">Werner Vogels, 2017</span>
+      <p class="res-why">История за 70 процентами из раздела 1: почему Amazon построил хранилище ключ-значение вместо того, чтобы настраивать свою реляционную базу, и что из этого вышло.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://cs.brown.edu/courses/cs227/archives/2011/slides/mar07-redis.pdf" target="_blank" rel="noopener">REmote DIctionary Server</a>
+      <span class="res-by">Chris Keith and James Tavares, Brown CS227, 2011</span>
+      <p class="res-why">Презентация, на которую слайд (p. 354) ссылается как на "Redis data types internals": как каждый тип устроен внутри (skip list для sorted set), плюс ранняя история Redis.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Ты выбрал hash для головоломки, sorted set для коллекции и set для стран её покупателей, но каждая команда была лишь превью. Что именно отвечает <code>LPUSH</code>, почему <code>TTL</code> возвращает −2 и зачем существует <code>INCR</code>, если <code>GET</code> и <code>SET</code> уже есть? Следующий урок пишет каждую команду, которую спрашивали прошлые экзамены.</p>
+</aside>
+
+</main>
+</body>
+</html>

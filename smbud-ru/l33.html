@@ -1,0 +1,1504 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Потоки в Hadoop: Storm, Flume и Sqoop · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l33">
+
+<header class="lesson-head">
+  <h1>Потоки в Hadoop: Storm, Flume и Sqoop</h1>
+  <p class="lede">После этого урока ты сможешь объяснить, почему топология Storm никогда не заканчивается и в какую задачу попадает каждый кортеж, собрать и рассчитать поток Flume из source, channel и sink по его файлу свойств и скопировать реляционную таблицу в HDFS или Hive с помощью Sqoop.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Flume — это водяной лоток, по которому брёвна сплавляют от места вырубки к лесопилке (p. 943). Apache Flume взял себе это имя, а вместе с ним и устройство: производят во многих местах, потребляют в одном, а лоток несёт груз между ними.</p>
+  <p>У интернет-магазина 64 веб-сервера, и каждый отправляет в Hadoop по 2 000 строк логов в секунду. Однажды ночью HDFS — та самая лесопилка — встаёт на час; серверы — нет. Где ждут 460 миллионов строк этого часа и насколько большой должна быть комната ожидания?</p>
+  <p>Ответ — однострочное эмпирическое правило со слайдов о расчёте Flume, одно-единственное умножение. По дороге встретятся Storm, который вычисляет на данных, которые никогда не кончаются, и Sqoop, который вообще не работает с потоками.</p>
+</div>
+
+
+<section id="l33-stream">
+  <h2>Вычисление, которое никогда не заканчивается</h2>
+
+  <p>Все инструменты до сих пор читали вход, который уже закончился. Задание MapReduce (<a href="l30.html">урок 30</a>), скрипт Pig или запрос Hive (<a href="l32.html">урок 32</a>) стартует с файлов в HDFS, работает и останавливается. Слайд (p. 924): "Lots of tools for data (i.e. batch) processing", но "None of them are realtime systems which is becoming a real requirement for businesses". Оповещение о мошенничестве не может ждать, пока файл закончится, потому что этот файл не закончится никогда.</p>
+
+  <p>Конспект курса описывает этот сдвиг так: в потоковой обработке данные «преобразуются и анализируются непрерывно, по мере того как они генерируются», вместо того чтобы сначала сохраняться и обрабатываться потом (конспект, гл. 4). Вход — это <mark class="key">поток данных (data stream)</mark>, неограниченная последовательность меняющихся во времени данных. Запрос остаётся зарегистрированным и работает над протекающими мимо данными, а поскольку конца неограниченного входа никто дождаться не может, он смотрит на ограниченные <mark class="key">окна (windows)</mark> — например, клики за последнюю минуту. На карте «пропускная способность — задержка» из конспекта это зона "Continuous": низкая задержка, за которую платят пропускной способностью.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-batch">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Батч: законченный входной файл поступает в задание; задание пишет один результат и останавливается">
+        <path d="M20 40 H50 L60 50 V90 H20 Z" class="fi-paper"/>
+        <path d="M50 40 V50 H60 Z" class="fi-soft"/>
+        <text x="40" y="108" class="tx-sm tx-mid">вход</text>
+        <line x1="64" y1="65" x2="106" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="110" y="50" width="80" height="30" class="fi-paper st-s4 sw-2"/>
+        <text x="150" y="70" class="tx-mono tx-mid">job</text>
+        <line x1="190" y1="65" x2="228" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <path d="M234 45 H254 L262 53 V85 H234 Z" class="fi-paper"/>
+        <path d="M254 45 V53 H262 Z" class="fi-soft"/>
+        <text x="248" y="104" class="tx-sm tx-mid">результат</text>
+        <text x="130" y="128" class="tx-sm tx-mid">задание идёт</text>
+        <rect x="60" y="136" width="140" height="12" class="fw-s4 st-s4"/>
+        <line x1="200" y1="128" x2="200" y2="166" class="sw-2"/>
+        <text x="210" y="148" class="tx-hand">конец</text>
+        <line x1="20" y1="160" x2="282" y2="160" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="282" y="182" class="tx-sm tx-muted tx-end">время</text>
+      </svg>
+      <p class="fig-label">Батч: вход закончился, а с ним и задание</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Поток: бесконечный ряд кортежей втекает в топологию, которая всё время выдаёт результаты и никогда не останавливается">
+        <text x="6" y="70" class="tx-muted">…</text>
+        <rect x="22" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="38" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="54" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="70" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="86" y="55" width="12" height="20" class="fw-s1 st-s1"/>
+        <line x1="102" y1="65" x2="136" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="140" y="50" width="80" height="30" class="fi-paper st-s5 sw-2"/>
+        <text x="180" y="70" class="tx-mono tx-mid">topology</text>
+        <line x1="220" y1="65" x2="240" y2="65" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="244" y="57" width="10" height="16" class="fw-s1 st-s1"/>
+        <rect x="258" y="57" width="10" height="16" class="fw-s1 st-s1"/>
+        <rect x="272" y="57" width="10" height="16" class="fw-s1 st-s1"/>
+        <text x="286" y="70" class="tx-muted">…</text>
+        <text x="60" y="104" class="tx-sm tx-mid">кортежи без конца</text>
+        <text x="262" y="104" class="tx-sm tx-mid">результаты</text>
+        <text x="150" y="128" class="tx-sm tx-mid">топология работает</text>
+        <rect x="60" y="136" width="222" height="12" class="fw-s5 st-s5"/>
+        <line x1="20" y1="160" x2="282" y2="160" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="282" y="182" class="tx-sm tx-muted tx-end">время</text>
+        <text x="130" y="192" class="tx-hand tx-mid">не кончается</text>
+      </svg>
+      <p class="fig-label">Поток: вход не кончается, и топология тоже</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Батч против потока. В батче MapReduce, Pig и Hive читают уже полный вход, и задание останавливается, когда его прочитало. В потоке вход Storm — это "Unbounded sequence of tuples" (p. 927), и топология продолжает выдавать результаты, пока кто-нибудь её не убьёт.</figcaption>
+  </figure>
+
+  <aside class="margin-note">BackType купил Twitter в мае 2011 года; в сентябре того же года Storm стал open source, а в 2014-м — проектом верхнего уровня Apache (история Storm от Натана Марца, в ресурсах).</aside>
+
+  <p>Storm, как сказано на том же слайде, был "Developed by BackType which was acquired by Twitter" и "provides realtime computation" с четырьмя обещаниями: "Scalable" — каждый кусок вычисления выполняется как множество параллельных задач; "Guarantees no data loss"; "Extremely robust and fault-tolerant" — упавший воркер перезапускается, а работа умершей машины переназначается; "Programming language agnostic". "Realtime" здесь значит низкую задержку, результаты за секунды, а не жёсткий дедлайн.</p>
+
+  <div class="pitfall">
+    <p>«Guarantees no data loss — значит, каждый кортеж обрабатывается ровно один раз». Нет: документация Storm обещает обработку at-least-once (хотя бы один раз). Кортеж, который не успели полностью обработать вовремя, заново проигрывается из spout, так что ничего не теряется, — но после сбоя один и тот же кортеж может быть обработан дважды, и счётчик может посчитать его дважды.</p>
+  </div>
+
+  <h3>Четыре слова: stream, spout, bolt, topology</h3>
+
+  <div class="def">
+    <p><dfn>Stream</dfn> (поток) — "Unbounded sequence of tuples" (p. 927). <mark class="key">Кортеж (tuple)</mark> — это именованный список значений, например (word: "fresh").</p>
+    <p><dfn>Spout</dfn> — "Source of streams" (p. 928): читает данные снаружи — из очереди сообщений, лога, API — и выпускает кортежи.</p>
+    <p><dfn>Bolt</dfn> — "Processes input streams and produces new streams: Can implement functions such as filters, aggregation, join, etc" (p. 929).</p>
+    <p><dfn>Topology</dfn> (топология) — "Network of spouts and bolts" (p. 930): ориентированный граф, в котором каждый bolt подписан на потоки других компонентов.</p>
+  </div>
+
+  <p>Топология — это потоковый двойник задания MapReduce, с двумя отличиями: это любой граф, а не фиксированная пара «map, потом reduce», и, словами туториала Storm, «задание MapReduce в конце концов заканчивается, а топология обрабатывает сообщения вечно (или пока ты её не убьёшь)». Storm — не последний потоковый процессор курса: Spark Streaming из модуля 11 (<a href="l38.html">урок 38</a>) принимает входы из "Kafka, Flume, Twitter, TCP Sockets" (p. 1200) — и Flume, второй инструмент этого урока, среди них.</p>
+
+  <h3>Кластер</h3>
+
+  <p>Слайд (p. 925) рисует три группы машин (рис. 2). <mark class="key">Nimbus</mark>, "Master node (similar to Hadoop JobTracker)", рассылает код топологии по кластеру, распределяет её задачи по машинам и переназначает их, когда машина падает, — это JobTracker из <a href="l31.html">урока 31</a>. <mark class="key">Supervisors</mark> "Run worker processes" на рабочих машинах. Между ними стоит ZooKeeper, "Used for cluster coordination".</p>
+
+  <p>Зачем третья сторона? Nimbus и Supervisors никогда не говорят напрямую: назначения и heartbeat-сигналы идут через ZooKeeper. Оба демона «fail-fast и без состояния; всё состояние хранится в Zookeeper или на локальном диске» (туториал Storm), так что любой из них можно убить и перезапустить без потерь, а пока Nimbus лежит, работающие топологии продолжают работать.</p>
+
+  <figure class="fig fig--plain" id="l33-fig-cluster">
+    <svg class="dia" viewBox="0 0 560 256" role="img" aria-label="Кластер Storm: Nimbus, главный узел, обменивается информацией с тремя машинами ZooKeeper, а те — с пятью Supervisors; напрямую Nimbus и Supervisors не связаны">
+      <line x1="126" y1="125" x2="224" y2="125" class="sw-3" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <line x1="276" y1="125" x2="404" y2="125" class="sw-3" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <rect x="78" y="111" width="44" height="28" class="fi-paper st-s6 dash sw-3"/>
+      <line x1="85" y1="118" x2="115" y2="118" class="st-muted"/>
+      <line x1="85" y1="125" x2="115" y2="125" class="st-muted"/>
+      <line x1="85" y1="132" x2="115" y2="132" class="st-muted"/>
+      <rect x="228" y="61" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="68" x2="265" y2="68" class="st-muted"/>
+      <line x1="235" y1="75" x2="265" y2="75" class="st-muted"/>
+      <line x1="235" y1="82" x2="265" y2="82" class="st-muted"/>
+      <rect x="228" y="111" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="118" x2="265" y2="118" class="st-muted"/>
+      <line x1="235" y1="125" x2="265" y2="125" class="st-muted"/>
+      <line x1="235" y1="132" x2="265" y2="132" class="st-muted"/>
+      <rect x="228" y="161" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="168" x2="265" y2="168" class="st-muted"/>
+      <line x1="235" y1="175" x2="265" y2="175" class="st-muted"/>
+      <line x1="235" y1="182" x2="265" y2="182" class="st-muted"/>
+      <rect x="408" y="31" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="38" x2="445" y2="38" class="st-muted"/>
+      <line x1="415" y1="45" x2="445" y2="45" class="st-muted"/>
+      <line x1="415" y1="52" x2="445" y2="52" class="st-muted"/>
+      <rect x="408" y="71" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="78" x2="445" y2="78" class="st-muted"/>
+      <line x1="415" y1="85" x2="445" y2="85" class="st-muted"/>
+      <line x1="415" y1="92" x2="445" y2="92" class="st-muted"/>
+      <rect x="408" y="111" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="118" x2="445" y2="118" class="st-muted"/>
+      <line x1="415" y1="125" x2="445" y2="125" class="st-muted"/>
+      <line x1="415" y1="132" x2="445" y2="132" class="st-muted"/>
+      <rect x="408" y="151" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="158" x2="445" y2="158" class="st-muted"/>
+      <line x1="415" y1="165" x2="445" y2="165" class="st-muted"/>
+      <line x1="415" y1="172" x2="445" y2="172" class="st-muted"/>
+      <rect x="408" y="191" width="44" height="28" class="fi-paper"/>
+      <line x1="415" y1="198" x2="445" y2="198" class="st-muted"/>
+      <line x1="415" y1="205" x2="445" y2="205" class="st-muted"/>
+      <line x1="415" y1="212" x2="445" y2="212" class="st-muted"/>
+      <text x="8" y="70" class="tx-sm">Master node</text>
+      <text x="8" y="92" class="tx-sm">(как JobTracker)</text>
+      <text x="100" y="160" class="tx-sm tx-mid">Nimbus</text>
+      <text x="250" y="212" class="tx-sm tx-mid">ZooKeeper</text>
+      <text x="250" y="234" class="tx-sm tx-mid">cluster coordination</text>
+      <text x="430" y="20" class="tx-sm tx-mid">Supervisors</text>
+      <text x="552" y="248" class="tx-sm tx-end">run worker processes</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Кластер Storm со слайда (p. 925). Nimbus, мастер, обведён пунктиром координатора. Он никогда не говорит с Supervisors напрямую: назначения и heartbeat-сигналы проходят через ZooKeeper, который хранит состояние, так что упавший Nimbus не останавливает работающие топологии.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Топология (topology) — граф из spouts и bolts, который никогда не заканчивается; Nimbus распределяет его задачи, Supervisors их выполняют, ZooKeeper хранит состояние.</mark></p>
+</section>
+
+
+<section id="l33-grouping">
+  <h2>Какая задача получит кортеж?</h2>
+
+  <p>"Spouts and bolts execute as many tasks across the cluster" (p. 931): каждый компонент получает некоторое число задач (tasks), и каждая выполняет один и тот же код на своей доле кортежей. Масштабировать топологию — значит поднять эти числа, а не переписывать код. Подсчёт слов из туториала Storm — на входе предложения, на выходе текущий счётчик по каждому слову — задаёт их последним аргументом:</p>
+
+<pre><code>// Storm tutorial word count: 5 spout, 8 split, 12 count tasks
+TopologyBuilder builder = new TopologyBuilder();
+builder.setSpout("sentences", new RandomSentenceSpout(), 5);
+builder.setBolt("split", new SplitSentence(), 8)
+        .shuffleGrouping("sentences");
+builder.setBolt("count", new WordCount(), 12)
+        .fieldsGrouping("split", new Fields("word"));</code></pre>
+
+  <p>Каждый выпущенный кортеж ставит вопрос со следующего слайда: "When a tuple is emitted which task does it go to?" Ответ — <mark class="key">группировка потока (stream grouping)</mark>, которая объявляется на каждом ребре, когда bolt подписывается на поток, — выше это <code>.shuffleGrouping(…)</code> и <code>.fieldsGrouping(…)</code>. Слайд (p. 933) перечисляет четыре.</p>
+
+  <figure class="tbl-fig" id="l33-tbl-groupings">
+    <figcaption>Четыре stream grouping со слайда (p. 933) и для чего нужна каждая.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>grouping</th><th>на слайде</th><th>что даёт</th><th>для чего</th></tr></thead>
+        <tbody>
+          <tr><td>shuffle</td><td>"pick a random task"</td><td>ровная нагрузка; любая задача может получить любой кортеж</td><td>шаги без состояния: разбор, фильтр, разбиение предложения</td></tr>
+          <tr class="is-key"><td>fields</td><td>"consistent hashing on a subset of tuple fields"</td><td>одинаковые значения полей всегда попадают в одну и ту же задачу</td><td>состояние по ключу: счётчик на слово, сессия на пользователя</td></tr>
+          <tr><td>all</td><td>"send to all tasks"</td><td>каждая задача получает копию</td><td>рассылка всем: изменение конфигурации, маленькая справочная таблица</td></tr>
+          <tr><td>global</td><td>"pick task with lowest id"</td><td>одна задача видит весь поток</td><td>один общий итог или top-N; на этом ребре нет параллелизма</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">На слайде сказано consistent hashing. Документация Storm описывает хеш полей по модулю числа задач. Для экзамена важно свойство: одинаковые значения — одна и та же задача.</aside>
+
+  <p>Выбор между ними решает подсчёт. Задача подсчёта держит счётчик на каждое слово в собственной памяти. При shuffle grouping кортежи "fresh" расходятся по всем задачам, и каждая хранит лишь часть счёта; итога не знает ни одна. При fields grouping по "word" каждый "fresh" попадает в одну задачу, которая поэтому и хранит истинный счёт, — потоковый близнец правила MapReduce «один ключ — один редьюсер» (<a href="l30.html">урок 30</a>). Рис. 3 добавляет report bolt на global grouping, чтобы одна задача видела все счётчики.</p>
+
+  <figure class="fig fig--plain" id="l33-fig-wordcount">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="Топология подсчёта слов: spout sentences с двумя задачами питает bolt split с тремя задачами через shuffle grouping; split питает bolt count с тремя задачами через fields grouping по word; count питает bolt report с одной задачей через global grouping">
+      <rect x="20" y="80" width="90" height="70" rx="8" class="fi-paper sw-2"/>
+      <rect x="165" y="70" width="90" height="90" rx="8" class="fi-paper sw-2"/>
+      <rect x="310" y="70" width="90" height="90" rx="8" class="fi-paper sw-2"/>
+      <rect x="455" y="95" width="90" height="40" rx="8" class="fi-paper sw-2"/>
+      <circle cx="65" cy="100" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="65" cy="130" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="210" cy="88" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="210" cy="115" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="210" cy="142" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="355" cy="88" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="355" cy="115" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="355" cy="142" r="10" class="fw-s1 st-s1 sw-2"/>
+      <circle cx="500" cy="115" r="10" class="fw-s1 st-s1 sw-2"/>
+      <line x1="112" y1="115" x2="161" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="257" y1="115" x2="306" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="402" y1="115" x2="451" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="65" y="34" class="tx-sm tx-muted tx-mid">spout</text>
+      <text x="210" y="34" class="tx-sm tx-muted tx-mid">bolt</text>
+      <text x="355" y="34" class="tx-sm tx-muted tx-mid">bolt</text>
+      <text x="500" y="34" class="tx-sm tx-muted tx-mid">bolt</text>
+      <text x="65" y="58" class="tx-mono tx-sm tx-mid">sentences</text>
+      <text x="210" y="58" class="tx-mono tx-sm tx-mid">split</text>
+      <text x="355" y="58" class="tx-mono tx-sm tx-mid">count</text>
+      <text x="500" y="58" class="tx-mono tx-sm tx-mid">report</text>
+      <text x="137" y="190" class="tx-sm tx-mid">shuffle</text>
+      <text x="282" y="190" class="tx-sm tx-mid">fields: word</text>
+      <text x="427" y="190" class="tx-sm tx-mid">global</text>
+      <text x="282" y="234" class="tx-hand tx-mid">одно слово — одна задача</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Подсчёт слов из туториала Storm плюс report bolt, с 2, 3, 3 и 1 задачами (кружки). Каждое ребро объявляет свою группировку: разбивать любое предложение может любая задача, все кортежи одного слова должны встретиться в одной задаче подсчёта, а одна задача report видит все счётчики.</figcaption>
+  </figure>
+
+  <p>Теперь разведи слова сам. Виджет делает так, что <strong>одну мысль</strong> невозможно пропустить: fields grouping держит одно и то же слово в одной и той же задаче — и именно это делает параллельный подсчёт правильным.</p>
+
+  <div class="widget" id="l33-w-topo">
+    <h3 class="widget-title">Песочница топологии: куда идёт каждое слово?</h3>
+    <p class="widget-intro">Подсчёт слов с рис. 3, но без report bolt. Spout снова и снова выпускает шесть коротких постов с фермерского рынка; split bolt превращает каждый пост в кортежи-слова; каждая задача подсчёта держит собственные счётчики. Задай число задач для каждого компонента и группировку ребра split → count (ребро spout → split остаётся на shuffle), потом выпускай предложения. Рисунок показывает кортежи последнего предложения, а таблица — что насчитала к этому моменту каждая задача подсчёта. Fields grouping хеширует слово (FNV-1a, простой хеш строки) по модулю числа задач; shuffle выбирает задачу случайно, но с фиксированным seed, так что каждый прогон после «Сбросить» одинаков.</p>
+    <ol class="tasks">
+      <li>Shuffle grouping, 3 задачи подсчёта. Нажми <em>«Одно предложение»</em>: пост — "fresh eggs and fresh milk". Пока не смотришь: попадут ли два его кортежа "fresh" в одну задачу подсчёта? Потом нажми <em>«Сбросить»</em> и дважды <em>«Следующий раунд»</em> (12 предложений, 8 раз "fresh"). Какая задача хранит 8?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Два "fresh" первого поста уходят в задачи 0 и 1. После 12 предложений 8 не хранит ни одна задача: у задачи 0 — 6, у задач 1 и 2 — по 1. Сумма правильная, но ни одна задача её не знает, и показание краснеет.</p></details>
+      </li>
+      <li>Переключись на fields grouping (прогон начнётся заново) и дважды нажми <em>«Следующий раунд»</em>. Предскажи, сколько столбцов в строке "fresh" будет заполнено.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Один: задача 1 хранит "fresh" 8 раз, истинный счёт, вместе с "milk" (4). Каждое слово живёт ровно в одной задаче — одно и то же слово всегда идёт в одну и ту же задачу, и это и есть главная мысль виджета. Посмотри и на нагрузку: задача 0 считала только "honey" (6 кортежей), а задача 2 — 18. Fields grouping распределяет ключи, а не кортежи.</p></details>
+      </li>
+      <li>Выбери all grouping и 4 задачи подсчёта, потом дважды нажми <em>«Следующий раунд»</em>: 36 кортежей-слов. Предскажи число доставок на ребре split → count и что каждая задача хранит для "fresh".
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>144 доставки, по 4 копии каждого кортежа, и каждая задача хранит "fresh" 8: точно, но посчитано четыре раза. All grouping — для того, что нужно каждой задаче, например новой конфигурации, а не для разделения работы.</p></details>
+      </li>
+      <li>Выбери global grouping, по-прежнему 4 задачи подсчёта, и прогони два раунда. Какая задача работает? Потом поставь spout на 2 задачи, а split на 4 и снова прогони два раунда — изменятся ли счётчики?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Задача 0, с наименьшим id, получает все 36 кортежей; задачи 1–3 простаивают, так что параллелизм count bolt пропадает зря. Global grouping подходит для одного итогового значения или top-N. Больше задач spout или split ничего не меняют в счётчиках: ни один из этих компонентов не хранит состояния, так что любая их задача может обработать любое предложение.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-topo', function (root, ui) {
+    var SENT = ['fresh eggs and fresh milk', 'honey and bread', 'fresh bread', 'milk and honey', 'fresh honey', 'eggs and bread'];
+    var WORDS = ['fresh', 'and', 'eggs', 'milk', 'honey', 'bread'], WATCH = 'fresh';
+    var GNAME = { shuffle: 'shuffle', fields: 'fields: word', all: 'all', global: 'global' };
+    /* FNV-1a on the characters of the word: the widget's stand-in for "the hash of the field" */
+    function fnv(w) { var h = 0x811c9dc5, i; for (i = 0; i < w.length; i++) { h ^= w.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h; }
+
+    var st, player = null;
+    function fresh() {
+      st = { k: 0, tuples: 0, deliveries: 0, counts: [{}, {}, {}, {}], load: [0, 0, 0, 0], truth: {}, rng: Course.rng(7), last: null };
+    }
+    fresh();
+    function restart() { if (player) player.reset(); else fresh(); }
+
+    var nSpout = ui.slider({ label: 'задачи spout', min: 1, max: 2, step: 1, value: 1, onInput: function () { restart(); } });
+    var nSplit = ui.slider({ label: 'задачи split', min: 1, max: 4, step: 1, value: 2, onInput: function () { restart(); } });
+    var nCount = ui.slider({ label: 'задачи count', min: 1, max: 4, step: 1, value: 3, onInput: function () { restart(); } });
+    var grouping = ui.select('grouping ребра split → count (p. 933)', [
+      { value: 'shuffle', label: 'shuffle: случайная задача' },
+      { value: 'fields', label: 'fields по "word"' },
+      { value: 'all', label: 'all: каждая задача' },
+      { value: 'global', label: 'global: наименьший id' }
+    ], function () { restart(); }, 'shuffle');
+
+    function nS() { return Math.max(1, Math.round(Number(nSpout.value))); }
+    function nP() { return Math.max(1, Math.round(Number(nSplit.value))); }
+    function nC() { return Math.max(1, Math.min(4, Math.round(Number(nCount.value)))); }
+
+    function emit() {
+      var c = nC(), g = grouping.value, sentence = SENT[st.k % SENT.length], sp = st.k % nS(), pt = st.rng.int(0, nP() - 1), routes = [];
+      sentence.split(' ').forEach(function (w) {
+        var to = [], i;
+        if (g === 'shuffle') to = [st.rng.int(0, c - 1)];
+        else if (g === 'fields') to = [fnv(w) % c];
+        else if (g === 'all') { for (i = 0; i < c; i++) to.push(i); }
+        else to = [0];
+        to.forEach(function (x) { st.counts[x][w] = (st.counts[x][w] || 0) + 1; st.load[x]++; });
+        st.deliveries += to.length; st.tuples++; st.truth[w] = (st.truth[w] || 0) + 1;
+        routes.push({ w: w, to: to });
+      });
+      st.k++;
+      st.last = { sentence: sentence, spout: sp, split: pt, routes: routes };
+    }
+
+    player = ui.player({ ms: 700, label: 'Запустить поток', stepLabel: 'Одно предложение', onTick: function () { emit(); }, onReset: function () { fresh(); } });
+    ui.button('Следующий раунд: шесть предложений', function () { for (var i = 0; i < 6; i++) emit(); });
+
+    var roN = ui.readout('предложения · кортежи-слова'), roD = ui.readout('доставки split → count'), roF = ui.readout('кто считает «fresh»');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'кортежи последнего предложения', color: 's1', mark: 'line' },
+      { label: 'кортеж со словом «fresh»', color: 'ink', mark: 'hl' },
+      { label: 'задача, только что получившая кортежи', color: 's1', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 300, { label: 'Топология подсчёта слов: задачи spout, split и count нарисованы кружками в прямоугольниках своих компонентов; стрелки показывают, куда ушли кортежи последнего предложения, кортежи со словом fresh подсвечены, а значок рядом с каждой задачей count показывает, сколько кортежей она только что получила' });
+    var wrap = Course.el('div', { 'class': 'scroll-x' }), table = Course.el('table', { 'class': 'tbl tbl--center' });
+    wrap.appendChild(table);
+    ui.stage.appendChild(wrap);
+
+    var Y0 = 60, H = 192, R = 13, CX = { spout: 65, split: 250, count: 420 };
+    function cy(i, n) { return Y0 + (i + 0.5) * H / n; }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function arrow(x1, y1, x2, y2, hl) {
+      var dx = x2 - x1, dy = y2 - y1, d = Math.sqrt(dx * dx + dy * dy) || 1;
+      var sx = x1 + dx * (R + 1) / d, sy = y1 + dy * (R + 1) / d, ex = x2 - dx * (R + 3) / d, ey = y2 - dy * (R + 3) / d;
+      if (hl) S('line', { x1: sx, y1: sy, x2: ex, y2: ey, 'class': 'hl' });
+      S('line', { x1: sx, y1: sy, x2: ex, y2: ey, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' });
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var a = nS(), b = nP(), c = nC(), L = st.last, recv = [0, 0, 0, 0], hlTo = [false, false, false, false], i;
+      if (L) L.routes.forEach(function (r) { r.to.forEach(function (t) { recv[t]++; if (r.w === WATCH) hlTo[t] = true; }); });
+      [['spout', 'sentences', 20, 90], ['bolt', 'split', 200, 100], ['bolt', 'count', 380, 120]].forEach(function (bx) {
+        S('rect', { x: bx[2], y: 50, width: bx[3], height: 212, rx: 8, 'class': 'fi-paper sw-2' });
+        T(bx[2] + bx[3] / 2, 20, bx[0], 'tx-sm tx-muted tx-mid');
+        T(bx[2] + bx[3] / 2, 40, bx[1], 'tx-mono tx-sm tx-mid');
+      });
+      T(155, 290, 'shuffle', 'tx-sm tx-mid');
+      T(340, 290, GNAME[grouping.value], 'tx-sm tx-mid');
+      if (L) {
+        arrow(CX.spout, cy(L.spout, a), CX.split, cy(L.split, b), false);
+        for (i = 0; i < c; i++) if (recv[i]) arrow(CX.split, cy(L.split, b), CX.count, cy(i, c), hlTo[i]);
+      }
+      for (i = 0; i < a; i++) {
+        S('circle', { cx: CX.spout, cy: cy(i, a), r: R, 'class': L && L.spout === i ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        T(CX.spout, cy(i, a) + 5, String(i), 'tx-mono tx-sm tx-mid');
+      }
+      for (i = 0; i < b; i++) {
+        S('circle', { cx: CX.split, cy: cy(i, b), r: R, 'class': L && L.split === i ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        T(CX.split, cy(i, b) + 5, String(i), 'tx-mono tx-sm tx-mid');
+      }
+      for (i = 0; i < c; i++) {
+        S('circle', { cx: CX.count, cy: cy(i, c), r: R, 'class': recv[i] ? 'fw-s1 st-s1 sw-2' : 'fi-paper sw-2' });
+        T(CX.count, cy(i, c) + 5, String(i), 'tx-mono tx-sm tx-mid');
+        if (recv[i]) T(442, cy(i, c) + 5, '+' + recv[i], 'tx-mono tx-sm');
+      }
+    }
+    function tableHtml() {
+      var c = nC(), h = '<thead><tr><th>слово</th>', i;
+      for (i = 0; i < c; i++) h += '<th>задача ' + i + '</th>';
+      h += '<th>истинный счёт</th></tr></thead><tbody>';
+      WORDS.forEach(function (w) {
+        h += '<tr' + (w === WATCH ? ' class="is-key"' : '') + '><td><code>' + w + '</code></td>';
+        for (i = 0; i < c; i++) { var v = st.counts[i][w] || 0; h += '<td class="num">' + (v ? v : '·') + '</td>'; }
+        h += '<td class="num">' + (st.truth[w] || 0) + '</td></tr>';
+      });
+      return h + '</tbody>';
+    }
+    function lastText() {
+      var L = st.last;
+      if (!L) return 'Нажми «Одно предложение»: spout выпустит свой первый пост, “fresh eggs and fresh milk”.';
+      var parts = L.routes.map(function (r) { return r.w + ' → ' + (r.to.length > 1 ? 'каждая задача' : 'задача ' + r.to[0]); });
+      return 'Последнее: “' + L.sentence + '” — задача spout ' + L.spout + ' → задача split ' + L.split + ' (shuffle) → count: ' + parts.join(', ') + '.';
+    }
+
+    ui.onChange(function () {
+      var c = nC(), g = grouping.value, holders = [], i, truth = st.truth[WATCH] || 0, txt, tone;
+      roN.set(st.k + ' · ' + st.tuples);
+      roD.set(st.deliveries + (g === 'all' && c > 1 ? ' (копий каждого кортежа: ' + c + ')' : '') + ' · по задачам: ' + st.load.slice(0, c).join(' · '));
+      for (i = 0; i < c; i++) if (st.counts[i][WATCH]) holders.push(i);
+      if (!truth) txt = 'пока не встречалось';
+      else if (g === 'all' && c > 1) txt = 'каждая задача: по ' + truth + ' — точно, но посчитано в каждой из ' + c + ' задач';
+      else if (holders.length === 1) { txt = 'только задача ' + holders[0] + ': ' + truth + ', истинный счёт' + (g === 'global' && c > 1 ? ' — остальные задачи простаивают' : ''); tone = 'good'; }
+      else { txt = 'задачи ' + holders.join(', ') + ': ' + holders.map(function (h) { return st.counts[h][WATCH]; }).join(' + ') + ' — итога ' + truth + ' не знает ни одна'; tone = 'bad'; }
+      roF.set(txt, tone);
+      note.set(lastText());
+      draw();
+      table.innerHTML = tableHtml();
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l33-flume">
+  <h2>Flume: пруд на каждой станции</h2>
+
+  <p>Прежде чем что-то запустить на Hadoop, данные должны туда попасть. Вопрос со слайда (p. 935): "How do you get your data from these sources to Hadoop?" — а источники здесь — RDBMS и приложения (рис. 4). У каждого компонента Hadoop есть Java API (p. 936), так что каждое приложение могло бы писать в HDFS само; почему этого мало, перечислено на следующем слайде: "Multiple events", "Streaming", "Diverse sources", "Buffering" — "Flume and Sqoop can help!"</p>
+
+  <figure class="fig fig--plain" id="l33-fig-ways">
+    <svg class="dia" viewBox="0 0 560 210" role="img" aria-label="Два пути в Hadoop: события с серверов приложений непрерывно проталкивает Flume; строки реляционной таблицы целиком забирает Sqoop; и те и другие попадают в Hadoop, то есть в HDFS, HBase или Hive">
+      <rect x="20" y="44" width="44" height="28" class="fi-paper"/>
+      <line x1="27" y1="51" x2="57" y2="51" class="st-muted"/>
+      <line x1="27" y1="58" x2="57" y2="58" class="st-muted"/>
+      <line x1="27" y1="65" x2="57" y2="65" class="st-muted"/>
+      <rect x="76" y="44" width="44" height="28" class="fi-paper"/>
+      <line x1="83" y1="51" x2="113" y2="51" class="st-muted"/>
+      <line x1="83" y1="58" x2="113" y2="58" class="st-muted"/>
+      <line x1="83" y1="65" x2="113" y2="65" class="st-muted"/>
+      <rect x="20" y="132" width="40" height="24" class="fw-s3 st-s3"/>
+      <rect x="60" y="132" width="40" height="24" class="fw-s3 st-s3"/>
+      <rect x="100" y="132" width="40" height="24" class="fw-s3 st-s3"/>
+      <rect x="20" y="156" width="40" height="24" class="fi-paper"/>
+      <rect x="60" y="156" width="40" height="24" class="fi-paper"/>
+      <rect x="100" y="156" width="40" height="24" class="fi-paper"/>
+      <rect x="20" y="180" width="40" height="24" class="fi-paper"/>
+      <rect x="60" y="180" width="40" height="24" class="fi-paper"/>
+      <rect x="100" y="180" width="40" height="24" class="fi-paper"/>
+      <line x1="124" y1="58" x2="216" y2="58" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="220" y="43" width="80" height="30" class="fi-paper sw-2"/>
+      <line x1="300" y1="58" x2="418" y2="86" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="144" y1="168" x2="216" y2="168" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="220" y="153" width="80" height="30" class="fi-paper sw-2"/>
+      <line x1="300" y1="168" x2="418" y2="150" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="422" y="44" width="118" height="146" rx="8" class="fi-paper sw-2"/>
+      <text x="20" y="30" class="tx-sm">приложения</text>
+      <text x="20" y="120" class="tx-sm">RDBMS</text>
+      <text x="260" y="63" class="tx-mono tx-mid">Flume</text>
+      <text x="260" y="98" class="tx-sm tx-mid">push · непрерывно</text>
+      <text x="260" y="173" class="tx-mono tx-mid">Sqoop</text>
+      <text x="260" y="203" class="tx-sm tx-mid">pull · целиком</text>
+      <text x="481" y="80" class="tx-bold tx-mid">Hadoop</text>
+      <text x="481" y="112" class="tx-sm tx-mid">HDFS</text>
+      <text x="481" y="138" class="tx-sm tx-mid">HBase</text>
+      <text x="481" y="164" class="tx-sm tx-mid">Hive</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Вопрос со слайда (p. 935) — как данные из двух источников попадают в Hadoop — и ответ двумя инструментами. События из приложений непрерывно проталкивает в Hadoop Flume; строки реляционной таблицы забирает целиком Sqoop, когда запускается импорт.</figcaption>
+  </figure>
+
+  <p>Производителей много, их число "changes constantly", и они сидят "in different governance zones, data centers, continents" (p. 940). Их данные тоже дрейфуют: датацентр переходит на IPv6, разработчик "changes logs (again)", у JSON-записи появляется новое поле (p. 941). Код на каждом производителе пришлось бы менять вслед за каждым таким изменением.</p>
+
+  <p>Определение даёт слайд (p. 939): "Apache Flume is a continuous data ingestion system" — open source, надёжная, масштабируемая, управляемая, настраиваемая, — которая доставляет логи, потоки кликов, данные датчиков, социальные потоки и фиды в хранилища (HDFS, S3), в системы запросов (Hive, HBase, Cassandra…) или в поисковые движки. Она была "Originally designed to be a log aggregation system by Cloudera Engineers" и "Evolved to handle any type of streaming event data" (p. 943). Flume перемещает данные, но не вычисляет на них.</p>
+
+  <h3>Агент: source, channel, sink</h3>
+
+  <p><mark class="key">Агент (agent)</mark> — это "Simplest unit in Flume" (p. 944): один процесс, который соединяет "any number of sources to any number of data stores" через три вида компонентов (p. 948).</p>
+
+  <div class="def">
+    <p><dfn>Source</dfn> (источник) — "Accepts incoming Data", "Scales as required", "Writes data to Channel".</p>
+    <p><dfn>Channel</dfn> (канал) — "Stores data in the order received".</p>
+    <p><dfn>Sink</dfn> (сток) — "Removes data from Channel", "Sends data to downstream Agent or Destination".</p>
+  </div>
+
+  <p>Едет по этой цепочке <dfn>событие (event)</dfn>, "the base unit of communication between components" (p. 946): <mark class="key">заголовок (header)</mark> с метаданными, который "Can be used for routing content", и <mark class="key">тело (body)</mark>, "actual content" (p. 947), — байты, которые Flume понимать вовсе не нужно. Важны стрелки на том же слайде: "Source pushes events", "Sink polls for events". Sink всё время спрашивает channel «Got any events?», а channel сам никого не вызывает. Слайд (p. 966) добавляет кратности: "Source – Channel: many-to-many", "Channel– Sink: one-to-many (sink reads only from one channel)".</p>
+
+  <figure class="fig fig--plain" id="l33-fig-agent">
+    <svg class="dia" viewBox="0 0 560 230" role="img" aria-label="Агент Flume: событие из headers и body входит в source, который проталкивает его в channel, очередь событий; sink опрашивает channel, забирает события и пишет их в HDFS. Одна пунктирная рамка отмечает транзакцию source — от source до channel, вторая — транзакцию sink, от channel до HDFS">
+      <rect x="124" y="20" width="342" height="170" rx="10" class="fi-paper sw-2"/>
+      <rect x="144" y="96" width="156" height="46" rx="6" class="st-muted dash fi-none"/>
+      <rect x="300" y="96" width="254" height="46" rx="6" class="st-muted dash fi-none"/>
+      <rect x="12" y="89" width="90" height="60" class="fi-paper sw-2"/>
+      <rect x="12" y="89" width="90" height="26" class="fw-s3 st-s3"/>
+      <rect x="12" y="115" width="90" height="34" class="fw-s1 st-s1"/>
+      <line x1="104" y1="119" x2="146" y2="119" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="150" y="104" width="66" height="30" class="fi-paper sw-2"/>
+      <line x1="216" y1="119" x2="238" y2="119" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="240" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="254" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="268" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="282" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="296" y="108" width="14" height="22" class="fi-s1 st-paper"/>
+      <rect x="310" y="108" width="14" height="22" class="fi-paper st-muted"/>
+      <rect x="324" y="108" width="14" height="22" class="fi-paper st-muted"/>
+      <rect x="338" y="108" width="14" height="22" class="fi-paper st-muted"/>
+      <line x1="394" y1="112" x2="356" y2="112" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="354" y1="127" x2="392" y2="127" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="396" y="104" width="66" height="30" class="fi-paper sw-2"/>
+      <line x1="462" y1="119" x2="498" y2="119" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="500" y="104" width="50" height="30" class="fi-paper sw-2"/>
+      <text x="57" y="79" class="tx-sm tx-mid">event</text>
+      <text x="57" y="107" class="tx-sm tx-mid">headers</text>
+      <text x="57" y="138" class="tx-sm tx-mid">body</text>
+      <text x="136" y="44" class="tx-sm">агент Flume</text>
+      <text x="183" y="124" class="tx-sm tx-mid">source</text>
+      <text x="222" y="84" class="tx-sm tx-mid">push</text>
+      <text x="380" y="84" class="tx-sm tx-mid">got any events?</text>
+      <text x="429" y="124" class="tx-sm tx-mid">sink</text>
+      <text x="525" y="124" class="tx-sm tx-mid">HDFS</text>
+      <text x="296" y="162" class="tx-sm tx-mid">channel</text>
+      <text x="210" y="182" class="tx-sm tx-mid">source TX</text>
+      <text x="430" y="182" class="tx-sm tx-mid">sink TX</text>
+      <text x="552" y="220" class="tx-hand tx-end">коммит после доставки</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Один агент, как на слайдах (pp. 946–949). Source проталкивает события в channel внутри своей транзакции; sink опрашивает ("Got any events?"), забирает батч внутри собственной транзакции и коммитит только тогда, когда HDFS его получила. Слайды рисуют channel цилиндром базы данных; на самом деле это очередь.</figcaption>
+  </figure>
+
+  <h3>Транзакции</h3>
+
+  <p>Агенты выстраиваются в цепочки: лекция рисует "Distributed Pipeline Architecture" из агентов от веб-логов до HDFS, у каждого свой channel, и sink одного агента питает source следующего. Слайд (p. 949): "Source uses transactions to write to the channel", "Sink uses transactions to remove data from the channel", "Sink transaction commits only after successful transfer of data". Source коммитит батч только тогда, когда channel принял его целиком. Sink берёт батч, доставляет его — в HDFS или в source следующего агента, который коммитит его в свой channel, — и только потом коммитит, удаляя батч. При любом сбое транзакция откатывается, и события остаются на месте: эстафетная палочка, которую отпускают, только когда её взяла другая рука.</p>
+
+  <aside class="redpen" data-page="949">
+    <p class="claim">"This ensures no data loss in Flume pipeline"</p>
+    <p class="fix">Транзакции делают безопасной каждую передачу, пока агенты работают: событие покидает channel только после того, как его получил следующий узел. Это отсутствие потерь в пути при надёжном (file) channel, и это at-least-once, а не exactly-once: батч, повторённый после неудачного коммита, может прийти дважды. С memory channel события в канале теряются, когда процесс агента умирает.</p>
+    <p class="because">Слайд (p. 968) называет memory channel "Not persistent", слайд о размерах батчей предупреждает о "duplication impact" больших батчей, а руководство пользователя Flume говорит, что «любые события, оставшиеся в memory channel, когда процесс агента умирает, восстановить нельзя», — попробуй кнопку сбоя в виджете ниже. Слайд (p. 986) повторяет утверждение ("Flume never loses any data in transit between Agents"): экзамен может его напечатать, так что знай его и его условия.</p>
+  </aside>
+
+  <h3>Зачем нужны каналы?</h3>
+
+  <p>Слайд (p. 951) даёт три причины: channel "Buffers data and insulates downstream from load spikes", "Provides persistent store for data in case the process restarts" и "Provides flow ordering* and transactional guarantees". У звёздочки нет сноски; уточнение — на итоговом слайде о Flume: "weak ordering guarantee, i.e., in the absence of failures the data will arrive in the order it was received". График на том же слайде рассказывает жизнь канала: в установившемся режиме он почти пуст; растёт, когда отказывает пункт назначения; на "Channel Full" отказывают и записи source, и давление уходит вверх по течению; когда пункт назначения восстановлен, накопившееся рассасывается.</p>
+
+  <p>Слайд (p. 968) предлагает два вида. <mark class="key">Memory channel</mark> — это "In-memory queue", "Fast", "Not persistent", "Limited capacity". Второй, "Disk", в конфигурации называется <mark class="key">file channel</mark> (<code>type = file</code>): он пишет события на локальный диск, переживает перезапуск и может быть намного больше — ценой скорости.</p>
+</section>
+
+
+<section id="l33-tiers">
+  <h2>От трёх веб-серверов к сходящемуся потоку</h2>
+
+  <p>Слайды (pp. 952–956) рассказывают случай, ради которого Flume и строили: логи веб-серверов в HDFS. При "only 3 web servers at the time of launch" "Ad-hoc solution will likely suffice!" (p. 953). Рост приносит проблемы: "How do you manage your output paths on HDFS?" и "How do you maintain your client code in face of changing environment as well as requirements?"</p>
+
+  <p>Один агент Flume между серверами и HDFS (p. 954) даёт "Insulation from HDFS downtime", "Quick offload of logs from Web Server machines" и "Better Network utilization" — но "What if the Flume node goes down?" Два агента, к которым подключён каждый сервер (p. 955), дают "Redundancy and Availability" и "Automatic load balancing and failover" — пока не появятся новые серверы. Масштабируемый ответ — <mark class="key">сходящийся поток (converging flow)</mark> (p. 956): агенты рядом с серверами, агрегируемые уровнями (tiers) 2 и 3 "before being put into destination system".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-tiers">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="До: три веб-сервера, у каждого своя стрелка прямо в HDFS">
+        <text x="20" y="24" class="tx-sm">веб-серверы</text>
+        <line x1="64" y1="60" x2="206" y2="108" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="64" y1="115" x2="206" y2="115" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="64" y1="170" x2="206" y2="122" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="20" y="46" width="44" height="28" class="fi-paper"/>
+        <line x1="27" y1="53" x2="57" y2="53" class="st-muted"/>
+        <line x1="27" y1="60" x2="57" y2="60" class="st-muted"/>
+        <line x1="27" y1="67" x2="57" y2="67" class="st-muted"/>
+        <rect x="20" y="101" width="44" height="28" class="fi-paper"/>
+        <line x1="27" y1="108" x2="57" y2="108" class="st-muted"/>
+        <line x1="27" y1="115" x2="57" y2="115" class="st-muted"/>
+        <line x1="27" y1="122" x2="57" y2="122" class="st-muted"/>
+        <rect x="20" y="156" width="44" height="28" class="fi-paper"/>
+        <line x1="27" y1="163" x2="57" y2="163" class="st-muted"/>
+        <line x1="27" y1="170" x2="57" y2="170" class="st-muted"/>
+        <line x1="27" y1="177" x2="57" y2="177" class="st-muted"/>
+        <rect x="210" y="100" width="70" height="30" class="fi-paper sw-2"/>
+        <text x="245" y="120" class="tx-mid">HDFS</text>
+        <text x="245" y="152" class="tx-sm tx-mid">пути вывода?</text>
+        <text x="20" y="214" class="tx-hand">код на каждом сервере</text>
+      </svg>
+      <p class="fig-label">До: без Flume (p. 953)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="После: восемь клиентских агентов отправляют события двум агрегирующим агентам, и у каждого есть пунктирный запасной путь к другому агрегатору; оба агрегатора пишут в HDFS более толстыми стрелками">
+        <line x1="74" y1="28" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="50" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="72" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="94" x2="138" y2="149" class="st-muted dots"/>
+        <line x1="74" y1="116" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="138" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="160" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="182" x2="138" y2="61" class="st-muted dots"/>
+        <line x1="74" y1="28" x2="136" y2="57" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="50" x2="136" y2="59" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="72" x2="136" y2="63" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="94" x2="136" y2="65" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="116" x2="136" y2="145" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="138" x2="136" y2="147" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="160" x2="136" y2="151" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="182" x2="136" y2="153" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="180" y1="61" x2="228" y2="98" class="st-s1 sw-4" marker-end="url(#arr-s1)"/>
+        <line x1="180" y1="149" x2="228" y2="112" class="st-s1 sw-4" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="28" x2="36" y2="28" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="50" x2="36" y2="50" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="72" x2="36" y2="72" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="94" x2="36" y2="94" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="116" x2="36" y2="116" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="138" x2="36" y2="138" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="160" x2="36" y2="160" class="st-s1" marker-end="url(#arr-s1)"/>
+        <line x1="16" y1="182" x2="36" y2="182" class="st-s1" marker-end="url(#arr-s1)"/>
+        <rect x="40" y="21" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="43" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="65" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="87" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="109" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="131" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="153" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="40" y="175" width="34" height="14" rx="3" class="fi-paper"/>
+        <rect x="140" y="51" width="40" height="20" rx="4" class="fi-paper sw-2"/>
+        <rect x="140" y="139" width="40" height="20" rx="4" class="fi-paper sw-2"/>
+        <rect x="232" y="90" width="56" height="30" class="fi-paper sw-2"/>
+        <text x="260" y="110" class="tx-mid">HDFS</text>
+        <text x="57" y="214" class="tx-sm tx-mid">уровень 1</text>
+        <text x="160" y="214" class="tx-sm tx-mid">уровень 2</text>
+        <text x="236" y="168" class="tx-hand tx-mid">батчи крупнее</text>
+      </svg>
+      <p class="fig-label">После: сходящийся поток (p. 956)</p>
+    </div>
+    <figcaption><b>Рис. 6.</b> Случай агрегации логов. До: каждый веб-сервер пишет в HDFS сам — на запуске это нормально, но каждый сервер несёт клиентский код и сам управляет своими путями вывода. После: уровни агентов сходятся к пункту назначения; внутренние агенты несут больше трафика и доставляют большие батчи, а пунктирные пути ко второму агрегатору дают failover. Слайд рисует 16, 4 и 3 агента на трёх уровнях; набросок — два уровня.</figcaption>
+  </figure>
+
+  <aside class="margin-note">На этих слайдах "batch size" значит, сколько агент отправляет вниз по течению за единицу времени. В конфигурации Flume batchSize — это число событий в одной транзакции.</aside>
+
+  <p>Зачем сходиться? HDFS предпочитает немногих писателей, которые пишут большие файлы (<a href="l31.html">урок 31</a>): каждый файл стоит памяти на NameNode. "Closer a tier is to the destination, larger the batch size it delivers downstream", отсюда и "Optimized handling of destination systems". На одного агента объём событий "is least in the outermost tier" и "highest in the innermost tier" (p. 958); на уровень — "In steady state, all tiers carry same event volume", а "Transient variations in flow are absorbed and ironed out by channels" (p. 959). Тот же итог, меньше агентов — больше на каждого.</p>
+
+  <h3>Три эмпирических правила</h3>
+
+  <p>"What we know" (p. 960): число веб-серверов, объём логов на сервер за единицу времени, пункт назначения и маршрутизация к нему, худший случай простоя пункта назначения. "What we will calculate": число уровней, размеры батчей на выходе, ёмкость канала — по одному правилу на каждое (pp. 961–964):</p>
+
+  <div class="formula">
+    \[ N_{t+1} = \left\lceil N_t / f \right\rceil, \quad 4 \le f \le 16 \]
+    \[ B_t = V / N_t \]
+    \[ C = r_{\text{in}}^{\max} \times T_{\text{out}}^{\max} \]
+    <dl class="legend">
+      <dt>\(N_t\)</dt><dd>число агентов на уровне \(t\); уровень 1 — клиентские агенты</dd>
+      <dt>\(f\)</dt><dd>fan-in: "One Aggregating Agent (A) can be used with anywhere from 4 to 16 client Agents" (p. 961)</dd>
+      <dt>\(V\)</dt><dd>объём событий, входящих в поток в установившемся режиме, одинаковый на каждом уровне (p. 959)</dd>
+      <dt>\(B_t\)</dt><dd>размер батча на выходе одного агента уровня \(t\): "total exit data volume divided by number of Agents in a tier" (p. 962)</dd>
+      <dt>\(C\)</dt><dd>ёмкость канала: "worst case data ingest rate sustained over the worst case downstream outage interval" (p. 963)</dd>
+      <dt>\(r_{\text{in}}^{\max}\)</dt><dd>худшая скорость поступления, в событиях в секунду</dd>
+      <dt>\(T_{\text{out}}^{\max}\)</dt><dd>худший простой ниже по течению, в секундах</dd>
+    </dl>
+  </div>
+
+  <p>Слайды формулируют правила словами; первая формула — это соотношение «от 4 до 16», применённое уровень за уровнем. Второе правило нарисовано на слайде (p. 962): \(n\) клиентских агентов отправляют по \(k\), так что один агент ниже по течению должен доставлять \(n * k + \Delta\), а два — по \((n * k + \Delta)/2\), где \(\Delta\) — запас. У каждого правила есть свои "Considerations": уровни должны ещё и обеспечивать "routing, load-balancing and failover"; "Having some extra room is good", а большие батчи делают дубликаты дорогими; "Multiple disks will yield better performance", и "Channel size impacts the back-pressure buildup in the pipeline" — больший канал отодвигает момент, когда производителям начинают отказывать. И у каждого есть "Test": нагрузочно проверить установившийся режим, пик и failover и ожидать, что "need more disk space than the physical footprint of the data size". Интернет-магазин из загадки, шаг за шагом:</p>
+
+  <ol class="steps" id="l33-steps-sizing">
+    <li><p>Что мы знаем: 64 веб-сервера, по 2 000 событий в секунду каждый, 500 байт на событие; пункт назначения — HDFS, без маршрутизации; худший простой HDFS — один час, 3 600 секунд.</p></li>
+    <li><p>Уровни (p. 961): по клиентскому агенту на сервер дают \(N_1 = 64\). Fan-in 8 даёт \(N_2 = 8\). Ещё один fan-in 8 дал бы единственный агрегатор, а единственный агент — это единая точка отказа (p. 954); fan-in 4 даёт \(N_3 = 2\).</p> \[ 64 \to 8 \to 2 \]</li>
+    <li><p>Объём (p. 959): в установившемся режиме каждый уровень несёт то, что входит в поток, — 64 МБ в секунду при 500 байтах на событие.</p> \[ V = 64 \times 2000 = 128\,000 \ \text{events/s} \]</li>
+    <li><p>Размер батча на выходе одного агента (p. 962): уровень 1 отправляет 2 000 событий/с на агента, уровень 2 — 16 000, уровень 3 — 64 000. Добавь запас \(\Delta\) и проверь failover: если один агент уровня 3 упал, второй должен в одиночку пропускать все 128 000.</p> \[ B_3 = 128\,000 / 2 = 64\,000 \]</li>
+    <li><p>Ёмкость канала (p. 963): уровень 3 должен удержать всё, что придёт за время простоя, — 460.8 миллиона событий по 500 байт, около 230 GB, то есть по 115 GB на агента. Это file channel, разложенный на несколько дисков; memory channel даже близко не подходит.</p> \[ \begin{aligned} C &amp;= 128\,000 \times 3600 \\ &amp;\approx 4.6 \times 10^{8} \ \text{events} \end{aligned} \]</li>
+  </ol>
+</section>
+
+
+<section id="l33-config">
+  <h2>Агент в десяти строках свойств</h2>
+
+  <p>Запуск Flume — это два шага (p. 970): "Configure agent(s) in property file", потом "Run Flume agent from console". Один файл может описывать несколько агентов; <code class="nw">--name</code> выбирает, какой запустить.</p>
+
+<pre><code>$ flume-ng agent --conf-file spool-to-logger.properties \
+  --name agent1</code></pre>
+
+  <p>Слайд (p. 971) — это весь файл агента «1-1-1»: один source, один channel, один sink:</p>
+
+<pre><code># spool-to-logger.properties (p. 971)
+agent1.sources = source1
+agent1.sinks = sink1
+agent1.channels = channel1
+
+agent1.sources.source1.channels = channel1
+agent1.sinks.sink1.channel = channel1
+
+agent1.sources.source1.type = spooldir
+agent1.sources.source1.spoolDir = /Users/udi/tmp/spooldir
+
+agent1.sinks.sink1.type = logger
+agent1.channels.channel1.type = file</code></pre>
+
+  <p>Читай его тремя блоками. Сначала имена компонентов <code>agent1</code>. Потом проводка: source перечисляет свои <code>channels</code>, во множественном числе, потому что может питать несколько; sink называет свой <code>channel</code>, в единственном, — правило о кратностях зашито прямо в имена ключей. Наконец, <code>type</code> и свойства каждого компонента. Этот агент превращает каждую строку каждого файла, брошенного в spooling-каталог, в событие, держит его в file channel и печатает через logger sink.</p>
+
+  <p>Каталог компонентов (pp. 967–969). Sources: Spooling Directory — "Text Files, Immutable, Unique name", поскольку source отслеживает файлы по имени и останавливается с ошибкой, если файл изменился или имя повторилось (руководство пользователя Flume), — SysLog, Exec (вывод команды вроде <code class="nw">tail -F</code>) и Custom. Channels: Memory и Disk. Sinks: HDFS, HBase, "Console Log" и "Local Directory" — в конфигурации это logger sink (<code>type = logger</code>) и file_roll sink.</p>
+
+  <h3>HDFS sink</h3>
+
+<pre><code># p. 972: the logger sink replaced by an HDFS sink
+agent1.sinks.sink1.type = hdfs
+agent1.sinks.sink1.hdfs.path = /tmp/flume
+agent1.sinks.sink1.hdfs.filePrefix = events
+agent1.sinks.sink1.hdfs.fileSuffix = .log
+agent1.sinks.sink1.hdfs.inUsePrefix = _
+agent1.sinks.sink1.hdfs.fileType = DataStream</code></pre>
+
+  <p><code>hdfs</code> — короткое имя класса со слайда, <code>org.apache.flume.sink.hdfs.HDFSEventSink</code>. Файлы ложатся в <code>/tmp/flume</code> как <code>events.&lt;timestamp&gt;.log</code> — это ответ на вопрос про "output paths" из истории с веб-серверами. Пока файл пишется, его имя начинается с <code>_</code>, а задания Hadoop такие файлы пропускают: ни одно задание не прочитает половину файла. Sink «перекатывает» файл (roll) — закрывает его и открывает новый, — и "By default, files are rolled over every 30 seconds", а <code>rollCount</code> и <code>rollSize</code> служат дополнительными триггерами (p. 973). <code>fileType</code> выбирает "SequenceFile = binary format", "DataStream = uncompressed files (text)" или "CompressedStream = compressed files" (p. 974).</p>
+
+  <div class="tip"><p>30 секунд со слайда (p. 973) — это <code>hdfs.rollInterval</code>. Руководство пользователя Flume даёт значения по умолчанию и двум другим триггерам — <code>rollSize</code> 1024 байта, <code>rollCount</code> 10 событий, — и побеждает тот триггер, что сработал первым, так что загруженный sink с настройками по умолчанию закрывает файл после 10 событий или 1 KB, смотря что наступит раньше, и забивает HDFS крошечными файлами. Поставь триггер в 0, чтобы его выключить.</p></div>
+
+  <h3>HTTP на входе, папки по заголовку</h3>
+
+  <p>Слайд (p. 975) меняет source на HTTP-сервер, перед memory channel на 1 000 событий:</p>
+
+<pre><code># p. 975: an HTTP source on port 8989 and a memory channel
+httpagent.sources.http-source.type = org.apache.flume.source.http.HTTPSource
+httpagent.sources.http-source.bind = localhost
+httpagent.sources.http-source.port = 8989
+httpagent.channels.ch.type = memory
+httpagent.channels.ch.capacity = 1000</code></pre>
+
+  <aside class="margin-note">Команда на слайде (p. 976) напечатана с фигурными кавычками и незакрытой строкой тела; версию здесь можно набрать.</aside>
+
+  <p>Клиенты отправляют события в "Fixed format: header + body" (p. 976): JSON-массив объектов с <code>headers</code> и <code>body</code>. Когда канал полон, source отвечает HTTP 503 (руководство пользователя Flume): обратное давление (back-pressure), которое клиент видит.</p>
+
+<pre><code>$ curl -X POST -H 'Content-Type: application/json; charset=UTF-8' \
+  -d '[{"headers": {"eventheader1": "event1", "eventheader2": "event2"},
+        "body": "This is the body1"}]' \
+  http://localhost:8989</code></pre>
+
+  <p>"Bucketing" (p. 977) — это "Dynamic assignment of files to folders": <code>%{topic}</code> в пути заменяется, событие за событием, значением заголовка <code>topic</code>, так что событие со слайда с <code>"topic" : "topic1"</code> попадает в <code>/tmp/flume/http/topic1/</code>. Имена заголовков чувствительны к регистру: "Topic" со слайда — это <code>topic</code> и в пути, и в событии. Bucketing по времени (p. 978) использует escape-последовательности дат:</p>
+
+<pre><code># p. 977: one folder per value of the header topic
+httpagent.sinks.hdfs-sink.hdfs.path = /tmp/flume/http/%{topic}
+
+# p. 978: one folder per hour, read from the sink's own clock
+agent1.sinks.sink1.hdfs.useLocalTimeStamp = true
+agent1.sinks.sink1.hdfs.path = /tmp/flume/twitterinterceptor/%Y/%m/%d/%H</code></pre>
+
+  <p>Escape-последовательностям времени нужен заголовок <code>timestamp</code>, который HTTP- и spooling-source сами не добавляют; <code>useLocalTimeStamp = true</code> позволяет sink взять вместо него собственные часы. Папка на каждый час — это та самая раскладка «партиция на каталог», которую читает Hive (<a href="l32.html">урок 32</a>).</p>
+
+  <aside class="margin-note">"They must exist already in HBASE" (p. 979): таблица и семейство столбцов — должны; квалификатор pCol появляется с первой записью, как столбцы в HBase (урок 32).</aside>
+
+  <p>Те же события можно отправить и в HBase (p. 979):</p>
+
+<pre><code># p. 979: each event into the column test:pCol of the HBase table test_table
+agent1.sinks.hbaseSink.type = org.apache.flume.sink.hbase.AsyncHBaseSink
+agent1.sinks.hbaseSink.table = test_table
+agent1.sinks.hbaseSink.columnFamily = test
+agent1.sinks.hbaseSink.serializer = org.apache.flume.sink.hbase.SimpleAsyncHbaseEventSerializer
+agent1.sinks.hbaseSink.serializer.payloadColumn = pCol</code></pre>
+
+  <h3>Несколько каналов, selectors и interceptors</h3>
+
+  <p>Source может "replicate or multiplex data across many channels", каждый из которых опустошает свой sink (p. 950). Слайд (p. 980) подключает один HTTP source к двум каналам — <code>ch1</code> в HDFS sink, <code>ch2</code> в logger sink:</p>
+
+<pre><code># p. 980: one source, two channels, two sinks
+httpagent.sources = http-source
+httpagent.sinks = hdfs-sink log-sink
+httpagent.channels = ch1 ch2
+
+httpagent.sources.http-source.channels = ch1 ch2
+httpagent.sinks.hdfs-sink.channel = ch1
+httpagent.sinks.log-sink.channel = ch2</code></pre>
+
+  <p>Какое событие куда идёт, решает <mark class="key">channel selector</mark> этого source (p. 981): "Replicating • Default • Every event sent everywhere" или "Multiplexing • routes events to channels based on their headers". Следующий слайд (p. 982) добавляет четыре строки — "If show = 1, route to ch1", если show = 2 — в ch2. Selector принадлежит source: маршрутизация происходит до каналов.</p>
+
+<pre><code># p. 982: route by the header show (without these lines: replicating)
+httpagent.sources.http-source.selector.type = multiplexing
+httpagent.sources.http-source.selector.header = show
+httpagent.sources.http-source.selector.mapping.1 = ch1
+httpagent.sources.http-source.selector.mapping.2 = ch2</code></pre>
+
+  <aside class="margin-note">Руководство пользователя Flume не знает у этого класса свойства keywords: он берёт выборку из 1 % всех твитов и отправляет их дальше как события Avro.</aside>
+
+  <p>Социальные сети — ещё один source (p. 983): Twitter source принимает четыре учётных данных аккаунта разработчика Twitter, которые на слайде замазаны, и список ключевых слов. Слайды (pp. 985 и 978) завершают его конвейер: оставить твиты о выборах и разложить их по одной папке HDFS на каждый час.</p>
+
+<pre><code># p. 983: tweets as events (the slide masks the credentials as **)
+agent1.sources.source1.type = org.apache.flume.source.twitter.TwitterSource
+agent1.sources.source1.consumerKey = **
+agent1.sources.source1.consumerSecret = **
+agent1.sources.source1.accessToken = **
+agent1.sources.source1.accessTokenSecret = **
+agent1.sources.source1.keywords = @realDonaldTrump, @HillaryClinton</code></pre>
+
+  <p>Наконец, <mark class="key">interceptor</mark> "can process events based on their contents or headers": "Simple data processing", "Overhead for Flume", "To be used with caution!" (p. 984). Он работает внутри source на каждом событии, так что медленный interceptor замедляет приём. Слайд (p. 985) оставляет только события, тело которых совпадает с регулярным выражением; <code>excludeEvents = true</code> наоборот отбрасывало бы их.</p>
+
+<pre><code># p. 985, with the registration line it needs: keep only events whose body contains "election"
+agent1.sources.source1.interceptors = regexInterceptor
+agent1.sources.source1.interceptors.regexInterceptor.type = regex_filter
+agent1.sources.source1.interceptors.regexInterceptor.regex = .*election.*
+agent1.sources.source1.interceptors.regexInterceptor.excludeEvents = false</code></pre>
+
+  <div class="pitfall"><p>«Трёх строк interceptor со слайда достаточно, чтобы фильтр заработал». Не сами по себе: interceptor работает, только когда его имя перечислено на source, как в первой строке выше (<code>a1.sources.r1.interceptors = i1 i2</code> в руководстве пользователя Flume). Без этой строки ничего не фильтруется.</p></div>
+
+  <p>Теперь собирай потоки и прогоняй через них нагрузку. Виджет делает видимой одну мысль: <strong>channel поглощает разницу между тем, что приходит, и тем, что может уйти, а когда он полон, отказ уходит вверх по течению</strong>, — поэтому его ёмкость должна покрывать худшую скорость поступления за худший простой.</p>
+
+  <div class="widget" id="l33-w-flume">
+    <h3 class="widget-title">Конструктор агента Flume: собери поток и ударь по нему</h3>
+    <p class="widget-intro">Выбери поток: один агент, как на слайде (p. 975), один агент с двумя каналами и двумя sinks, как на слайде (p. 980), или четыре клиентских агента, сходящихся к агрегатору. Четыре веб-сервера отправляют по 100 событий в секунду каждый; между t = 10 s и t = 30 s приходит всплеск нагрузки, простой HDFS или и то и другое. Каналы — это ряды ячеек, которые заполняются. Файл свойств после показаний генерируется из выбранного тобой потока. Скорости (100, 300 и 600 событий в секунду) и 20 000 событий file channel — круглые числа виджета (настоящий file channel по умолчанию вмещает миллион); 1 000 у memory channel — значение со слайда (p. 975).</p>
+    <ol class="tasks">
+      <li>Один агент, memory channel, HDFS лежит, всплеск × 1. Прежде чем нажать <em>«Пуск, 90 s»</em>: приходит 400 событий в секунду, а уйти не может ни одно. Когда заполнится канал на 1 000 и сколько событий будет отвергнуто к t = 30 s? Потом повтори с file channel.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Полон примерно через 2.5 s после начала простоя (1 000 / 400); дальше source отвергает всё: около 7 000 событий к t = 30 s. Правило со слайда (p. 963) требует 400 × 20 = 8 000 событий, как говорит последнее показание. File channel принимает их все: его пик — около 8 000 при t = 30 s, потом он опустошается со скоростью 600 − 400 = 200 в секунду и снова пуст примерно к t = 70 s.</p></details>
+      </li>
+      <li>Сходящийся поток, memory channels, HDFS лежит, всплеск × 1. Предскажи, какой канал заполнится первым и когда веб-серверам начнут отказывать.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Канал агрегатора, к t = 13 s. Его source затем отвергает батчи клиентов (пунктирные стрелки), и каждый клиентский канал растёт на 100 событий в секунду: полон к t = 23 s. Только тогда отказывают веб-серверам — около 3 000 событий к t = 30 s против 7 000 с одним агентом. Каждый узел буферизует, и обратное давление идёт вверх по течению по одному уровню за раз.</p></details>
+      </li>
+      <li>Сходящийся поток, HDFS работает (выключи простой), всплеск × 3. Где поглощается всплеск — с memory channels, а потом с file channels?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Каждый клиент получает 300 событий в секунду и может отправить 300, так что уровень 1 пропускает всплеск дальше. Агрегатор получает 1 200, а пишет в HDFS только 600: с memory channels он полон к t = 12 s, клиенты — к t = 19 s, и отвергнуто около 7 000 событий. С file channels агрегатор поглощает (1 200 − 600) × 20 = 12 000 событий и рассасывает их за следующие 60 s: "Transient variations in flow are absorbed and ironed out by channels" (p. 959).</p></details>
+      </li>
+      <li>Два канала, memory, HDFS лежит. С replicating selector продолжает ли logger печатать во время простоя? Переключись на multiplexing и сравни; прочитай строки selector в файле. Наконец, нажми <em>«Сбой и перезапуск»</em> во время простоя, пока в каналах есть события, — один раз с memory, другой раз с file channels.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Replicating кладёт каждое событие в оба канала, поэтому, как только <code>ch1</code> полон (t = 13 s), source отвергает всё, и logger тоже голодает. С multiplexing отвергается только половина с <code>show = 1</code> (около 3 000 событий), а <code>show = 2</code> продолжает доходить до logger; в файле появляются четыре строки selector со слайда (p. 982). Сбой опустошает memory channel — события потеряны, хотя веб-серверам сказали, что они доставлены, — а file channel после перезапуска находит их на диске.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-flume', function (root, ui) {
+    var PROD = 100, NWS = 4, W0 = 10, W1 = 30, TMAX = 90, SUB = 20, DT = 1 / SUB;
+    var CAP = { memory: 1000, file: 20000 }, DRAIN_HDFS = 600, DRAIN_LOG = 600, DRAIN_HOP = 300;
+    var s = null, player = null;
+
+    function fresh() {
+      s = { t: 0, ch: 0, ch1: 0, ch2: 0, agg: 0, cl: [0, 0, 0, 0], hdfs: 0, log: 0, refused: 0, lost: 0, refNow: false, hop: false, prev: 0, crash: null };
+    }
+    fresh();
+    function restart() { if (player) player.reset(); else fresh(); }
+
+    var flow = ui.select('поток', [
+      { value: 'one', label: 'один агент (p. 975)' },
+      { value: 'two', label: 'два канала и два sink (p. 980)' },
+      { value: 'conv', label: '4 клиента → агрегатор' }
+    ], function () { restart(); }, 'one');
+    var chan = ui.select('тип канала (p. 968)', [
+      { value: 'memory', label: 'memory: 1,000 событий' },
+      { value: 'file', label: 'file («Disk»): 20,000' }
+    ], function () { restart(); }, 'memory');
+    var sel = ui.select('selector (только для двух каналов)', [
+      { value: 'replicating', label: 'replicating (по умолчанию)' },
+      { value: 'multiplexing', label: 'multiplexing по show' }
+    ], function () { restart(); }, 'replicating');
+    var spike = ui.slider({ label: 'всплеск нагрузки, t = 10–30 s', min: 1, max: 4, step: 0.5, value: 1, format: function (v) { return '× ' + v; }, onInput: function () { restart(); } });
+    var down = ui.toggle('HDFS лежит с t = 10 s до 30 s', true, function () { restart(); });
+
+    function m0() { return Math.max(1, Number(spike.value) || 1); }
+    function C() { return CAP[chan.value] || 1000; }
+    function win(t) { return t >= W0 - 1e-9 && t < W1 - 1e-9; }
+    function fill() { var f = flow.value; return f === 'one' ? s.ch : f === 'two' ? s.ch1 + s.ch2 : s.agg + s.cl[0] + s.cl[1] + s.cl[2] + s.cl[3]; }
+
+    /* one simulated second in 20 small steps: each sink drains first, then the sources accept what fits */
+    function second() {
+      if (s.t >= TMAX) return;
+      var cap = C(), f = flow.value, ref0 = s.refused, hop = false, k, i;
+      s.prev = fill();
+      for (k = 0; k < SUB; k++) {
+        var t = s.t + k * DT, w = win(t), m = w ? m0() : 1, capH = (w && down.value) ? 0 : DRAIN_HDFS, a, d, acc;
+        if (f === 'one') {
+          d = Math.min(s.ch, capH * DT); s.ch -= d; s.hdfs += d;
+          a = NWS * PROD * m * DT; acc = Math.max(0, Math.min(a, cap - s.ch)); s.ch += acc; s.refused += a - acc;
+        } else if (f === 'two') {
+          d = Math.min(s.ch1, capH * DT); s.ch1 -= d; s.hdfs += d;
+          d = Math.min(s.ch2, DRAIN_LOG * DT); s.ch2 -= d; s.log += d;
+          a = NWS * PROD * m * DT;
+          if (sel.value === 'replicating') { acc = Math.max(0, Math.min(a, cap - s.ch1, cap - s.ch2)); s.ch1 += acc; s.ch2 += acc; s.refused += a - acc; }
+          else {
+            var h = a / 2, x1 = Math.max(0, Math.min(h, cap - s.ch1)), x2 = Math.max(0, Math.min(h, cap - s.ch2));
+            s.ch1 += x1; s.ch2 += x2; s.refused += (h - x1) + (h - x2);
+          }
+        } else {
+          d = Math.min(s.agg, capH * DT); s.agg -= d; s.hdfs += d;
+          var want = s.cl.map(function (x) { return Math.min(x, DRAIN_HOP * DT); });
+          var tw = want[0] + want[1] + want[2] + want[3], take = Math.max(0, Math.min(tw, cap - s.agg));
+          if (tw > 0) { for (i = 0; i < 4; i++) s.cl[i] -= want[i] * take / tw; s.agg += take; }
+          if (tw - take > 1e-6) hop = true;
+          for (i = 0; i < 4; i++) { a = PROD * m * DT; acc = Math.max(0, Math.min(a, cap - s.cl[i])); s.cl[i] += acc; s.refused += a - acc; }
+        }
+      }
+      s.t += 1; s.refNow = s.refused - ref0 > 1e-6; s.hop = hop;
+    }
+    function crash() {
+      var f = flow.value, mem = chan.value === 'memory', amount = f === 'one' ? s.ch : f === 'two' ? s.ch1 + s.ch2 : s.agg;
+      if (mem) { if (f === 'one') s.ch = 0; else if (f === 'two') { s.ch1 = 0; s.ch2 = 0; } else s.agg = 0; s.lost += amount; }
+      s.crash = { t: s.t, amount: amount, mem: mem };
+    }
+
+    player = ui.player({ ms: 150, max: TMAX, label: 'Пуск, 90 s', stepLabel: 'Одна секунда', onTick: function () { second(); }, onReset: function () { fresh(); } });
+    ui.button('Сбой и перезапуск агента у HDFS', function () { crash(); }, { kind: 'ghost' });
+
+    var roT = ui.readout('время'), roF = ui.readout('заполнение каналов'), roD = ui.readout('доставлено'),
+        roR = ui.readout('отвергнуто на source (HTTP 503)'), roL = ui.readout('потеряно при сбоях'), roN = ui.readout('какой буфер нужен каналу у HDFS');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'события движутся', color: 's1', mark: 'line' },
+      { label: 'затор: следующий узел отказывает', color: 's1', mark: 'dash' },
+      { label: 'события ждут в канале', color: 's1', mark: 'square' },
+      { label: 'отвергнуто на source', color: 'bad', mark: 'cross' },
+      { label: 'пункт назначения лежит', color: 'bad', mark: 'dash' }
+    ]);
+    var svg = ui.svg(560, 280, { label: 'Выбранный поток Flume: веб-серверы слева отправляют события агенту или агентам; каждый канал — ряд ячеек, который заполняется; стрелки несут события в HDFS или в logger и становятся пунктирными, когда следующий узел их отвергает; крестики отмечают отвергнутые события и упавшую HDFS' });
+    /* the generated properties file sits after the readouts, so that the drawing stays next to the controls */
+    var fileBox = Course.el('details', { 'class': 'widget-note', open: '' }), pre = Course.el('pre'), code = Course.el('code');
+    fileBox.appendChild(Course.el('summary', { text: 'Файл свойств этого потока, сгенерированный по рисунку' }));
+    pre.appendChild(code);
+    fileBox.appendChild(pre);
+    root.insertBefore(fileBox, root.querySelector('.tasks'));
+
+    function fmt(x) { return String(Math.round(Math.max(0, x))).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, txt, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: txt }); }
+    function machine(cx, cy) {
+      S('rect', { x: cx - 22, y: cy - 14, width: 44, height: 28, 'class': 'fi-paper' });
+      [-7, 0, 7].forEach(function (dd) { S('line', { x1: cx - 15, y1: cy + dd, x2: cx + 15, y2: cy + dd, 'class': 'st-muted' }); });
+    }
+    function arrow(x1, y1, x2, y2, dashed) { S('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': 'st-s1 sw-2' + (dashed ? ' dash' : ''), 'marker-end': 'url(#arr-s1)' }); }
+    function cross(x, y, r) {
+      S('line', { x1: x - r, y1: y - r, x2: x + r, y2: y + r, 'class': 'st-bad sw-3' });
+      S('line', { x1: x - r, y1: y + r, x2: x + r, y2: y - r, 'class': 'st-bad sw-3' });
+    }
+    function queue(x, y, n, w, h, frac) {
+      var filled = frac > 0.0005 ? Math.max(1, Math.round(Math.min(1, frac) * n)) : 0, i;
+      for (i = 0; i < n; i++) S('rect', { x: x + i * w, y: y, width: w, height: h, 'class': i < filled ? 'fi-s1 st-paper' : 'fi-paper st-muted' });
+    }
+    function box(x, y, w, h, label) { S('rect', { x: x, y: y, width: w, height: h, 'class': 'fi-paper sw-2' }); if (label) T(x + w / 2, y + h / 2 + 5, label, 'tx-sm tx-mid'); }
+    /* a dead destination: a red dashed ring around its box, and the word "down" under it */
+    function deadRing(x, y, w, h, lx, ly) { S('rect', { x: x - 5, y: y - 5, width: w + 10, height: h + 10, rx: 4, 'class': 'st-bad sw-2 dash fi-none' }); T(lx, ly, 'лежит', 'tx-sm tx-bad tx-mid'); }
+    function agentBox(x, y, w, h) { S('rect', { x: x, y: y, width: w, height: h, rx: 10, 'class': 'fi-paper sw-2' }); }
+    function hdfsDown() { return s.t > 0 && win(s.t - 0.5) && down.value; }
+    function servers(tx, tys, refusing) {
+      T(10, 22, 'веб-серверы', 'tx-sm');
+      [70, 120, 170, 220].forEach(function (cy, i) {
+        machine(32, cy);
+        arrow(54, cy, tx - 2, tys[i], false);
+        if (refusing) cross((54 + tx) / 2, (cy + tys[i]) / 2, 6);
+      });
+    }
+
+    function drawOne(cap) {
+      var dn = hdfsDown();
+      servers(135, [131, 141, 149, 159], s.refNow);
+      agentBox(118, 95, 324, 100);
+      T(280, 86, 'httpagent', 'tx-mono tx-sm tx-mid');
+      box(135, 130, 66, 30, 'source');
+      arrow(201, 145, 220, 145, false);
+      T(282, 124, 'channel', 'tx-sm tx-mid');
+      queue(222, 134, 10, 12, 22, s.ch / cap);
+      T(282, 182, fmt(s.ch) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      arrow(342, 145, 360, 145, false);
+      box(362, 130, 66, 30, 'sink');
+      arrow(428, 145, 476, 145, dn);
+      box(478, 128, 72, 34, 'HDFS');
+      if (dn) deadRing(478, 128, 72, 34, 514, 192);
+    }
+    function drawTwo(cap) {
+      var dn = hdfsDown(), mux = sel.value === 'multiplexing';
+      servers(135, [138, 146, 154, 162], s.refNow && !mux);
+      agentBox(118, 50, 324, 205);
+      T(280, 42, 'httpagent', 'tx-mono tx-sm tx-mid');
+      T(130, 74, 'selector: ' + (sel.value === 'replicating' ? 'replicating' : 'multiplexing по show'), 'tx-sm');
+      box(135, 135, 66, 30, 'source');
+      arrow(201, 145, 220, 113, false);
+      arrow(201, 155, 220, 199, false);
+      if (s.refNow && mux) cross(210, 130, 6);          /* only the events for ch1 are refused */
+      T(214, 116, 'ch1', 'tx-mono tx-sm tx-end');
+      queue(222, 100, 10, 12, 22, s.ch1 / cap);
+      T(282, 140, fmt(s.ch1) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      T(214, 206, 'ch2', 'tx-mono tx-sm tx-end');
+      queue(222, 190, 10, 12, 22, s.ch2 / cap);
+      T(282, 230, fmt(s.ch2) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      arrow(342, 111, 360, 111, false);
+      arrow(342, 201, 360, 201, false);
+      box(362, 96, 66, 30, 'sink 1');
+      box(362, 186, 66, 30, 'sink 2');
+      arrow(428, 111, 476, 111, dn);
+      arrow(428, 201, 476, 201, false);
+      box(478, 94, 72, 34, 'HDFS');
+      box(478, 184, 72, 34, 'logger');
+      if (dn) deadRing(478, 94, 72, 34, 514, 158);
+    }
+    function drawConv(cap) {
+      var dn = hdfsDown();
+      T(4, 22, 'веб-серверы', 'tx-sm');
+      [60, 110, 160, 210].forEach(function (cy, i) {
+        machine(26, cy);
+        arrow(48, cy, 76, cy, false);
+        if (s.refNow) cross(62, cy, 6);
+        agentBox(78, cy - 17, 140, 34);
+        queue(100, cy - 9, 8, 12, 18, s.cl[i] / cap);
+        arrow(218, cy, 270, 160 + (cy - 135) * 0.3, s.hop);
+      });
+      T(148, 252, 'у каждого: ' + fmt(s.cl[0]) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      T(148, 272, '4 клиентских агента', 'tx-sm tx-mid');
+      T(362, 110, 'агрегатор', 'tx-sm tx-mid');
+      agentBox(272, 120, 180, 80);
+      queue(302, 150, 10, 12, 20, s.agg / cap);
+      T(362, 190, fmt(s.agg) + ' / ' + fmt(cap), 'tx-mono tx-sm tx-mid');
+      arrow(452, 160, 482, 160, dn);
+      box(488, 143, 62, 34, 'HDFS');
+      if (dn) deadRing(488, 143, 62, 34, 519, 206);
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var cap = C();
+      if (flow.value === 'one') drawOne(cap); else if (flow.value === 'two') drawTwo(cap); else drawConv(cap);
+    }
+
+    var HDFS_SINK = ['hdfs.path = /tmp/flume', 'hdfs.filePrefix = events', 'hdfs.fileSuffix = .log', 'hdfs.inUsePrefix = _', 'hdfs.fileType = DataStream'];
+    function chanLines(prefix, name) {
+      return chan.value === 'memory'
+        ? [prefix + '.channels.' + name + '.type = memory', prefix + '.channels.' + name + '.capacity = 1000']
+        : [prefix + '.channels.' + name + '.type = file', prefix + '.channels.' + name + '.capacity = 20000'];
+    }
+    /* bind: one agent that takes the posts of four other machines listens on 0.0.0.0; a client agent of the
+       converging flow runs on its own web server, so localhost (the value of p. 975) is enough */
+    function httpLines(prefix, bind) {
+      var L = [prefix + '.sources.http-source.type = org.apache.flume.source.http.HTTPSource', prefix + '.sources.http-source.bind = ' + bind, prefix + '.sources.http-source.port = 8989'];
+      return bind === 'localhost' ? L : ['# bind 0.0.0.0: the web servers post from other machines (p. 975 binds localhost)'].concat(L);
+    }
+    function sinkLines(prefix, name, path) {
+      return [prefix + '.sinks.' + name + '.type = hdfs'].concat(HDFS_SINK.map(function (l, i) { return prefix + '.sinks.' + name + '.' + (i === 0 && path ? 'hdfs.path = ' + path : l); }));
+    }
+    function fileText() {
+      var f = flow.value, L = [];
+      if (f === 'one') {
+        L = ['# httpagent.properties — the flow of p. 975, channel type as chosen', 'httpagent.sources = http-source', 'httpagent.sinks = hdfs-sink', 'httpagent.channels = ch', '',
+          'httpagent.sources.http-source.channels = ch', 'httpagent.sinks.hdfs-sink.channel = ch', ''].concat(httpLines('httpagent', '0.0.0.0'), [''], sinkLines('httpagent', 'hdfs-sink', '/tmp/flume/hdfs'), [''], chanLines('httpagent', 'ch'));
+      } else if (f === 'two') {
+        L = ['# httpagent.properties — the wiring of p. 980, channel types as chosen', 'httpagent.sources = http-source', 'httpagent.sinks = hdfs-sink log-sink', 'httpagent.channels = ch1 ch2', '',
+          'httpagent.sources.http-source.channels = ch1 ch2', 'httpagent.sinks.hdfs-sink.channel = ch1', 'httpagent.sinks.log-sink.channel = ch2', ''].concat(httpLines('httpagent', '0.0.0.0'));
+        if (sel.value === 'multiplexing') L = L.concat(['httpagent.sources.http-source.selector.type = multiplexing', 'httpagent.sources.http-source.selector.header = show',
+          'httpagent.sources.http-source.selector.mapping.1 = ch1', 'httpagent.sources.http-source.selector.mapping.2 = ch2']);
+        else L.push('# no selector lines: replicating is the default (p. 981)');
+        L = L.concat([''], sinkLines('httpagent', 'hdfs-sink', '/tmp/flume/http'), ['httpagent.sinks.log-sink.type = logger', ''], chanLines('httpagent', 'ch1'), chanLines('httpagent', 'ch2'));
+      } else {
+        L = ['# client1.properties (client1 … client4, one per web server)', 'client1.sources = http-source', 'client1.sinks = avro-sink', 'client1.channels = ch', '',
+          'client1.sources.http-source.channels = ch', 'client1.sinks.avro-sink.channel = ch', ''].concat(httpLines('client1', 'localhost'), ['',
+          '# the hop to the next agent (Flume user guide, not on the slides)',
+          'client1.sinks.avro-sink.type = avro', 'client1.sinks.avro-sink.hostname = aggregator-host', 'client1.sinks.avro-sink.port = 4545', ''], chanLines('client1', 'ch'), ['',
+          '# aggregator.properties', 'aggregator.sources = avro-source', 'aggregator.sinks = hdfs-sink', 'aggregator.channels = ch', '',
+          'aggregator.sources.avro-source.channels = ch', 'aggregator.sinks.hdfs-sink.channel = ch', '',
+          'aggregator.sources.avro-source.type = avro', 'aggregator.sources.avro-source.bind = 0.0.0.0', 'aggregator.sources.avro-source.port = 4545', ''],
+          sinkLines('aggregator', 'hdfs-sink', '/tmp/flume'), [''], chanLines('aggregator', 'ch'));
+      }
+      return L.join('\n');
+    }
+
+    function needText() {
+      var rate = NWS * PROD * m0(), dur = W1 - W0, txt;
+      if (flow.value === 'two' && sel.value === 'multiplexing') rate = rate / 2;
+      if (down.value) txt = fmt(rate) + '/s × ' + dur + ' s = ' + fmt(rate * dur) + ' событий (по правилу, p. 963; посчитано)';
+      else if (rate > DRAIN_HDFS) txt = '(' + fmt(rate) + ' − ' + fmt(DRAIN_HDFS) + ')/s × ' + dur + ' s = ' + fmt((rate - DRAIN_HDFS) * dur) + ' событий (посчитано)';
+      else txt = 'никакой: HDFS принимает ' + fmt(DRAIN_HDFS) + '/s, больше, чем приходящие ' + fmt(rate) + '/s';
+      return txt + ' · ёмкость: ' + fmt(C());
+    }
+    function phaseText() {
+      var f = flow.value, cap = C(), w = s.t > 0 && win(s.t - 0.5), dn = w && down.value, now = fill();
+      if (s.crash && s.t - s.crash.t <= 3) {
+        if (!s.crash.amount) return 'Сбой при t = ' + s.crash.t + ' s: канал был пуст, так что терять было нечего.';
+        return s.crash.mem
+          ? 'Сбой при t = ' + s.crash.t + ' s: в memory channel было ' + fmt(s.crash.amount) + ' событий, и они пропали — хотя веб-серверам сказали, что они доставлены.'
+          : 'Сбой при t = ' + s.crash.t + ' s: ' + fmt(s.crash.amount) + ' событий file channel лежали на диске и после перезапуска никуда не делись.';
+      }
+      if (s.t === 0) return 'Нажми «Пуск». Четыре веб-сервера отправляют по 100 событий в секунду — всего 400, — а HDFS может принять 600 в секунду. С t = 10 s до t = 30 s приходит выбранный тобой всплеск или простой.';
+      if (s.t >= TMAX) return 'Конец прогона: «Сбросить», чтобы начать заново, или измени настройку.';
+      if (s.refNow) {
+        if (f === 'conv') return 'Обратное давление дошло до веб-серверов: агрегатор полон, клиентские каналы полны, и клиентские sources отвечают HTTP 503.';
+        if (f === 'two' && sel.value === 'replicating') return 'ch1 полон, а replicating обязан класть каждое событие в оба канала: source отвергает всё, и logger тоже голодает.';
+        if (f === 'two') return 'ch1 полон: события с show = 1 отвергаются, а события с show = 2 по-прежнему доходят до logger.';
+        return 'Канал полон: source отвергает новые события, и веб-серверы получают HTTP 503 (p. 951, “Channel Full”).';
+      }
+      if (f === 'conv' && s.hop) return 'Агрегатор полон: его source отвергает часть батчей клиентов, их sinks откатываются и повторяют попытку, и клиентские каналы растут — обратное давление идёт вверх по течению по одному узлу за раз.';
+      if (dn && now > s.prev + 0.5) return 'HDFS лежит: sink ничего не доставляет, и каждое пришедшее событие остаётся в канале (p. 951, “Downstream Failure”).';
+      if (w && now > s.prev + 0.5) return 'Всплеск приносит больше событий, чем sink успевает забрать: канал поглощает разницу.';
+      if (now < s.prev - 0.5) return 'Поток вернулся в норму, и sink забирает быстрее, чем приходят события: накопившееся тает (p. 951, “Downstream Restored”).';
+      return 'Установившийся режим: что пришло, то и ушло, и канал остаётся почти пустым.';
+    }
+
+    ui.onChange(function () {
+      var cap = C(), f = flow.value, full = function (x) { return x >= cap - 0.5 ? ' (полон)' : ''; };
+      roT.set('t = ' + s.t + ' s из ' + TMAX + (s.t > 0 && win(s.t - 0.5) ? (down.value ? ' · HDFS лежит' : '') + (m0() > 1 ? ' · всплеск × ' + m0() : '') : ''));
+      if (f === 'one') roF.set('канал: ' + fmt(s.ch) + ' / ' + fmt(cap) + full(s.ch));
+      else if (f === 'two') roF.set('ch1: ' + fmt(s.ch1) + full(s.ch1) + ' · ch2: ' + fmt(s.ch2) + full(s.ch2) + ' (из ' + fmt(cap) + ')');
+      else roF.set('агрегатор: ' + fmt(s.agg) + full(s.agg) + ' · каждый клиент: ' + fmt(s.cl[0]) + full(s.cl[0]) + ' (из ' + fmt(cap) + ')');
+      roD.set('в HDFS: ' + fmt(s.hdfs) + (f === 'two' ? ' · в logger: ' + fmt(s.log) : ''));
+      roR.set(fmt(s.refused), s.refused > 0.5 ? 'bad' : 'good');
+      roL.set(fmt(s.lost), s.lost > 0.5 ? 'bad' : 'good');
+      roN.set(needText());
+      note.set(phaseText());
+      draw();
+      code.textContent = fileText();
+    });
+  });
+  </script>
+
+  <p>Слайд (p. 986) подводит итог Flume: она "is suitable for large volume data collection, especially when data is being produced in multiple locations"; "Once planned and sized appropriately, Flume will practically run itself"; она даёт слабую гарантию порядка, транзакционный обмен между агентами и "rich out-of-the box features such as contextual routing".</p>
+</section>
+
+
+<section id="l33-sqoop">
+  <h2>Sqoop: ночной грузовик</h2>
+
+  <p>Второй источник из того же вопроса — реляционная база данных. Sqoop (p. 988): "Importing from relational DB sources", "PULL-based (no streams)", "Bulk imports", "With one command line action, import data from RDBMS to HDFS/Hive", с коннекторами для MySQL, Oracle, SQL Server, PostgreSQL. Сценарии использования (p. 989): "Occasional copy for running map-reduce tasks" и "Keep RDBMS for transactional needs and periodically dump data on HDFS" — транзакции остаются в базе данных, анализ переезжает в Hadoop. Flume — труба, которая никогда не закрывается; Sqoop — грузовик, который едет, когда его вызвали.</p>
+
+<pre><code># p. 990: copy the table tradingDays of the MySQL database nseProd into HDFS, one mapper
+sqoop import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--table=tradingDays \
+--target-dir /mysql/nseProd \
+--m 1</code></pre>
+
+  <aside class="margin-note">Руководство пользователя Sqoop пишет <span class="nw">-m 1</span> или <span class="nw">--num-mappers 1</span>; слайды пишут <span class="nw">--m 1</span>.</aside>
+
+  <p>Читай: инструмент (<code>import</code>), JDBC-адрес базы <code>nseProd</code> на локальном MySQL, учётные данные, таблица, каталог HDFS, который надо создать, число мапперов. За этой командой Sqoop запускает задание MapReduce только с map-задачами: каждый маппер читает свою долю таблицы собственным <code>SELECT</code> и пишет собственный файл (<code>part-m-00000</code>, …) в целевой каталог.</p>
+
+  <h3>Как делятся строки</h3>
+
+  <p>Доли — это диапазоны одного столбца, по умолчанию первичного ключа: Sqoop спрашивает у базы его наименьшее и наибольшее значение и режет этот интервал на столько диапазонов равной ширины, сколько мапперов (рис. 7). <code class="nw">--split-by</code> называет другой столбец — "explicitly specify the column to use for splitting rows between mappers" (p. 992), — когда первичного ключа нет или он делит плохо. Равная ширина — не равное число строк: ключ с большими дырами оставляет часть мапперов без работы.</p>
+
+  <figure class="fig fig--plain" id="l33-fig-split">
+    <svg class="dia" viewBox="0 0 560 256" role="img" aria-label="Импорт Sqoop с четырьмя мапперами: минимум и максимум ключа, 1 и 4000, разрезаны на четыре диапазона по тысяче id; каждый диапазон достаётся одному мапперу, и каждый маппер пишет один файл в целевой каталог">
+      <rect x="60" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <rect x="170" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <rect x="280" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <rect x="390" y="48" width="110" height="28" class="fw-s1 st-s1"/>
+      <line x1="115" y1="78" x2="115" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="225" y1="78" x2="225" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="335" y1="78" x2="335" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="445" y1="78" x2="445" y2="116" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="70" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <rect x="180" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <rect x="290" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <rect x="400" y="120" width="90" height="30" class="fi-paper sw-2"/>
+      <line x1="115" y1="152" x2="115" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="225" y1="152" x2="225" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="335" y1="152" x2="335" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="445" y1="152" x2="445" y2="166" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <path d="M95 170 H125 L135 180 V220 H95 Z" class="fi-paper"/>
+      <path d="M125 170 V180 H135 Z" class="fi-soft"/>
+      <path d="M205 170 H235 L245 180 V220 H205 Z" class="fi-paper"/>
+      <path d="M235 170 V180 H245 Z" class="fi-soft"/>
+      <path d="M315 170 H345 L355 180 V220 H315 Z" class="fi-paper"/>
+      <path d="M345 170 V180 H355 Z" class="fi-soft"/>
+      <path d="M425 170 H455 L465 180 V220 H425 Z" class="fi-paper"/>
+      <path d="M455 170 V180 H465 Z" class="fi-soft"/>
+      <text x="280" y="26" class="tx-mono tx-sm tx-mid">SELECT MIN(id), MAX(id) FROM tradingDays</text>
+      <text x="50" y="67" class="tx-mono tx-sm tx-end">id</text>
+      <text x="115" y="67" class="tx-mono tx-sm tx-mid">1–1000</text>
+      <text x="225" y="67" class="tx-mono tx-sm tx-mid">1001–2000</text>
+      <text x="335" y="67" class="tx-mono tx-sm tx-mid">2001–3000</text>
+      <text x="445" y="67" class="tx-mono tx-sm tx-mid">3001–4000</text>
+      <text x="115" y="140" class="tx-mono tx-sm tx-mid">mapper 0</text>
+      <text x="225" y="140" class="tx-mono tx-sm tx-mid">mapper 1</text>
+      <text x="335" y="140" class="tx-mono tx-sm tx-mid">mapper 2</text>
+      <text x="445" y="140" class="tx-mono tx-sm tx-mid">mapper 3</text>
+      <text x="280" y="246" class="tx-mono tx-sm tx-mid">part-m-00000 … part-m-00003</text>
+    </svg>
+    <figcaption><b>Рис. 7.</b> Импорт Sqoop с четырьмя мапперами. Sqoop запрашивает наименьшее и наибольшее значение столбца разбиения — по умолчанию первичного ключа, — режет этот интервал на четыре диапазона равной ширины и отдаёт каждый диапазон одному мапперу, который выполняет собственный <code>SELECT</code> и пишет собственный файл. Значения ключа для картинки выдуманы.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="991">
+    <p class="claim">"Sqoop uses the primary key to decide how many mappers to use, and for splitting the rows among mappers" · "--m 1 fixes 1 mapper / mandatory if the table you are importing doesn’t have a primary key, or if you are importing a query"</p>
+    <p class="fix">Число мапперов задаёт <code class="nw">-m</code> (<code class="nw">--num-mappers</code>), и по умолчанию их четыре; первичный ключ решает только то, как строки делятся между ними. Один маппер нужен, когда у таблицы нет первичного ключа и не задан столбец <code class="nw">--split-by</code>. Импорт по запросу тоже может идти параллельно — с <code class="nw">--split-by</code>.</p>
+    <p class="because">Руководство пользователя Sqoop: «по умолчанию используются четыре задачи»; без первичного ключа и без <code class="nw">--split-by</code> «импорт упадёт, если число мапперов явно не задано равным единице»; запрос в свободной форме либо выполняется параллельно, и тогда «нужно также выбрать столбец разбиения через --split-by», либо «импортируется последовательно, с одной map-задачей через -m 1». Экзамен может напечатать фразу со слайда: знай, что в ней сказано и что Sqoop делает на самом деле.</p>
+  </aside>
+
+  <p>Вместо целой таблицы — запрос (p. 993): "Instead of full table", "<code>$CONDITIONS</code> mandatory". Одна эта опция — ещё не команда: полной команде нужны целевой каталог и либо один маппер, либо столбец разбиения:</p>
+
+<pre><code># p. 993, completed: three columns of the 2016 rows, four mappers split on month
+sqoop import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--query 'select year, month, day from tradingDays where year=2016 and $CONDITIONS' \
+--split-by month \
+--target-dir /mysql/tradingDays2016 \
+-m 4</code></pre>
+
+  <p>Sqoop заменяет токен <code>$CONDITIONS</code> в копии запроса каждого маппера диапазоном <code>month</code> этого маппера. Это не переменная shell: одинарные кавычки не подпускают к нему shell.</p>
+
+  <h3>В Hive, и только новое</h3>
+
+  <p>Ещё две опции превращают импорт в таблицу Hive (p. 994). Целевой каталог здесь новый: как и любое задание MapReduce, Sqoop отказывается писать в уже существующий выходной каталог, а <code>/mysql/nseProd</code> занят первым импортом.</p>
+
+<pre><code># p. 994: the same table, registered in Hive as tradingDays
+sqoop import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--table=tradingDays \
+--hive-import \
+--hive-table=tradingDays \
+--target-dir /mysql/table/tradingDays2 \
+--m 1</code></pre>
+
+  <aside class="redpen" data-page="994">
+    <p class="claim">"Sqoop will create an external table and point the table to the directory in HDFS"</p>
+    <p class="fix">По умолчанию <code class="nw">--hive-import</code> создаёт обычную (managed) таблицу Hive и перемещает импортированные файлы в каталог хранилища Hive; в целевом каталоге ничего не остаётся, а удаление таблицы стирает данные.</p>
+    <p class="because">Руководство пользователя Sqoop: «Sqoop сгенерирует скрипт Hive, содержащий операцию CREATE TABLE, которая определяет твои столбцы в типах Hive, и оператор LOAD DATA INPATH, перемещающий файлы данных в каталог хранилища Hive». Файлы оказываются в каталоге хранилища со слайда (p. 909), знакомом по <a href="l32.html">уроку 32</a>, как и файлы любой таблицы, которой управляет Hive; внешняя таблица оставила бы их на месте. Экзамен сверяют со слайдами, и он может процитировать эту фразу: знай, что в ней сказано и что Sqoop делает на самом деле.</p>
+  </aside>
+
+  <p>Каждую ночь заново импортировать всю таблицу — значит снова и снова копировать одни и те же строки. Слайд (p. 995): "Import only the new data" — "Save an import configuration as a JOB and call it later on repetitively". Инкрементальные опции выбирают строки по <mark class="key">check column</mark> (контрольному столбцу), "Ideally a timestamp of last update of the row": "LastValue saves the max value of the column at every import", а "Further import will get data &gt; LastValue" (p. 998). Режим <code>lastmodified</code> (p. 997) — для строк, которые обновляются; другой режим из руководства пользователя, <code>append</code>, — для таблиц, которые только растут с возрастающим id. Сохранённое задание помнит последнее значение, так что каждый <code>sqoop job --exec myjob</code> (p. 999) продолжает с того места, где остановился предыдущий запуск. В исправленном задании ниже есть строка, которой нет на слайде, — флаг <code class="nw">--append</code>, не путать с режимом <code>append</code>: каждый запуск пишет в один и тот же <code>/mysql/nseProd</code>, и без него Sqoop отказывается импортировать в уже существующий каталог (красная ручка ниже).</p>
+
+<pre><code># p. 997, corrected: save an incremental import as the job myjob
+sqoop job \
+--create myjob \
+-- import \
+--connect jdbc:mysql://localhost:3306/nseProd \
+--username=qt \
+--password=password \
+--table=tradingDays \
+--target-dir /mysql/nseProd \
+--append \
+--m 1 \
+--incremental lastmodified \
+--check-column ts</code></pre>
+
+<pre><code># p. 999: run it now, and every night after
+sqoop job --exec myjob</code></pre>
+
+  <aside class="redpen" data-page="997">
+    <p class="claim">"--import \" … "--target-dir /mysql/nseProd \" / "--m 1" / "--incremental lastmodified" / "—check-column ts"</p>
+    <p class="fix">Сохраняемый инструмент идёт после одиночного <code class="nw">--</code> и пробела: <code class="nw">-- import \</code>. Каждой строке, кроме последней, нужен свой <code>\</code>, так что <code class="nw">--m 1 \</code> и <code class="nw">--incremental lastmodified \</code>, а последняя опция — <code class="nw">--check-column ts</code> с двумя дефисами. На слайде (p. 996) та же <code class="nw">--import</code>. А заданию, которое должны вызывать "repetitively" (p. 995), нужен <code class="nw">--append</code>: <code>/mysql/nseProd</code> уже существует — его создал импорт со слайда (p. 990), и каждый запуск после первого снова его находит.</p>
+    <p class="because">Руководство пользователя Sqoop даёт синтаксис <code>sqoop job (generic-args) (job-args) [-- [subtool-name] (subtool-args)]</code> и пример <code>sqoop job --create myjob -- import --connect …</code>. В напечатанном виде shell закончил бы команду после <code class="nw">--m 1</code>. Про каталог то же руководство говорит: «если целевой каталог уже существует в HDFS, Sqoop откажется импортировать и перезаписывать его содержимое. Если указать аргумент --append, Sqoop импортирует данные во временный каталог, а затем переименует файлы в обычный целевой каталог». Экзамен сверяют со слайдами: узнавай напечатанную форму, а пиши исправленную.</p>
+  </aside>
+
+  <p>С инкрементальными импортами приходят две слепые зоны. Обновлённая строка приходит в HDFS второй раз, новым файлом рядом со своей старой копией; инструмент merge из Sqoop с <code class="nw">--merge-key</code> сводит копии в одну (руководство пользователя Sqoop). А удалённую строку никто не заметит: в её check column ничего не меняется.</p>
+
+  <figure class="tbl-fig" id="l33-tbl-vs">
+    <figcaption>Flume и Sqoop — два ответа на вопрос со слайда (p. 935).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Flume</th><th>Sqoop</th></tr></thead>
+        <tbody>
+          <tr><td>откуда читает</td><td>приложения: логи, события, клики, датчики, социальные потоки</td><td>реляционные базы данных через JDBC-коннекторы</td></tr>
+          <tr><td>управление</td><td>push: sources принимают и проталкивают в channels (sinks опрашивают)</td><td>pull: "PULL-based (no streams)"</td></tr>
+          <tr><td>когда</td><td>непрерывно, агенты работают всё время</td><td>от случая к случаю или периодически, когда запускается команда или задание</td></tr>
+          <tr><td>единица</td><td>событие: headers + body, транзакционными батчами</td><td>строки таблицы или запроса, целиком</td></tr>
+          <tr><td>параллелизм</td><td>больше агентов, уровни, несколько channels и sinks</td><td><code class="nw">-m</code> мапперов на диапазонах столбца разбиения</td></tr>
+          <tr><td>куда пишет</td><td>HDFS (bucketing по заголовку или времени), HBase, logger, …</td><td>файлы HDFS или таблица Hive</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Назад к загадке. 460 миллионов строк того часа ждут в каналах сходящегося потока, самые большие — на уровне рядом с HDFS: 128 000 событий в секунду в течение 3 600 секунд (p. 963), около 230 GB — по 115 GB на каждого из двух его агентов, в file channels на нескольких дисках, тогда как memory channel со слайда (p. 975) вмещает тысячу событий. Считать то, что течёт мимо, — работа Storm, с fields grouping по слову; а таблица товаров, которая спокойно лежит в базе магазина, приезжает грузовиком: Sqoop, раз в ночь, <code class="nw">--incremental lastmodified</code>.</p>
+</section>
+
+
+<section id="l33-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Storm, Flume и Sqoop не входят в практические темы по правилам экзамена, и ни в одном прошлом варианте нет упражнения на них: они относятся к теоретической части. Ниже — теоретические вопросы в тех формах, которые называет readme прошлых вариантов, — выбор из вариантов, «верно/неверно», открытые ответы; за неверные ответы может быть штраф, о котором объявляют прямо перед экзаменом, — расчёт по правилу, которое дают слайды, и одно упражнение на написание конфигурации и команды.</p>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-grouping">
+    <div class="exam-q" lang="en">
+      <p>A Storm topology counts the occurrences of each word in a stream of sentences. A bolt splits the sentences and emits one tuple per word to a counting bolt with several tasks, each keeping a counter per word. Which stream grouping lets the counting tasks share the work while the count of each word stays exact in a single task?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Shuffle grouping <span class="fb">Работу она делит, но кортежи одного слова попадают в случайные задачи: каждая задача хранит частичный счёт, и итога не хранит ни одна.</span></li>
+      <li>All grouping <span class="fb">Каждая задача получает каждый кортеж и считает всё: счётчики точные, но вычисляются в каждой задаче, так что работа не делится.</span></li>
+      <li data-correct>Fields grouping on the field "word" <span class="fb">Задача выбирается по хешу слова ("consistent hashing on a subset of tuple fields", p. 933): одно и то же слово всегда попадает в одну и ту же задачу, а разные слова расходятся по задачам.</span></li>
+      <li>Global grouping <span class="fb">Все кортежи идут в задачу с наименьшим id: счётчики точные, но всю работу делает одна задача.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Fields grouping on "word". The tuple is routed by a hash of the chosen field, so all tuples with the same word reach the same task, which therefore holds the exact count for that word, while different words are spread over the tasks. Shuffle grouping would split each word's count over several tasks; all grouping would make every task count everything; global grouping would send everything to one task.</p></div>
+      <div class="exam-note"><p>Суть вопроса — связь группировки и состояния: bolt, который хранит состояние по ключу, должен получать кортежи этого ключа в одном месте. Каждый неверный вариант прав в чём-то другом — shuffle для bolts без состояния, all для рассылки всем, global для одного итога, — поэтому они и соблазнительны.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-storm">
+    <div class="exam-q" lang="en">
+      <p>Describe the main concepts of Apache Storm — stream, spout, bolt, topology — and the components of a Storm cluster. In what does a Storm topology differ from a MapReduce job?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Storm is a distributed system for realtime computation, developed at BackType, which Twitter acquired. A stream is an unbounded sequence of tuples, a tuple being a named list of values. A spout is a source of streams: it reads data from an external source and emits tuples. A bolt processes one or more input streams and produces new streams; it can implement filters, aggregations, joins or any function. A topology is a network of spouts and bolts — a directed graph — and every component runs as many tasks across the cluster; a stream grouping (shuffle, fields, all, global) decides which task receives each tuple. The cluster has a master node, Nimbus, similar to Hadoop's JobTracker, which distributes the code, assigns tasks to machines and monitors failures; a ZooKeeper cluster used for coordination, which keeps the cluster state; and Supervisors on the worker machines, which run the worker processes. A MapReduce job reads a bounded input and finishes; a topology processes an unbounded stream with low latency and runs until it is killed.</p></div>
+      <div class="exam-note"><p>Полный ответ — это четыре определения, три компонента и одно отличие «заканчивается / никогда не заканчивается». Если есть место, добавь, зачем ZooKeeper стоит между Nimbus и Supervisors: собственного состояния они не хранят, так что любой можно перезапустить, а топологии продолжают работать, пока Nimbus лежит (туториал Storm).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-tx">
+    <div class="exam-q" lang="en">
+      <p>Explain how Apache Flume moves events from a source to a sink within an agent, and from one agent to the next, without losing them. What does this mechanism not guarantee?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>A Flume agent hosts a source, a channel and a sink. The source accepts incoming data, turns it into events (headers with metadata, used for routing, and a body with the content) and writes them into the channel inside a transaction, which commits only when the channel has accepted the whole batch. The sink polls the channel and removes a batch inside its own transaction, and commits only after a successful transfer — when the destination, such as HDFS, has written it, or when the source of the next agent has committed it into its own channel. On any failure the transaction rolls back and the events stay in the channel to be retried. An event therefore leaves a channel only when the next hop holds it, and no event is lost in transit between agents. Not guaranteed: durability with a memory channel, which is not persistent — its events are lost if the agent process dies, so only a file (disk) channel survives a restart; exactly-once delivery, since a batch retried after a failed commit can arrive twice; and strict ordering, since Flume gives only a weak ordering guarantee: events arrive in the order received in the absence of failures.</p></div>
+      <div class="exam-note"><p>Слайды печатают "This ensures no data loss" (p. 949): повтори это, а потом добавь условия — красную ручку этого урока. Вопрос просит обе половины: сначала механизм, потом три ограничения.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-order">
+    <div class="exam-q" lang="en">
+      <p>True or false: Apache Flume guarantees that events always reach the destination in the order in which the source received them.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Только "in the absence of failures": итоговый слайд о Flume называет это "weak ordering guarantee". Если агент умирает и его веб-серверы переключаются на второй агент (p. 955), события из file channel первого агента приходят после более новых.</span></li>
+      <li data-correct>False <span class="fb">Слайд (p. 986): "Flume provides weak ordering guarantee, i.e., in the absence of failures the data will arrive in the order it was received". Именно «Always» делает утверждение ложным.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. Flume provides only a weak ordering guarantee: in the absence of failures, events arrive in the order in which they were received. After a failure — for example an agent that dies and whose producers fail over to another agent — events can arrive out of order.</p></div>
+      <div class="exam-note"><p>Ищи абсолютное слово: гарантия со слайда действует только без сбоев. "flow ordering*" со слайда (p. 951) несёт то же ограничение в своей звёздочке.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="3.6" data-tol="0.05" data-unit="million events" id="l33-exam-capacity">
+    <div class="exam-q" lang="en">
+      <p>Consider the farmers' market system of the Exam of 12 Sep 2025: farmers sell their products at local markets, and every sale is sent as an event to a tier of Flume agents that writes into HDFS. In the worst case the tier ingests 1,500 events per second, and HDFS may be unavailable for up to 40 minutes. Following the rule of thumb of the slides, what channel capacity does the tier need, in millions of events?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Channel capacity = worst-case ingest rate × worst-case downstream outage = 1,500 events/s × 2,400 s = 3,600,000 events, i.e. 3.6 million events, spread over the agents of the tier. At this size a file channel is needed, on several disks, with more disk space than the raw data.</p></div>
+      <div class="exam-note"><p>Правило со слайда (p. 963) в формулировке итогового слайда (p. 964); сценарий взят из варианта, вопрос наш. Обычная ошибка — забыть перевести минуты: 1 500 × 40 = 60 000 событий покрывают всего 40 секунд простоя.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about Apache Flume and Apache Sqoop are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>In a Flume agent, a source may write to several channels, while a sink reads from exactly one channel. <span class="fb">Верно: "Source – Channel: many-to-many", "Channel– Sink: one-to-many (sink reads only from one channel)" (p. 966).</span></li>
+      <li>The Flume channel pushes events to the sink as soon as they arrive. <span class="fb">Неверно: "Source pushes events", "Sink polls for events" (p. 946); channel пассивен.</span></li>
+      <li>With a memory channel, the events waiting in the channel survive a crash of the agent process. <span class="fb">Неверно: memory channel — "Not persistent" (p. 968); события через перезапуск сохраняет только file (disk) channel.</span></li>
+      <li data-correct>The multiplexing channel selector routes each event to channels according to the value of one of its headers. <span class="fb">Верно: "routes events to channels based on their headers" (p. 981), например заголовок show = 1 — в ch1 (p. 982).</span></li>
+      <li data-correct>Sqoop is pull-based: it reads the relational database in bulk when the import runs. <span class="fb">Верно: "PULL-based (no streams)", "Bulk imports" (p. 988).</span></li>
+      <li>Sqoop streams every new row of a table into HDFS as soon as the row is inserted. <span class="fb">Неверно: "no streams" (p. 988); инкрементальное задание забирает новые строки, только когда его запускают.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>True: the first, the fourth and the fifth. The sink polls the channel; a memory channel is not persistent; Sqoop imports in bulk when it is run, not as a stream.</p></div>
+      <div class="exam-note"><p>В каждом неверном утверждении подменено одно слово слайда: push вместо poll, survives вместо "Not persistent", streams вместо "no streams". При возможном штрафе отмечай только то, что подтверждает фраза со слайда.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-hospital">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise in writing a configuration and a command.</b> Consider the ER model of the hospital heating management system of the Exam of 30 Jan 2026: a Hospital (Hospital_ID, Name) has Buildings (Building_ID, Name, Year), Departments (Department_ID, Specialty, N_Beds, Head_Physician_ID) and Heating Systems (Heater_Sys_ID, Heating_Power), which heat Floors. Every heating system posts a reading each minute as a JSON event over HTTP, with a header <code>building</code> that holds its Building_ID. The Department table, whose primary key is the integer Department_ID, lives in the hospital's MySQL database <code>hospitaldb</code>.</p>
+      <p>(a) Write the properties file of a Flume agent <code>heatagent</code> that receives the readings on port 8989 and writes them as plain text files into HDFS under <code>/hospital/readings</code>, one folder per building, without losing the readings held by the agent if its process restarts. (b) Write the Sqoop command that copies the Department table into the HDFS directory <code>/hospital/departments</code> with two mappers.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>heatagent.sources = http-source
+heatagent.sinks = hdfs-sink
+heatagent.channels = ch
+
+heatagent.sources.http-source.channels = ch
+heatagent.sinks.hdfs-sink.channel = ch
+
+heatagent.sources.http-source.type = org.apache.flume.source.http.HTTPSource
+heatagent.sources.http-source.bind = 0.0.0.0
+heatagent.sources.http-source.port = 8989
+
+heatagent.sinks.hdfs-sink.type = hdfs
+heatagent.sinks.hdfs-sink.hdfs.path = /hospital/readings/%{building}
+heatagent.sinks.hdfs-sink.hdfs.filePrefix = readings
+heatagent.sinks.hdfs-sink.hdfs.fileSuffix = .log
+heatagent.sinks.hdfs-sink.hdfs.inUsePrefix = _
+heatagent.sinks.hdfs-sink.hdfs.fileType = DataStream
+
+heatagent.channels.ch.type = file</code></pre>
+<pre><code>sqoop import \
+--connect jdbc:mysql://localhost:3306/hospitaldb \
+--username=admin \
+--password=password \
+--table=Department \
+--target-dir /hospital/departments \
+-m 2</code></pre>
+        <p>(a) The agent is started with <code>flume-ng agent --conf-file heatagent.properties --name heatagent</code>. <code>%{building}</code> puts each reading in the folder of its header value; <code>DataStream</code> writes plain text; the file channel keeps the waiting readings on disk across a restart, which a memory channel would not. (b) The two mappers split the rows by ranges of the primary key Department_ID, so no <code class="nw">--split-by</code> is needed; each writes one file into the new directory.</p>
+      </div>
+      <div class="exam-note"><p>Упражнение наше, в обстановке прошлого варианта; до сих пор ни один вариант не просил код Flume или Sqoop. Оно проверяет три идеи: ключи проводки (<code>channels</code> у source, <code>channel</code> у sink), bucketing по заголовку в пути HDFS и file channel как ответ на «без потерь». <code>bind = 0.0.0.0</code> принимает запросы с других машин; <code>localhost</code> со слайда — только локальные.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l33-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Count bolt с 3 задачами получает слова через shuffle grouping. Что через некоторое время хранит задача 0 для слова "fresh"?</p>
+    <ul class="options">
+      <li>Точное число появлений "fresh" в потоке <span class="fb">Только fields (или global) grouping привела бы каждый "fresh" в одну задачу; здесь часть из них получили задачи 1 и 2.</span></li>
+      <li>Ничего, поскольку shuffle grouping отправляет всё в задачу с наименьшим id <span class="fb">Это global grouping.</span></li>
+      <li data-correct>Часть счёта; остальное разбросано по задачам 1 и 2 <span class="fb">Shuffle выбирает случайную задачу для каждого кортежа, так что каждая задача хранит частичный счёт — виджет показал 6 + 1 + 1.</span></li>
+      <li>Утроенный истинный счёт, по копии на задачу <span class="fb">Копии в каждую задачу — это all grouping, и даже тогда каждая задача хранит истинный счёт один раз, а не три.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Ты поднимаешь подсчёт слов с 1 до 4 задач на каждый bolt и оставляешь группировки: shuffle в split bolt, fields по "word" в count bolt. Какие утверждения верны? Отметь всё подходящее.</p>
+    <ul class="options">
+      <li data-correct>Split bolt по-прежнему работает: чтобы разбить предложение, не нужно помнить другие предложения <span class="fb">Bolt без состояния может принять любой кортеж в любой задаче — поэтому там shuffle grouping и годится.</span></li>
+      <li>Счётчики теперь разбросаны по 4 задачам, так что нужна итоговая сумма по задачам <span class="fb">Не с fields grouping: каждое слово считается только в одной задаче.</span></li>
+      <li>Global grouping на count bolt подошла бы ничуть не хуже <span class="fb">Счётчики были бы точными, но всю работу делала бы одна задача, а остальные три простаивали бы.</span></li>
+      <li data-correct>Каждое слово по-прежнему считает ровно одна задача подсчёта <span class="fb">Fields grouping хеширует слово, так что одно и то же слово всегда попадает в одну и ту же задачу, каким бы ни было число задач.</span></li>
+    </ul>
+    <p class="q-fb">Группировка следует за состоянием: шагам без состояния — shuffle, состоянию по ключу — fields.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В сходящемся потоке Flume из трёх уровней HDFS падает и не поднимается. В каком порядке заполняются каналы?</p>
+    <ul class="options">
+      <li>Сначала уровень 1, потому что он ближе всего к веб-серверам <span class="fb">Уровень 1 может продолжать отправлять, пока уровень 2 принимает; он заполняется последним.</span></li>
+      <li>Все уровни одновременно, потому что каждый уровень несёт одинаковый объём <span class="fb">Одинаковая пропускная способность в установившемся режиме (p. 959) — не одинаковое заполнение: заполняется только тот уровень, который не может доставить.</span></li>
+      <li>Ни один: sinks держат свои события, пока HDFS не вернётся <span class="fb">Sinks ничего не держат: неудачная транзакция sink откатывается, и события остаются в канале.</span></li>
+      <li data-correct>Сначала уровень 3, потом уровень 2, потом уровень 1: обратное давление идёт вверх по течению по одному узлу за раз <span class="fb">Уровень рядом с HDFS перестаёт опустошаться и заполняется; потом его source отвергает батчи уровня 2, и так далее — сходящийся поток из виджета.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">У агента с memory channel в канале 800 событий, когда его процесс убивают. После перезапуска…</p>
+    <ul class="options">
+      <li data-correct>800 событий пропали <span class="fb">Memory channel — "Not persistent" (p. 968); source уже закоммитил их, так что производители считают их доставленными.</span></li>
+      <li>sink доставит их, потому что его транзакция не была закоммичена <span class="fb">Откат защищает от неудачной доставки, пока агент жив; сама память пропала.</span></li>
+      <li>source попросит веб-серверы отправить их ещё раз <span class="fb">Source уже закоммитил их в канал; о них никто не помнит.</span></li>
+      <li>ничего не потеряно, потому что каждый канал пишет на диск <span class="fb">Так делает только file channel — "Disk" со слайдов.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">У агента два канала со слайда (p. 980) и multiplexing selector со слайда (p. 982). Приходит событие с заголовком show = 2. Где оно окажется?</p>
+    <ul class="options">
+      <li>В ch1 и ch2: каждое событие идёт везде <span class="fb">Это replicating selector, вариант по умолчанию, когда selector не настроен.</span></li>
+      <li data-correct>Только в ch2, так что его напечатает logger sink, а в HDFS оно никогда не попадёт <span class="fb">"If show = 2, route ch2" (p. 982), а ch2 опустошает log-sink (p. 980).</span></li>
+      <li>В ch1, потому что selector читает тело события <span class="fb">Selector читает заголовок, здесь show; в тело никто не заглядывает.</span></li>
+      <li>Туда, куда решит HDFS sink <span class="fb">Selector принадлежит source; каждый sink просто опустошает свой единственный канал.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Ты запускаешь <code>sqoop import</code> с <code class="nw">-m 4</code> на таблице без первичного ключа и без <code class="nw">--split-by</code>. Что произойдёт?</p>
+    <ul class="options">
+      <li>Sqoop разобьёт по первому столбцу таблицы <span class="fb">Sqoop не угадывает столбец разбиения.</span></li>
+      <li>Четыре маппера прочитают каждый всю таблицу <span class="fb">Это скопировало бы каждую строку четыре раза; вместо этого Sqoop отказывается.</span></li>
+      <li>Сработает, потому что первичный ключ решает только число мапперов <span class="fb">Наоборот: <code class="nw">-m</code> задаёт число, а ключ — разбиение; это красная ручка про слайд (p. 991).</span></li>
+      <li data-correct>Импорт упадёт: дай столбец разбиения через <code class="nw">--split-by</code> или запусти один маппер с <code class="nw">-m 1</code> <span class="fb">Без столбца, который можно нарезать на диапазоны, разделить строки между четырьмя мапперами невозможно.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">В каких из этих ситуаций нужен Sqoop, а не Flume? Отметь всё подходящее.</p>
+    <ul class="options">
+      <li data-correct>Данные — это таблица клиентов в базе MySQL <span class="fb">Реляционные таблицы — вход Sqoop, через JDBC-коннектор.</span></li>
+      <li>Веб-серверы весь день пишут строки логов <span class="fb">Бесконечный поток событий: Flume.</span></li>
+      <li data-correct>Достаточно копии раз в ночь, и нужны только строки, изменившиеся со вчерашнего дня <span class="fb">Сохранённое задание с <code class="nw">--incremental lastmodified</code> и check column.</span></li>
+      <li>События должны попадать в разные папки HDFS в зависимости от одного из своих заголовков <span class="fb">Bucketing с <code>%{header}</code> в пути HDFS sink у Flume.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l33-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Батч-инструменты читают входы, которые закончились; поток — это неограниченная последовательность кортежей, к которой запросы идут непрерывно, по окнам. Storm вычисляет на потоках с помощью топологий — графов из spouts (источников потоков) и bolts (обработки), которые работают, пока их не убьют, — на кластере, где Nimbus распределяет, Supervisors выполняют, а ZooKeeper координирует.</li>
+    <li>Каждый компонент выполняется как множество задач; stream grouping каждого ребра решает, какая задача получит кортеж: shuffle (случайная), fields (одинаковые значения — одна задача; нужна для состояния по ключу, например подсчёта слов), all (копия каждой задаче), global (задача с наименьшим id). "No data loss" у Storm — это at-least-once.</li>
+    <li>Агент Flume — это source → channel → sink: source принимает данные и проталкивает события (headers + body) в channel, который хранит их в порядке поступления; sink опрашивает, забирает и доставляет. Source может питать много каналов; sink читает один.</li>
+    <li>Транзакции по обе стороны канала, где sink коммитит только после доставки, предотвращают потери в пути — с надёжным (file) channel, at-least-once и со слабой гарантией порядка. Memory channel быстрый, но при сбое теряет свои события.</li>
+    <li>Сходящиеся потоки рассчитывают по трём правилам: от 4 до 16 клиентских агентов на агрегатор; размер батча на выходе = выходной объём уровня / число агентов на уровне; ёмкость канала = худшая скорость поступления × худший простой. Файл свойств объявляет имена, подключает sources к каналам, а sinks — каждый к одному каналу, и задаёт типы: HDFS sink с путём, префиксами и типом файла, bucketing по заголовку или времени, replicating или multiplexing selectors, interceptors.</li>
+    <li>Sqoop забирает таблицы или результаты запросов целиком через JDBC, как задание MapReduce только с map: <code class="nw">-m</code> мапперов на диапазонах первичного ключа или <code class="nw">--split-by</code>; <code>$CONDITIONS</code> в <code class="nw">--query</code>; <code class="nw">--hive-import</code> в managed-таблицу Hive; сохранённые инкрементальные задания с check column и последним значением.</li>
+  </ul>
+  <aside class="cheat" id="l33-cheat">
+    <dl>
+      <dt>Stream (p. 927)</dt><dd>неограниченная последовательность кортежей; кортеж — именованный список значений</dd>
+      <dt>Spout · bolt (pp. 928–929)</dt><dd>источник потоков · обрабатывает входные потоки и порождает новые (фильтры, агрегация, join)</dd>
+      <dt>Topology (p. 930)</dt><dd>сеть из spouts и bolts; работает, пока не убьют; компоненты выполняются как множество задач (p. 931)</dd>
+      <dt>Кластер Storm (p. 925)</dt><dd>Nimbus: master node, аналог JobTracker · ZooKeeper: координация кластера, хранит состояние · Supervisors: запускают worker processes</dd>
+      <dt>Stream grouping (p. 933)</dt><dd>shuffle: случайная задача · fields: хеш полей, одинаковые значения → одна задача · all: каждая задача · global: задача с наименьшим id</dd>
+      <dt>Гарантия Storm</dt><dd>"no data loss" = at-least-once: кортежи проигрываются заново, дубликаты возможны</dd>
+      <dt>Flume</dt><dd>"a continuous data ingestion system" (p. 939), родилась для агрегации логов в Cloudera</dd>
+      <dt>Agent (p. 948)</dt><dd>source (принимает, пишет в channel) → channel (хранит в порядке поступления) → sink (забирает, отправляет дальше)</dd>
+      <dt>Event (p. 947)</dt><dd>header: метаданные, для маршрутизации · body: само содержимое</dd>
+      <dt>Push · poll (p. 946)</dt><dd>source pushes events · sink polls for events</dd>
+      <dt>Кратности (p. 966)</dt><dd>source–channel many-to-many · channel–sink one-to-many: sink читает один channel</dd>
+      <dt>Channels (p. 968)</dt><dd>memory: очередь в памяти, быстрая, не персистентная, ограниченная ёмкость · Disk = file channel (<code>type = file</code>): надёжный</dd>
+      <dt>Порядок (p. 986)</dt><dd>слабый: в порядке поступления, если нет сбоев</dd>
+      <dt>Уровни (p. 961)</dt><dd>один агрегирующий агент на 4–16 клиентских агентов</dd>
+      <dt>Exit batch size (p. 962)</dt><dd>\(B_t = V / N_t\): выходной объём уровня / агентов на уровне</dd>
+      <dt>Ёмкость канала (p. 963)</dt><dd>\(C = r_{\text{in}}^{\max} \times T_{\text{out}}^{\max}\): худшая скорость поступления × худший простой</dd>
+      <dt>Запуск агента (p. 970)</dt><dd><code>flume-ng agent --conf-file spool-to-logger.properties --name agent1</code></dd>
+      <dt>Проводка (p. 971)</dt><dd><code>agent1.sources.source1.channels = channel1</code> (мн. ч.) · <code>agent1.sinks.sink1.channel = channel1</code> (ед. ч.)</dd>
+      <dt>HDFS sink (pp. 972–974)</dt><dd><code>type = hdfs</code>, <code>hdfs.path</code>, <code>hdfs.filePrefix</code>, <code>hdfs.fileSuffix</code>, <code>hdfs.inUsePrefix = _</code>, <code>hdfs.fileType = DataStream</code>; перекатывает "every 30 seconds" (p. 973) или раньше — по первому сработавшему из <code>rollInterval</code>, <code>rollSize</code>, <code>rollCount</code></dd>
+      <dt>Bucketing (pp. 977–978)</dt><dd><code>hdfs.path = /tmp/flume/http/%{topic}</code> · <code>…/%Y/%m/%d/%H</code> с <code>hdfs.useLocalTimeStamp = true</code></dd>
+      <dt>Selectors (pp. 981–982)</dt><dd>replicating: по умолчанию, каждое событие в каждый канал · <code>selector.type = multiplexing</code>, <code>selector.header = show</code>, <code>selector.mapping.1 = ch1</code></dd>
+      <dt>Interceptor (pp. 984–985)</dt><dd><code>sources.source1.interceptors = regexInterceptor</code>, затем <code>….regexInterceptor.type = regex_filter</code>, <code>regex = .*election.*</code>, <code>excludeEvents = false</code></dd>
+      <dt>Sqoop (p. 988)</dt><dd>импорт из реляционных БД; pull-based, без потоков; целиком; одна команда</dd>
+      <dt>Импорт (p. 990)</dt><dd><code>sqoop import --connect jdbc:mysql://localhost:3306/nseProd --username=qt --password=password --table=tradingDays --target-dir /mysql/nseProd --m 1</code></dd>
+      <dt>Мапперы и разбиение</dt><dd><code class="nw">-m</code> мапперов (по умолчанию 4); диапазоны первичного ключа или <code class="nw">--split-by col</code>; <code class="nw">-m 1</code>, когда нет ни ключа, ни столбца разбиения</dd>
+      <dt>Импорт по запросу (p. 993)</dt><dd><code>--query '… where … and $CONDITIONS'</code> с <code class="nw">--target-dir</code> и <code class="nw">--split-by</code> или <code class="nw">-m 1</code></dd>
+      <dt>Hive (p. 994)</dt><dd><code>--hive-import --hive-table=tradingDays</code>: managed-таблица, файлы перемещаются в хранилище</dd>
+      <dt>Инкрементальное задание (pp. 995–999)</dt><dd><code>sqoop job --create myjob -- import … --append --incremental lastmodified --check-column ts</code> · <code>sqoop job --exec myjob</code>; следующий запуск берёт данные &gt; LastValue; <code class="nw">--append</code> позволяет каждому запуску писать в уже существующий целевой каталог</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l33-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="http://nathanmarz.com/blog/history-of-apache-storm-and-lessons-learned.html" target="_blank" rel="noopener">History of Apache Storm and lessons learned</a>
+      <span class="res-by">Nathan Marz, creator of Storm</span>
+      <p class="res-why">Как Storm построили в BackType, как вместе с ней его купил Twitter и как в 2011 году его выпустили, — история за первой строкой слайда (p. 924), рассказанная создателем Storm, которого лекция благодарит на слайде (p. 1000).</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://storm.apache.org/releases/current/Tutorial.html" target="_blank" rel="noopener">Storm Tutorial</a>
+      <span class="res-by">Apache Storm documentation</span>
+      <p class="res-why">Nimbus, Supervisors и ZooKeeper, streams, spouts и bolts и топология подсчёта слов с её shuffle и fields groupings: слайды (pp. 925–933) прозой, с кодом из раздела 2.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://flume.apache.org/FlumeUserGuide.html" target="_blank" rel="noopener">Flume User Guide</a>
+      <span class="res-by">Apache Flume project</span>
+      <p class="res-why">Источник слайдов о Flume: рисунки агента и нескольких агентов, каталоги sources, channels и sinks со всеми свойствами, selectors и interceptors. Держи его открытым рядом с разделом 5 и сгенерированным файлом виджета.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://sqoop.apache.org/docs/1.4.7/SqoopUserGuide.html" target="_blank" rel="noopener">Sqoop User Guide (v1.4.7)</a>
+      <span class="res-by">Apache Sqoop project</span>
+      <p class="res-why">Управление параллелизмом, импорт по запросу в свободной форме с <code>$CONDITIONS</code>, импорт в Hive, инкрементальный импорт и сохранённые задания — те самые фразы, которые цитируют красные ручки раздела 6. С тех пор Sqoop ушёл на покой в Apache Attic; его идеи живут в JDBC-ридере Spark.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.oreilly.com/radar/the-world-beyond-batch-streaming-101/" target="_blank" rel="noopener">Streaming 101: The world beyond batch</a>
+      <span class="res-by">Tyler Akidau, O'Reilly Radar</span>
+      <p class="res-why">Ограниченные и неограниченные данные, время события и время обработки, фиксированные, скользящие и сессионные окна, с рисунками: рамка главы о потоковой обработке из конспекта курса, развитая дальше.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Flume и Sqoop приносят данные, которыми ты владеешь: логи твоих серверов, таблицы твоей базы. Но многое из того, что стоит иметь, лежит на чужих сайтах. Как добыть это?</p>
+</aside>
+
+</main>
+</body>
+</html>

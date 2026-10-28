@@ -1,0 +1,1189 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Feature stores · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the joined rows under the two widgets, and the entity-key cells of the time-series table. Tokens only. */
+.l29-rows { margin: 0.75rem 1rem 0.5rem; }
+.l29-rows .tbl th, .l29-rows .tbl td { white-space: nowrap; }
+.l29-rows .tbl td.is-bad { color: var(--bad); font-weight: 600; }
+.l29-rows .tbl td.is-null { color: var(--ink-3); }
+.l29-ts td.l29-ek { box-shadow: inset 0 0 0 2px var(--s3); }
+.l29-ts th:nth-child(3), .l29-ts th:nth-child(4), .l29-ts td:nth-child(3), .l29-ts td:nth-child(4) { padding-left: 0.4rem; }
+.tbl tr.l29-role > th { font-weight: 500; color: var(--ink-3); font-size: var(--t-xs); border-bottom: 1px solid var(--line); }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l29">
+
+<header class="lesson-head">
+  <h1>Feature stores</h1>
+  <p class="lede">После этого урока ты объяснишь, почему команды машинного обучения держат свои признаки в отдельном хранилище — одно определение, офлайн-хранилище для обучения, онлайн-хранилище для обслуживания, — и соберёшь обучающую выборку, которая никогда не заглядывает в будущее.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>В сентябре 2017 года инженерный блог Uber описал Michelangelo — платформу, на которой работали модели машинного обучения компании. Одна из её частей, хранилище признаков (feature store), держала около 10,000 признаков — входных столбцов моделей, — которые пересчитывались каждый день, были общими для команд по имени и хранились в двух системах: в озере данных на Hive/HDFS для обучения и в Cassandra для онлайн-предсказаний. Слайд лекции History начинается именно с этого: "First Experience in Uber, with Michelangelo platform" (p. 739). Его временная шкала добавляет к 2021 году Airbnb, Gojek, Tecton, AWS, Databricks и Google.</p>
+  <p>Вот загадка. Признак вроде «сколько этот клиент потратил за последние 30 дней» — это один короткий запрос. Зачем столько компаний построили целую систему — два хранилища, каталог, мониторинг — вокруг чисел, которые считает один запрос?</p>
+  <p>Потому что однострочный признак может сломаться двумя способами, о которых ни один запрос никогда не сообщит: его посчитают дважды, и его прочитают не в тот момент. К концу урока ты назовёшь оба, увидишь в виджете, как каждый ломает модель, и поймёшь, почему «хранилище» Uber вовсе не было новой базой данных.</p>
+</div>
+
+
+<section id="l29-loop">
+  <h2>Признаки и цикл MLOps</h2>
+
+  <p>Начнём с примера использования со слайда (p. 738) — приложения кредитного скоринга. Чтобы решить вопрос о кредите, модель читает несколько чисел о каждом клиенте: "Customer demographics (age, income, etc.)", "Historical credit behavior (loan repayments, defaults)" и "Real-time transaction data (recent purchases, account balance changes)". Каждое из этих чисел — признак.</p>
+
+  <div class="def">
+    <p><dfn>Признак (feature)</dfn> — "the input variables or attributes that describe (data) objects used by machine learning models to make predictions, such as customer age, transaction history, or weather conditions" (p. 720).</p>
+    <p><dfn>Хранилище признаков (feature store)</dfn> — "a centralized repository used to store, manage, and serve features for machine learning (ML) tasks". Его цель: "to streamline the process of creating, sharing, and using these features across various ML models" (p. 720).</p>
+  </div>
+
+  <p>В статистических обозначениях признак — это столбец матрицы плана \(X\); хранилище признаков держит эти столбцы — с именами, датами и общим доступом — вне какой-то одной модели.</p>
+
+  <p>Тот же слайд говорит, где место хранилища: "It's a key asset in ML-Ops". <mark class="key">MLOps</mark> (Machine Learning Operations) — это "a set of practices and tools that aim to streamline the development, deployment, and maintenance of machine learning (ML) models in production environments"; он "extends the principles of DevOps (Development and Operations) to the ML domain" и "brings together data scientists, machine learning engineers, and operations teams" (p. 722). Следующий слайд (p. 723) рисует его как цикл без конца.</p>
+
+  <figure class="fig fig--plain" id="l29-fig-loop">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Цикл MLOps со слайда 6 лекции 11b как два соединённых круга: слева Develop, Data prep и EDA ведут в правый круг, где Review, Deploy, Inference и Monitor ведут обратно к (Re)-Train слева; выделены две станции, которые потребляют признаки, — (Re)-Train и Inference">
+      <path d="M240.5 165.65 A75 75 0 0 1 132.5 204.95" class="hl"/>
+      <path d="M406.2 104.8 A75 75 0 0 1 379.7 203.6" class="hl"/>
+      <path d="M128.1 202.2 A75 75 0 0 1 106.4 100.3" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M109.3 95.9 A75 75 0 0 1 211.9 77.8" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M216.2 80.9 A75 75 0 0 1 240.5 114.3 L264 114.3" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M240.5 165.65 A75 75 0 0 1 132.5 204.95" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M269.5 114.35 A75 75 0 0 1 300.3 76.4" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M304.8 73.8 A75 75 0 0 1 403.6 100.3" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M406.2 104.8 A75 75 0 0 1 379.7 203.6" class="sw-2" marker-end="url(#arr)"/>
+      <path d="M375.2 206.2 A75 75 0 0 1 269.5 165.65 L246 165.65" class="sw-2" marker-end="url(#arr)"/>
+      <text x="170" y="147" class="tx-lg tx-mid tx-muted">Dev</text>
+      <text x="340" y="147" class="tx-lg tx-mid tx-muted">Ops</text>
+      <text x="86" y="162" class="tx-end">Develop</text>
+      <text x="154" y="50" class="tx-mid">Data prep</text>
+      <text x="205" y="112" class="tx-mid">EDA</text>
+      <text x="312" y="112" class="tx-mid">Review</text>
+      <text x="364" y="50" class="tx-mid">Deploy</text>
+      <text x="422" y="167">Inference</text>
+      <text x="310" y="240" class="tx-mid">Monitor</text>
+      <text x="190" y="240" class="tx-mid">(Re)-Train</text>
+      <text x="255" y="284" class="tx-hand tx-mid">одни и те же признаки нужны дважды</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Цикл со слайда (p. 723), перерисованный как два соединённых круга — разработка слева, эксплуатация справа, — где восемь станций слайда читаются как один цикл. Выделены две станции, которые потребляют признаки: (Re)-Train и Inference.</figcaption>
+  </figure>
+
+  <aside class="margin-note">Слайд валидирует "using a test dataset". В терминах машинного обучения выбор модели делают на валидационной выборке, а тестовую берегут для финальной оценки; на экзамене цитируй слайд.</aside>
+
+  <p>Следующий слайд (p. 724) рассказывает тот же цикл в пяти фазах, и для каждой — что обещает MLOps:</p>
+  <ol>
+    <li><b>Development</b> — эксперименты с "models, algorithms, and feature sets"; код, модели и датасеты версионируются.</li>
+    <li><b>Training and Validation</b> — модель обучают и "validated using a test dataset", причём так, что это "can be reproduced".</li>
+    <li><b>Deployment</b> — автоматизирован практиками CI/CD.</li>
+    <li><b>Monitoring</b> — "real-time insights into how the model is performing, and whether data or concept drift is affecting its accuracy": в реальном времени видно, как работает модель и не портит ли дрейф её точность.</li>
+    <li><b>Retraining</b> — переобучение, "When the model's performance drops or when new data becomes available".</li>
+  </ol>
+
+  <p>Слайд "ML-Ops – focus on data and features" (p. 725) делит тот же жизненный цикл на четыре части — Data, ML, Dev и Ops, — и первая из них — чистая работа с данными: собрать, отобрать, преобразовать, проверить. Именно в этой части работает хранилище признаков.</p>
+
+  <p>Закрепим сразу два дрейфа из фазы 4: слайды ими пользуются, но не определяют. <mark class="key">Дрейф данных (data drift)</mark>: меняется распределение входов — в этом году заявители моложе. <mark class="key">Дрейф концепции (concept drift)</mark>: меняется связь между входами и целевой переменной — та же картина трат больше не означает тот же риск. В статистических терминах сдвигается \(P(X)\) или сдвигается \(P(Y \mid X)\).</p>
+
+  <p>Слайды (pp. 726–728) перечисляют восемь компонентов MLOps: контроль версий моделей и данных ("datasets, features, models, and hyperparameters"); CI/CD для ML; обучение и переобучение моделей; мониторинг и отслеживание качества моделей ("accuracy, precision, recall, and business-specific KPIs"); управление данными и признаками; автоматизация и оркестрация ("Kubernetes, Airflow, or Kubeflow"); совместная работа команд; управление моделями и соответствие требованиям (governance and compliance). Следующий слайд (p. 729) добавляет пять выгод: быстрее выход на рынок, лучше совместная работа, выше надёжность моделей, повторное использование "of code, pipelines, and features", лучше управление моделями.</p>
+
+  <p>Пятый компонент — дверь в этот урок: "MLOps integrates with feature stores to ensure that the same data transformations applied during training are applied in production, avoiding issues like 'training-serving skew.'" (p. 727).</p>
+
+  <p class="memo"><mark class="key">MLOps — это цикл, и признаки нужны на двух его станциях: обучении (training) и инференсе (inference).</mark></p>
+</section>
+
+
+<section id="l29-skew">
+  <h2>Самая большая проблема: один признак, посчитанный дважды</h2>
+
+  <p>Слайд (p. 743) называется "The biggest problem to face": "Features for a machine learning model are required in both the modelling and production (deployment) phases of the lifecycle. This implies duplication of code and risk of inconsistency".</p>
+
+  <p>Вот как это выглядит. Data scientist пишет в ноутбуке <code>spend_l30d</code> — траты клиента за последние 30 дней: покупки минус возвраты, посчитанные по истории, чтобы собрать обучающую выборку. Модель выходит в продакшен, и инженер переписывает тот же признак внутри боевого сервиса — другой язык, дедлайн, и без возвратов. 14 июня у клиента C2, который накануне вернул товар за 220.00, в обучающих данных 275.00, а в продакшене 495.00. Обе программы работают без единой ошибки.</p>
+
+  <div class="def">
+    <p><dfn>Расхождение между обучением и обслуживанием (training-serving skew)</dfn> — ситуация, "where a model performs poorly because the features used in production differ from the ones used during training" (p. 734). Слайд (p. 743) называет его "online/offline skew".</p>
+  </div>
+
+  <figure class="fig fig--pair fig--plain" id="l29-fig-before-after">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="До: сырые события питают две программы — ноутбук, который собирает обучающие данные, и сервис, который кормит инференс; для одного и того же клиента обучающее значение 275.00, а выданное 495.00">
+        <rect x="18" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="32" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="60" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <text x="45" y="142" class="tx-sm tx-mid">события</text>
+        <line x1="74" y1="106" x2="100" y2="58" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="74" y1="122" x2="100" y2="170" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="104" y="30" width="88" height="34" class="fi-paper sw-2"/>
+        <text x="148" y="51" class="tx-sm tx-mid">код ноутбука</text>
+        <rect x="104" y="164" width="88" height="34" class="fi-paper sw-2"/>
+        <text x="148" y="185" class="tx-sm tx-mid">код сервиса</text>
+        <line x1="192" y1="47" x2="214" y2="47" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="192" y1="181" x2="214" y2="181" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="218" y="30" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="51" class="tx-sm tx-mid">обучение</text>
+        <rect x="218" y="164" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="185" class="tx-sm tx-mid">инференс</text>
+        <text x="255" y="86" class="tx-mono tx-mid">275.00</text>
+        <text x="255" y="154" class="tx-mono tx-mid">495.00</text>
+        <text x="255" y="124" class="tx-lg tx-mid tx-bad tx-bold">≠</text>
+        <text x="148" y="122" class="tx-hand tx-mid">две программы</text>
+      </svg>
+      <p class="fig-label">До: две программы, два значения</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="После: сырые события питают одно хранилище признаков с одним определением; обучение и инференс получают для одного и того же клиента 275.00">
+        <rect x="18" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="32" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <rect x="60" y="104" width="12" height="20" class="fw-s1 st-s1"/>
+        <text x="45" y="142" class="tx-sm tx-mid">события</text>
+        <line x1="74" y1="114" x2="96" y2="114" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="100" y="82" width="96" height="64" class="fi-paper sw-2"/>
+        <text x="148" y="108" class="tx-sm tx-mid tx-bold">feature store</text>
+        <text x="148" y="128" class="tx-sm tx-mid">определение</text>
+        <line x1="196" y1="94" x2="216" y2="60" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="196" y1="134" x2="216" y2="168" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="218" y="30" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="51" class="tx-sm tx-mid">обучение</text>
+        <rect x="218" y="164" width="74" height="34" class="fi-paper"/>
+        <text x="255" y="185" class="tx-sm tx-mid">инференс</text>
+        <text x="255" y="86" class="tx-mono tx-mid">275.00</text>
+        <text x="255" y="154" class="tx-mono tx-mid">275.00</text>
+        <text x="255" y="124" class="tx-lg tx-mid tx-good tx-bold">=</text>
+        <text x="128" y="204" class="tx-hand tx-mid">то же значение</text>
+      </svg>
+      <p class="fig-label">После: одно определение, одно значение</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Клиент C2 14 июня, как в виджете раздела 3. Слева: ноутбук вычитает возвращённый товар, сервис — нет, и модели, обученной на 275.00, подают 495.00. Справа: рисунок со слайда (p. 742) — сырые данные входят в одно хранилище признаков и выходят в "Features used for model training" и "Features used for model inference".</figcaption>
+  </figure>
+
+  <p>Лекарство — перестать держать две программы. На слайде (p. 742) хранилище признаков — это "An interface between the raw data and the models. It takes raw data and then transforms it into features subsequently used for model training and inference", и оно "ensures that the features used across both models (and possibly many models) are consistent". Тот же слайд называет его "a centralised repository that stores curated features" и "a data management layer that allows data scientists, machine learning engineers, and data engineers to collaborate, share, and discover features".</p>
+
+  <div class="pitfall">
+    <p>«Skew — просто другое слово для drift». Нет. Расхождение (skew) возникает, пока мир стоит на месте: один сырой вход, два вычисления. Дрейф (drift) — это изменение мира при одном вычислении. Хранилище признаков убирает skew по построению; дрейф оно может только обнаружить, отслеживая признаки (p. 736), — а лечится дрейф переобучением.</p>
+  </div>
+
+  <p>Что хранилище признаков «гарантирует», словами слайда (p. 743): "Consistency between model training and inference leads to better model accuracy", "eliminating online/offline skew", "Share and reuse features across models and teams, ensuring faster model development", "Provide feature versioning, lineage, provenance, and regulatory compliance". Слайд (p. 737) сводит это к четырём выгодам: <b>Consistency</b> (одни и те же преобразования в обучении и в продакшене), <b>Efficiency</b> (без дублирующего feature engineering), <b>Scalability</b> (батчевые признаки и признаки реального времени в большом масштабе) и <b>Version Control</b> (модели, обученные на старых версиях признаков, "can still be reproduced").</p>
+
+  <div class="tip"><p>Два списка выгод стоят в нескольких слайдах друг от друга, и закрытый вопрос может их перемешать. MLOps (p. 729): faster time to market, improved collaboration, increased model reliability, reusability, better model governance. Хранилище признаков (p. 737): consistency, efficiency, scalability, version control.</p></div>
+
+  <p>Слайд (p. 733) показывает, кто и когда разговаривает с хранилищем. Data engineers, data scientists и ML engineers "Define and iterate on new features", "Load feature data for training" и "for testing"; сервис предсказаний в продакшене получает значения признаков, посчитанные для инференса, и пишет обратно в хранилище ("Log served features, prediction, outcomes", "Track feature stats to identify issues"); инженеры читают это обратно, чтобы "Monitor for drift &amp; quality issues". Каждая фаза цикла читает из хранилища или пишет в него.</p>
+
+  <p>Всегда ли оно того стоит? Хранилища признаков "are a must-have when working on a project where the intention is to deploy models at scale and in production"; "However, if you are working within a small team and on a small project or a POC, you may not need it" (p. 744). У проверки концепции (proof of concept) одна модель и нет продакшена: ничего не считается дважды.</p>
+
+  <p class="memo"><mark class="key">Хранилище признаков заменяет две программы, считающие один и тот же признак, одним определением, которое кормит и обучение, и обслуживание (serving).</mark></p>
+</section>
+
+
+<section id="l29-stores">
+  <h2>Два хранилища: история для обучения, последнее значение для обслуживания</h2>
+
+  <p>Одно определение не значит одна база данных. Вернёмся к кредитному скорингу (p. 738): "For training, the offline store would provide historical data, while for real-time predictions, the online store would supply the latest transaction data." Два хранилища — потому что обучение и обслуживание задают два разных вопроса.</p>
+
+  <p><mark class="key">Офлайн-хранилище (offline store)</mark> "Contains batch features used for model training. These are typically updated at regular intervals (e.g., daily or weekly) and stored in large-scale data storage systems like Hadoop or cloud-based data lakes" (p. 735). Оно держит "months' or years' worth of feature data", "often stored in data warehouses or data lakes like S3, BigQuery, Snowflake, Redshift" (p. 765). Его вопрос — сканирование: значение каждого клиента за каждый день последних двух лет. Это нагрузка хранилища данных (<a href="l23.html">урок 23</a>).</p>
+
+  <p><mark class="key">Онлайн-хранилище (online store)</mark> "Contains real-time features used for serving live predictions. These features need to be served with low latency for real-time inference and are typically stored in low-latency databases like Redis" (p. 735). Оно хранит "feature values for low-latency lookup during inference", и "They typically only store the latest feature values for each entity" (p. 765). Его вопрос — поиск по ключу: текущие значения клиента C2, сейчас, за миллисекунды — <code>GET</code> по ключу, ровно то, для чего построен Redis (<a href="l17.html">урок 17</a>).</p>
+
+  <p>Слайд (p. 765) добавляет: "Online stores are usually eventually consistent." Почему это допустимо? Статья, по которой идут слайды, объясняет: у большинства применений ML нет строгих требований к согласованности. Проверка на мошенничество по балансу, которому несколько секунд, — всё ещё разумная проверка, а проверка, которая пришла, когда платёж уже прошёл, бесполезна. Побеждают задержка и доступность — сторона BASE в компромиссе из <a href="l05.html">урока 5</a>.</p>
+
+  <div class="pitfall">
+    <p>«Cassandra — это key-value хранилище: так сказано на слайде (p. 765)». Перечитай фразу: "They are usually implemented with key-value stores like DynamoDB, Redis, or Cassandra" описывает, как онлайн-хранилище использует Cassandra — один поиск по ключу партиционирования. По семейству курс относит Cassandra к колоночным базам: лекция с правилами экзамена перечисляет "Key-value DB (Redis)" и "columnar DB (Cassandra)", а конспект курса называет её "a columnar database with some key-value features" (<a href="l20.html">урок 20</a>). Если спросят о семействе Cassandra, отвечай: колоночная (columnar).</p>
+  </div>
+
+  <h3>Serving: один API, два ответа</h3>
+
+  <p>Чтение из двух хранилищ — задача, которую слайды называют Serving (обслуживание): "An easy and canonical way to access all features in a company consistently across all environments" (p. 764). Офлайн "feature values are commonly accessed through notebook-friendly feature store SDKs"; онлайн "a feature store delivers a single vector of features at a time made up of the freshest feature values, through a high-performance API backed by a low-latency database". На том же слайде (p. 764) одни и те же три признака запрашиваются обоими способами (<code>l7d</code> и <code>l30d</code> значат "last 7 days" и "last 30 days"):</p>
+
+  <div class="tabs" id="l29-tabs-serving">
+    <div data-tab="Онлайн: один вектор">
+      <p>"Request feature vector for inference" — ответ через REST API:</p>
+<pre><code>.get_feature_vector (
+    features=["item_clicks_l7d",
+              "item_price",
+              "user_spend_l30d"],
+    entities={"user_id":3,
+              "item_id":62}
+)</code></pre>
+      <p>Ответ, "Feature Vector (latest values, low-latency)":</p>
+<pre><code>{
+  "item_clicks_l7d":6,
+  "item_price":"$25.12",
+  "user_spend_l30d":"$12.10"
+}</code></pre>
+    </div>
+    <div data-tab="Офлайн: обучающий датафрейм">
+      <p>"Request training data" — ответ через Python SDK:</p>
+<pre><code>.get_training_data (
+    features=["item_clicks_l7d",
+              "item_price",
+              "user_spend_l30d"],
+    entities=entities_df
+)</code></pre>
+      <p>Ответ, "Training Dataframe (historical values)":</p>
+<pre><code>user_id  item_id  time   item_clicks_l7d  item_price  user_spend_l30d
+1        54       7485   6                $23.2       $0
+2        35       46854  5                $41.54      $8.41</code></pre>
+    </div>
+  </div>
+
+  <p>Те же три имени, два совсем разных ответа: один вектор последних значений для одного ключа — или по строке на каждую пару (сущность, время) со значениями, какими они были тогда. Столбец <code>time</code> вернётся в разделе 5.</p>
+
+  <div class="pitfall">
+    <p>«<code>get_feature_vector</code> — это API Feast». Нет: слайды (pp. 763–769) воспроизводят общую статью о хранилищах признаков (статью Tecton из ресурсов ниже), и имена методов со слайда (p. 764) относятся к иллюстрации этой статьи, а не к Feast. Настоящие вызовы Feast — те, что на слайде (p. 762), <code>get_historical_features</code> и <code>get_online_features</code>; цитируй их, когда вопрос называет Feast.</p>
+  </div>
+
+  <figure class="tbl-fig" id="l29-tbl-usecases">
+    <figcaption>Три сценария и вызов Feast для каждого (p. 762). Два из трёх — офлайн: важно не обучение против предсказания, а батч против отдельного запроса.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Сценарий</th><th>Пример</th><th>API</th></tr></thead>
+        <tbody>
+          <tr><td>Training data generation</td><td>Fetching user and item features for (user, item) pairs when training a production recommendation model</td><td><code>get_historical_features</code></td></tr>
+          <tr><td>Offline feature retrieval for batch predictions</td><td>Predicting user churn for all users on a daily basis</td><td><code>get_historical_features</code></td></tr>
+          <tr><td>Online feature retrieval for real-time model predictions</td><td>Fetching pre-computed features to predict whether a real-time credit card transaction is fraudulent</td><td><code>get_online_features</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Как значения попадают в онлайн-хранилище? Слайд о Feast (p. 757): "For offline use cases that only rely on batch data, Feast does not need to ingest data and can query your existing data", а "For online use cases, Feast supports ingesting features from batch sources to make them available online (through a process called <mark class="key">materialization</mark>), and pushing streaming features to make them available both offline / online". Офлайн-хранилищем может быть хранилище данных, которое у тебя уже есть, и запросы идут прямо к нему; материализация (materialization) копирует последнее значение каждого ключа в онлайн-хранилище; поток делает push в оба.</p>
+
+  <p>Виджет ставит рядом два хранилища и две программы из раздела 2. Главное, что он показывает: <strong>расхождение молчит</strong> — оно появляется, прячется и возвращается вместе с данными и календарём, и убирает его только одно общее определение.</p>
+
+  <div class="widget" id="l29-w-stores">
+    <h3 class="widget-title">Один признак, два хранилища: откуда берётся расхождение</h3>
+    <p class="widget-intro">Четыре клиента приложения кредитного скоринга, их покупки и возвраты с 1 мая по 30 июня и один признак: <code>spend_l30d</code>, покупки минус возвраты за последние 30 дней. Ноутбук считает его для офлайн-хранилища (по строке на клиента за каждый день); онлайн-хранилище держит по одному ключу на клиента — значение, которое отдаётся модели в день запроса. Выбери, кто заполняет онлайн-хранилище и какие ошибки делает написанный вручную сервис. Данные придуманы для виджета; каждое значение вычислено из них.</p>
+    <ol class="tasks">
+      <li>Выбери «хранилище признаков». Прежде чем смотреть на показания: сколько строк в офлайн-хранилище на 30 июня и сколько ключей в онлайн-хранилище? Почему такая разница?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>244 строки (4 клиента × 61 день) против 4 ключей. Офлайн-хранилище держит "months' or years' worth of feature data for training purposes"; онлайн-хранилища "typically only store the latest feature values for each entity" (p. 765) — 14 июня там всё те же 4 ключа, а в офлайн-хранилище 180 строк. Модели в продакшене нужен один ключ, сейчас; обучению нужна вся история.</p></details>
+      </li>
+      <li>Выбери «две программы», включи только «забывает возвраты» и двигай день от 1 до 30 июня. Предскажи, когда счётчик расхождений впервые станет ненулевым и для кого.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>13 июня, для C2: 275.00 в обучающих строках, 495.00 в выдаче — в тот день C2 вернул товар за 220.00. С 16 июня присоединяется C1 (возврат 12.00: 160.70 против 172.70). Двенадцать дней две программы совпадали идеально: проверка на расхождение, запущенная в начале июня, прошла бы.</p></details>
+      </li>
+      <li>Включён только «календарный месяц»: в какой день июня расхождение исчезает? И что сервис отдаёт 1 июня?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Оно исчезает 30 июня — в единственный день, когда «этот месяц» и «последние 30 дней» — одно и то же окно. 1 июня сервис отдаёт 0.00 для C1, C2 и C3, которые за предыдущие 30 дней потратили 215.50, 215.00 и 195.00. Баг приходит и уходит вместе с календарём: 83 из 120 запросов июня неверны.</p></details>
+      </li>
+      <li>Включи все три бага (105 запросов с расхождением в июне), потом переключись на «хранилище признаков». Что происходит и почему никакой переключатель не может вернуть расхождение?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Счётчики падают до 0 из 4 и 0 из 120. Второй программы, в которой мог бы жить баг, больше нет: онлайн-хранилище заполняется материализацией последнего офлайн-значения каждого ключа, так что значение, отданное в любой день, — ровно то число, что лежит в обучающей строке этого дня. Это и есть "Consistency" со слайда (p. 737) — одни и те же преобразования признаков в обучении и в продакшене.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l29-w-stores', function (root, ui) {
+    /* day 1 = 1 May … day 31 = 31 May, day 32 = 1 June … day 61 = 30 June; a negative amount is a refund */
+    var EV = {
+      C1: [[3, 42.30], [10, 38.10], [17, 51.20], [24, 44.00], [31, 39.90], [38, 47.60], [45, 41.20], [47, -12.00], [52, 52.80], [59, 45.50]],
+      C2: [[20, 180.00], [28, 35.00], [36, 220.00], [41, 60.00], [44, -220.00], [55, 75.00]],
+      C3: [[27, 95.00], [29, 60.00], [30, 40.00], [58, 80.00], [60, 50.00]],
+      C4: [[49, 25.00], [56, 30.00]]
+    };
+    var CUST = ['C1', 'C2', 'C3', 'C4'], FILL = 160, NONE = { refunds: false, month: false, fill: false };
+    function r2(x) { return Math.round(x * 100) / 100; }
+    function spend(c, d, bug) {                        /* the feature on day d; bug = the service's mistakes */
+      var lo = bug.month ? (d <= 31 ? 0 : 31) : d - 30, s = 0, n = 0;
+      EV[c].forEach(function (e) {
+        if (e[0] > lo && e[0] <= d) { if (e[1] < 0 && bug.refunds) return; s += e[1]; n++; }
+      });
+      if (n === 0 && bug.fill) return FILL;
+      return r2(s);
+    }
+
+    var who = ui.select('кто заполняет онлайн-хранилище', [
+      { value: 'two', label: 'две программы: ноутбук и сервис' },
+      { value: 'fs', label: 'хранилище признаков: одно определение' }
+    ], null, 'two');
+    var tRef = ui.toggle('баг сервиса: забывает возвраты', true);
+    var tMon = ui.toggle('баг сервиса: календарный месяц вместо последних 30 дней', false);
+    var tFill = ui.toggle('баг сервиса: пустое окно даёт 160.00, а не 0.00', false);
+    var day = ui.slider({ label: 'день запроса в июне', min: 1, max: 30, step: 1, value: 14, format: function (v) { return v + ' июня'; } });
+    var roOff = ui.readout('офлайн-хранилище'), roOn = ui.readout('онлайн-хранилище');
+    var roToday = ui.readout('расхождений в день запроса'), roMonth = ui.readout('запросов с расхождением в июне');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'движение значений признака', color: 's1', mark: 'line' },
+      { label: 'зарегистрированное определение', color: 's3', mark: 'area' },
+      { label: 'выданное значение ≠ обучающему', color: 'bad', mark: 'square' }
+    ]);
+    var svg = ui.svg(560, 250, { label: 'Сырые события питают либо две программы — ноутбук, заполняющий офлайн-хранилище, и сервис, заполняющий онлайн-хранилище, — либо одно зарегистрированное определение, чьи значения материализуются из офлайн- в онлайн-хранилище; онлайн-хранилище показывает по ключу на клиента со значением, выданным в день запроса, и обводит его красным, если оно отличается от обучающего' });
+    var rowsBox = Course.el('div', { 'class': 'l29-rows' });
+    ui.stage.appendChild(rowsBox);
+
+    function bug() { return { refunds: tRef.value, month: tMon.value, fill: tFill.value }; }
+    function state() {
+      var fs = who.value === 'fs', b = bug(), d = 31 + Math.round(day.value);
+      var rows = CUST.map(function (c) {
+        var off = spend(c, d, NONE), on = fs ? off : spend(c, d, b);
+        return { c: c, off: off, on: on, skew: Math.abs(off - on) > 0.005 };
+      });
+      var month = 0;
+      for (var j = 32; j <= 61; j++) CUST.forEach(function (c) {
+        var a = spend(c, j, NONE), v = fs ? a : spend(c, j, b);
+        if (Math.abs(a - v) > 0.005) month++;
+      });
+      return { fs: fs, d: d, rows: rows, today: rows.filter(function (r) { return r.skew; }).length, month: month };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function arrow(x1, y1, x2, y2) { S('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' }); }
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      [18, 31.5, 45, 58.5, 72].forEach(function (x) { S('rect', { x: x, y: 112, width: 12, height: 20, 'class': 'fw-s1 st-s1' }); });
+      T(50, 152, 'события', 'tx-sm tx-mid');
+      /* the offline store: a table with a header row and the history below it */
+      for (var cx = 0; cx < 5; cx++) for (var ry = 0; ry < 4; ry++) {
+        S('rect', { x: 262 + 20 * cx, y: 24 + 12 * ry, width: 20, height: 12, 'class': ry === 0 ? 'fw-s3 st-s3' : 'fi-paper' });
+      }
+      T(312, 92, 'офлайн-хранилище', 'tx-sm tx-mid');
+      S('rect', { x: 440, y: 30, width: 110, height: 34, rx: 4, 'class': 'fi-paper' });
+      T(495, 52, 'обучение', 'tx-sm tx-mid');
+      arrow(364, 47, 436, 47);
+      /* the online store: one key-value pair per customer */
+      T(317, 140, 'онлайн-хранилище', 'tx-sm tx-mid');
+      st.rows.forEach(function (r, i) {
+        var y = 150 + 22 * i;
+        S('rect', { x: 262, y: y, width: 38, height: 22, 'class': 'fw-s3 st-s3' });
+        S('rect', { x: 300, y: y, width: 72, height: 22, 'class': r.skew ? 'fi-paper st-bad sw-3' : 'fi-paper' });
+        T(281, y + 16, r.c, 'tx-mono tx-sm tx-mid');
+        T(336, y + 16, r.on.toFixed(2), 'tx-mono tx-sm tx-mid');
+      });
+      S('rect', { x: 440, y: 176, width: 110, height: 34, rx: 4, 'class': 'fi-paper' });
+      T(495, 198, 'обслуживание', 'tx-sm tx-mid');
+      arrow(374, 194, 436, 194);
+      if (st.fs) {
+        S('rect', { x: 116, y: 100, width: 104, height: 40, 'class': 'fw-s3 st-s3 sw-2' });
+        T(168, 125, 'определение', 'tx-sm tx-mid');
+        arrow(88, 122, 112, 121);
+        arrow(220, 108, 258, 58);
+        S('path', { d: 'M366 64 C404 86 404 132 378 150', 'class': 'st-s1 sw-2 fi-none', 'marker-end': 'url(#arr-s1)' });
+        T(410, 112, 'материализация', 'tx-sm');
+      } else {
+        S('rect', { x: 116, y: 30, width: 104, height: 34, 'class': 'fi-paper sw-2' });
+        T(168, 52, 'ноутбук', 'tx-sm tx-mid');
+        S('rect', { x: 116, y: 176, width: 104, height: 34, 'class': 'fi-paper sw-2' });
+        T(168, 198, 'сервис', 'tx-sm tx-mid');
+        arrow(88, 116, 112, 54);
+        arrow(88, 128, 112, 186);
+        arrow(220, 47, 258, 47);
+        arrow(220, 193, 258, 193);
+      }
+    }
+    function table(st) {
+      rowsBox.textContent = '';
+      var head = Course.el('tr', null, ['клиент', 'обучающая строка (офлайн)', 'выдано (онлайн)', 'разница'].map(function (h) { return Course.el('th', { text: h }); }));
+      var body = Course.el('tbody');
+      st.rows.forEach(function (r) {
+        var diff = r2(r.on - r.off);
+        body.appendChild(Course.el('tr', null, [
+          Course.el('td', { text: r.c }),
+          Course.el('td', { 'class': 'n', text: r.off.toFixed(2) }),
+          Course.el('td', { 'class': 'n' + (r.skew ? ' is-bad' : ''), text: r.on.toFixed(2) }),
+          Course.el('td', { 'class': 'n' + (r.skew ? ' is-bad' : ''), text: r.skew ? (diff > 0 ? '+' : '−') + Math.abs(diff).toFixed(2) : '0' })
+        ]));
+      });
+      rowsBox.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, head), body])));
+    }
+    ui.onChange(function () {
+      var st = state();
+      draw(st); table(st);
+      roOff.set('строк: ' + (4 * st.d) + ' (4 клиента × ' + st.d + ' дн.)');
+      roOn.set('4 ключа: последнее значение каждого');
+      roToday.set(st.today + ' из 4', st.today ? 'bad' : 'good');
+      roMonth.set(st.month + ' из 120', st.month ? 'bad' : 'good');
+      if (st.fs) note.set('Одно определение: значения ноутбука материализуются в онлайн-хранилище, так что багам сервиса не на что действовать.');
+      else if (st.today) note.set('Нигде ни одной ошибки: обе программы отработали нормально. Модель обучили на офлайн-числах, а теперь ей подают другие.');
+      else if (st.month) note.set('В этот день две программы согласны — но в июне они расходятся, запросов с расхождением: ' + st.month + '.');
+      else note.set('Две программы согласны — пока никто не поменял одну из них.');
+    });
+  });
+  </script>
+
+  <p class="memo"><mark class="key">Офлайн-хранилище отвечает на вопрос «какое значение было тогда?» — для обучения; онлайн-хранилище отвечает на вопрос «какое значение сейчас?» — для одного ключа, за миллисекунды.</mark></p>
+</section>
+
+
+<section id="l29-tasks">
+  <h2>Внутри коробки: пять задач</h2>
+
+  <p>Слайд (p. 763) открывает коробку (рис. 3). Данные входят из потокового источника и батчевого источника и уходят к обслуживанию модели (model serving) и обучению модели (model training). На пути данных стоят три задачи — transform, storage, serving, причём внутри serving есть ещё on-demand transform, — а две охватывают все: операционный мониторинг (operational monitoring) и реестр (registry). Слайды нумеруют их так: 1 Serving, 2 Storage, 3 Transform, 4 Monitoring, 5 Registry; первые две ты уже знаешь.</p>
+
+  <figure class="fig fig--plain" id="l29-fig-tasks">
+    <svg class="dia" viewBox="0 0 560 304" role="img" aria-label="Хранилище признаков со слайда 46 лекции 11b с деталями со слайда 49 лекции 11b: потоковый источник питает stream transform, батчевый источник — batch transform; оба преобразования заполняют обе части хранения, онлайн- и офлайн-хранилище; онлайн-хранилище кормит model serving через on-demand transform на панели serving, офлайн-хранилище кормит model training; operational monitoring охватывает всё сверху, registry — снизу">
+      <text x="46" y="108" class="tx-sm tx-mid tx-muted">источники</text>
+      <rect x="14" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="28" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="42" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="56" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <rect x="70" y="128" width="12" height="20" class="fw-s1 st-s1"/>
+      <text x="48" y="168" class="tx-sm tx-mid">stream</text>
+      <path d="M20 184 v26 a27 5 0 0 0 54 0 v-26" class="fi-paper"/>
+      <ellipse cx="47" cy="184" rx="27" ry="5" class="fi-paper"/>
+      <text x="47" y="236" class="tx-sm tx-mid">batch</text>
+      <rect x="96" y="14" width="368" height="280" rx="6" class="sw-2"/>
+      <text x="280" y="34" class="tx-mid tx-bold">Feature Store</text>
+      <rect x="104" y="44" width="352" height="28" class="fw-ink"/>
+      <text x="280" y="63" class="tx-sm tx-mid">Operational monitoring</text>
+      <rect x="104" y="80" width="112" height="156" class="fi-paper"/>
+      <rect x="224" y="80" width="112" height="156" class="fi-paper"/>
+      <rect x="344" y="80" width="112" height="156" class="fi-paper"/>
+      <text x="160" y="100" class="tx-sm tx-mid tx-bold">Transform</text>
+      <text x="280" y="100" class="tx-sm tx-mid tx-bold">Storage</text>
+      <text x="400" y="100" class="tx-sm tx-mid tx-bold">Serving</text>
+      <rect x="112" y="124" width="80" height="28" class="fw-s5 st-s5 sw-2"/>
+      <text x="152" y="143" class="tx-sm tx-mid">stream</text>
+      <rect x="112" y="178" width="80" height="28" class="fw-s4 st-s4 sw-2"/>
+      <text x="152" y="197" class="tx-sm tx-mid">batch</text>
+      <path d="M240 122 v32 a40 6 0 0 0 80 0 v-32" class="fi-paper"/>
+      <ellipse cx="280" cy="122" rx="40" ry="6" class="fi-paper"/>
+      <text x="280" y="146" class="tx-sm tx-mid">online</text>
+      <path d="M240 176 v32 a40 6 0 0 0 80 0 v-32" class="fi-paper"/>
+      <ellipse cx="280" cy="176" rx="40" ry="6" class="fi-paper"/>
+      <text x="280" y="200" class="tx-sm tx-mid">offline</text>
+      <rect x="352" y="122" width="96" height="32" class="fw-s2 st-s2 sw-2"/>
+      <text x="400" y="143" class="tx-sm tx-mid">on-demand</text>
+      <rect x="104" y="244" width="352" height="40" class="fw-s3 st-s3"/>
+      <text x="280" y="269" class="tx-sm tx-mid tx-bold">Registry</text>
+      <rect x="476" y="116" width="80" height="44" rx="4" class="fi-paper"/>
+      <text x="516" y="134" class="tx-sm tx-mid">model</text>
+      <text x="516" y="152" class="tx-sm tx-mid">serving</text>
+      <rect x="476" y="170" width="80" height="44" rx="4" class="fi-paper"/>
+      <text x="516" y="188" class="tx-sm tx-mid">model</text>
+      <text x="516" y="206" class="tx-sm tx-mid">training</text>
+      <line x1="84" y1="138" x2="108" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="76" y1="194" x2="108" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <path d="M192 138 H204 M192 192 H204 M204 138 V192" class="st-s1 sw-2 fi-none"/>
+      <line x1="204" y1="138" x2="236" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="204" y1="192" x2="236" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="320" y1="138" x2="348" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="448" y1="138" x2="472" y2="138" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="320" y1="192" x2="472" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Пять задач со слайда (p. 763), внутри — преобразования со слайда (p. 766). Потоковое преобразование (пурпурное) и батчевое (бирюзовое) питают оба хранилища — потоковые признаки отправляются push-ем в оба, батчевые значения материализуются в онлайн-хранилище (p. 757); онлайн-хранилище доходит до model serving через serving, где on-demand transform (оранжевое) добавляет то, что знает только запрос; офлайн-хранилище кормит model training. Operational monitoring и registry охватывают всё.</figcaption>
+  </figure>
+
+  <h3>Transform: где работает feature engineering</h3>
+
+  <aside class="margin-note">Большая часть feature engineering — обычный код обработки данных: суммы по окнам, кодирования. Машинное обучение появляется на продвинутом конце — например, эмбеддинги из уроков 27 и 28, которые тоже признаки.</aside>
+
+  <p>Слайд (p. 741) определяет, что выполняет задача transform. Инженерия признаков (feature engineering): "DEF: a machine learning approach that extracts features from a raw dataset, resulting in new features". Она "ranges from basic transformations such as aggregations to more advanced feature transformations such as word embeddings produced by machine learning algorithms", а её цель — "to essentially create a better dataset to improve the performance of machine learning algorithms". Слайд (p. 734) называет повседневные шаги: "aggregations, normalization, one-hot encoding".</p>
+
+  <p>Эти задания "are executed on data processing engines (e.g. Spark or Pandas) to which the feature store is connected" (p. 766): хранилище их оркестрирует, а не заменяет Spark (<a href="l38.html">урок 38</a>). Слайд (p. 767) делит их на три вида — по тому, когда существуют их входные данные:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-transforms">
+    <figcaption>Три типа преобразований со слайда (p. 767). На слайде четвёртый заголовок напечатан как "Common input data source"; читай его как "Example" (см. красную ручку ниже).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Feature type</th><th>Definition</th><th>Common input data source</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td>Batch Transform</td><td>Transformations that are applied only to data at rest</td><td>Data warehouse, data lake, database</td><td>User country, product category</td></tr>
+          <tr><td>Streaming Transform</td><td>Transformations that are applied to streaming sources</td><td>Kafka, Kinesis, PubSub</td><td># of clicks per vertical per user in last 30 minutes, # of views per listing in past hour</td></tr>
+          <tr><td>On-demand transform</td><td>Transformations that are used to produce features based on data that is only available at the time of the prediction. These features cannot be pre-computed.</td><td>User-facing application</td><td>Is the user currently in a supported location? Similarity score between listing and search query</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="767">
+    <p class="claim">"Common input data source" (напечатано заголовком и третьего, и четвёртого столбца)</p>
+    <p class="fix">В четвёртом столбце — примеры признаков, а не источники данных: его заголовок должен быть "Example".</p>
+    <p class="because">Это решают ячейки: "User country, product category" или "Is the user currently in a supported location?" — это признаки, а источники — "Data warehouse, data lake, database", "Kafka, Kinesis, PubSub", "User-facing application" — стоят в третьем столбце. Статья, которую воспроизводит слайд, озаглавливает этот столбец "Example". Экзамен могут сверять с таблицей в напечатанном виде, вместе с повторённым заголовком: знай, что источники — третий столбец, а примеры — четвёртый.</p>
+  </aside>
+
+  <p>Вектор, выданный на слайде (p. 766), смешивает все три: <code>"item_clicks_last_5_mins":6</code> приходит из потокового преобразования, <code>"user_spend_last_30_days":"$1.10"</code> — из батчевого, а <code>"user_current_location":"US_NY"</code> — из on-demand преобразования, которому подали данные приложения из запроса, <code>{user_ip: "x.x.x.x"}</code>. Почему третий нельзя посчитать заранее? Его вход — где пользователь находится прямо сейчас — существует только в момент, когда приходит запрос.</p>
+
+  <h3>Мониторинг и реестр</h3>
+
+  <p>Мониторинг (p. 768) отслеживает "operational metrics relating to core functionality": для хранения "availability, capacity, utilization, staleness", для обслуживания "throughput, latency, error rates". Не путай его с ключевым компонентом "Monitoring and Validation" (p. 736), который проверяет сами значения признаков, чтобы "data drifts or anomalies are detected early". Один следит за машиной, другой — за данными.</p>
+
+  <p><mark class="key">Реестр (registry)</mark> "is a central interface for user interactions with the feature store. Teams use the registry as a common catalog to explore, develop, collaborate on, and publish new definitions. The registry allows for important metadata to be attached to feature definitions" (p. 769). Он хранит определения, а не значения. Именно он делает повторное использование реальным: "catalog or search functionality" со слайда (p. 736) позволяет следующему data scientist найти <code>spend_l30d</code>, а не писать его в третий раз.</p>
+
+  <p>Слайды (pp. 734–736) перечисляют восемь "Key Components". Каждый живёт в одной из пяти задач (соответствие — наше):</p>
+
+  <figure class="tbl-fig" id="l29-tbl-components">
+    <figcaption>Восемь ключевых компонентов со слайдов (pp. 734–736) и задача со слайда (p. 763), которая несёт каждый.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Ключевой компонент</th><th>Словами слайда</th><th>Задача</th></tr></thead>
+        <tbody>
+          <tr><td>1 Feature Storage</td><td>"historical features (used for training models) and real-time features (used for serving live predictions)"</td><td>Storage</td></tr>
+          <tr><td>2 Feature Engineering Pipeline</td><td>"aggregations, normalization, one-hot encoding"</td><td>Transform</td></tr>
+          <tr><td>3 Feature Versioning</td><td>"critical in avoiding 'training-serving skew'"</td><td>Registry</td></tr>
+          <tr><td>4 Online and Offline Stores</td><td>батчевые признаки для обучения; признаки реального времени "with low latency"</td><td>Storage</td></tr>
+          <tr><td>5 Feature Serving</td><td>"training environments (batch mode) and production environments (real-time)"</td><td>Serving</td></tr>
+          <tr><td>6 Data Governance &amp; Access Control</td><td>"who can create, access, or update certain features"</td><td>Registry</td></tr>
+          <tr><td>7 Feature Discoverability and Reusability</td><td>"a catalog or search functionality"</td><td>Registry</td></tr>
+          <tr><td>8 Monitoring and Validation</td><td>"data drifts or anomalies are detected early"</td><td>Monitoring</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p class="memo"><mark class="key">Три задачи на пути данных — transform, storage, serving — и две над всеми: monitoring и registry.</mark></p>
+</section>
+
+
+<section id="l29-feast">
+  <h2>Feast: сущности, feature views и point-in-time join</h2>
+
+  <p>Лекция заканчивается одной технологией в подробностях: Feast, "Feature Store for Machine Learning", "Type: Open-source" (p. 746). Он родился в сервисе такси Gojek вместе с Google Cloud и был анонсирован в январе 2019 года (блог Google Cloud) — это точка "Go-jek 2019" на слайде (p. 739). Его объекты образуют небольшое дерево (рис. 4).</p>
+
+  <figure class="fig fig--plain" id="l29-fig-feast">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Объекты Feast, как на слайде 39 лекции 11b: Project содержит Feature Views; каждый Feature View связывает Features, Entity и Data Source; эти определения живут в реестре, а Data Source лишь указывает на сырые данные, которые остаются в собственной таблице пользователя, например в BigQuery">
+      <rect x="10" y="10" width="414" height="282" rx="6" class="st-s3 dash"/>
+      <text x="24" y="34" class="tx-sm">registry: определения</text>
+      <rect x="30" y="50" width="120" height="34" class="fi-paper sw-2"/>
+      <text x="90" y="72" class="tx-mid">Project</text>
+      <path d="M60 84 V129 H86" marker-end="url(#arr)"/>
+      <rect x="98" y="104" width="150" height="34" class="fi-paper"/>
+      <rect x="94" y="108" width="150" height="34" class="fi-paper"/>
+      <rect x="90" y="112" width="150" height="34" class="fi-paper sw-2"/>
+      <text x="165" y="134" class="tx-mid">Feature View</text>
+      <text x="258" y="134" class="tx-mono tx-sm">driver_stats</text>
+      <path d="M120 146 V261"/>
+      <path d="M120 173 H192" marker-end="url(#arr)"/>
+      <path d="M120 217 H192" marker-end="url(#arr)"/>
+      <path d="M120 261 H192" marker-end="url(#arr)"/>
+      <rect x="204" y="150" width="120" height="30" class="fi-paper"/>
+      <rect x="200" y="154" width="120" height="30" class="fi-paper"/>
+      <rect x="196" y="158" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="256" y="178" class="tx-mid">Feature</text>
+      <rect x="196" y="202" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="256" y="222" class="tx-mid">Entity</text>
+      <rect x="196" y="246" width="120" height="30" class="fi-paper sw-2"/>
+      <text x="256" y="266" class="tx-mid">Data Source</text>
+      <text x="334" y="178" class="tx-mono tx-sm">rating</text>
+      <text x="326" y="222" class="tx-mono tx-sm">driver_id</text>
+      <line x1="316" y1="261" x2="444" y2="261" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <rect x="450" y="236" width="28" height="16" class="fw-s3 st-s3"/>
+      <rect x="478" y="236" width="28" height="16" class="fw-s3 st-s3"/>
+      <rect x="506" y="236" width="28" height="16" class="fw-s3 st-s3"/>
+      <rect x="450" y="252" width="28" height="16" class="fi-paper"/>
+      <rect x="478" y="252" width="28" height="16" class="fi-paper"/>
+      <rect x="506" y="252" width="28" height="16" class="fi-paper"/>
+      <rect x="450" y="268" width="28" height="16" class="fi-paper"/>
+      <rect x="478" y="268" width="28" height="16" class="fi-paper"/>
+      <rect x="506" y="268" width="28" height="16" class="fi-paper"/>
+      <text x="492" y="224" class="tx-sm tx-mid">BigQuery</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Структура проекта со слайда (p. 756): проект содержит feature views, а каждый feature view связывает свои признаки, свою сущность и свой источник данных. Всё это — определения, которые хранятся в реестре (пунктир); источник данных лишь указывает на сырые данные, которые остаются там, где ты их держишь (p. 759). Имена <code>driver_stats</code>, <code>rating</code> и <code>driver_id</code> — пример из следующей таблицы.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn>Проект (project)</dfn> — "Projects provide complete isolation of feature stores at the infrastructure level. This is accomplished through resource namespacing" (p. 757).</p>
+    <p><dfn>Сущность (entity)</dfn> — "a collection of semantically related features. Users define entities to map to the domain of their use case" (p. 758): водитель, клиент.</p>
+    <p><dfn>Feature view (представление признаков)</dfn> — "a collection of features" (p. 758), привязанная к своим сущностям и к одному источнику данных.</p>
+    <p><dfn>Источник данных (data source)</dfn> — "raw underlying data that users own (e.g. in a table in BigQuery). Feast does not manage any of the raw underlying data" (p. 759).</p>
+    <p><dfn>Реестр (registry)</dfn> — "Feast uses a registry to store all applied Feast objects (e.g. Feature views, entities, etc). The registry exposes methods to apply, list, retrieve and delete these objects" (p. 759).</p>
+  </div>
+
+  <p>Feature view соответствует "0 or more entities" (p. 758): ноль — для глобального признака ("num_daily_global_transactions"), одна — для признака пользователя ("user_age or last_5_bought_items"), несколько — "aka a composite key", составной ключ, — для признака пары ("num_user_purchases_in_merchant_category": пользователь и категория продавца). "A collection of entities for a feature view is called an <mark class="key">entity key</mark>" — набор сущностей feature view называется ключом сущности, и "Entities should be reused across feature views", чтобы признаки об одном и том же находились и соединялись по одному ключу.</p>
+
+  <p>А теперь фраза, которую разбирает весь остаток раздела: "Feast uses a time-series data model to represent data. This data model is used to interpret feature data in data sources in order to build training datasets or materialize features into an online store" (p. 759). Слайды (pp. 760–761) показывают, как выглядят её строки:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-timeseries">
+    <figcaption>Модель данных временных рядов со слайдов (pp. 760–761). У каждой строки есть временная метка; каждый столбец — сущность или признак, каждая ячейка — значение сущности или значение признака. Обведённая пара — ключ сущности строки 1. На предыдущем слайде (p. 760) — та же таблица без <code>customer_id</code>.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl l29-ts">
+        <thead>
+          <tr><th>row</th><th>timestamp</th><th>customer_id</th><th>driver_id</th><th>trips_today</th><th>rating</th></tr>
+          <tr class="l29-role"><th></th><th>timestamp</th><th>entity</th><th>entity</th><th>feature</th><th>feature</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="n">1</td><td>5/22/2021 0:00:00</td><td class="l29-ek">customer_A</td><td class="l29-ek">driver_1001</td><td class="n">5</td><td class="n">4.8</td></tr>
+          <tr><td class="n">2</td><td>5/22/2021 0:00:00</td><td>customer_B</td><td>driver_1002</td><td class="n">0</td><td class="n">4.2</td></tr>
+          <tr><td class="n">3</td><td>5/22/2021 0:00:00</td><td>customer_C</td><td>driver_1003</td><td class="n">8</td><td class="n">4.5</td></tr>
+          <tr><td class="n">4</td><td>5/22/2021 0:00:00</td><td>customer_D</td><td>driver_1004</td><td class="n">3</td><td class="n">4.2</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Слайды используют "entity key" в двух смыслах: набор сущностей feature view (p. 758) и пара значений, которая идентифицирует одну строку, (customer_A, driver_1001) на слайде (p. 761). Оба употребления — из Feast. В Python SDK Feast feature view водителей со слайда (p. 760) объявляется так (по документации Feast; не со слайдов):</p>
+
+<pre><code># a feature view: two features of the entity "driver",
+# read from a BigQuery table
+from datetime import timedelta
+from feast import BigQuerySource, Entity, FeatureView, Field
+from feast.types import Float32, Int64
+
+driver = Entity(name="driver", join_keys=["driver_id"])
+
+driver_stats = FeatureView(
+    name="driver_stats",
+    entities=[driver],
+    ttl=timedelta(days=1),
+    schema=[
+        Field(name="trips_today", dtype=Int64),
+        Field(name="rating", dtype=Float32),
+    ],
+    source=BigQuerySource(table="my-project.rides.driver_stats"),
+)</code></pre>
+
+  <h3>Зачем нужна временная метка: point-in-time join</h3>
+
+  <p>Почему так важно время? Собери обучающую выборку для вопроса «закончится ли эта поездка жалобой?». Метки приходят строками — водитель, время поездки, жалоба да или нет, — и это называется entity dataframe. К каждой строке надо прицепить рейтинг водителя. Простой join по <code>driver_id</code> с сегодняшней таблицей даёт каждой строке сегодняшний рейтинг — включая рейтинги, посчитанные после поездки, возможно, как раз из-за этой жалобы. Модель учится на информации, которой в продакшене у неё никогда не будет: это <mark class="key">утечка данных (data leakage)</mark>. Её симптом — офлайн-оценка намного лучше всего, что выдаёт продакшен.</p>
+
+  <p>Лекарство называет документация Feast — слайды нет: "Feast performs a point-in-time join (also called a 'last known good value' temporal join): for each entity row, it retrieves the latest feature values with a timestamp at or before the entity row's event_timestamp." Иначе говоря, для каждой строки берётся последнее значение признака с меткой не позже метки строки. Без этого правила "features generated after the prediction time could leak into training data — effectively letting the model 'see the future'". Это и есть корректность на момент времени (point-in-time correctness). В символах:</p>
+
+  <div class="formula">
+    \[ \tau^{*} = \max\,\{\, \tau_i : \tau_i \le t \,\} \]
+    \[ \text{joined value} = v(k, \tau^{*}) \]
+    \[ \text{null if}\ \ t - \tau^{*} \gt \text{ttl} \]
+    <dl class="legend">
+      <dt>\(k,\ t\)</dt><dd>ключ сущности и временная метка одной обучающей строки</dd>
+      <dt>\(\tau_i\)</dt><dd>временные метки строк признака с тем же ключом \(k\)</dd>
+      <dt>\(v(k, \tau)\)</dt><dd>значение признака в строке с ключом \(k\) и меткой \(\tau\)</dd>
+      <dt>ttl</dt><dd>время жизни (time to live) feature view: насколько старым может быть значение, чтобы ещё считаться</dd>
+    </dl>
+  </div>
+
+  <ol class="steps" id="l29-steps-pit">
+    <li><p>Возьми одну строку entity dataframe: ключ <code>driver_1001</code>, метка 5/22 10:00.</p></li>
+    <li><p>Оставь строки признака с тем же ключом: 4.6 (5/20), 4.7 (5/21), 4.8 (5/22), 4.9 (5/23), 4.9 (5/24), все в 0:00.</p></li>
+    <li><p>Выброси все строки с датой позже 10:00 5/22: двух значений 4.9 в момент поездки ещё не существовало.</p></li>
+    <li><p>Возьми последнее из оставшегося: \(\tau^{*}\) = 5/22 0:00, значение 4.8 — рейтинг того дня на слайде (p. 760).</p></li>
+    <li><p>Проверь его возраст по ttl: 10 часов, в пределах ttl в одни сутки, так что 4.8 присоединяется. Будь значение старше ttl, признак был бы null — и тоже null, если бы ни один рейтинг не был датирован 10:00 или раньше.</p></li>
+  </ol>
+
+  <p>То же правило объясняет онлайн-хранилище: материализация — это point-in-time join, вычисленный на момент «сейчас» для каждого ключа, — "the latest feature values for each entity" (p. 765). Виджет собирает обучающую выборку обоими способами. Главное, что он показывает: <strong>обучающая строка может видеть только прошлое своей собственной метки</strong>, а простой join тихо подсовывает ей будущее.</p>
+
+  <div class="widget" id="l29-w-pit">
+    <h3 class="widget-title">Присоедини метки к истории признака</h3>
+    <p class="widget-intro">Три водителя и их ежедневный рейтинг: точки, значения над ними; 5/22 — день из таблицы (p. 760). Шесть размеченных поездок (крестики): закончилась ли поездка жалобой? Каждая изогнутая стрелка показывает, какой рейтинг join прицепляет к поездке, а само значение написано под поездкой. Таблица ниже — обучающая выборка. Рейтинги, кроме рейтингов 5/22, и поездки придуманы для виджета.</p>
+    <ol class="tasks">
+      <li>С наивным соединением предскажи, сколько из шести поездок получат рейтинг из своего будущего. Какая поездка, если такая есть, в безопасности?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Пять из шести. Наивный join берёт сегодняшнюю таблицу, одно значение на водителя — рейтинги 5/24, — и только поездка driver_1003 5/25 в 20:00 происходит после этого обновления. Простой join прав только для строк новее последнего обновления признака, а в обучающей выборке таких почти не бывает.</p></details>
+      </li>
+      <li>Переключись на point-in-time join. Что получает поездка driver_1001 5/22 в 10:00 и почему не 4.9?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>4.8, с меткой 5/22 0:00: последнее значение не позже 10:00. Значения 4.9 датированы 5/23 и 5/24 — в 10:00 5/22 их не существовало. Утечки падают с 5 до 0.</p></details>
+      </li>
+      <li>Посмотри на единственную жалобу, driver_1002 5/22 в 20:00, в обоих режимах. Какой рейтинг даёт ей каждый join и чем опасен наивный?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Наивный: 3.8, посчитанный 5/24, после жалобы и, возможно, из-за неё. Point-in-time: 4.2 — рейтинг, который был у водителя в начале поездки. Модель, обученная на 3.8, учится тому, что низкие рейтинги идут вместе с жалобами, по числам, которые сама жалоба и опустила, — а в продакшене она всегда видит только рейтинг до поездки. Офлайн-оценка выглядит прекрасно; боевая — нет.</p></details>
+      </li>
+      <li>В режиме point-in-time поставь ttl на 24 часа, потом на 12. Какие строки каждый раз становятся null?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>При 24 часах — только поездка 5/25 в 20:00: её последнему рейтингу 44 часа. При 12 часах null пять из шести; значение сохраняет только поездка 5/22 в 10:00 (ему 10 часов). Ttl обменивает покрытие на свежесть: старое значение не выдаётся молча за текущее.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l29-w-pit', function (root, ui) {
+    var DAYS = ['5/20', '5/21', '5/22', '5/23', '5/24', '5/25', '5/26'];
+    var NAMES = ['driver_1001', 'driver_1002', 'driver_1003'];
+    /* daily ratings at 0:00 from 5/20 to 5/24; the 5/22 column is the table of p. 760 */
+    var VALS = [[4.6, 4.7, 4.8, 4.9, 4.9], [4.6, 4.5, 4.2, 3.9, 3.8], [4.4, 4.5, 4.5, 4.6, 4.6]];
+    /* the entity dataframe: driver, hour since 5/20 0:00, complaint */
+    var TRIPS = [{ d: 0, h: 38, y: 'no' }, { d: 0, h: 58, y: 'no' }, { d: 1, h: 16, y: 'no' },
+                 { d: 1, h: 68, y: 'yes' }, { d: 2, h: 85, y: 'no' }, { d: 2, h: 140, y: 'no' }];
+    var X0 = 110, X1 = 540, LANE = [62, 142, 222];
+    function X(h) { return X0 + (X1 - X0) * h / 144; }
+    function when(h) { return DAYS[Math.floor(h / 24)] + ' ' + (h % 24) + ':00'; }
+    function rows(d) { return VALS[d].map(function (v, k) { return { h: 24 * k, v: v }; }); }
+
+    var mode = ui.select('join', [
+      { value: 'naive', label: 'наивный: сегодняшнее значение' },
+      { value: 'pit', label: 'point-in-time: последнее до поездки' }
+    ], null, 'naive');
+    var ttl = ui.slider({ label: 'ttl у feature view', min: 6, max: 72, step: 6, value: 72, format: function (v) { return v + ' ч'; } });
+    var roLeak = ui.readout('поездок с рейтингом из их будущего'), roNull = ui.readout('поездок, обнулённых ttl');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'рейтинг (строка признака)', color: 's1', mark: 'dot' },
+      { label: 'размеченная поездка', color: 's2', mark: 'cross' },
+      { label: 'join', color: 's2', mark: 'line' },
+      { label: 'join в будущее', color: 'bad', mark: 'line' },
+      { label: 'окно назад (ttl)', color: 's2', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 296, { label: 'Временная шкала с 5/20 по 5/26, по дорожке на водителя: ежедневные рейтинги — точки, шесть размеченных поездок — крестики, и от каждой поездки стрелка к рейтингу, который присоединяет join; стрелки, направленные вперёд во времени, нарисованы красным' });
+    var rowsBox = Course.el('div', { 'class': 'l29-rows' });
+    ui.stage.appendChild(rowsBox);
+
+    function join(t) {
+      var fr = rows(t.d);
+      if (mode.value === 'naive') { var last = fr[fr.length - 1]; return { f: last, leak: last.h > t.h, nul: false }; }
+      var best = null;
+      fr.forEach(function (f) { if (f.h <= t.h && (!best || f.h > best.h)) best = f; });
+      if (!best) return { f: null, leak: false, nul: true };
+      return { f: best, leak: false, nul: t.h - best.h > ttl.value };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function draw(js) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var pit = mode.value === 'pit';
+      T(96, 24, 'driver_id', 'tx-sm tx-end');
+      T(548, 24, 'сегодня', 'tx-sm tx-end');
+      DAYS.forEach(function (s, k) {
+        S('line', { x1: X(24 * k), y1: 36, x2: X(24 * k), y2: 262, 'class': 'st-grid sw-1' });
+        T(X(24 * k), 286, s, 'tx-sm tx-mid');
+      });
+      S('line', { x1: X1, y1: 36, x2: X1, y2: 262, 'class': 'st-muted dash' });
+      LANE.forEach(function (y, d) {
+        S('line', { x1: X0, y1: y, x2: X1, y2: y, 'class': 'st-line' });
+        T(96, y + 5, NAMES[d].slice(7), 'tx-mono tx-sm tx-end');
+      });
+      if (pit) TRIPS.forEach(function (t) {
+        var y = LANE[t.d], a = Math.max(0, t.h - ttl.value);
+        S('rect', { x: X(a), y: y - 8, width: X(t.h) - X(a), height: 16, 'class': 'fw-s2 st-none' });
+      });
+      TRIPS.forEach(function (t, i) {
+        var j = js[i], y = LANE[t.d], xt = X(t.h);
+        if (!j.f) return;
+        var xf = X(j.f.h), cls = j.leak ? 'st-bad sw-2' : (j.nul ? 'st-muted dash' : 'st-s2 sw-2');
+        var mk = j.leak ? 'url(#arr-bad)' : (j.nul ? 'url(#arr-muted)' : 'url(#arr-s2)');
+        S('path', { d: 'M' + xt + ' ' + (y + 6) + ' Q' + ((xt + xf) / 2) + ' ' + (y + 30) + ' ' + xf + ' ' + (y + 10), 'class': cls + ' fi-none', 'marker-end': mk });
+      });
+      VALS.forEach(function (row, d) {
+        row.forEach(function (v, k) {
+          S('circle', { cx: X(24 * k), cy: LANE[d], r: 6, 'class': 'fi-s1 st-paper sw-2' });
+          S('rect', { x: X(24 * k) - 4, y: LANE[d] - 28, width: 8, height: 20, 'class': 'fi-paper st-none' });
+          T(X(24 * k), LANE[d] - 12, v.toFixed(1), 'tx-mono tx-sm tx-mid halo');
+        });
+      });
+      TRIPS.forEach(function (t, i) {
+        var j = js[i], y = LANE[t.d], x = X(t.h);
+        S('path', { d: 'M' + (x - 6) + ' ' + (y - 6) + ' L' + (x + 6) + ' ' + (y + 6) + ' M' + (x - 6) + ' ' + (y + 6) + ' L' + (x + 6) + ' ' + (y - 6), 'class': 'st-s2 sw-3' });
+        T(x, y + 44, j.nul ? 'null' : j.f.v.toFixed(1), 'tx-mono tx-sm tx-mid halo' + (j.leak ? ' tx-bad tx-bold' : (j.nul ? ' tx-muted' : ' tx-bold')));
+      });
+    }
+    function table(js) {
+      rowsBox.textContent = '';
+      var head = Course.el('tr', null, ['#', 'driver_id', 'event_timestamp', 'жалоба', 'рейтинг', 'дата значения'].map(function (h) { return Course.el('th', { text: h }); }));
+      var body = Course.el('tbody');
+      TRIPS.forEach(function (t, i) {
+        var j = js[i], age = j.f ? t.h - j.f.h : 0;
+        var dated = !j.f ? 'нет' : when(j.f.h) + (j.leak ? ' · будущее' : (j.nul ? ' · возраст ' + age + ' ч > ttl' : ''));
+        body.appendChild(Course.el('tr', null, [
+          Course.el('td', { 'class': 'n', text: String(i + 1) }),
+          Course.el('td', { text: NAMES[t.d] }),
+          Course.el('td', { text: when(t.h) }),
+          Course.el('td', { text: t.y === 'yes' ? 'да' : 'нет' }),
+          Course.el('td', { 'class': 'n' + (j.leak ? ' is-bad' : (j.nul ? ' is-null' : '')), text: j.nul ? 'null' : j.f.v.toFixed(1) }),
+          Course.el('td', { 'class': j.leak ? 'is-bad' : (j.nul ? 'is-null' : ''), text: dated })
+        ]));
+      });
+      rowsBox.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl' }, [Course.el('thead', null, head), body])));
+    }
+    ui.onChange(function () {
+      var js = TRIPS.map(join);
+      var leaks = js.filter(function (j) { return j.leak; }).length, nulls = js.filter(function (j) { return j.nul; }).length;
+      draw(js); table(js);
+      roLeak.set(leaks + ' из 6', leaks ? 'bad' : 'good');
+      roNull.set(nulls + ' из 6');
+      note.set(mode.value === 'naive'
+        ? 'Наивный: одна строка на водителя, самая свежая. Ttl здесь ни при чём.'
+        : 'Point-in-time: каждая поездка смотрит назад от своей метки, не дальше чем на ' + ttl.value + ' ч.');
+    });
+  });
+  </script>
+
+  <p>В Feast весь join — это один вызов, а онлайн-поиск — другой (документация Feast; <code>store</code> — это <code>FeatureStore</code> твоего проекта):</p>
+
+<pre><code># the training set: one row per labelled trip,
+# each row joined point-in-time
+import pandas as pd
+
+entity_df = pd.DataFrame({
+    "driver_id": ["driver_1001", "driver_1002"],
+    "event_timestamp": pd.to_datetime(
+        ["2021-05-22 10:00", "2021-05-22 20:00"]),
+    "complaint": [0, 1],
+})
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_stats:rating", "driver_stats:trips_today"],
+).to_df()</code></pre>
+
+<pre><code># one vector of the latest values for one key, for a prediction now
+features = store.get_online_features(
+    features=["driver_stats:rating", "driver_stats:trips_today"],
+    entity_rows=[{"driver_id": "driver_1001"}],
+).to_dict()</code></pre>
+
+  <p class="memo"><mark class="key">Обучающая строка может видеть только значения признаков, датированные её собственной меткой или раньше; онлайн-хранилище — тот же join, взятый на момент "now".</mark></p>
+</section>
+
+
+<section id="l29-landscape">
+  <h2>Девять продуктов, одна история, пять измерений</h2>
+
+  <p>Слайд (p. 739) говорит, с чего всё началось: "First Experience in Uber, with Michelangelo platform." Рис. 5 перерисовывает его временную шкалу.</p>
+
+  <figure class="fig fig--plain" id="l29-fig-history">
+    <svg class="dia" viewBox="0 0 560 330" role="img" aria-label="Временная шкала со слайда 22 лекции 11b, сверху вниз: 2017 Uber с Michelangelo; 2018 Airbnb; Hopsworks; 2019 Go-jek, где родился Feast; 2020 Kaskada; Tecton; DoorDash и Abacus.AI; Iguazio и AWS SageMaker; 2021 Splice Machine и Molecula; Databricks, Google и Alteryx; Iterative.AI">
+      <line x1="110" y1="14" x2="110" y2="318" class="st-muted" marker-end="url(#arr-muted)"/>
+      <circle cx="110" cy="30" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="57" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="84" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="111" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="138" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="165" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="192" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="219" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="246" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="273" r="6" class="fi-muted st-paper sw-2"/>
+      <circle cx="110" cy="300" r="6" class="fi-muted st-paper sw-2"/>
+      <text x="94" y="35" class="tx-mono tx-sm tx-end">2017</text>
+      <text x="94" y="62" class="tx-mono tx-sm tx-end">2018</text>
+      <text x="94" y="116" class="tx-mono tx-sm tx-end">2019</text>
+      <text x="94" y="143" class="tx-mono tx-sm tx-end">2020</text>
+      <text x="94" y="251" class="tx-mono tx-sm tx-end">2021</text>
+      <text x="126" y="35" class="tx-sm">Uber · Michelangelo</text>
+      <text x="126" y="62" class="tx-sm">Airbnb</text>
+      <text x="126" y="89" class="tx-sm">Hopsworks</text>
+      <text x="126" y="116" class="tx-sm">Go-jek</text>
+      <text x="126" y="143" class="tx-sm">Kaskada</text>
+      <text x="126" y="170" class="tx-sm">Tecton</text>
+      <text x="126" y="197" class="tx-sm">DoorDash · Abacus.AI</text>
+      <text x="126" y="224" class="tx-sm">Iguazio · AWS SageMaker</text>
+      <text x="126" y="251" class="tx-sm">Splice Machine · Molecula</text>
+      <text x="126" y="278" class="tx-sm">Databricks · Google · Alteryx</text>
+      <text x="126" y="305" class="tx-sm">Iterative.AI</text>
+      <text x="340" y="38" class="tx-hand">самый первый</text>
+      <text x="228" y="119" class="tx-hand">Feast is born here</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Временная шкала со слайда (p. 739), по точке на строку, с годами там, где их пишет слайд. Слайд пишет Hopsworks как "Hopworks". Примечание про Go-jek — наше: Gojek вместе с Google Cloud открыл исходный код Feast в январе 2019 года.</figcaption>
+  </figure>
+
+  <p>Слайды (pp. 746–754) разбирают девять продуктов по одному шаблону: "Type" плюс "Key Characteristics". Большинство черт повторяется на каждом слайде ("Online and Offline Stores", версионирование, "real-time and batch"); отличают продукты тип и одна-две черты:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-products">
+    <figcaption>Девять хранилищ признаков со слайдов (pp. 746–754), с типом в том виде, как он напечатан. Три open-source, одно коммерческое, пять проприетарных. Tecton куплен Databricks в августе 2025 года; на экзамене называй тип со слайда.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Система</th><th>Тип</th><th>Чем выделяется на своём слайде</th></tr></thead>
+        <tbody>
+          <tr><td>1 Feast (p. 746)</td><td>Open-source</td><td>не привязан к облаку или работает on-premise; "Simple Design: Focuses on feature serving"; "Good for Startups/SMEs"</td></tr>
+          <tr><td>2 Hopsworks (p. 747)</td><td>Open-source (with enterprise version)</td><td>Spark, TensorFlow, Kubernetes; хранилища "backed by distributed systems like Apache Hive and MySQL"; RBAC и GDPR</td></tr>
+          <tr><td>3 Tecton (p. 748)</td><td>Commercial</td><td>"Built specifically for real-time machine learning"; автоматические батчевые и потоковые pipeline; мониторинг дрейфа</td></tr>
+          <tr><td>4 AWS SageMaker Feature Store (p. 749)</td><td>Proprietary (part of AWS SageMaker)</td><td>S3, Redshift, Glue; IAM для контроля доступа</td></tr>
+          <tr><td>5 Databricks Feature Store (p. 750)</td><td>Proprietary (part of Databricks)</td><td>"Unified with Delta Lake"; происхождение признаков (feature lineage); нативный Spark</td></tr>
+          <tr><td>6 Google Vertex AI Feature Store (p. 751)</td><td>Proprietary (part of Google Cloud)</td><td>полностью управляемый; BigQuery, Dataflow; мониторинг дрейфа и аномалий</td></tr>
+          <tr><td>7 Azure ML Feature Store (p. 752)</td><td>Proprietary (part of Microsoft Azure)</td><td>Data Lake, Azure Synapse; Azure Active Directory</td></tr>
+          <tr><td>8 Scribble Data Enrich (p. 753)</td><td>Proprietary</td><td>настраиваемые pipeline обогащения данных; не привязан к облаку; "SME Focus"</td></tr>
+          <tr><td>9 Featureform (p. 754)</td><td>Open-source</td><td>"Declarative Feature Definitions"; мультиоблачный; "Lightweight Design"</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Курс разбирает каждое семейство систем "along 5 dimensions" (вводная лекция, слайд 6). Слайды о хранилищах признаков эти измерения не заполняют; вот профиль, который следует из их страниц (наш):</p>
+
+  <figure class="tbl-fig" id="l29-tbl-dims">
+    <figcaption>Хранилище признаков по пяти измерениям курса.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Измерение</th><th>Хранилище признаков</th></tr></thead>
+        <tbody>
+          <tr><td>(1) data model</td><td>временной ряд с ключом сущности: строки из ключа сущности, временной метки и значений признаков, сгруппированные в feature views и описанные в реестре (pp. 758–761)</td></tr>
+          <tr><td>(2) (declarative vs. imperative) query languages</td><td>декларативные определения признаков (Python-объекты Feast; "Declarative Feature Definitions" у Featureform), которые читаются через два вызова SDK, <code>get_historical_features</code> и <code>get_online_features</code> (p. 762): поиск по ключу и point-in-time join, без общего языка запросов</td></tr>
+          <tr><td>(3) data distribution</td><td>офлайн-хранилище — на распределённом хранилище данных или озере (S3, BigQuery, Snowflake, Redshift, Hadoop), онлайн-хранилище — на распределённом key-value хранилище (Redis, DynamoDB); материализация и push переносят данные между ними (pp. 735, 757, 765)</td></tr>
+          <tr><td>(4) non-functional aspects</td><td>низкая задержка и свежесть онлайн, объём и история офлайн; онлайн-хранилища обычно согласованы в конечном счёте (eventually consistent); операционные метрики для хранения и обслуживания (pp. 765, 768)</td></tr>
+          <tr><td>(5) architectural solutions</td><td>пять задач: transform (batch, streaming, on-demand), storage (offline и online), serving, monitoring, registry (p. 763)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Так где же место хранилища признаков среди систем этого курса? Над ними:</p>
+
+  <figure class="tbl-fig" id="l29-tbl-compare">
+    <figcaption>Хранилище признаков — это слой над системами, которые ты уже знаешь, а не новый движок хранения.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Система</th><th>Что хранит</th><th>Как из неё читают</th><th>Её место в хранилище признаков</th></tr></thead>
+        <tbody>
+          <tr><td>Хранилище данных или озеро данных (<a href="l23.html">урок 23</a>)</td><td>исторические таблицы</td><td>сканирования и агрегации за годы</td><td>офлайн-хранилище</td></tr>
+          <tr><td>Key-value хранилище вроде Redis (<a href="l17.html">урок 17</a>)</td><td>одно значение на ключ</td><td><code>GET</code> по ключу, за миллисекунды</td><td>онлайн-хранилище</td></tr>
+          <tr><td>Векторная база данных (<a href="l27.html">уроки 27</a>–<a href="l28.html">28</a>)</td><td>эмбеддинги и индекс над ними</td><td>ближайшие соседи по сходству</td><td>эмбеддинг может быть признаком, но хранилище ищет его по ключу сущности, а не по сходству</td></tr>
+          <tr><td>Потоковая обработка (<a href="l33.html">урок 33</a>)</td><td>события по мере поступления</td><td>непрерывные преобразования</td><td>источник потоковых признаков, которые отправляются push-ем в оба хранилища</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Вернёмся к Uber. Общие признаки Michelangelo жили в HDFS/Hive для обучения и в Cassandra для онлайн-предсказаний, а преобразования, которые каждая модель к ним применяла, писались на маленьком языке, чьи «выражения — часть конфигурации модели, и одни и те же выражения применяются и при обучении, и при предсказании» (Uber Engineering blog, 2017). Одно определение — значит, признак не считается дважды; два хранилища — одно для истории, другое для последних значений, которые читаются по ключу. Вторая опасность из загадки, чтение значения не в тот момент, — это то, для чего нужны временные метки модели временных рядов и point-in-time join. Вот почему «хранилище» никогда не было новой базой данных: это слой определений над озером данных и хранилищем с низкой задержкой. Последняя фраза лекции говорит то же самое: "a feature store acts as the backbone of the feature lifecycle in machine learning systems, enabling teams to efficiently manage and serve high-quality features across different stages of the ML pipeline, from model development to deployment" (p. 771).</p>
+
+  <p class="memo"><mark class="key">Хранилище признаков — это слой: реестр определений над хранилищем данных для истории и key-value хранилищем для последних значений, а не новый вид базы данных.</mark></p>
+</section>
+
+
+<section id="l29-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Хранилища признаков не встречались ни в одном прошлом экзамене, а практическая часть 2026/27 покрывает Neo4j, MongoDB, Elasticsearch, Redis и SparkQL: этот урок относится к теоретической части. Её вопросы приходят в форматах, которые называет readme прошлых экзаменов, — открытые, с выбором ответа, «верно/неверно», — и за неверные ответы может быть штраф, о котором объявляют прямо перед экзаменом.</p>
+
+  <div class="exam" data-kind="open" id="l29-exam-skew">
+    <div class="exam-q" lang="en">
+      <p>Define training-serving skew as presented in the lecture. Explain why it arises in machine-learning systems, how a feature store prevents it, and how it differs from data drift.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Training-serving skew, also called online/offline skew, is the situation in which a model performs poorly because the features used in production differ from the ones used during training. It arises because features are required both in the modelling phase and in the production (deployment) phase of the lifecycle: when each phase has its own feature code, the code is duplicated and the two implementations can silently diverge, for example in the time window, in the handling of refunds or in the default for missing values. A feature store prevents it by keeping one registered and versioned definition per feature and one transformation pipeline, whose results are stored in an offline store, which provides historical values for training, and in an online store, which provides the latest values with low latency for inference, both accessed through one serving API. In this way the same feature transformations are applied in training and in production. Data drift is different: the distribution of the input data changes over time while the computation stays the same; a feature store can detect drift by monitoring the features, but the remedy is retraining.</p></div>
+      <div class="exam-note"><p>Полный ответ состоит из трёх частей: определение словами слайда (p. 734) вместе с синонимом (p. 743), причина — два пути кода для одного признака (p. 743) — и механизм: одно определение, два хранилища. Противопоставление дрейфу показывает понимание, а не память.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-online">
+    <div class="exam-q" lang="en">
+      <p>In a feature store, which component typically stores only the latest feature values for each entity and is usually eventually consistent?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>The offline store <span class="fb">Оно держит "months' or years' worth of feature data for training purposes" (p. 765): историю, а не только последние значения.</span></li>
+      <li>The registry <span class="fb">Реестр хранит определения и их метаданные (p. 769), а не значения признаков.</span></li>
+      <li data-correct>The online store <span class="fb">"They typically only store the latest feature values for each entity" и "Online stores are usually eventually consistent" (p. 765).</span></li>
+      <li>The data source <span class="fb">В Feast это сырые данные, которыми владеют пользователи; "Feast does not manage any of the raw underlying data" (p. 759).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The online store. It persists the latest feature value of each entity for low-latency lookups during inference, usually in a key-value store such as Redis or DynamoDB, and it is usually eventually consistent. The offline store keeps months or years of history for training.</p></div>
+      <div class="exam-note"><p>Каждый отвлекающий вариант — другой компонент той же архитектуры; два свойства из вопроса — именно те, что слайд (p. 765) приписывает онлайн-хранилищу.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: in Feast, for offline use cases that rely only on batch data, the data must first be ingested into the feature store.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Слайд говорит обратное: "Feast does not need to ingest data and can query your existing data" (p. 757).</span></li>
+      <li data-correct>False <span class="fb">Загрузка (ingestion) нужна для онлайн-сценариев: материализация из батчевых источников и push потоковых признаков (p. 757).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. For offline use cases that rely only on batch data, Feast does not need to ingest data and queries the existing data in place. Data are ingested only for online use cases: batch features are materialized into the online store, and streaming features are pushed to make them available both offline and online.</p></div>
+      <div class="exam-note"><p>Вопрос «верно/неверно» легко построить, перевернув одну фразу слайда. С возможным штрафом за неверный ответ отвечай только то, что подтверждает фраза со слайда (p. 757).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l29-exam-feast">
+    <div class="exam-q" lang="en">
+      <p>In Feast, what are an entity, a feature view and an entity key? Give an example of a feature view with zero entities, one with one entity and one with several entities, and explain why Feast uses a time-series data model.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>An entity is a collection of semantically related features, defined by the users to map to the domain of their use case, for example a driver or a customer. A feature view is a collection of features, bound to its entities and to a data source; it maps to zero or more entities. A collection of entities for a feature view is called an entity key; in the data, the entity key of a row is the tuple of its entity values, for example (customer_A, driver_1001). Zero entities: a global feature such as num_daily_global_transactions. One entity: a user feature such as user_age or last_5_bought_items. Several entities, a composite key: num_user_purchases_in_merchant_category, for a user and a merchant category. Feast uses a time-series data model, in which every row carries a timestamp, the entity values and the feature values, in order to build training datasets and to materialize features into an online store: the timestamps let a training row receive the latest feature values at or before its own time, without values from the future, and they tell materialization which value is the latest.</p></div>
+      <div class="exam-note"><p>Определения — почти дословно со слайда (p. 758), примеры тоже; составной ключ — часть, которую легче всего забыть. Последнее предложение выходит за рамки слайдов (point-in-time correctness описана в документации Feast): оно показывает, почему слайд (p. 759) так настаивает на времени.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-ondemand">
+    <div class="exam-q" lang="en">
+      <p>Which of the following features can only be produced by an on-demand transformation? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>User country <span class="fb">Данные в покое (at rest): батчевое преобразование (p. 767).</span></li>
+      <li>Number of views per listing in the past hour <span class="fb">Считается непрерывно из потока (Kafka, Kinesis, PubSub): потоковое преобразование.</span></li>
+      <li data-correct>Whether the user is currently in a supported location <span class="fb">Зависит от "data that is only available at the time of the prediction" — где пользователь сейчас (p. 767).</span></li>
+      <li data-correct>The similarity score between a listing and the search query <span class="fb">Запрос существует только в момент, когда он приходит: "These features cannot be pre-computed" (p. 767).</span></li>
+      <li>Product category <span class="fb">Свойство данных в покое: батчевое преобразование.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The third and the fourth. On-demand transformations produce features from data that is only available at the time of the prediction, coming from the user-facing application, so they cannot be pre-computed. User country and product category come from batch transformations of data at rest; views per listing in the past hour come from a streaming transformation.</p></div>
+      <div class="exam-note"><p>Примеры — со слайда (p. 767), так что вопрос может использовать их дословно. Проверка, которую надо применить: существует ли вход до того, как придёт запрос? Если да, признак можно посчитать заранее.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l29-exam-farm">
+    <div class="exam-q" lang="en">
+      <p>Consider the ER scenario of the exam of 12 Sep 2025, tracking farmers and their sales at local markets: People (Personal ID, Name, Surname, Age, Address, State) Buy Products (Product ID, Name, Quantity, Expiration Date), with a Buy Date and an Amount; Products are sold at Markets (Name, Location, Opening Time, Closing Time, Size).</p>
+      <p>A cooperative wants two models: (a) every night, predict for each product the amount that will be bought the next day; (b) at the moment a person pays, decide whether the purchase is fraudulent. Using a feature store, propose for each model its entity key and features of the three transformation types where they fit, say which store serves each prediction, and which Feast retrieval method is used for training and for prediction.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) Entity Product, entity key Product ID. Batch features computed from the history of Buy: the total Amount bought in the last 7 days, the number of days to the Expiration Date. Training: get_historical_features with an entity dataframe of (Product ID, date) rows labelled with the amount of the next day, so that each row is joined with the feature values at or before its date. The nightly prediction for all products is a batch prediction: it also uses get_historical_features on the offline store; no low latency is needed.</p>
+        <p>(b) Entity Person, entity key Personal ID. Batch feature: Age. Streaming feature: the number of purchases of this person in the last 10 minutes, computed from the stream of Buy events and pushed to both stores. On-demand feature: whether the market of the payment is open at the time of the payment, computed at request time from the request data and the market's Opening Time and Closing Time; it cannot be precomputed. Training: get_historical_features on past purchases labelled fraudulent or not. Prediction: get_online_features for the Personal ID, served by the online store with the latest values and low latency, plus the on-demand transformation at request time.</p>
+      </div>
+      <div class="exam-note"><p>Наше упражнение, а не из прошлых экзаменов: сценарий взят, чтобы потренировать словарь в контексте. Ловушка — пункт (a): ночное предсказание — это офлайн, ровно как "Predicting user churn for all users on a daily basis" на слайде (p. 762), так что оно использует get_historical_features, а не онлайн-хранилище.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l29-exam-products">
+    <div class="exam-q" lang="en">
+      <p>According to the lecture, which of these feature stores are open-source? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Feast <span class="fb">"Type: Open-source" (p. 746).</span></li>
+      <li>Tecton <span class="fb">"Type: Commercial" (p. 748).</span></li>
+      <li data-correct>Hopsworks <span class="fb">"Type: Open-source (with enterprise version)" (p. 747).</span></li>
+      <li>AWS SageMaker Feature Store <span class="fb">"Proprietary (part of AWS SageMaker)" (p. 749).</span></li>
+      <li data-correct>Featureform <span class="fb">"Type: Open-source" (p. 754).</span></li>
+      <li>Databricks Feature Store <span class="fb">"Proprietary (part of Databricks)" (p. 750).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Feast, Hopsworks and Featureform. Tecton is commercial; AWS SageMaker, Databricks, Google Vertex AI and Azure ML feature stores are proprietary parts of their platforms, and Scribble Data Enrich is proprietary too.</p></div>
+      <div class="exam-note"><p>Чистое запоминание слайдов (pp. 746–754): три open-source, одно коммерческое, пять проприетарных. Сомневаться стоит на Hopsworks — слайд записывает его как open-source с enterprise-версией.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l29-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Модель для выявления мошенничества отлично выглядит на офлайн-тесте и заметно хуже работает в продакшене с первого же дня. В мире ничего не изменилось. Какая причина вероятнее всего?</p>
+    <ul class="options">
+      <li>Дрейф концепции <span class="fb">Дрейфу нужны время и меняющийся мир; а этот разрыв есть с первого дня.</span></li>
+      <li>Онлайн-хранилище согласовано лишь в конечном счёте <span class="fb">Значения возрастом в несколько секунд объясняют небольшие различия на немногих запросах, а не разрыв с первого дня.</span></li>
+      <li data-correct>Признаки доходят до модели в продакшене через другой код, или в обучающую выборку утекли будущие значения <span class="fb">И training-serving skew (p. 734), и утечка заставляют офлайн-оценки обещать то, чего продакшен дать не может, — проверь оба.</span></li>
+      <li>Нет реестра <span class="fb">Отсутствие каталога вредит повторному использованию и поиску, а не значениям, которые получает развёрнутая модель.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">У driver_1001 рейтинги 4.6 (5/20 0:00), 4.7 (5/21 0:00), 4.8 (5/22 0:00) и 4.9 (5/23 0:00). Обучающая строка датирована 5/22 10:00. Какой рейтинг присоединит point-in-time join?</p>
+    <ul class="options">
+      <li>4.9 <span class="fb">Датирован 5/23: в 10:00 5/22 его ещё не существовало. Это утечка наивного join.</span></li>
+      <li data-correct>4.8 <span class="fb">Последнее значение не позже 5/22 10:00 — рейтинг 5/22 со слайда (p. 760).</span></li>
+      <li>4.75, среднее двух значений вокруг 10:00 <span class="fb">Point-in-time join выбирает одно датированное значение; он не интерполирует.</span></li>
+      <li>4.7 <span class="fb">До 10:00, но не последнее: 4.8 с меткой 5/22 0:00 позже и всё ещё в прошлом.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие утверждения об офлайн-хранилище верны? Выбери все верные варианты.</p>
+    <ul class="options">
+      <li data-correct>Оно держит значения признаков за месяцы или годы, для обучения <span class="fb">"months' or years' worth of feature data for training purposes" (p. 765).</span></li>
+      <li>Оно отвечает на один поиск по ключу за миллисекунды во время инференса <span class="fb">Это онлайн-хранилище: "low-latency lookup during inference" (p. 765).</span></li>
+      <li data-correct>Часто это хранилище данных или озеро данных, например S3, BigQuery, Snowflake или Redshift <span class="fb">Список со слайда (p. 765).</span></li>
+      <li>В Feast батчевые данные нужно загрузить в него, прежде чем их можно запрашивать <span class="fb">"Feast does not need to ingest data and can query your existing data" (p. 757).</span></li>
+      <li data-correct>Обычно оно обновляется через равные промежутки, например ежедневно или еженедельно <span class="fb">"updated at regular intervals (e.g., daily or weekly)" (p. 735).</span></li>
+    </ul>
+    <p class="q-fb">История и сканирования — офлайн, последнее значение и поиск по ключу — онлайн: два хранилища отвечают на два разных вопроса.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему онлайн-хранилище может позволить себе согласованность лишь в конечном счёте?</p>
+    <ul class="options">
+      <li>Потому что каждое значение хранится ещё и в офлайн-хранилище <span class="fb">Копия где-то ещё не делает устаревшее значение свежим; вопрос в том, важна ли устарелость.</span></li>
+      <li>Потому что оно не хранит историю, так что и согласовывать нечего <span class="fb">Оно хранит последнее значение каждого ключа, и его реплики всё равно могут на мгновение расходиться.</span></li>
+      <li>Потому что его читает один клиент <span class="fb">Его читает каждый сервис предсказаний, часто сразу со многих машин.</span></li>
+      <li data-correct>Потому что предсказание по значению возрастом в несколько секунд всё ещё полезно, а медленный ответ — нет <span class="fb">Для большинства применений ML задержка и доступность важнее строгой согласованности — сторона BASE из урока 5.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Feature view в Feast вычисляет <code>num_user_purchases_in_merchant_category</code>. Какой у него ключ сущности (entity key)?</p>
+    <ul class="options">
+      <li data-correct>Пара (пользователь, категория продавца): составной ключ <span class="fb">"multiple entities, aka a composite key" (p. 758).</span></li>
+      <li>Никакого: это глобальный признак <span class="fb">У глобальных признаков вроде num_daily_global_transactions ноль сущностей; а этот зависит от того, кто покупает и где.</span></li>
+      <li>Только пользователь <span class="fb">У признака пользователя вроде user_age одна сущность; а этот зависит ещё и от категории продавца.</span></li>
+      <li>Временная метка <span class="fb">Она есть у каждой строки, но в ключ сущности не входит.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Что делает материализация в Feast?</p>
+    <ul class="options">
+      <li>Вычисляет on-demand признаки, когда приходит запрос <span class="fb">Это on-demand transform, внутри serving (p. 763).</span></li>
+      <li>Отправляет потоковые признаки в оба хранилища <span class="fb">Это push, вторая половина слайда (p. 757).</span></li>
+      <li data-correct>Копирует последние значения признаков из батчевых источников в онлайн-хранилище <span class="fb">"ingesting features from batch sources to make them available online (through a process called materialization)" (p. 757).</span></li>
+      <li>Сохраняет определения признаков в реестре <span class="fb">Определения применяются (apply) к реестру (p. 759); материализация переносит значения, а не определения.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Data scientist собирается написать <code>spend_l30d</code> с нуля, хотя коллега написал его в прошлом году. Какая задача хранилища признаков должна была её остановить?</p>
+    <ul class="options">
+      <li>Monitoring <span class="fb">Операционный мониторинг следит за доступностью, задержкой и тому подобным (p. 768), а не за тем, кто что пишет.</span></li>
+      <li data-correct>Registry <span class="fb">"a common catalog to explore, develop, collaborate on, and publish new definitions" (p. 769) — discoverability со слайда (p. 736).</span></li>
+      <li>Storage <span class="fb">Storage хранит значения; найти определение — работа каталога.</span></li>
+      <li>On-demand transform <span class="fb">Он вычисляет признаки в момент запроса; к повторному использованию он отношения не имеет.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l29-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Признак — входная переменная модели; хранилище признаков — "a centralized repository used to store, manage, and serve features for machine learning (ML) tasks" (p. 720) и "a key asset in ML-Ops", то есть в практиках, которые крутят цикл из разработки, обучения и валидации, развёртывания, мониторинга и переобучения.</li>
+    <li>Самая большая проблема (p. 743): признаки нужны и при моделировании, и в продакшене, поэтому их считают две программы, и они расходятся — training-serving skew, или online/offline skew. Хранилище признаков заменяет их одним определением. Skew — не дрейф: дрейф — это изменение мира.</li>
+    <li>Офлайн-хранилище держит месяцы или годы истории в хранилищах и озёрах данных, обновляется ежедневно или еженедельно и служит обучению; онлайн-хранилище держит только последнее значение каждой сущности в key-value хранилище с низкой задержкой, обычно согласованном в конечном счёте, и служит инференсу. Материализация заполняет онлайн-хранилище; потоки делают push в оба.</li>
+    <li>Внутри коробки (p. 763): 1 Serving, 2 Storage, 3 Transform (batch, streaming, on-demand), 4 Monitoring (операционные метрики), 5 Registry (каталог определений).</li>
+    <li>Feast: проекты, feature views, признаки, сущности, ключи сущностей (составные, если сущностей несколько), источники данных, которыми он не управляет, реестр, модель данных временных рядов; <code>get_historical_features</code> — для обучения и батчевых предсказаний, <code>get_online_features</code> — для предсказаний в реальном времени.</li>
+    <li>Корректность на момент времени (point-in-time correctness): каждая обучающая строка соединяется с последним значением признака не позже её собственной метки, null — за пределами ttl; простой join допускает утечку будущего и раздувает офлайн-оценки.</li>
+    <li>Девять продуктов (pp. 746–754): open-source Feast, Hopsworks и Featureform, коммерческий Tecton, пять проприетарных. Хранилище признаков — это слой над хранилищами, которые у тебя уже есть: хранилище данных или озеро для истории, хранилище с низкой задержкой для последних значений; первым был Michelangelo в Uber в 2017 году (p. 739).</li>
+  </ul>
+  <aside class="cheat" id="l29-cheat">
+    <dl>
+      <dt>Feature (p. 720)</dt><dd>входная переменная или атрибут, описывающий объект данных; модель использует её для предсказания</dd>
+      <dt>Feature store (p. 720)</dt><dd>централизованный репозиторий, чтобы хранить, управлять и выдавать признаки для ML; "a key asset in ML-Ops"</dd>
+      <dt>MLOps (p. 722)</dt><dd>практики и инструменты для разработки, развёртывания и сопровождения ML-моделей в продакшене; DevOps для ML</dd>
+      <dt>Жизненный цикл MLOps (p. 724)</dt><dd>development → training and validation → deployment → monitoring → retraining</dd>
+      <dt>Training-serving skew (p. 734)</dt><dd>модель работает плохо, потому что признаки в продакшене отличаются от признаков при обучении; "online/offline skew" (p. 743)</dd>
+      <dt>Data drift / concept drift</dt><dd>меняется \(P(X)\) / меняется \(P(Y \mid X)\) — меняется мир, а не код</dd>
+      <dt>Offline store (pp. 735, 765)</dt><dd>история, месяцы или годы; хранилища и озёра данных (S3, BigQuery, Snowflake, Redshift, Hadoop); для обучения</dd>
+      <dt>Online store (pp. 735, 765)</dt><dd>последнее значение на сущность; низкая задержка; key-value (Redis, DynamoDB); eventually consistent; для инференса</dd>
+      <dt>Materialization / push (p. 757)</dt><dd>батчевые источники → онлайн-хранилище / потоковые признаки → оба хранилища; офлайн-сценарий на батчевых данных: без загрузки</dd>
+      <dt>Пять задач (p. 763)</dt><dd>1 Serving · 2 Storage · 3 Transform · 4 Monitoring · 5 Registry</dd>
+      <dt>Transforms (p. 767)</dt><dd>batch: данные в покое · streaming: Kafka, Kinesis, PubSub · on-demand: данные момента запроса, заранее не посчитать</dd>
+      <dt>Monitoring (p. 768)</dt><dd>storage: availability, capacity, utilization, staleness · serving: throughput, latency, error rates</dd>
+      <dt>Registry (p. 769)</dt><dd>общий каталог определений признаков и их метаданных</dd>
+      <dt>Объекты Feast (pp. 756–759)</dt><dd>project (пространство имён) → feature views → features, entity, data source; entity key = сущности одного view (составной, если их несколько)</dd>
+      <dt>Получение данных в Feast (p. 762)</dt><dd><code>get_historical_features</code>: обучающие данные, батчевые предсказания · <code>get_online_features</code>: предсказания в реальном времени</dd>
+      <dt>Point-in-time join</dt><dd>\(\tau^{*} = \max\{\tau_i \le t\}\); null, если \(t - \tau^{*} \gt\) ttl</dd>
+      <dt>Когда нужно (p. 744)</dt><dd>модели в масштабе и в продакшене; не для маленькой команды, маленького проекта или POC</dd>
+      <dt>Продукты (pp. 746–754)</dt><dd>open-source: Feast, Hopsworks, Featureform · commercial: Tecton · proprietary: SageMaker, Databricks, Vertex AI, Azure ML, Scribble Data</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l29-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.uber.com/blog/michelangelo-machine-learning-platform/" target="_blank" rel="noopener">Meet Michelangelo: Uber's Machine Learning Platform</a>
+      <span class="res-by">Jeremy Hermann и Mike Del Balso, Uber Engineering, 2017</span>
+      <p class="res-why">Первое публичное хранилище признаков, тот самый "First Experience in Uber" со слайда (p. 739): около 10,000 общих признаков, которые хранятся в HDFS/Hive для обучения и в Cassandra для онлайн-предсказаний, с выражениями преобразований, которые одинаково применяются при обучении и при предсказании.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" target="_blank" rel="noopener">Point-in-time joins</a>
+      <span class="res-by">Документация Feast</span>
+      <p class="res-why">Картинка с временной шкалой, на которой стоят раздел 5 и его виджет: каждая строка entity dataframe смотрит назад, в пределах ttl, в поисках последнего значения признака.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://www.databricks.com/glossary/what-is-a-feature-store" target="_blank" rel="noopener">What is a Feature Store?</a>
+      <span class="res-by">Статья Tecton, теперь на сайте Databricks</span>
+      <p class="res-why">Источник слайдов (pp. 763–769): serving, storage, transform, monitoring и registry словами самих авторов, с причинами, по которым онлайн-хранилище согласовано лишь в конечном счёте.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://developers.google.com/machine-learning/guides/rules-of-ml" target="_blank" rel="noopener">Rules of Machine Learning</a>
+      <span class="res-by">Martin Zinkevich, Google</span>
+      <p class="res-why">Раздел о training-serving skew: переиспользуй код между обучением и обслуживанием, остерегайся join с меняющимися таблицами, измеряй расхождение — практики, которые хранилище признаков встраивает в себя.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://eugeneyan.com/writing/feature-stores/" target="_blank" rel="noopener">Feature Stores: A Hierarchy of Needs</a>
+      <span class="res-by">Eugene Yan</span>
+      <p class="res-why">Ключевые компоненты со слайдов (pp. 734–737) в виде лестницы — access, serving, integrity, convenience, autopilot — со сравнением реальных хранилищ признаков и той же оговоркой, что на слайде (p. 744).</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Хранилище признаков передаёт свои преобразования движку вроде Spark (p. 766). Но как вообще запустить одно вычисление на тысяче машин?</p>
+</aside>
+
+</main>
+</body>
+</html>

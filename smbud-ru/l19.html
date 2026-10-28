@@ -1,0 +1,1379 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Как сохранить in-memory базу живой; кеширование и memcached · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the text field of the topology widget (the toolkit has no text input); tokens only */
+.l19-keyinput { width: 100%; min-height: 2.5rem; padding: 0.3rem 0.6rem; font-family: var(--f-mono); font-size: var(--t-sm); color: var(--ink); background: var(--paper); border: 1.5px solid var(--line-2); border-radius: var(--radius); }
+.l19-keyinput:focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l19">
+
+<header class="lesson-head">
+  <h1>Как сохранить in-memory базу живой; кеширование и memcached</h1>
+  <p class="lede">После этого урока ты сможешь рассказать, что делает Redis, чтобы падение процесса или гибель машины стоили недорого, — снапшоты, логи, slaves, Sentinel, Cluster и его 16384 слота, — и когда кэш, который забывает намеренно, как memcached, вообще стоит заводить.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Две программы держат все свои данные в RAM, и ты выдёргиваешь у обеих шнур питания. Слайд про первую — это список механизмов, чтобы пережить ровно это: снапшоты на диске, лог каждой записи, копии на других машинах и автоматические способы поставить копию главной, когда машина умирает (p. 359). Слайд про вторую читается как признание: "No persistency (if your server goes down, data in memcached is gone)", "No redundancy / fail-over", "No replication (single item in cache lives on one server only)" (p. 381).</p>
+  <p>И всё же четырьмя слайдами раньше вторую программу "used by Netlog, Facebook, Flickr, Wikipedia, Twitter, YouTube" (p. 377). Какая из двух спроектирована плохо?</p>
+  <p>Ни одна — и причина прячется в одном-единственном слове определения кэша. К концу урока ты будешь знать это слово, четыре вида механизмов, которые нужны первой программе, и одно отношение, которое решает, стоит ли вообще заводить вторую.</p>
+</div>
+
+
+<section id="l19-axes">
+  <h2>Четыре способа не дать RAM забыть</h2>
+
+  <p>Redis отвечает из памяти, поэтому он и быстрый (<a href="l17.html">урок 17</a>). У памяти две слабости: она забывает всё, когда останавливается процесс или машина, и на одной машине её не бесконечно много. Лекция честно говорит о цене лечения первой: "increased persistency will tend to increase latency and decrease throughput" (p. 349) — чем надёжнее хранение, тем выше задержка и ниже пропускная способность.</p>
+
+  <p>Слайд "Scaling Redis" (p. 359) отвечает четырьмя заголовками, и каждый защищает от своей аварии (рис. 1):</p>
+
+  <div class="def">
+    <p><dfn>Персистентность (persistence)</dfn> — "Redis provides two mechanisms to deal with persistence: Redis database snapshots (RDB) and append-only files (AOF)." Защищает от того, что процесс останавливается и RAM стирается.</p>
+    <p><dfn>Репликация (replication)</dfn> — экземпляр, который называют <mark class="key">master</mark>, "ensures that one or more instances … the slaves, become exact copies of the master. Clients can connect to the master or to the slaves. Slaves are read only by default." Защищает от потери целой машины.</p>
+    <p><dfn>Партиционирование (partitioning)</dfn> — "Breaking up data and distributing it across different hosts in a cluster", на одном из трёх уровней: клиент ("Partitioning on client-side code"), прокси ("An extra layer that proxies all redis queries and performs partitioning", например Twemproxy) или маршрутизатор запросов ("instances will make sure to forward the query to the right node", например Redis Cluster). Защищает от того, что данные перерастают одну машину.</p>
+    <p><dfn>Failover (переключение на резерв)</dfn> — "Manual", "Automatic with Redis Sentinel (for master-slave topology)" или "Automatic with Redis Cluster (for cluster topology)". Защищает от того, что master умер и никто не принимает записи.</p>
+  </div>
+
+  <aside class="margin-note">Начиная с версии 5 Redis называет slave репликой (replica; команда — REPLICAOF). Слайды говорят slave, и этот урок тоже.</aside>
+
+  <figure class="fig fig--plain" id="l19-fig-axes">
+    <svg class="dia" viewBox="0 0 560 280" role="img" aria-label="Четыре аварии и ответ слайда 19 лекции 8 на каждую: RAM стёрта — persistence (Redis пишет на диск файл RDB или AOF); машина потеряна — replication (master копирует данные в slave); данные не влезают — partitioning (три машины держат по части); master умер — failover (slave повышается до master)">
+      <line x1="204" y1="40" x2="282" y2="40" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="158" y="26" width="44" height="28" class="fi-paper"/>
+      <line x1="165" y1="33" x2="195" y2="33" class="st-muted"/>
+      <line x1="165" y1="40" x2="195" y2="40" class="st-muted"/>
+      <line x1="165" y1="47" x2="195" y2="47" class="st-muted"/>
+      <path d="M290 20 H312 L322 30 V60 H290 Z" class="fi-paper"/>
+      <path d="M312 20 V30 H322 Z" class="fi-soft"/>
+      <text x="20" y="45" class="tx-sm">RAM стёрта</text>
+      <text x="180" y="72" class="tx-sm tx-mid">Redis</text>
+      <text x="306" y="78" class="tx-sm tx-mid">RDB · AOF</text>
+      <text x="430" y="45" class="tx-bold">persistence</text>
+
+      <line x1="204" y1="105" x2="282" y2="105" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="158" y="91" width="44" height="28" class="fi-paper st-s6 dash sw-3"/>
+      <line x1="165" y1="98" x2="195" y2="98" class="st-muted"/>
+      <line x1="165" y1="105" x2="195" y2="105" class="st-muted"/>
+      <line x1="165" y1="112" x2="195" y2="112" class="st-muted"/>
+      <rect x="284" y="91" width="44" height="28" class="fi-paper"/>
+      <line x1="291" y1="98" x2="321" y2="98" class="st-muted"/>
+      <line x1="291" y1="105" x2="321" y2="105" class="st-muted"/>
+      <line x1="291" y1="112" x2="321" y2="112" class="st-muted"/>
+      <text x="20" y="110" class="tx-sm">машина потеряна</text>
+      <text x="180" y="137" class="tx-sm tx-mid">master</text>
+      <text x="306" y="137" class="tx-sm tx-mid">slave</text>
+      <text x="430" y="110" class="tx-bold">replication</text>
+
+      <rect x="158" y="156" width="44" height="28" class="fi-paper"/>
+      <line x1="165" y1="163" x2="195" y2="163" class="st-muted"/>
+      <line x1="165" y1="170" x2="195" y2="170" class="st-muted"/>
+      <line x1="165" y1="177" x2="195" y2="177" class="st-muted"/>
+      <rect x="228" y="156" width="44" height="28" class="fi-paper"/>
+      <line x1="235" y1="163" x2="265" y2="163" class="st-muted"/>
+      <line x1="235" y1="170" x2="265" y2="170" class="st-muted"/>
+      <line x1="235" y1="177" x2="265" y2="177" class="st-muted"/>
+      <rect x="298" y="156" width="44" height="28" class="fi-paper"/>
+      <line x1="305" y1="163" x2="335" y2="163" class="st-muted"/>
+      <line x1="305" y1="170" x2="335" y2="170" class="st-muted"/>
+      <line x1="305" y1="177" x2="335" y2="177" class="st-muted"/>
+      <text x="20" y="175" class="tx-sm">данные не влезают</text>
+      <text x="180" y="202" class="tx-sm tx-mid">часть 1</text>
+      <text x="250" y="202" class="tx-sm tx-mid">часть 2</text>
+      <text x="320" y="202" class="tx-sm tx-mid">часть 3</text>
+      <text x="430" y="175" class="tx-bold">partitioning</text>
+
+      <line x1="204" y1="235" x2="282" y2="235" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="158" y="221" width="44" height="28" class="fi-paper"/>
+      <line x1="165" y1="228" x2="195" y2="228" class="st-muted"/>
+      <line x1="165" y1="235" x2="195" y2="235" class="st-muted"/>
+      <line x1="165" y1="242" x2="195" y2="242" class="st-muted"/>
+      <line x1="160" y1="217" x2="200" y2="253" class="st-bad sw-3"/>
+      <line x1="160" y1="253" x2="200" y2="217" class="st-bad sw-3"/>
+      <rect x="284" y="221" width="44" height="28" class="fi-paper st-s6 dash sw-3"/>
+      <line x1="291" y1="228" x2="321" y2="228" class="st-muted"/>
+      <line x1="291" y1="235" x2="321" y2="235" class="st-muted"/>
+      <line x1="291" y1="242" x2="321" y2="242" class="st-muted"/>
+      <text x="20" y="240" class="tx-sm">master умер</text>
+      <text x="243" y="225" class="tx-sm tx-mid halo">повысить</text>
+      <text x="180" y="267" class="tx-sm tx-mid">master</text>
+      <text x="306" y="267" class="tx-sm tx-mid">slave, теперь master</text>
+      <text x="430" y="240" class="tx-bold">failover</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Четыре заголовка слайда (p. 359), каждый — против своей аварии. Пунктирная охристая рамка отмечает master: копию, которая принимает записи.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Persistence переживает перезапуск, replication — потерю машины, partitioning — рост данных, failover сохраняет приём записей, когда master умирает.</mark></p>
+
+  <h3>Снапшот или лог?</h3>
+
+  <p>Слайд только называет оба механизма; как они работают — из документации Redis. Снапшот <abbr title="Redis database">RDB</abbr> — это фотография: раз в несколько минут или раньше, если поменялось много ключей, Redis записывает копию всего набора данных на определённый момент в один компактный файл. <abbr title="append-only file">AOF</abbr> — это бухгалтерская книга: каждая команда записи дописывается в лог, и при перезапуске Redis его проигрывает.</p>
+
+  <p>Поэтому сбой обходится по-разному (рис. 2). Снапшот теряет всё, что записано после него, — минуты. Лог теряет только то, что не успело попасть на диск: около секунды при политике по умолчанию (сброс на диск раз в секунду) и ничего, если файл синхронизируется после каждой записи. Эта последняя настройка и есть "increased persistency" со слайда (p. 349): каждая запись ждёт диска. Взамен снапшот меньше и быстрее загружается, чем лог всех команд. Если включены оба, Redis перезапускается из лога — более полного из двух.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l19-fig-persist">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="RDB: восемь записей, снапшот после четвёртой, сбой после восьмой; после перезапуска вернулись только четыре записи до снапшота, последние четыре потеряны">
+        <text x="20" y="24" class="tx-sm">записи до сбоя</text>
+        <rect x="20" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="150" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="176" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="202" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <line x1="118" y1="28" x2="118" y2="62" class="sw-2 dash"/>
+        <line x1="236" y1="36" x2="252" y2="52" class="st-bad sw-3"/>
+        <line x1="236" y1="52" x2="252" y2="36" class="st-bad sw-3"/>
+        <text x="118" y="78" class="tx-sm tx-mid">снапшот</text>
+        <text x="244" y="78" class="tx-sm tx-mid">сбой</text>
+        <line x1="20" y1="96" x2="270" y2="96" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="276" y="112" class="tx-sm tx-muted tx-end">время</text>
+        <text x="20" y="130" class="tx-sm">после перезапуска</text>
+        <rect x="20" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <rect x="150" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <rect x="176" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <rect x="202" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <text x="170" y="188" class="tx-hand tx-mid">потеряно</text>
+      </svg>
+      <p class="fig-label">RDB: снапшот раз в несколько минут</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="AOF: те же восемь записей, каждая дописана в лог, и тот же сбой; после перезапуска лог проигрывается и семь записей возвращаются, потеряна только последняя, сделанная в последнюю секунду">
+        <text x="20" y="24" class="tx-sm">записи, каждая дописана в лог</text>
+        <rect x="20" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="150" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="176" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="202" y="34" width="14" height="20" class="fw-s1 st-s1"/>
+        <line x1="236" y1="36" x2="252" y2="52" class="st-bad sw-3"/>
+        <line x1="236" y1="52" x2="252" y2="36" class="st-bad sw-3"/>
+        <text x="244" y="78" class="tx-sm tx-mid">сбой</text>
+        <line x1="20" y1="96" x2="270" y2="96" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="276" y="112" class="tx-sm tx-muted tx-end">время</text>
+        <text x="20" y="130" class="tx-sm">после перезапуска: лог проигран</text>
+        <rect x="20" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="46" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="72" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="98" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="124" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="150" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="176" y="140" width="14" height="20" class="fw-s1 st-s1"/>
+        <rect x="202" y="140" width="14" height="20" class="fi-paper st-muted dash"/>
+        <text x="200" y="188" class="tx-hand tx-mid">потеряна 1 s</text>
+      </svg>
+      <p class="fig-label">AOF: лог каждой записи</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Те же восемь записей и тот же сбой. Слева: перезапуск загружает последний снапшот, и всё, что записано после него, пропало. Справа: перезапуск проигрывает лог; при политике по умолчанию (сброс раз в секунду) теряется не больше последней секунды. Слайд называет два файла; как они работают — из документации Redis.</figcaption>
+  </figure>
+</section>
+
+
+<section id="l19-topologies">
+  <h2>Четыре топологии в таблице два на два</h2>
+
+  <p>Слайд (p. 360) перечисляет четыре схемы, у каждой в скобках её обещание: "I. Standalone", "II. Sentinel (automatic failover)", "III. Twemproxy (distribute data)", "IV. Cluster (automatic failover and distribute data)". Две способности, четыре комбинации.</p>
+
+  <h3>I · Standalone: копии есть, повысить их некому</h3>
+
+  <p>Слайд (p. 361) рисует три формы: master в одиночку, master со slaves и slaves у slaves ("multi-level"). Slaves дают "data redundancy, reads offloading and save-to-disk offloading": копию на случай гибели машины master, больше машин для чтения и машину, которая пишет снапшоты и логи вместо master. "Clients can connect to the Master for read/write operations or to the Slaves for read operations." И затем строка, которая важнее всего: "There is no automatic failover."</p>
+
+  <p>Почему slaves только для чтения? Порядок записей задаёт одна машина, поэтому копии никогда в нём не расходятся. Копирование асинхронное (из документации Redis): master отвечает раньше, чем slaves получили запись, так что slave, повышенный после сбоя, может не иметь последних записей.</p>
+
+  <h3>II · Sentinel: сторож, который повышает</h3>
+
+  <p>"Redis Sentinel provides a reliable automatic failover in a master/slave topology, automatically promoting a slave to master if the existing master fails" (p. 362). В примере Sentinel работает на каждом из трёх серверов, следит за master и slaves и переговаривается с остальными. Зачем несколько? Чтобы один Sentinel с перебитым кабелем не мог сместить здоровый master: документация Redis требует минимум трёх, а для failover нужен голос большинства из них. Второй пункт: "Sentinel does not distribute data across nodes" — каждый slave по-прежнему хранит весь набор данных.</p>
+
+  <h3>III · Twemproxy: прокси, который делит</h3>
+
+  <p>"Twemproxy works as a proxy between the clients and many Redis instances" — в примере их три за балансировщиком нагрузки — и "Is able to automatically distribute data among different standalone Redis instances" (p. 363). Он "Supports consistent hashing": серверы и ключи хешируются на одну и ту же окружность, и ключ принадлежит первой точке сервера после него по часовой стрелке; когда сервер добавляется или уходит, переезжают только ключи рядом с его точками — примерно один из n при n серверах, тогда как «хеш по модулю числа серверов» переселил бы почти все. Twemproxy "is a project from Twitter and is not part of redis"; "Multi-key commands and transactions are not supported" — такой команде может понадобиться несколько серверов, — и failover нет: погибший экземпляр уносит свои ключи с собой.</p>
+
+  <details class="why">
+    <summary>«Not supported» — правда ни одна?</summary>
+    <p>Собственные заметки Twemproxy тоньше: он разбивает <code>MGET</code>, <code>MSET</code> и <code>DEL</code> по серверам (<code>MSET</code> тогда не атомарна); <code>SINTER</code> или <code>RPOPLPUSH</code> работают, только когда все их ключи хешируются на один сервер, а это устраивают hash tags; транзакции <code>MULTI</code>/<code>EXEC</code> не работают совсем. На экзамене приводи фразу со слайда.</p>
+  </details>
+
+  <h3>IV · Cluster: слоты с владельцами</h3>
+
+  <p>"Redis Cluster distributes data across different Redis instances and perform automatic failover if any problem happens to any master instance" (p. 364). "All nodes are directly connected with a service channel": узлы проверяют друг друга и договариваются, кто жив. "The keyspace is divided into hash slots. Different nodes will hold a subset of hash slots." Кластер из примера делит их так: "Slots 0-6000", "Slots 6001-12000", "Slots 12001-16383": всего 16384 <mark class="key">хеш-слота (hash slots)</mark>, и каждым владеет один master. В какой слот попадает ключ, определяет формула из спецификации Redis Cluster:</p>
+
+  <div class="formula">
+    \[ \text{slot}(k) = \text{CRC16}(k) \bmod 16384 \]
+    <dl class="legend">
+      <dt>\(k\)</dt><dd>ключ как строка</dd>
+      <dt>CRC16</dt><dd>16-битная контрольная сумма байтов ключа, число от 0 до 65535</dd>
+    </dl>
+  </div>
+
+  <p>Ключ <code>foo</code> попадает в слот 12182, так что в кластере со слайда он живёт на master C. Когда master падает, один из его slaves повышается и забирает его диапазон слотов; формула не меняется никогда, поэтому каждый ключ сохраняет свой слот. Последний пункт: "Multi-key commands are only allowed for keys in the same hash slot." Команда, которой нужны два ключа, должна выполняться на одной машине, атомарно. <code>user:42:name</code> и <code>user:42:city</code> попадают в слоты 6755 и 8210 — оба на master B, и всё же команда отвергается, потому что между masters переезжают слоты, а не машины:</p>
+
+<pre><code>redis> MGET user:42:name user:42:city
+(error) CROSSSLOT Keys in request don't hash to the same slot</code></pre>
+
+  <p>Выход — <mark class="key">hash tag</mark>: если в ключе есть <code>{…}</code>, хешируется только часть внутри первой пары фигурных скобок. <code>{user:42}:name</code> и <code>{user:42}:city</code> оба хешируют <code>user:42</code> и делят слот 15880:</p>
+
+<pre><code>redis> MSET {user:42}:name "Ada" {user:42}:city "Milano"
+OK</code></pre>
+
+  <aside class="redpen" data-page="364">
+    <p class="claim">"Master C" → "Slave B1" · "Slave A2" → "Slave A22" · "Slave B1" → "Slave B11", "Slave B12" (labels of the figure "Redis Cluster")</p>
+    <p class="fix">Slave у Master C должен называться C1: "Slave B1" повторяет подпись slave у Master B. И в Redis Cluster каждый slave копирует master напрямую: slaves у slaves, картинка "multi-level" со слайда (p. 361), относятся к standalone-топологии.</p>
+    <p class="because">Узел становится slave командой <code>CLUSTER REPLICATE</code>, и документация Redis требует: "The specified node ID is a master". Когда master падает, его слоты забирает один из его собственных slaves, как показывает режим Cluster в виджете. Экзамен может показать рисунок в напечатанном виде: узнавай его, а сам рисуй masters с прямыми slaves.</p>
+  </aside>
+
+  <p>Теперь поубивай masters сам. Виджет показывает <strong>один инсайт</strong>: копии — ещё не failover, а failover — ещё не распределение; и то и другое есть только у Cluster.</p>
+
+  <div class="widget" id="l19-w-topo">
+    <h3 class="widget-title">Убей master: четыре топологии, один ключ</h3>
+    <p class="widget-intro">Выбери топологию и ключи одной команды (или набери свои). Рисунок показывает, какая машина отвечает за твой первый ключ; под ним — куда попадают ключи: в хеш-слот Cluster или на кольцо прокси. Потом убей master, на котором лежит твой ключ, и посмотри, что ещё работает. Слоты виджет вычисляет через CRC16, как Redis Cluster; кольцо прокси — упрощённая иллюстрация, тоже на CRC16, с двумя точками на master.</p>
+    <ol class="tasks">
+      <li>Начни с «I · standalone: master-slave» и нажми <em>«Убить master с твоим ключом»</em>. Прежде чем смотреть: могут ли клиенты читать? А писать?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Читать — да: slaves по-прежнему отвечают из своих копий, в которых может не быть последних записей. Писать — нет: "Slaves are read only by default" (p. 359) и "There is no automatic failover" (p. 361). Нажми <em>«Повысить slave вручную»</em>: записи возвращаются — после простоя длиной ровно в то время, которое понадобилось человеку, чтобы заметить. Это и есть "Manual" failover со слайда (p. 359).</p></details>
+      </li>
+      <li>Переключись на «II · Sentinel» и снова убей master. Предскажи, кто его заменит и изменится ли показатель «данные».
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Slave 1 становится master, и никто не нажимает кнопку: Sentinels сходятся на том, что master лежит, и повышают его, а slave 2 начинает копировать новый master. «Данные» по-прежнему говорят, что все ключи на одном master: "Sentinel does not distribute data across nodes" (p. 362).</p></details>
+      </li>
+      <li>«III · Twemproxy» с ключом <code>foo</code>: убей master, на котором он лежит. Какие ключи становятся недоступны и заменяет ли его кто-нибудь?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Только ключи этого одного master — на этом кольце <code>foo</code> (позиция 44950) принадлежит master 2. Два других master продолжают отвечать, и никто его не заменяет: Twemproxy распределяет данные, но failover у него нет. Распределение и failover — две отдельные способности; в этом весь смысл таблицы два на два ниже.</p></details>
+      </li>
+      <li>«IV · Cluster» с <code>user:42:name user:42:city</code>. Предскажи, выполнится ли команда на оба ключа. Потом выбери пару с <code>{user:42}</code> и убей master, на котором она лежит.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Отвергается: слоты 6755 и 8210 разные, хотя оба на master B. С hash tag оба ключа хешируют <code>user:42</code>, слот 15880, и команда выполняется. Убийство master C повышает его slave C1, который теперь владеет слотами 12001–16383: у слотов меняется владелец, а слот ключа не меняется.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l19-w-topo', function (root, ui) {
+    /* CRC16-XMODEM on the UTF-8 bytes of the key: the hash of the Redis Cluster specification
+       (checked: "123456789" -> 0x31C3, foo -> slot 12182, hello -> 866, somekey -> 11058) */
+    function utf8(s) {
+      var out = [], i, c, c2, cp;
+      for (i = 0; i < s.length; i++) {
+        c = s.charCodeAt(i);
+        if (c < 0x80) out.push(c);
+        else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+        else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+          c2 = s.charCodeAt(++i); cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+          out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+        } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+      return out;
+    }
+    function crc16(s) {
+      var b = utf8(s), crc = 0, i, k;
+      for (i = 0; i < b.length; i++) {
+        crc ^= b[i] << 8;
+        for (k = 0; k < 8; k++) { crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1); crc &= 0xffff; }
+      }
+      return crc;
+    }
+    function hashPart(key) {
+      var s = key.indexOf('{');
+      if (s < 0) return key;
+      var e = key.indexOf('}', s + 1);
+      if (e < 0 || e === s + 1) return key;
+      return key.substring(s + 1, e);
+    }
+    function slotOf(key) { return crc16(hashPart(key)) % 16384; }
+    var RANGES = ['0–6000', '6001–12000', '12001–16383'], NAMES = ['A', 'B', 'C'];
+    function shardOf(slot) { return slot <= 6000 ? 0 : slot <= 12000 ? 1 : 2; }
+    /* the proxy's ring, cut open: two points per master (an illustration; Twemproxy's default ring has many more) */
+    var RING = [[9000, 0], [21000, 1], [33000, 2], [41000, 0], [52000, 1], [61000, 2]];
+    function ringOwner(pos) { for (var i = 0; i < RING.length; i++) if (RING[i][0] >= pos) return RING[i]; return RING[0]; }
+
+    var dead = -1, promoted = false, hint = '';
+    function fresh() { dead = -1; promoted = false; hint = ''; }
+
+    var topo = ui.select('топология (слайд 20 лекции 8)', [
+      { value: 'single', label: 'I · standalone: только master' },
+      { value: 'ms', label: 'I · standalone: master-slave' },
+      { value: 'sentinel', label: 'II · Sentinel' },
+      { value: 'twem', label: 'III · Twemproxy' },
+      { value: 'cluster', label: 'IV · Cluster' }
+    ], function () { fresh(); }, 'ms');
+    var input;
+    var pre = ui.select('ключи одной команды', [
+      { value: 'foo', label: 'foo' },
+      { value: 'user:42:name user:42:city', label: 'user:42:name user:42:city' },
+      { value: '{user:42}:name {user:42}:city', label: '{user:42}:name {user:42}:city' },
+      { value: 'hello', label: 'hello' },
+      { value: 'own', label: 'свои: набери их ниже' }
+    ], function (v) { if (v !== 'own') input.value = v; hint = ''; }, 'foo');
+    input = Course.el('input', { type: 'text', id: 'l19-w-topo-keys', 'class': 'l19-keyinput', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'off' });
+    input.value = 'foo';
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide' }, [
+      Course.el('label', { 'for': 'l19-w-topo-keys' }, [Course.el('span', { 'class': 'ctl-label', text: 'или набери свои ключи через пробел' })]),
+      input
+    ]));
+    input.addEventListener('input', function () { pre.value = 'own'; hint = ''; ui.changed(); });
+
+    function keys() { return input.value.split(/\s+/).filter(function (k) { return k.length > 0; }).slice(0, 4); }
+    function sharded() { return topo.value === 'twem' || topo.value === 'cluster'; }
+    function ownerIndex(k) {
+      if (k == null) return 0;
+      if (topo.value === 'cluster') return shardOf(slotOf(k));
+      if (topo.value === 'twem') return ringOwner(crc16(k))[1];
+      return 0;
+    }
+
+    ui.button('Убить master с твоим ключом', function () {
+      if (dead >= 0) { hint = 'Здесь мёртвый master только один: нажми «Начать заново», чтобы его вернуть.'; return; }
+      dead = ownerIndex(keys()[0]); promoted = false; hint = '';
+    }, { kind: 'primary' });
+    ui.button('Повысить slave вручную', function () {
+      if (topo.value === 'ms' && dead >= 0) { promoted = true; hint = ''; }
+      else if (topo.value === 'ms') hint = 'Master жив: повышать пока некого.';
+      else if (topo.value === 'single') hint = 'Повышать некого: master один.';
+      else if (topo.value === 'twem') hint = 'У masters за этим прокси нет slaves, а Twemproxy никогда никого не повышает: он только распределяет данные.';
+      else hint = 'Не нужно: в этой топологии повышение автоматическое.';
+    });
+    ui.button('Начать заново', function () { fresh(); }, { kind: 'ghost', icon: 'refresh' });
+
+    var roW = ui.readout('запись (SET)'), roR = ui.readout('чтение (GET)'), roF = ui.readout('failover'), roD = ui.readout('данные'), roK = ui.readout('твои ключи');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'запрос клиента', color: 's2', mark: 'line' },
+      { label: 'копирование master → slave', color: 's1', mark: 'line' },
+      { label: 'машина, которая принимает записи', color: 's6', mark: 'dash' },
+      { label: 'хеш-слоты (Cluster)', color: 's3', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 312, { label: 'Экземпляры Redis выбранной топологии: клиент, masters и slaves, прокси или узлы кластера; запрос к твоему ключу идёт на машину, которая на него отвечает; ниже — куда попадают ключи: в хеш-слот кластера или на кольцо прокси' });
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function machine(cx, cy, o) {
+      S('rect', { x: cx - 22, y: cy - 14, width: 44, height: 28, 'class': 'fi-paper' + (o.master ? ' st-s6 dash sw-3' : '') });
+      [-7, 0, 7].forEach(function (d) { S('line', { x1: cx - 15, y1: cy + d, x2: cx + 15, y2: cy + d, 'class': 'st-muted' }); });
+      if (o.dead) {
+        S('line', { x1: cx - 20, y1: cy - 18, x2: cx + 20, y2: cy + 18, 'class': 'st-bad sw-3' });
+        S('line', { x1: cx - 20, y1: cy + 18, x2: cx + 20, y2: cy - 18, 'class': 'st-bad sw-3' });
+      }
+      if (o.label) T(o.lx != null ? o.lx : cx, o.ly != null ? o.ly : cy + 30, o.label, 'tx-sm' + (o.anchor != null ? o.anchor : ' tx-mid') + (o.halo ? ' halo' : ''));
+    }
+    function client(x, y) { S('rect', { x: x, y: y, width: 36, height: 24, rx: 6, 'class': 'fi-paper' }); }
+    function arrow(x1, y1, x2, y2, cls, mk) { S('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': cls, 'marker-end': 'url(#' + mk + ')' }); }
+    function curve(d, cls, mk) { S('path', { d: d, 'class': cls + ' fi-none', 'marker-end': 'url(#' + mk + ')' }); }
+    function sentinel(cx, cy) { S('circle', { cx: cx, cy: cy, r: 11, 'class': 'fi-paper st-ink' }); T(cx, cy + 5, 'S', 'tx-sm tx-mid tx-bold'); }
+    function labelRows(xs) {
+      /* staggered labels above a strip: two rows, so that close positions do not collide */
+      var last = [-1e9, -1e9];
+      return xs.map(function (x) {
+        if (x - last[0] >= 62) { last[0] = x; return 0; }
+        if (x - last[1] >= 62) { last[1] = x; return 1; }
+        return -1;
+      });
+    }
+
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var t = topo.value, ks = st.keys;
+      if (t === 'single') {
+        client(16, 98); T(34, 140, 'клиент', 'tx-sm tx-mid');
+        arrow(54, 110, 224, 110, 'st-s2 sw-2' + (dead >= 0 ? ' dash' : ''), 'arr-s2');
+        T(140, 98, 'SET · GET', 'tx-sm tx-mid halo');
+        machine(250, 110, { master: dead < 0, dead: dead >= 0, label: dead >= 0 ? 'master: лежит' : 'master' });
+        T(280, 272, 'без партиционирования: все ключи на единственном master', 'tx-sm tx-mid');
+      } else if (t === 'ms' || t === 'sentinel') {
+        var newM = dead >= 0 && (t === 'sentinel' || promoted);
+        client(16, 98); T(34, 140, 'клиент', 'tx-sm tx-mid');
+        if (dead < 0) {
+          arrow(218, 76, 182, 162, 'st-s1 sw-2', 'arr-s1');
+          arrow(242, 76, 318, 162, 'st-s1 sw-2', 'arr-s1');
+          arrow(54, 104, 204, 66, 'st-s2 sw-2', 'arr-s2');
+          T(124, 74, 'SET', 'tx-sm tx-mid halo');
+        } else if (newM) {
+          curve('M 186 166 Q 250 118 314 164', 'st-s1 sw-2', 'arr-s1');
+          arrow(54, 116, 146, 172, 'st-s2 sw-2', 'arr-s2');
+          T(84, 160, 'SET', 'tx-sm tx-mid halo');
+        } else {
+          arrow(54, 104, 204, 66, 'st-s2 sw-2 dash', 'arr-s2');                 /* dashed: refused */
+          T(124, 74, 'SET', 'tx-sm tx-mid halo');
+          arrow(54, 116, 146, 172, 'st-s2 sw-2', 'arr-s2');                      /* solid: the slave still answers */
+          T(84, 160, 'GET', 'tx-sm tx-mid halo');
+        }
+        machine(230, 60, { master: dead < 0, dead: dead >= 0, label: dead >= 0 ? 'master: лежит' : 'master', ly: 36 });
+        machine(170, 180, { master: newM, label: newM ? 'slave 1, теперь master' : 'slave 1', ly: 212 });
+        machine(330, 180, { label: 'slave 2', ly: 212 });
+        if (t === 'sentinel') {
+          sentinel(282, 60); sentinel(222, 180); sentinel(382, 180);
+          T(440, 40, 'S: Sentinel', 'tx-sm tx-mid');
+          T(440, 58, 'на каждом сервере', 'tx-sm tx-mid');
+        }
+        T(280, 272, 'без партиционирования: master и полные копии на slaves', 'tx-sm tx-mid');
+      } else if (t === 'twem') {
+        var own = st.owner;
+        client(16, 98); T(34, 140, 'клиент', 'tx-sm tx-mid');
+        arrow(54, 110, 104, 110, 'st-s2 sw-2', 'arr-s2');
+        T(80, 86, 'SET · GET', 'tx-sm tx-mid');
+        machine(130, 110, { label: 'Twemproxy', ly: 142 });
+        [46, 110, 174].forEach(function (y, i) {
+          if (i === own && ks.length) arrow(154, 110, 276, y, 'st-s2 sw-2' + (dead === i ? ' dash' : ''), 'arr-s2');
+          else S('line', { x1: 154, y1: 110, x2: 276, y2: y, 'class': 'st-muted' });
+          machine(300, y, { master: dead !== i, dead: dead === i, label: 'master ' + (i + 1) + (dead === i ? ': лежит' : ''), lx: 332, ly: y + 5, anchor: '' });
+        });
+        /* the ring, cut open */
+        var px = function (p) { return 40 + p / 65535 * 480; };
+        S('line', { x1: 40, y1: 262, x2: 520, y2: 262, 'class': 'st-muted dash sw-2' });
+        if (ks.length) {
+          var p0 = crc16(ks[0]), o0 = ringOwner(p0);
+          if (o0[0] >= p0) { if (px(o0[0]) - px(p0) > 16) arrow(px(p0) + 6, 262, px(o0[0]) - 8, 262, 'st-s2 sw-2', 'arr-s2'); }
+          else { arrow(px(p0) + 6, 262, 524, 262, 'st-s2 sw-2', 'arr-s2'); if (px(o0[0]) - 36 > 16) arrow(36, 262, px(o0[0]) - 8, 262, 'st-s2 sw-2', 'arr-s2'); }
+        }
+        RING.forEach(function (r) {
+          S('rect', { x: px(r[0]) - 6, y: 256, width: 12, height: 12, 'class': 'fi-paper sw-2' + (dead === r[1] ? ' st-bad' : '') });
+          T(px(r[0]), 286, 'M' + (r[1] + 1), 'tx-sm tx-mid');
+        });
+        var pos = ks.map(function (k) { return crc16(k); });
+        var uniq = pos.filter(function (p, i) { return pos.indexOf(p) === i; }).sort(function (a, b) { return a - b; });
+        var rows = labelRows(uniq.map(px));
+        uniq.forEach(function (p, i) {
+          S('circle', { cx: px(p), cy: 262, r: 5, 'class': 'fi-s3' });
+          if (rows[i] >= 0) T(px(p), rows[i] === 0 ? 246 : 232, String(p), 'tx-mono tx-sm tx-mid');
+        });
+        T(280, 306, 'кольцо в развёртке: позиции 0–65535, две точки на master', 'tx-sm tx-mid tx-muted');
+      } else {
+        /* Cluster: three masters with their slot ranges, one direct slave each, all on the service channel */
+        var ownC = st.owner, COLS = [182, 312, 442];
+        S('rect', { x: 110, y: 32, width: 426, height: 164, rx: 10, 'class': 'st-muted dash fi-none' });
+        T(323, 212, 'service channel: каждый узел связан с каждым', 'tx-sm tx-mid');
+        client(16, 38); T(34, 80, 'клиент', 'tx-sm tx-mid');
+        COLS.forEach(function (cx, i) {
+          var down = dead === i;
+          arrow(cx, 114, cx, 129, 'st-s1 sw-2' + (down ? ' dash' : ''), 'arr-s1');
+          machine(cx, 58, { master: !down, dead: down });
+          T(cx, 90, down ? NAMES[i] + ': лежит' : 'master ' + NAMES[i], 'tx-sm tx-mid');
+          T(cx, 106, down ? 'нет слотов' : RANGES[i], 'tx-mono tx-sm tx-mid');
+          machine(cx, 146, { master: down, label: down ? NAMES[i] + '1: ' + RANGES[i] : 'slave ' + NAMES[i] + '1', ly: 178 });
+        });
+        if (ks.length) {
+          var cxo = COLS[ownC];
+          if (dead === ownC) curve('M 34 38 V 22 H ' + (cxo - 46) + ' V 146 H ' + (cxo - 26), 'st-s2 sw-2', 'arr-s2');
+          else curve('M 34 38 V 22 H ' + cxo + ' V 42', 'st-s2 sw-2', 'arr-s2');
+          T(84, 14, 'SET · GET', 'tx-sm tx-mid');
+        }
+        /* the 16384 slots */
+        var sx = function (s) { return 40 + s / 16383 * 480; };
+        [[0, 6000], [6001, 12000], [12001, 16383]].forEach(function (r, i) {
+          S('rect', { x: sx(r[0]), y: 262, width: sx(r[1]) - sx(r[0]), height: 20, 'class': 'fw-s3 st-s3' });
+          T((sx(r[0]) + sx(r[1])) / 2, 277, dead === i ? NAMES[i] + '1 (был ' + NAMES[i] + ')' : NAMES[i], 'tx-sm tx-mid');
+        });
+        var sl = ks.map(slotOf);
+        var us = sl.filter(function (s, i) { return sl.indexOf(s) === i; }).sort(function (a, b) { return a - b; });
+        var rws = labelRows(us.map(sx));
+        us.forEach(function (s, i) {
+          S('path', { d: 'M ' + (sx(s) - 5) + ' 252 L ' + (sx(s) + 5) + ' 252 L ' + sx(s) + ' 260 Z', 'class': 'fi-s3' });   /* a key's position: fi-s3, as on the proxy's ring */
+          if (rws[i] >= 0) T(sx(s), rws[i] === 0 ? 246 : 232, String(s), 'tx-mono tx-sm tx-mid');
+        });
+        T(280, 302, 'хеш-слоты 0–16383: slot = CRC16(key) mod 16384', 'tx-sm tx-mid tx-muted');
+      }
+    }
+
+    function state() {
+      var ks = keys(), t = topo.value, k0 = ks[0];
+      var st = { keys: ks, owner: ownerIndex(k0) };
+      var W, R, F, D, K, toneW, toneR, toneK, msg;
+      if (t === 'single') {
+        D = 'все ключи на одном master';
+        K = ks.length ? 'все на master: без партиционирования' : '—';
+        if (dead < 0) { W = 'принимает master'; R = 'отвечает master'; F = 'нет: переключаться не на что'; msg = 'Всё держит одна машина. Убей её и посмотри, что останется.'; }
+        else { W = 'отказ: единственный master лежит'; R = 'отказ'; toneW = toneR = 'bad'; F = 'нет: кто-то должен перезапустить master'; msg = 'Всё лежит, пока master не перезапустится, — а без RDB или AOF он вернётся пустым.'; }
+      } else if (t === 'ms' || t === 'sentinel') {
+        D = t === 'sentinel' ? 'все ключи на master, полные копии на 2 slaves: без распределения' : 'все ключи на master, полные копии на 2 slaves';
+        K = ks.length ? 'на master и на каждом slave' : '—';
+        if (dead < 0) {
+          W = 'принимает master'; R = 'отвечает master или slave';
+          F = t === 'sentinel' ? 'автоматический: 3 Sentinel следят за master' : 'нет: “There is no automatic failover” (слайд 21 лекции 8)';
+          msg = t === 'sentinel' ? 'Три Sentinel следят за master. Убей его.' : 'Slaves копируют каждую запись master. Теперь убей master.';
+        } else if (t === 'sentinel') {
+          W = 'принимает slave 1, повышенный Sentinels'; toneW = 'good'; R = 'отвечает slave 1 (новый master) или slave 2';
+          F = 'автоматический: Sentinels договорились, повысили slave 1 и перенаправили slave 2';
+          msg = 'Sentinels увидели, что master замолчал, сошлись на том, что он лежит, и большинством голосов повысили slave 1; slave 2 теперь копирует slave 1, а клиенты спрашивают у Sentinels новый адрес. Записи, которые старый master ещё не успел скопировать, потеряны (репликация асинхронная).';
+        } else if (promoted) {
+          W = 'принимает slave 1, повышенный вручную'; toneW = 'good'; R = 'отвечает slave 1 или slave 2';
+          F = 'вручную: оператор повысил slave 1';
+          msg = 'Записи вернулись — после простоя длиной в то время, которое понадобилось человеку, чтобы заметить. Оператору пришлось ещё и перенаправить slave 2 и клиентов.';
+        } else {
+          W = 'отказ: master лежит, а slaves только для чтения'; toneW = 'bad'; R = 'отвечают slaves (в их копиях может не быть последних записей)';
+          F = 'пока нет: нажми «Повысить slave вручную»'; toneR = 'key';
+          msg = '“Slaves are read only by default” (слайд 19 лекции 8) и “There is no automatic failover” (слайд 21 лекции 8): чтение выживает, записи ждут человека.';
+        }
+      } else if (t === 'twem') {
+        D = 'разделены между 3 masters через consistent hashing';
+        if (ks.length) {
+          K = ks.map(function (k) { var p = crc16(k); return k + ': кольцо ' + p + ' → master ' + (ringOwner(p)[1] + 1); }).join(' · ');
+        } else K = 'набери ключ';
+        F = 'нет: Twemproxy только распределяет данные';
+        if (dead < 0) {
+          W = 'прокси направляет на master каждого ключа'; R = W;
+          msg = 'Прокси хеширует каждый ключ на кольцо и отправляет его на первую точку master по часовой стрелке (вправо, с переходом через конец).';
+        } else {
+          var hit = ks.some(function (k) { return ringOwner(crc16(k))[1] === dead; });
+          W = hit ? 'отказ для ключей master ' + (dead + 1) + '; остальные работают' : 'твои ключи работают: их masters живы';
+          R = W; toneW = toneR = hit ? 'bad' : '';
+          msg = 'Master ' + (dead + 1) + ' лежит, и никто его не заменяет: его ключи недоступны, пока он не вернётся. Остальные masters продолжают отвечать — распределение без failover.';
+        }
+      } else {
+        D = '16384 слота разделены между 3 masters, у каждого slave';
+        if (ks.length) {
+          var sl = ks.map(slotOf);
+          K = ks.map(function (k, i) { return k + ': слот ' + sl[i] + ' (' + NAMES[shardOf(sl[i])] + ')'; }).join(' · ');
+          if (ks.length > 1) {
+            var same = sl.every(function (s) { return s === sl[0]; });
+            K += same ? ' · один слот: multi-key команда выполняется' : ' · разные слоты: multi-key команда отвергается (CROSSSLOT)';
+            toneK = same ? 'good' : 'bad';
+          }
+        } else K = 'набери ключ';
+        if (dead < 0) {
+          W = 'идёт на master, владеющий слотом'; R = 'идёт на владельца слота';
+          F = 'автоматический: встроен в кластер';
+          msg = ks.length > 1 ? 'Каждый ключ живёт в слоте CRC16(key) mod 16384. Multi-key команды — только для ключей в одном слоте (слайд 24 лекции 8).' : 'Каждый ключ живёт в слоте CRC16(key) mod 16384; на рисунке слайда master A владеет слотами 0–6000, B — 6001–12000, C — 12001–16383.';
+        } else {
+          W = 'принимает ' + NAMES[dead] + '1, новый владелец слотов ' + RANGES[dead]; toneW = 'good'; R = W;
+          F = 'автоматический: slave ' + NAMES[dead] + '1 выбран и повышен';
+          msg = 'Узлы заметили по service channel, что master ' + NAMES[dead] + ' лежит; его slave ' + NAMES[dead] + '1 повышен и теперь владеет слотами ' + RANGES[dead] + '. Формула не изменилась: каждый ключ сохраняет свой слот, у слота сменился только владелец.';
+        }
+      }
+      st.W = W; st.R = R; st.F = F; st.D = D; st.K = K; st.toneW = toneW; st.toneR = toneR; st.toneK = toneK; st.msg = msg;
+      return st;
+    }
+
+    ui.onChange(function () {
+      var st = state();
+      roW.set(st.W, st.toneW || undefined);
+      roR.set(st.R, st.toneR || undefined);
+      roF.set(st.F);
+      roD.set(st.D);
+      roK.set(st.K, st.toneK || undefined);
+      note.set(hint || st.msg);
+      draw(st);
+    });
+  });
+  </script>
+
+  <figure class="tbl-fig" id="l19-tbl-2x2">
+    <figcaption>Четыре топологии со слайда (p. 360) по двум независимым вопросам.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>каждый master хранит все данные</th><th>данные распределены по masters</th></tr></thead>
+        <tbody>
+          <tr><th>нет автоматического failover</th><td>I · Standalone (только master, master-slave, multi-level)</td><td>III · Twemproxy (consistent hashing; нет multi-key команд и транзакций)</td></tr>
+          <tr><th>автоматический failover</th><td>II · Sentinel (slaves повышаются голосованием)</td><td>IV · Cluster (16384 слота; multi-key только в пределах одного слота)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>«Redis обладает высокой доступностью». Слайд с преимуществами (p. 365) перечисляет "Availability" и "Fault-Tolerance" — но это верно только для нижней строки таблицы: про standalone-развёртывание слайд (p. 361) говорит "There is no automatic failover."</p></div>
+</section>
+
+
+<section id="l19-cache">
+  <h2>Когда кэш окупается</h2>
+
+  <p>Вернёмся ко второй программе из загадки. Слайды определяют кэш по Википедии (p. 367): "A cache is a collection of data duplicating original values stored elsewhere or computed earlier, where the original data is expensive to fetch (owing to longer access time) or to compute, compared to the cost of reading the cache" — термин, который они приписывают IBM, 1960-е годы. Его анатомия (p. 368) — это key-value хранилище из урока 17, урезанное до костей: "simple key/value storage" и три операции: save, get, delete.</p>
+
+  <p>Словарь со слайда (p. 369) и что означает каждое название:</p>
+
+  <div class="def">
+    <p><dfn>Стоимость хранения (storage cost)</dfn> — память, потраченная на хранение копий.</p>
+    <p><dfn>Стоимость извлечения (retrieval cost)</dfn> — цена одного обращения к кэшу: "network load / algorithm load", переход на другой сервер или работа самого поиска.</p>
+    <p><dfn>Инвалидация (invalidation)</dfn> — "keeping data up to date / removing irrelevant data": выбрасывание копий, чей оригинал изменился.</p>
+    <p><dfn>Политика вытеснения (replacement policy)</dfn> — какую запись выкинуть, когда кэш полон: "FIFO/LFU/LRU/MRU/RANDOM vs. Belady's algorithm". FIFO вытесняет самую старую запись, LFU — используемую реже всего, LRU — дольше всех не использованную, MRU — использованную последней, RANDOM — любую. Алгоритм Белади (Laszlo Belady, IBM, 1966) вытесняет запись, которая снова понадобится позже всех: лучший возможный выбор и невозможный на практике, потому что для него нужно знать будущее. Это эталон для остальных, как байесовский классификатор в статистике для реальных классификаторов: оптимален и недостижим без информации, которой у тебя нет.</p>
+    <p><dfn>Холодный / тёплый кэш (cold cache / warm cache)</dfn> — только что запущен и пуст, так что почти каждый запрос промахивается; или заполнен теми записями, которые запросы спрашивают снова и снова.</p>
+  </div>
+
+  <aside class="margin-note">На слайде написано "hits / hits + misses", без скобок. Собственный пример слайда, 45/(45+10), показывает, что имеется в виду.</aside>
+
+  <p>Запрос, который нашёл свой ключ, — это <mark class="key">попадание в кэш (cache hit)</mark>; запрос, который не нашёл, — промах (miss), и он идёт к оригиналу. Слайд (p. 370) берёт 45 попаданий и 10 промахов:</p>
+
+  \[ \begin{aligned} h &amp;= \frac{\text{hits}}{\text{hits} + \text{misses}} \\ &amp;= \frac{45}{45 + 10} \approx 0.818 \end{aligned} \]
+  \[ \text{miss ratio} = 1 - h \approx 0.182 \]
+
+  <p>Слайд округляет их до "82% hit ratio" и "18% miss ratio".</p>
+
+  <h3>Попаданий больше, чем промахов?</h3>
+
+  <p>Слайд "When to cache?" (p. 371) даёт принцип и упрощённое правило: "caches are only efficient when the benefits of faster access outweigh the overhead of checking and keeping your cache up to date" — "more cache hits then cache misses". Вывод ниже, которого на слайдах нет, превращает принцип в число. Обозначим \(t_c\) стоимость одного обращения к кэшу, а \(t_o\) — стоимость оригинала, запроса к базе:</p>
+
+  <ol class="steps" id="l19-steps-breakeven">
+    <li><p>Попадание стоит только обращения: \(t_c\). Промах стоит обращения и затем похода к оригиналу: \(t_c + t_o\).</p></li>
+    <li><p>Доля \(h\) запросов попадает, а \(1 - h\) промахивается, так что средний запрос стоит</p> \[ T = h\,t_c + (1-h)(t_c + t_o) . \]</li>
+    <li><p>Соберём \(t_c\), который платит каждый запрос:</p> \[ T = t_c + (1-h)\,t_o . \]</li>
+    <li><p>Без кэша каждый запрос стоит \(t_o\). Кэш окупается, когда \(T \lt t_o\):</p> \[ t_c + (1-h)\,t_o \lt t_o \iff h \gt \frac{t_c}{t_o} . \]</li>
+    <li><p>Значит, доля попаданий в точке безубыточности (break-even) равна \(h^* = t_c / t_o\): цена одного обращения, измеренная в походах к оригиналу. «Попаданий больше, чем промахов», \(h \gt 0.5\), — то же правило, только когда обращение стоит половину похода. (Запись копий и их инвалидация добавляются к \(t_c\): это "keeping your cache up to date" со слайда.)</p></li>
+  </ol>
+
+  <aside class="redpen" data-page="371">
+    <p class="claim">"more cache hits then cache misses"</p>
+    <p class="fix">Это не условие. Кэш окупается, когда его доля попаданий превышает точку безубыточности \(t_c / t_o\) — стоимость обращения, делённую на стоимость оригинала. «Попаданий больше, чем промахов» — частный случай, когда обращение стоит половину похода к оригиналу.</p>
+    <p class="because">При \(t_c = 1\) ms перед запросом в 200 ms окупается уже доля попаданий 0.3: \(1 + 0.7 \times 200 = 141\) ms вместо 200 ms. При \(t_c = 1.5\) ms перед запросом в 2 ms проигрывает даже 0.7: \(1.5 + 0.3 \times 2 = 2.1\) ms. Попробуй оба случая в виджете ниже. Пункт над этим на том же слайде формулирует настоящий принцип; экзамен может процитировать упрощённое правило как напечатано, так что знай оба и говори, какое из них — условие.</p>
+  </aside>
+
+  <div class="widget" id="l19-w-cache">
+    <h3 class="widget-title">Кэш перед базой данных: попадания, промахи и устаревшие чтения</h3>
+    <p class="widget-intro">Поток из 3000 запросов к профилям 100 пользователей (тот самый <code>getUserData</code> со слайда, p. 386), десять в секунду; примерно 2 из 100 — записи: пользователь меняет настройку. Перекос (skew) задаёт, насколько доминируют популярные пользователи. График показывает среднее время на чтение, вычисленное из смоделированной доли попаданий и двух твоих стоимостей; полоса показывает первые и последние 60 чтений. Ни одно число здесь не со слайдов: поток смоделирован, стоимости — твои.</p>
+    <ol class="tasks">
+      <li>Поставь перекос 0: все пользователи одинаково популярны. Прежде чем смотреть: доля попаданий будет выше или ниже 0.5 — и окупится ли кэш при \(t_c = 1\) ms, \(t_o = 50\) ms?
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Около 0.2 (0.198): попаданий гораздо меньше, чем промахов. Кэш всё равно окупается: \(1 + 0.802 \times 50 \approx 41\) ms вместо 50 ms, потому что точка безубыточности — \(1/50 = 0.02\). Это и есть инсайт виджета: «попаданий больше, чем промахов» никогда не было условием, условие — \(h \gt t_c / t_o\). Первая строка полосы показывает холодный старт: пустой кэш промахивается почти всегда.</p></details>
+      </li>
+      <li>Перекос 1.2 даёт попаданий больше, чем промахов (\(h \approx 0.70\)). Теперь сделай базу быстрой, а кэш далёким: \(t_o = 2\) ms, \(t_c = 1.5\) ms. Предскажи вердикт.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Кэш проигрывает: \(1.5 + 0.296 \times 2 \approx 2.09\) ms против 2 ms. Точка безубыточности — \(1.5 / 2 = 0.75\), выше тех 0.70, которых достигает этот кэш: попаданий больше, чем промахов, а всё равно медленнее, чем вовсе без кэша.</p></details>
+      </li>
+      <li>Нажми <em>«Вернуть по умолчанию»</em>, поставь перекос 1.0 и размер 10. Расставь по местам FIFO, LRU, LFU, MRU, RANDOM и Belady, прежде чем их пробовать.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Belady 0.611, LFU 0.513, LRU 0.379, FIFO 0.336, RANDOM 0.332, MRU 0.144. Belady — потолок: он знает будущее. В этом потоке популярность никогда не меняется, поэтому ближе всех подбирается LFU, который держит самых популярных пользователей. MRU выбрасывает ровно ту запись, которую только что использовали, — худший выбор, когда возвращаются одни и те же пользователи. (В реальном трафике популярность дрейфует, и LRU следит за ней лучше, чем LFU.)</p></details>
+      </li>
+      <li>Поставь размер 40 (перекос 1.0, LRU, TTL «не истекает») и посмотри на устаревшие попадания. Потом поставь TTL 10 s; потом переключись на инвалидацию по событию.
+        <details class="answer"><summary>Что ты должен увидеть</summary>
+          <p>Без истечения: \(h \approx 0.75\), но 1182 устаревших попадания, 40 % всех чтений — популярные пользователи остаются в кэше навсегда, и их изменения так и не видны. TTL 10 s: 149 устаревших попаданий (5 %), но \(h\) падает до 0.64. По событию: ноль устаревших попаданий при \(h \approx 0.735\). Более короткий TTL покупает свежесть ценой попаданий и никогда не доходит до нуля; удаление при каждой записи доходит до нуля ценой одного промаха после каждой записи.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l19-w-cache', function (root, ui) {
+    var M = 100, N = 3000, PER_S = 10, P_WRITE = 0.02;
+    var TTLS = [1, 2, 5, 10, 20, 30, 60, 120, Infinity];
+    /* one fixed stream of random numbers: the skew changes only which user each request asks for */
+    var base = (function () {
+      var r = Course.rng(19), out = [];
+      for (var i = 0; i < N; i++) out.push({ u: r.random(), w: r.random() < P_WRITE });
+      return out;
+    })();
+    var reqs = null, reqsS = null;
+    function streamFor(s) {
+      var wts = [], tot = 0, k, i;
+      for (k = 1; k <= M; k++) { var p = Math.pow(k, -s); wts.push(p); tot += p; }
+      var cdf = [], acc = 0;
+      for (k = 0; k < M; k++) { acc += wts[k] / tot; cdf.push(acc); }
+      cdf[M - 1] = 1;
+      var out = base.map(function (b) { var j = 0; while (j < M - 1 && cdf[j] < b.u) j++; return { k: j, w: b.w }; });
+      var last = {};
+      for (i = N - 1; i >= 0; i--) {                 // next READ of the same user, for Belady
+        out[i].next = last[out[i].k] == null ? Infinity : last[out[i].k];
+        if (!out[i].w) last[out[i].k] = i;
+      }
+      return out;
+    }
+    function simulate(rq, C, policy, mode, ttl) {
+      var r = Course.rng(7), list = [], where = {}, ver = [], i;
+      for (i = 0; i < M; i++) ver.push(0);
+      var reads = 0, hits = 0, stale = 0, log = [];
+      function drop(idx) {
+        delete where[list[idx].k];
+        list.splice(idx, 1);
+        for (var j = idx; j < list.length; j++) where[list[j].k] = j;
+      }
+      function victim() {
+        if (policy === 'random') return Math.floor(r.random() * list.length);
+        var best = 0, j, e, b;
+        for (j = 1; j < list.length; j++) {
+          e = list[j]; b = list[best];
+          if (policy === 'fifo' && e.ins < b.ins) best = j;
+          else if (policy === 'lru' && e.last < b.last) best = j;
+          else if (policy === 'mru' && e.last > b.last) best = j;
+          else if (policy === 'lfu' && (e.cnt < b.cnt || (e.cnt === b.cnt && e.last < b.last))) best = j;
+          else if (policy === 'opt' && e.next > b.next) best = j;
+        }
+        return best;
+      }
+      for (i = 0; i < N; i++) {
+        var q = rq[i], t = i / PER_S;
+        if (q.w) {
+          ver[q.k]++;
+          if (mode === 'event' && where[q.k] != null) drop(where[q.k]);
+          continue;
+        }
+        reads++;
+        var idx = where[q.k], e = idx == null ? null : list[idx], res;
+        if (e && (mode === 'event' || t - e.setT < ttl)) {
+          hits++;
+          res = e.ver < ver[q.k] ? 'stale' : 'hit';
+          if (res === 'stale') stale++;
+          e.last = i; e.cnt++; e.next = q.next;
+        } else {
+          res = 'miss';
+          if (e) { e.ver = ver[q.k]; e.setT = t; e.ins = i; e.last = i; e.cnt++; e.next = q.next; }
+          else {
+            if (list.length >= C) drop(victim());
+            list.push({ k: q.k, ver: ver[q.k], setT: t, ins: i, last: i, cnt: 1, next: q.next });
+            where[q.k] = list.length - 1;
+          }
+        }
+        log.push(res);
+      }
+      return { reads: reads, hits: hits, misses: reads - hits, stale: stale, h: reads ? hits / reads : 0, log: log };
+    }
+
+    var skew = ui.slider({ label: 'перекос популярности s (0: все 100 пользователей одинаково популярны)', min: 0, max: 1.5, step: 0.1, value: 1 });
+    var size = ui.slider({ label: 'размер кэша (записей, на 100 пользователей)', min: 1, max: 40, step: 1, value: 20 });
+    var pol = ui.select('политика вытеснения (слайд 29 лекции 8)', [
+      { value: 'fifo', label: 'FIFO: вытеснить самую старую запись' },
+      { value: 'lru', label: 'LRU: вытеснить дольше всех не использованную' },
+      { value: 'lfu', label: 'LFU: вытеснить используемую реже всех' },
+      { value: 'mru', label: 'MRU: вытеснить использованную последней' },
+      { value: 'random', label: 'RANDOM: вытеснить любую' },
+      { value: 'opt', label: 'Belady: вытеснить нужную позже всех (знает будущее)' }
+    ], null, 'lru');
+    var mode = ui.select('инвалидация', [
+      { value: 'ttl', label: 'по времени: держать, пока не истечёт TTL (слайд 48 лекции 8)' },
+      { value: 'event', label: 'по событию: удалять запись при каждой записи (слайд 50 лекции 8)' }
+    ], null, 'ttl');
+    var ttl = ui.slider({ label: 'TTL (только для инвалидации по времени)', min: 0, max: 8, step: 1, value: 8, format: function (v) { var x = TTLS[Math.round(v)]; return x === Infinity ? 'не истекает' : x + ' s'; } });
+    var tc = ui.slider({ label: 'одно обращение к кэшу, t<sub>c</sub>', min: 0.1, max: 5, step: 0.1, value: 1, format: function (v) { return v.toFixed(1) + ' ms'; } });
+    var to = ui.slider({ label: 'один запрос к базе, t<sub>o</sub>', min: 1, max: 200, step: 1, value: 50, format: function (v) { return Math.round(v) + ' ms'; } });
+    ui.button('Вернуть по умолчанию', function () {
+      skew.set(1, true); size.set(20, true); pol.value = 'lru'; mode.value = 'ttl'; ttl.set(8, true); tc.set(1, true); to.set(50, true);
+    }, { kind: 'ghost', icon: 'refresh' });
+
+    var roN = ui.readout('чтения, попадания, промахи (модель)');
+    var roH = ui.readout('доля попаданий h = hits / (hits + misses)');
+    var roS = ui.readout('устаревшие попадания: отдана старая копия');
+    var roT = ui.readout('время на чтение, расчёт: t<sub>c</sub> + (1 − h)·t<sub>o</sub>');
+    var roB = ui.readout('точка безубыточности h* = t<sub>c</sub> / t<sub>o</sub>');
+    var note = ui.note('');
+
+    var plot = ui.plot({ x: [0, 1], y: [0, 57], xLabel: 'доля попаданий h', yLabel: 'время на чтение (ms)', aspect: 2, label: 'Среднее время на чтение в зависимости от доли попаданий: горизонтальная линия без кэша, убывающая линия с кэшем, точка безубыточности, доля 0.5 и точка смоделированного кэша' });
+    var strip = ui.svg(560, 120, { label: 'Первые 60 и последние 60 чтений смоделированного потока: каждое — попадание, устаревшее попадание или промах' });
+    ui.legend([
+      { label: 'без кэша: каждое чтение стоит t<sub>o</sub>', color: 's4', mark: 'line' },
+      { label: 'с кэшем: t<sub>c</sub> + (1 − h)·t<sub>o</sub>', color: 's5', mark: 'line' },
+      { label: 'точка безубыточности h*', color: 'soft', mark: 'dash' },
+      { label: '«попаданий больше, чем промахов»: h = 0.5', color: 'muted', mark: 'dash' },
+      { label: 'этот смоделированный кэш', color: 'ink', mark: 'hl' }
+    ]);
+
+    var st = null;
+    function run() {
+      var s = Math.round(skew.value * 10) / 10;
+      if (s !== reqsS) { reqs = streamFor(s); reqsS = s; }
+      return simulate(reqs, Math.max(1, Math.round(size.value)), pol.value, mode.value, TTLS[Math.round(ttl.value)]);
+    }
+    function ms(x) { return (x < 10 ? x.toFixed(2) : x.toFixed(1)) + ' ms'; }
+
+    plot.draw(function (g) {
+      if (!st) return;
+      var a = tc.value, b = to.value, h = st.h, hs = a / b;
+      g.hline(b, { color: 's4', width: 2.5 });
+      g.line(function (x) { return a + (1 - x) * b; }, { color: 's5', width: 2.5 });
+      g.vline(0.5, { color: 'muted', dash: true });
+      if (hs <= 1) g.vline(hs, { color: 'soft', dash: true });
+      var y = a + (1 - h) * b;
+      g.circle(h, y, 9, { px: true, color: 'key', alpha: 0.6, stroke: false });
+      g.points([[h, y]], { color: 'ink', r: 4.5 });
+    });
+
+    function drawStrip() {
+      while (strip.firstChild) strip.removeChild(strip.firstChild);
+      function S(tag, a) { return Course.svg(tag, a, strip); }
+      var CLS = { hit: 'fi-s2', stale: 'fw-bad st-bad sw-2', miss: 'fi-paper st-muted' };
+      [[st.log.slice(0, 60), 18, 'первые 60 чтений: кэш стартует холодным'], [st.log.slice(-60), 64, 'последние 60 чтений: кэш тёплый']].forEach(function (row) {
+        S('text', { x: 20, y: row[1], 'class': 'tx-sm', text: row[2] });
+        row[0].forEach(function (res, i) { S('rect', { x: 20 + i * 8.6, y: row[1] + 8, width: 7, height: 16, 'class': CLS[res] }); });
+      });
+      [['hit', 'попадание', 20], ['stale', 'старая копия', 140], ['miss', 'промах (база)', 290]].forEach(function (l) {
+        S('rect', { x: l[2], y: 100, width: 7, height: 14, 'class': CLS[l[0]] });
+        S('text', { x: l[2] + 14, y: 112, 'class': 'tx-sm', text: l[1] });
+      });
+    }
+
+    ui.onChange(function () {
+      st = run();
+      var a = tc.value, b = to.value, h = st.h, T = a + (1 - h) * b, hs = a / b;
+      roN.set('чтений ' + st.reads + ': попаданий ' + st.hits + ', промахов ' + st.misses);
+      roH.set(h.toFixed(3) + ' · доля промахов ' + (1 - h).toFixed(3));
+      roS.set(st.stale ? st.stale + ', ' + (100 * st.stale / st.reads).toFixed(1) + ' % чтений' : '0: каждое попадание было свежим', st.stale ? 'bad' : 'good');
+      roT.set(a.toFixed(1) + ' + ' + (1 - h).toFixed(3) + ' × ' + Math.round(b) + ' = ' + ms(T) + ' (без кэша: ' + Math.round(b) + ' ms)');
+      if (hs >= 1) roB.set(hs.toFixed(2) + ': не окупится ни при какой доле попаданий', 'bad');
+      else if (h > hs) roB.set(hs.toFixed(3) + ' · этот кэш окупается: в ' + (b / T).toFixed(2) + ' раза быстрее', 'good');
+      else roB.set(hs.toFixed(3) + ' · с этим кэшем медленнее, чем без него', 'bad');
+      var pn = { fifo: 'FIFO вытесняет запись, сохранённую первой.', lru: 'LRU вытесняет запись, которую дольше всех не использовали, — это политика memcached (слайд 42 лекции 8).', lfu: 'LFU вытесняет запись, которую спрашивали реже всех.', mru: 'MRU вытесняет запись, использованную последней.', random: 'RANDOM вытесняет любую запись.', opt: 'Belady вытесняет запись, чьё следующее чтение дальше всех: он читает будущее, поэтому запустить его может только симулятор (слайд 29 лекции 8).' }[pol.value];
+      var mn = mode.value === 'event' ? ' По событию: “Store forever, and expire on certain events” (слайд 50 лекции 8); TTL игнорируется.' : (TTLS[Math.round(ttl.value)] === Infinity ? ' По времени без истечения: копия остаётся, пока её не вытеснят, какой бы старой она ни была.' : ' По времени: “You can’t trust that data coming from cache is correct” (слайд 48 лекции 8).');
+      note.set(pn + mn);
+      plot.setView({ x: [0, 1], y: [0, (a + b) * 1.12] });
+      drawStrip();
+    });
+  });
+  </script>
+
+  <h3>Где живут кэши</h3>
+
+  <p>Кэши стоят везде, где за чем-то быстрым стоит что-то медленное. Слайд (p. 372) перечисляет железо ("cpu, hdd"), операционные системы ("ram"), "web stack", приложения — и даже "your own short term vs long term memory". Веб-стек держит целую лестницу кэшей (p. 373): кэш браузера, кэш DNS, сети доставки контента (CDN), прокси-серверы и, в приложении, "full output caching" и кэширование данных из раздела 5. Вдоль лестницы (p. 374) "the closer to the original request(er), the faster" — "but probably also the harder to get it right", поскольку "the closer to the requester the more parameters the cache depends on": копия в твоём браузере зависит от тебя, твоих cookies, твоего языка; копия рядом с базой обслуживает всех пользователей.</p>
+</section>
+
+
+<section id="l19-memcached">
+  <h2>Memcached: кэш, который забывает намеренно</h2>
+
+  <p>Memcached — это кэш из слайдов: "Free &amp; open source, high-performance, distributed memory object caching system", "Generic in nature, intended for use in speeding up dynamic web applications by alleviating database load", "key/value dictionary" (p. 376) — то есть распределённый кэш объектов в памяти, который разгружает базу динамических веб-приложений. Его "Developed by Brad Fitzpatrick for LiveJournal in 2003" (p. 377).</p>
+
+  <div class="story" data-year="2003–2004"><p>LiveJournal тогда работал примерно на 70 машинах для 2,5 миллиона аккаунтов. В статье 2004 года в Linux Journal Фицпатрик писал, что хотел «глобальную хеш-таблицу, к которой все веб-процессы на всех машинах могли бы обращаться одновременно», и сообщал о серверах, которые работали по 4–5 месяцев без перерыва и обрабатывали в среднем 7000 запросов в секунду.</p></div>
+
+  <p>"Technically" (p. 378): "It's a server", к которому обращаются через "Client access over TCP or UDP". "Servers can run in pools": "eg. 3 servers with 64GB mem each give you a single pool of 192GB storage for caching". И проектное решение: "Servers are independent, clients manage the pool". Ни один сервер не знает о других; клиентская библиотека хеширует ключ и выбирает сервер (рис. 3) — это клиентский уровень партиционирования со слайда (p. 359). У каждого ключа один дом, поэтому каждый добавленный сервер добавляет всю свою память.</p>
+
+  <figure class="fig fig--plain" id="l19-fig-pool">
+    <svg class="dia" viewBox="0 0 560 240" role="img" aria-label="Клиент отправляет get('user_42') на сервер 2 из трёх независимых серверов memcached по 64 GB; где живёт ключ, решает клиент, а не серверы; вместе три сервера образуют один пул на 192 GB">
+      <line x1="58" y1="104" x2="276" y2="52" class="st-muted"/>
+      <line x1="58" y1="116" x2="276" y2="178" class="st-muted"/>
+      <line x1="58" y1="110" x2="274" y2="115" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <rect x="20" y="98" width="36" height="24" rx="6" class="fi-paper"/>
+      <rect x="278" y="36" width="44" height="28" class="fi-paper"/>
+      <line x1="285" y1="43" x2="315" y2="43" class="st-muted"/>
+      <line x1="285" y1="50" x2="315" y2="50" class="st-muted"/>
+      <line x1="285" y1="57" x2="315" y2="57" class="st-muted"/>
+      <rect x="278" y="101" width="44" height="28" class="fi-paper"/>
+      <line x1="285" y1="108" x2="315" y2="108" class="st-muted"/>
+      <line x1="285" y1="115" x2="315" y2="115" class="st-muted"/>
+      <line x1="285" y1="122" x2="315" y2="122" class="st-muted"/>
+      <rect x="278" y="166" width="44" height="28" class="fi-paper"/>
+      <line x1="285" y1="173" x2="315" y2="173" class="st-muted"/>
+      <line x1="285" y1="180" x2="315" y2="180" class="st-muted"/>
+      <line x1="285" y1="187" x2="315" y2="187" class="st-muted"/>
+      <text x="38" y="142" class="tx-sm tx-mid">клиент</text>
+      <text x="166" y="100" class="tx-mono tx-sm tx-mid halo">get('user_42')</text>
+      <text x="334" y="55" class="tx-sm">сервер 1 · 64 GB</text>
+      <text x="334" y="120" class="tx-sm">сервер 2 · 64 GB</text>
+      <text x="334" y="185" class="tx-sm">сервер 3 · 64 GB</text>
+      <text x="300" y="228" class="tx-sm tx-mid tx-bold">3 × 64 GB = один пул на 192 GB</text>
+      <text x="30" y="30" class="tx-hand">сервер выбирает клиент</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Пул memcached, как его описывает слайд (p. 378). Серверы никогда не разговаривают друг с другом: клиентская библиотека хеширует ключ и отправляет запрос на тот единственный сервер, где он лежит.</figcaption>
+  </figure>
+
+  <p>Что заслуживает места в нём (pp. 379–380): данные "high demand (used often)", "expensive (hard to compute)" и "common", то есть общие для пользователей, — "Best: All three". Типичные жильцы: "user sessions (often)", "user data (often, shared)", "homepage data (eg. often, shared, expensive)".</p>
+
+  <h3>Его принципы — это его ограничения</h3>
+
+  <p>Слайд (p. 381) начинается с одного достоинства, "Fast network access (memcached servers close to other application servers)", а затем идут четыре отказа: "No persistency (if your server goes down, data in memcached is gone)", "No redundancy / fail-over", "No replication (single item in cache lives on one server only)", "No authentication (not in shared environments)". Следующий слайд (p. 382) добавляет ограничения и ещё два отказа: "1 key is maximum 1MB", "keys are strings of 250 characters (in application typically MD5 of user readable string)", "No enumeration of keys (thus no list of valid keys in cache at certain moment)", "No active clean-up (only clean up when more space needed, LRU: Least Recently Used )".</p>
+
+  <aside class="redpen" data-page="382">
+    <p class="claim">"1 key is maximum 1MB"</p>
+    <p class="fix">Лимит 1 MB (по умолчанию) относится к элементу (item) — значению, которое хранится под ключом. Сам ключ ограничен 250 символами, как говорит следующий пункт.</p>
+    <p class="because">В напечатанном виде два пункта противоречат друг другу: 250 символов не могут весить 1 MB. Протокол memcached ограничивает ключи 250 символами, а элементы по умолчанию — 1 MB. Экзамен может процитировать напечатанную фразу: узнавай её и помни, что ключ ограничен 250 символами.</p>
+  </aside>
+
+  <p>Сравни этот список со слайдом (p. 359): memcached намеренно лишён трёх из четырёх видов механизмов раздела 1 — persistence, replication, failover — и оставляет только простейшую форму четвёртого, партиционирование силами клиента. Остальные три ему не нужны: каждое значение в нём дублирует что-то, что хранится в другом месте, поэтому погибший сервер стоит времени — его ключи промахиваются, пока не загрузятся из базы заново, — а не данных. Его клиентский API (p. 383) — небольшой словарь любого key-value хранилища: <code>add</code>, <code>set</code>, <code>get</code>, <code>getMulti</code>, <code>delete</code>, <code>increment</code>, <code>decrement</code>, <code>flush</code>, плюс <code>addServer</code>, чтобы расширить пул, и <code>getStats</code>, чтобы за ним следить.</p>
+
+  <h3>Memcached и Redis бок о бок</h3>
+
+  <p>Слайд (p. 365) перечисляет преимущества Redis: "Performance", "Availability", "Fault-Tolerance", "Scalability (adaptability)", "Portability"; "Support for complex data types and structures", "Atomic operations and Transactions", "Pipelining (send multiple commands at once)", "LUA scripting support", "LRU eviction of keys", "Keys with limited time-to-live"; а также сервер с открытым кодом, простой в настройке, с клиентами на многих языках. В сравнении с принципами memcached:</p>
+
+  <figure class="tbl-fig" id="l19-tbl-vs">
+    <figcaption>От чего отказывается memcached и что предлагает Redis, слайд за слайдом.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>memcached</th><th>Redis</th></tr></thead>
+        <tbody>
+          <tr><th>значения</th><td>"key/value dictionary" непрозрачных элементов, не больше 1 MB каждый (pp. 376, 382)</td><td>структуры данных: strings, hashes, lists, sets, sorted sets… (p. 354)</td></tr>
+          <tr><th>persistence</th><td>"No persistency" (p. 381)</td><td>снапшоты RDB и лог AOF (p. 359)</td></tr>
+          <tr><th>replication</th><td>"No replication": один сервер на элемент (p. 381)</td><td>master → slaves только для чтения (p. 359)</td></tr>
+          <tr><th>failover</th><td>"No redundancy / fail-over" (p. 381)</td><td>вручную, Sentinel или Cluster (p. 359)</td></tr>
+          <tr><th>partitioning</th><td>"clients manage the pool" (p. 378)</td><td>клиент, прокси (Twemproxy) или Cluster (p. 359)</td></tr>
+          <tr><th>очистка</th><td>LRU, только когда нужно место (p. 382)</td><td>"LRU eviction of keys", "Keys with limited time-to-live" (p. 365)</td></tr>
+          <tr><th>скорость (рис. 4)</th><td class="num">80,000</td><td class="num">80,000; с pipelining 250,000</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Последняя строка — это диаграмма со слайда о преимуществах Redis (p. 365), перерисованная на рис. 4. На ней нет ни единиц, ни описания бенчмарка, и взята она из блога вендора (redislabs.com): читай её ради порядков величин.</p>
+
+  <figure class="fig fig--plain" id="l19-fig-bench">
+    <svg class="dia" viewBox="0 0 560 262" role="img" aria-label="Столбчатая диаграмма слайда 25 лекции 8, значения как напечатаны: Redis pipelined 250,000; Redis 80,000; Memcached 80,000; Couchbase Memcached 44,000; VoltDB/MemSQL/HANA 17,000; Cassandra 12,000; MongoDB 3,500; Riak/Dynamo 2,700; MySQL 900; единицы не указаны">
+      <line x1="214" y1="8" x2="214" y2="226" class="st-ink"/>
+      <rect x="214" y="15" width="256" height="14" class="fi-s1"/>
+      <rect x="214" y="39" width="82" height="14" class="fi-s1"/>
+      <rect x="214" y="63" width="82" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="87" width="45" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="111" width="17" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="135" width="12" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="159" width="4" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="183" width="3" height="14" class="fw-s1 st-s1"/>
+      <rect x="214" y="207" width="1" height="14" class="fw-s1 st-s1"/>
+      <text x="206" y="26" class="tx-sm tx-end">Redis pipelined</text>
+      <text x="206" y="50" class="tx-sm tx-end">Redis</text>
+      <text x="206" y="74" class="tx-sm tx-end">Memcached</text>
+      <text x="206" y="98" class="tx-sm tx-end">Couchbase Memcached</text>
+      <text x="206" y="122" class="tx-sm tx-end">VoltDB/MemSQL/HANA</text>
+      <text x="206" y="146" class="tx-sm tx-end">Cassandra</text>
+      <text x="206" y="170" class="tx-sm tx-end">MongoDB</text>
+      <text x="206" y="194" class="tx-sm tx-end">Riak/Dynamo</text>
+      <text x="206" y="218" class="tx-sm tx-end">MySQL</text>
+      <text x="476" y="26" class="tx-mono tx-sm">250,000</text>
+      <text x="302" y="50" class="tx-mono tx-sm">80,000</text>
+      <text x="302" y="74" class="tx-mono tx-sm">80,000</text>
+      <text x="265" y="98" class="tx-mono tx-sm">44,000</text>
+      <text x="237" y="122" class="tx-mono tx-sm">17,000</text>
+      <text x="232" y="146" class="tx-mono tx-sm">12,000</text>
+      <text x="224" y="170" class="tx-mono tx-sm">3,500</text>
+      <text x="223" y="194" class="tx-mono tx-sm">2,700</text>
+      <text x="221" y="218" class="tx-mono tx-sm">900</text>
+      <text x="430" y="64" class="tx-hand">втрое больше</text>
+      <text x="214" y="250" class="tx-sm tx-muted">единиц на слайде нет</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Диаграмма со слайда (p. 365), "NoSQL &amp; SQL response performance comparison", значения как напечатаны; закрашенные столбцы — Redis. Слайд также даёт время отклика каждой системы: меньше 1 ms у Redis и Memcached, меньше 20 ms у Couchbase Memcached, 10–50 ms у VoltDB/MemSQL/HANA и Cassandra, меньше 100 ms у MongoDB и Riak/Dynamo, больше 100 ms у MySQL.</figcaption>
+  </figure>
+
+  <p>Из неё стоит вынести два факта. Redis и Memcached делят 80,000: отказы memcached покупают простоту, а не скорость. А "Redis pipelined" достигает 250,000, втрое больше. Pipelining, "send multiple commands at once" (p. 365), убирает ожидание: вместо одного сетевого обмена на команду клиент отправляет пачку и собирает ответы вместе. Слайд (p. 393) говорит то же про чтение: даже попадание стоит похода к серверу memcached, так что используй multiget, "fetch multiple keys from memcached in one single call" — "result is array of items". <code>MGET</code> в Redis делает то же самое. В PHP это <code>getMulti</code> со слайда (p. 383) (строка наша):</p>
+
+<pre><code>&lt;?php
+// multiget: three keys, one round trip; returns an array of the items found
+$users = $cache-&gt;getMulti(array('user_1', 'user_2', 'user_3'));
+?&gt;</code></pre>
+</section>
+
+
+<section id="l19-aside">
+  <h2>Cache-aside в коде и две трудные вещи</h2>
+
+  <p>Слайды показывают memcached в работе на PHP. Первая программа кэширует целую страницу — "full output caching" со слайда (p. 373) (p. 384):</p>
+
+<pre><code>&lt;?php
+// p. 384: prints the page, built only on a miss
+$html = $cache-&gt;get('mypage');
+if (!$html)
+{
+  ob_start();
+  echo "&lt;html&gt;";
+  // all the fancy stuff goes here
+  echo "&lt;/html&gt;";
+  $html = ob_get_contents();
+  ob_end_clean();
+  $cache-&gt;set('mypage', $html);
+}
+echo $html;
+?&gt;</code></pre>
+
+  <p>Прочитай вслух: спроси у кэша <code>'mypage'</code>; если ничего не вернулось, построй страницу (буфер вывода PHP, <code>ob_start</code> … <code>ob_get_contents</code>, ловит всё, что выведено между ними), сохрани её под ключом, выведи. Следующий посетитель получает сохранённую копию. Эта схема — заглянуть в кэш; при промахе вычислить или достать, сохранить, вернуть — называется <mark class="key">cache-aside</mark> (этого названия на слайдах нет; рис. 5).</p>
+
+  <figure class="fig fig--plain" id="l19-fig-aside">
+    <svg class="dia" viewBox="0 0 560 220" role="img" aria-label="Cache-aside: get(key) спрашивает кэш; при попадании значение возвращается; при промахе приложение делает запрос к базе, сохраняет результат через set(key, value) и возвращает его; следующий get того же ключа — попадание">
+      <line x1="126" y1="55" x2="174" y2="55" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="264" y1="55" x2="364" y2="55" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="220" y1="77" x2="220" y2="126" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="307" y1="145" x2="340" y2="145" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="430" y1="128" x2="430" y2="74" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="24" y="40" width="100" height="30" class="fi-paper sw-2"/>
+      <polygon points="220,35 262,55 220,75 178,55" class="fi-paper sw-2"/>
+      <rect x="370" y="40" width="120" height="30" class="fi-paper sw-2"/>
+      <rect x="135" y="130" width="170" height="30" class="fi-paper sw-2"/>
+      <rect x="345" y="130" width="170" height="30" class="fi-paper sw-2"/>
+      <text x="74" y="60" class="tx-mono tx-mid">get(key)</text>
+      <text x="220" y="60" class="tx-sm tx-mid">в кэше?</text>
+      <text x="430" y="60" class="tx-sm tx-mid">вернуть значение</text>
+      <text x="220" y="150" class="tx-sm tx-mid">запрос к базе</text>
+      <text x="430" y="150" class="tx-mono tx-mid">set(key, value)</text>
+      <text x="314" y="45" class="tx-sm tx-mid halo">попадание</text>
+      <text x="232" y="106" class="tx-sm">промах</text>
+      <text x="442" y="106" class="tx-sm">сохранить</text>
+      <text x="200" y="200" class="tx-hand">потом get(key) — попадание</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Cache-aside — схема каждого PHP-примера на слайдах: при промахе в базу идёт приложение, а не кэш, и оно же сохраняет найденное.</figcaption>
+  </figure>
+
+  <p>Кэшировать целую страницу быстро, но хрупко: страница зависит от всего, что на ней показано. Слайд (p. 385) переносит кэш "on a lower level", к кэшированию данных: "easier to find all dependencies", "ideal solution for offloading database queries", потому что "the database is almost always the biggest bottleneck in backend performance problems". Код со слайда кэширует строку одного пользователя (p. 386; ключ в <code>set</code> восстановлен, см. красную ручку):</p>
+
+<pre><code>&lt;?php
+// p. 386: the row of user $UID, from the cache if there
+function getUserData($UID)
+{
+  $key = 'user_' . $UID;
+  $userData = $cache-&gt;get($key);
+  if (!$userData)
+  {
+    $queryResult = Database::query(
+      "SELECT * FROM USERS WHERE uid = " . (int) $UID);
+    $userData = $queryResult-&gt;getRow();
+    $cache-&gt;set($key, $userData);
+  }
+  return $userData;
+}
+?&gt;</code></pre>
+
+  <p>Ключ — бизнес-ключ пользователя с префиксом: <code>'user_' . $UID</code>. При промахе выполняется один запрос по первичному ключу — <code>(int)</code> пропускает в SQL только число, — и строка сохраняется.</p>
+
+  <aside class="redpen" data-page="386">
+    <p class="claim">"<code>$cache-&gt;set($userData);</code>"</p>
+    <p class="fix">Должно быть <code>$cache-&gt;set($key, $userData);</code> — ключ пропущен.</p>
+    <p class="because">PHP-клиент сохраняет элемент под ключом, <code>set(key, value)</code>, ровно так, как его вызывает слайд (p. 384): <code>$cache-&gt;set('mypage', $html)</code>. Без ключа под <code>'user_' . $UID</code> ничего не сохраняется, следующий <code>get($key)</code> снова промахивается, и каждый вызов идёт в базу: кэш с долей попаданий ноль. (Оба слайда к тому же предполагают объект <code>$cache</code>, созданный где-то ещё; внутри PHP-функции его нужно передать параметром или объявить global.) Экзамен могут сверять с напечатанной строкой: найди пропущенный ключ.</p>
+  </aside>
+
+  <h3>Две трудные вещи</h3>
+
+  <p>Слайд (p. 387) — одна цитата: "There are only two hard things in Computer Science: cache invalidation and naming things." — Phil Karlton. Для первой из них слайды дают две стратегии (рис. 6).</p>
+
+  <p><b>По времени</b> (pp. 388–389): "Caching for a certain amount of time", "eg. 10 minutes"; "don't delete caches"; "thus: You can't trust that data coming from cache is correct". Это "Great for summaries", "Overview", "Pages where it's not that big a problem if data is a little bit out of date (eg. search results)" и "Good for quick and dirty optimizations". В Redis это TTL из <a href="l18.html">урока 18</a>: <code>SET key value EX 600</code>.</p>
+
+  <p><b>По событию</b> (pp. 390–392): "Store forever, and expire on certain events" — "store userdata for ever", и "when user changes any of his preferences, throw cache away". Сторона чтения хранит результат запроса без срока жизни, и ей можно велеть его инвалидировать (p. 391):</p>
+
+<pre><code>&lt;?php
+// p. 391: the row of user $UID, or drop its cached copy
+function getUserData($UID, $invalidateCache = false)
+{
+  $db = DB::getInstance();
+  $db-&gt;prepare("SELECT * FROM USERS WHERE uid = {UID}");
+  $db-&gt;assignInt('UID', $UID);
+  $db-&gt;setCacheTTL(0); // cache forever
+  if ($invalidateCache)
+  {
+    return $db-&gt;invalidateCache();
+  }
+  $db-&gt;execute(); return $db-&gt;getRow();
+}
+?&gt;</code></pre>
+
+  <p>а сторона записи выбрасывает копию после каждого обновления (p. 392):</p>
+
+<pre><code>&lt;?php
+// p. 392: update the row, then drop its cached copy
+function updateUserData($UID, $data)
+{
+  $db = DB::getInstance();
+  $db-&gt;prepare("UPDATE USERS SET ... WHERE uid = {UID}");
+  ...
+  getUserData($UID, true); // invalidate cache
+  return $result;
+}
+?&gt;</code></pre>
+
+  <p>Кэш живёт внутри обёртки над базой (<code>setCacheTTL(0)</code>, «кэшировать навсегда»; <code>invalidateCache()</code>), которую слайды не показывают: читай схему, а не API. После обновления следующее чтение промахивается и загружает свежую строку: старая копия исчезает, как только запись её удаляет, ценой одного удаления на запись и одного промаха после неё. В виджете раздела 3 TTL менял устаревшие чтения на промахи и никогда не доходил до нуля; удаление при записи дошло до нуля и сохранило почти всю долю попаданий.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l19-fig-inval">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="По времени: при записи база меняется с v1 на v2, но v1 в кэше живёт до конца своего TTL, так что два чтения в промежутке получают старое значение; после истечения промах загружает v2">
+        <text x="12" y="52" class="tx-sm">база</text>
+        <text x="12" y="102" class="tx-sm">кэш</text>
+        <text x="12" y="153" class="tx-sm">чтения</text>
+        <line x1="150" y1="16" x2="150" y2="34" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="24" class="tx-sm">запись</text>
+        <rect x="76" y="40" width="74" height="18" class="fw-s1 st-s1"/>
+        <rect x="150" y="40" width="136" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="53" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="218" y="53" class="tx-mono tx-sm tx-mid">v2</text>
+        <rect x="80" y="90" width="156" height="18" class="fw-s1 st-s1"/>
+        <rect x="150" y="90" width="86" height="18" class="fw-bad"/>
+        <rect x="248" y="90" width="38" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="103" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="267" y="103" class="tx-mono tx-sm tx-mid">v2</text>
+        <line x1="80" y1="116" x2="236" y2="116" class="st-muted"/>
+        <line x1="80" y1="112" x2="80" y2="120" class="st-muted"/>
+        <line x1="236" y1="112" x2="236" y2="120" class="st-muted"/>
+        <text x="158" y="132" class="tx-sm tx-mid">TTL: 10 min</text>
+        <circle cx="100" cy="150" r="6" class="fi-s2"/>
+        <circle cx="130" cy="150" r="6" class="fi-s2"/>
+        <circle cx="172" cy="150" r="6" class="fi-s2 st-bad sw-2"/>
+        <circle cx="210" cy="150" r="6" class="fi-s2 st-bad sw-2"/>
+        <circle cx="252" cy="150" r="6" class="fi-paper st-muted sw-2"/>
+        <circle cx="278" cy="150" r="6" class="fi-s2"/>
+        <text x="191" y="182" class="tx-hand tx-mid">устаревшие</text>
+        <line x1="76" y1="200" x2="282" y2="200" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="288" y="216" class="tx-sm tx-muted tx-end">время</text>
+      </svg>
+      <p class="fig-label">По времени: TTL 10 минут</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="По событию: запись сразу удаляет v1 из кэша; следующее чтение промахивается и загружает v2; ни одно чтение не получает старое значение">
+        <text x="12" y="52" class="tx-sm">база</text>
+        <text x="12" y="102" class="tx-sm">кэш</text>
+        <text x="12" y="153" class="tx-sm">чтения</text>
+        <line x1="150" y1="16" x2="150" y2="34" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="158" y="24" class="tx-sm">запись</text>
+        <rect x="76" y="40" width="74" height="18" class="fw-s1 st-s1"/>
+        <rect x="150" y="40" width="136" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="53" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="218" y="53" class="tx-mono tx-sm tx-mid">v2</text>
+        <rect x="80" y="90" width="70" height="18" class="fw-s1 st-s1"/>
+        <line x1="144" y1="85" x2="156" y2="113" class="sw-2"/>
+        <line x1="144" y1="113" x2="156" y2="85" class="sw-2"/>
+        <rect x="172" y="90" width="114" height="18" class="fw-s1 st-s1"/>
+        <text x="113" y="103" class="tx-mono tx-sm tx-mid">v1</text>
+        <text x="229" y="103" class="tx-mono tx-sm tx-mid">v2</text>
+        <text x="150" y="132" class="tx-sm tx-mid">удалено при записи</text>
+        <circle cx="100" cy="150" r="6" class="fi-s2"/>
+        <circle cx="130" cy="150" r="6" class="fi-s2"/>
+        <circle cx="172" cy="150" r="6" class="fi-paper st-muted sw-2"/>
+        <circle cx="210" cy="150" r="6" class="fi-s2"/>
+        <circle cx="252" cy="150" r="6" class="fi-s2"/>
+        <circle cx="278" cy="150" r="6" class="fi-s2"/>
+        <text x="200" y="182" class="tx-hand tx-mid">без устаревших</text>
+        <line x1="76" y1="200" x2="282" y2="200" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="288" y="216" class="tx-sm tx-muted tx-end">время</text>
+      </svg>
+      <p class="fig-label">По событию: удаление при каждой записи</p>
+    </div>
+    <figcaption><b>Рис. 6.</b> Та же запись, две стратегии. Закрашенные точки — попадания, красное кольцо — попадание в старую копию, пустая точка — промах. Слева: копия доживает свой TTL, так что до его конца читатели получают старое значение (p. 388). Справа: запись удаляет копию; следующее чтение промахивается и загружает новое значение (p. 390).</figcaption>
+  </figure>
+
+  <p>Лекция заканчивается тремя советами (p. 394): будь осторожен, когда важна безопасность, — помни про "no authentication" (аутентификация SASL тогда была в разработке); "Caching is not an excuse not to do database tuning. (Remember cold cache?)" — после перезапуска промахивается каждый запрос, и база берёт на себя всю нагрузку; и пиши юнит-тесты для кода кэширования, потому что "Debugging problems related to out-of-date cache data is hard and boring. Very boring."</p>
+
+  <p>Вернёмся к загадке. Слово — <em>duplicating</em>, «дублирующий»: кэш хранит "data duplicating original values stored elsewhere" (p. 367). Когда memcached теряет сервер, оригиналы по-прежнему лежат в базе: потеря — это время (холодный кэш, база под полной нагрузкой), но никогда не данные. Redis, когда его используют как базу, может хранить единственную копию, так что сбой стал бы настоящей потерей: отсюда снапшоты, логи, slaves, Sentinel и Cluster. Ни одна из программ не спроектирована плохо; они отвечают на разные вопросы. А стоит ли заводить кэш — это одно отношение: его доля попаданий против точки безубыточности \(t_c / t_o\).</p>
+</section>
+
+
+<section id="l19-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Теоретические вопросы в тех формах, которые называет readme к прошлым экзаменам, — множественный выбор, верно/неверно, открытые ответы; за неверные ответы может быть штраф, о нём объявляют прямо перед экзаменом, — затем вычисление, которое делают сами слайды, и одно практическое задание в формулировках прошлых заданий по Redis.</p>
+
+  <div class="exam" data-kind="mcq" id="l19-exam-topo">
+    <div class="exam-q" lang="en">
+      <p>Which Redis topology provides both automatic failover and the distribution of data across nodes?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Standalone master-slave <span class="fb">Slaves дают избыточность и разгрузку чтения, но "There is no automatic failover" (p. 361), и каждый slave хранит все данные.</span></li>
+      <li>Sentinel <span class="fb">Только автоматический failover: "Sentinel does not distribute data across nodes" (p. 362).</span></li>
+      <li>Twemproxy <span class="fb">Он распределяет данные через consistent hashing, но failover у него нет: ключи погибшего экземпляра недоступны.</span></li>
+      <li data-correct>Cluster <span class="fb">"Cluster (automatic failover and distribute data)" (p. 360): хеш-слоты распределяют данные, а slave повышается, когда его master падает (p. 364).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образцовый ответ</summary>
+      <div class="exam-answer" lang="en"><p>Redis Cluster. Its keyspace is divided into 16384 hash slots shared among the masters, and if a master fails one of its slaves is promoted automatically. Sentinel gives only automatic failover, Twemproxy only data distribution, and the standalone topology neither.</p></div>
+      <div class="exam-note"><p>Таблица два на два со слайда (p. 360) — это весь вопрос. Ловушка, которой надо избежать, — Sentinel: он про доступность, а не про распределение.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l19-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>Redis Sentinel distributes data across the nodes of a master/slave topology. <span class="fb">Неверно: "Sentinel does not distribute data across nodes" (p. 362).</span></li>
+      <li data-correct>In Redis Cluster, multi-key commands are only allowed for keys in the same hash slot. <span class="fb">Верно, дословно со слайда (p. 364); hash tags кладут связанные ключи в один слот.</span></li>
+      <li data-correct>By default, Redis slaves are read only. <span class="fb">Верно: "Slaves are read only by default" (p. 359).</span></li>
+      <li>In the standalone master-slave topology, a slave is promoted automatically when the master fails. <span class="fb">Неверно: "There is no automatic failover" (p. 361); это работа Sentinel.</span></li>
+      <li data-correct>In memcached a single item lives on one server only, and is lost if that server goes down. <span class="fb">Верно: "No replication (single item in cache lives on one server only)" и "No persistency" (p. 381).</span></li>
+      <li>Twemproxy is part of Redis and performs automatic failover. <span class="fb">Дважды неверно: "Twemproxy is a project from Twitter and is not part of redis" (p. 363), и он только распределяет данные.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образцовый ответ</summary>
+      <div class="exam-answer" lang="en"><p>True: the second, the third and the fifth. Sentinel provides automatic failover without distributing data; the standalone topology has no automatic failover; Twemproxy is an external proxy from Twitter that distributes data and has no failover.</p></div>
+      <div class="exam-note"><p>Раз за неверные ответы может быть штраф, отмечай только то, что подтверждает фраза со слайда. Каждое неверное утверждение здесь подменяет одну способность из таблицы два на два другой.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l19-exam-persist">
+    <div class="exam-q" lang="en">
+      <p>Redis keeps its data in memory. Describe the two mechanisms it provides for persistence, what each of them can lose in a crash, and the trade-off between persistence and performance.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образцовый ответ</summary>
+      <div class="exam-answer" lang="en"><p>Redis provides Redis database snapshots (RDB) and append-only files (AOF). An RDB snapshot is a point-in-time copy of the whole dataset, written to disk periodically: it is compact and fast to reload, but everything written after the last snapshot is lost in a crash, typically minutes of data. The AOF appends every write command to a log that is replayed at restart: it loses at most what was not yet flushed to disk (about one second with the default once-per-second flush, nothing if the file is synced after every write), but the file is larger and slower to replay. Both can be enabled together. In general, increased persistency tends to increase latency and decrease throughput — syncing after every write makes each write wait for the disk. Redis is therefore not a replacement for relational databases or document stores: it is best used for rapidly changing data whose size is foreseeable and fits mostly in memory, often next to such a store.</p></div>
+      <div class="exam-note"><p>Слайды дают два названия (p. 359) и фразу о компромиссе (p. 349); остальная часть ответа их объясняет, как и положено теоретическому ответу. Три вещи, за которые дают баллы: оба механизма, что теряет каждый и компромисс между надёжностью хранения и задержкой.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="81.8" data-tol="0.5" data-unit="%" id="l19-exam-ratio">
+    <div class="exam-q" lang="en">
+      <p>A cache served 45 cache hits and 10 cache misses. What is its hit ratio, in percent?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образцовый ответ</summary>
+      <div class="exam-answer" lang="en"><p>Hit ratio = hits / (hits + misses) = 45 / (45 + 10) = 0.818, about 82 %. The miss ratio is 1 − 0.818, about 18 %.</p></div>
+      <div class="exam-note"><p>Числа со слайда (p. 370), где напечатано 82 % и 18 %. Пиши скобки: "hits / hits + misses" со слайда, прочитанное буквально, — не отношение. Если вопрос дальше спрашивает, окупается ли такой кэш, ответ зависит от доли попаданий в сравнении с \(t_c / t_o\), а не от того, что 82 % больше 50 %.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l19-exam-memcached">
+    <div class="exam-q" lang="en">
+      <p>Memcached offers no persistence, no replication, no fail-over and no authentication. Explain why it is nevertheless widely used, and compare it with Redis.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образцовый ответ</summary>
+      <div class="exam-answer" lang="en"><p>Memcached is a free and open-source, high-performance, distributed in-memory key/value cache, intended to speed up dynamic web applications by alleviating database load. Its servers are independent: the client manages the pool and sends each key to one server (for example three servers of 64 GB form one 192 GB pool). Items are at most 1 MB, keys at most 250 characters; keys cannot be enumerated, and space is reclaimed with LRU only when needed. It can do without persistence, replication and fail-over because it is a cache: every item duplicates data whose original is stored elsewhere, usually in the database, so losing a server costs time — the next requests miss and reload from the database — but not data. Redis instead offers persistence (RDB snapshots, AOF), replication to read-only slaves, automatic failover (Sentinel, Cluster), partitioning by proxy or by Cluster, and values that are data structures. In the benchmark shown in the lecture the two are equally fast (80,000 each). Memcached fits a pure cache; Redis fits data that must survive or needs structures.</p></div>
+      <div class="exam-note"><p>Экзаменатор ищет связь между всеми этими «No» и тем, что это кэш. Список свойств без этого «почему» отвечает только на половину вопроса.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l19-exam-hospital">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise in the style of the past papers' Redis exercises.</b> Consider the ER model of a hospital heating management system (the scenario of the Exam of 30 Jan 2026): Hospital (Hospital_ID, Name) has Departments (Department_ID, Specialty, N_Beds, Head_Physician_ID), Buildings and Heating Systems; Persons (P_ID, Email) work for Departments with a Role. A dashboard shows, for each Department, a summary page computed by a slow query over its floors and heaters.</p>
+      <p>Consider the Department entity and write the Redis commands for the following operations. (a) Cache the summary of Department "D7" under a key, so that it expires after 10 minutes. (b) Check how long the cached summary will remain valid. (c) The Head Physician of "D7" changes: invalidate the cached summary immediately. (d) The dashboard runs on a Redis Cluster: store the Specialty "Cardiology" and the N_Beds 24 of "D7" under two keys that a single command can read together, and read them.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образцовый ответ</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>SET department:D7:summary "Cardiology - 3 floors - 24 beds - 2 heaters" EX 600
+TTL department:D7:summary
+DEL department:D7:summary
+MSET {department:D7}:specialty "Cardiology" {department:D7}:n_beds 24
+MGET {department:D7}:specialty {department:D7}:n_beds</code></pre>
+        <p>(a) A time-based invalidation: 10 minutes = 600 seconds (equivalently <code>SET</code> followed by <code>EXPIRE department:D7:summary 600</code>). (b) <code>TTL</code> returns the remaining seconds, at most 600, and -2 once the key has expired. (c) An event-based invalidation: <code>DEL</code> returns 1, and the next read misses and recomputes the summary. (d) The hash tag <code>{department:D7}</code> makes both keys hash the same string, so they share a hash slot and the multi-key commands are allowed; <code>MGET</code> returns "Cardiology" and "24".</p>
+      </div>
+      <div class="exam-note"><p>Задание наше, построено на формулировках прошлых заданий по Redis ("Create a key-value pair … with TTL equal to …", "check its lifespan"). Проверяются три идеи: TTL в секундах, инвалидация по событию как явный <code>DEL</code> и правило одного слота в Redis Cluster вместе с hash tag — без фигурных скобок <code>MGET</code> на два ключа в разных слотах отвергается.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l19-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Standalone-развёртывание master-slave: master падает в 3 часа ночи. Что видят клиенты, пока кто-нибудь не вмешается?</p>
+    <ul class="options">
+      <li>Slave повышается за секунды, и записи возобновляются <span class="fb">Для этого нужен Sentinel или Cluster; standalone-топология ждёт человека.</span></li>
+      <li>Не работает ничего, включая чтение <span class="fb">"Clients can connect … to the Slaves for read operations" (p. 361), а slaves по-прежнему живы.</span></li>
+      <li data-correct>Чтение продолжает работать на slaves; запись не работает <span class="fb">Slaves по умолчанию только для чтения (p. 359), и "There is no automatic failover" (p. 361): копии отвечают на чтение, записи не принимает никто.</span></li>
+      <li>Записи идут на slaves и копируются обратно, когда master вернётся <span class="fb">Slaves по умолчанию только для чтения, и никто не складывает записи в очередь для мёртвого master.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Тебе нужен автоматический failover. Какие топологии его дают? Выбери все верные.</p>
+    <ul class="options">
+      <li>Twemproxy <span class="fb">Он распределяет данные, и только: погибший экземпляр уносит свои ключи с собой.</span></li>
+      <li data-correct>Sentinel <span class="fb">"automatically promoting a slave to master if the existing master fails" (p. 362).</span></li>
+      <li>Master-slave multi-level <span class="fb">Больше копий, та же standalone-топология: "There is no automatic failover" (p. 361).</span></li>
+      <li data-correct>Cluster <span class="fb">Он "perform[s] automatic failover if any problem happens to any master instance" (p. 364).</span></li>
+    </ul>
+    <p class="q-fb">Failover и распределение — два отдельных вопроса; «да» на оба отвечает только Cluster.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В Redis Cluster <code>user:42:name</code> лежит в слоте 6755, а <code>user:42:city</code> — в слоте 8210, и обоими владеет master B. Выполнится ли команда на оба ключа?</p>
+    <ul class="options">
+      <li>Да, потому что оба ключа живут на одном master <span class="fb">Правило — про слоты: "Multi-key commands are only allowed for keys in the same hash slot" (p. 364). Слоты можно по одному переносить на разные masters.</span></li>
+      <li data-correct>Нет: ключи в разных слотах; hash tag вроде <code>{user:42}</code> в обоих именах положил бы их в один слот <span class="fb">С тегом хешируется только <code>user:42</code>, и оба ключа делят слот 15880.</span></li>
+      <li>Нет: multi-key команды в Redis Cluster не разрешены никогда <span class="fb">Они разрешены, когда все ключи хешируются в один слот, — для этого и существуют hash tags.</span></li>
+      <li>Да, но только если в кластере ровно один master <span class="fb">Проверяются слоты, а не машины, при любом числе masters.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Обращение к кэшу стоит \(t_c = 2\) ms, запрос к базе — \(t_o = 10\) ms, доля попаданий — 0.3. Что кэш делает со средним временем чтения?</p>
+    <ul class="options">
+      <li>Увеличивает его, раз попаданий меньше, чем промахов <span class="fb">Условие — \(h \gt t_c / t_o\), здесь 0.2, а не \(h \gt 0.5\): см. красную ручку к слайду (p. 371).</span></li>
+      <li>Экономит \(0.3 \times 10 = 3\) ms на каждом чтении <span class="fb">Здесь забыто, что каждое чтение платит за обращение \(t_c\) — и попадания, и промахи.</span></li>
+      <li>Без размера кэша ничего сказать нельзя <span class="fb">Размер действует через долю попаданий; когда \(h\) дано, всё решают \(t_c\) и \(t_o\).</span></li>
+      <li data-correct>Немного уменьшает его: \(2 + 0.7 \times 10 = 9\) ms вместо 10 ms <span class="fb">Точка безубыточности — \(t_c / t_o = 0.2\), а 0.3 выше неё.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему memcached может позволить себе "No persistency" и "No replication"?</p>
+    <ul class="options">
+      <li>Его серверы работают в пулах, так что у одного из них всегда есть вторая копия <span class="fb">Пул делит ключи между серверами, а не копирует их: "single item in cache lives on one server only" (p. 381).</span></li>
+      <li data-correct>Каждый элемент — копия данных, хранящихся в другом месте: потерянный сервер стоит времени, а не данных <span class="fb">Кэш — это "a collection of data duplicating original values stored elsewhere" (p. 367); промахи загружают данные заново из базы.</span></li>
+      <li>Клиент хранит копию каждого прочитанного элемента <span class="fb">Клиент только решает, на каком сервере лежит ключ; сам он ничего не хранит.</span></li>
+      <li>Он всё равно пишет всё на диск <span class="fb">"No persistency (if your server goes down, data in memcached is gone)" (p. 381).</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Данные пользователей кэшируются с инвалидацией по времени, TTL 10 минут. Пользователь меняет имя. Какие утверждения верны? Выбери все верные.</p>
+    <ul class="options">
+      <li data-correct>До 10 минут некоторые читатели могут видеть старое имя <span class="fb">"You can't trust that data coming from cache is correct" (p. 388).</span></li>
+      <li>Кэш замечает изменение и сразу обновляет запись <span class="fb">Это инвалидация по событию (p. 390), а здесь она не настроена.</span></li>
+      <li data-correct>Запись в кэше не удаляется, когда имя меняется <span class="fb">"don't delete caches" (p. 388): запись просто доживает свой TTL.</span></li>
+      <li>Более короткий TTL сделал бы устаревшие чтения невозможными <span class="fb">Он сужает окно и стоит попаданий, но никогда его не закрывает — виджет и при 10 s показывал устаревшие попадания.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Алгоритм Белади есть на слайде о политиках вытеснения (p. 369), но ни один настоящий кэш его не использует. Почему?</p>
+    <ul class="options">
+      <li>Его слишком долго вычислять <span class="fb">Правило простое; не хватает информации — будущих запросов.</span></li>
+      <li>Он работает хуже, чем LRU <span class="fb">Он работает лучше любой другой политики — в виджете он был потолком.</span></li>
+      <li data-correct>Он вытесняет запись, которая понадобится позже всех, а это может знать только симуляция <span class="fb">Это оптимум, который служит эталоном для FIFO, LFU, LRU, MRU и RANDOM.</span></li>
+      <li>Он работает только для кэшей процессора <span class="fb">Он применим к любому кэшу; его предложили в 1966 году для памяти компьютера, а виджет запускает его на кэше профилей пользователей.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l19-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Слайд (p. 359) сохраняет жизнь базе в памяти четырьмя видами механизмов: persistence (снапшоты RDB, лог AOF), replication (master копирует в slaves только для чтения), partitioning (в клиенте, в прокси вроде Twemproxy или в маршрутизаторе запросов вроде Redis Cluster) и failover (вручную, Sentinel, Cluster).</li>
+    <li>Снапшот теряет то, что записано после него, — минуты; лог теряет не больше того, что ещё не сброшено на диск, — по умолчанию около секунды; больше надёжности хранения — это больше задержка и ниже пропускная способность (p. 349).</li>
+    <li>Топологии укладываются в таблицу два на два: у Standalone нет ни автоматического failover, ни распределения, у Sentinel — только failover, у Twemproxy — только распределение, у Cluster — оба, с 16384 хеш-слотами, slot = CRC16(key) mod 16384, и multi-key командами только в пределах одного слота (hash tags собирают ключи вместе).</li>
+    <li>Кэш дублирует значения, которые хранятся в другом месте. Доля попаданий = hits / (hits + misses), на слайде (p. 370) 45/55 ≈ 82 %; кэш окупается, когда доля попаданий превышает \(t_c / t_o\), — «попаданий больше, чем промахов» лишь эмпирическое правило. FIFO, LFU, LRU, MRU и RANDOM сравнивают с оптимумом Белади, которому нужно будущее.</li>
+    <li>Memcached (Фицпатрик, LiveJournal, 2003) — пул независимых серверов, которым управляет клиент; он отказывается от persistence, redundancy и fail-over, replication, аутентификации, перечисления ключей и активной очистки, ограничивает элементы 1 MB, а ключи 250 символами и вытесняет по LRU. Отказываться ему позволяет то, что он — кэш.</li>
+    <li>Cache-aside: <code>get</code>; при промахе — запрос к базе, <code>set(key, value)</code>, вернуть. Инвалидируй по времени (TTL: просто, но возможны устаревшие чтения) или по событию (хранить вечно, удалять при каждой записи); доставай много ключей за один обмен с сервером через multiget или pipelining.</li>
+  </ul>
+  <aside class="cheat" id="l19-cheat">
+    <dl>
+      <dt>Persistence (p. 359)</dt><dd>RDB: снапшот набора данных на момент времени · AOF: append-only лог каждой записи, проигрывается при перезапуске</dd>
+      <dt>Persistence против скорости (p. 349)</dt><dd>больше persistence → больше задержка, ниже пропускная способность</dd>
+      <dt>Replication</dt><dd>master → slaves, точные копии; клиенты пишут в master, читают из любого; slaves по умолчанию только для чтения</dd>
+      <dt>Уровни partitioning</dt><dd>клиент · прокси (Twemproxy) · маршрутизатор запросов (Redis Cluster)</dd>
+      <dt>Failover</dt><dd>вручную · Sentinel (master-slave) · Cluster</dd>
+      <dt>I · Standalone</dt><dd>только master / master-slave / multi-level; нет автоматического failover</dd>
+      <dt>II · Sentinel</dt><dd>автоматический failover; данные не распределяет</dd>
+      <dt>III · Twemproxy</dt><dd>распределяет данные через consistent hashing; нет failover; нет multi-key команд и транзакций; не часть Redis</dd>
+      <dt>IV · Cluster</dt><dd>failover + распределение; 16384 хеш-слота; service channel; multi-key только в пределах одного слота</dd>
+      <dt>Хеш-слот</dt><dd>\(\text{slot}(k) = \text{CRC16}(k) \bmod 16384\)</dd>
+      <dt>Hash tag</dt><dd><code>MSET {user:42}:name "Ada" {user:42}:city "Milano"</code> → хешируется только <code>user:42</code>: один слот</dd>
+      <dt>Кэш (p. 367)</dt><dd>данные, дублирующие исходные значения, которые хранятся в другом месте или вычислены раньше</dd>
+      <dt>Hit ratio (p. 370)</dt><dd>hits / (hits + misses); 45/(45+10) ≈ 82 %; miss ratio = 1 − hit ratio</dd>
+      <dt>Точка безубыточности</dt><dd>\(T = t_c + (1-h)\,t_o\); кэш окупается тогда и только тогда, когда \(h \gt t_c / t_o\)</dd>
+      <dt>Вытеснение (p. 369)</dt><dd>FIFO · LFU · LRU · MRU · RANDOM против Belady: вытеснить запись, которая понадобится позже всех (оптимально, нужно будущее)</dd>
+      <dt>Холодный / тёплый кэш</dt><dd>пуст, почти каждый запрос промахивается / заполнен тем, что спрашивают запросы</dd>
+      <dt>Memcached</dt><dd>Фицпатрик, LiveJournal, 2003; пул под управлением клиента (3 × 64 GB = 192 GB); нет persistency, redundancy / fail-over, replication, аутентификации, перечисления ключей, активной очистки; элемент ≤ 1 MB, ключ ≤ 250 символов; LRU</dd>
+      <dt>Cache-aside</dt><dd><code>get(key)</code>; промах → запрос к базе → <code>set(key, value)</code> → вернуть</dd>
+      <dt>Инвалидация</dt><dd>по времени: TTL, например 10 min, возможны устаревшие чтения (<code>SET key value EX 600</code>) · по событию: хранить вечно, удалять при записи (<code>DEL key</code>)</dd>
+      <dt>Multiget / pipelining</dt><dd>много ключей или команд за один обмен с сервером: <code>getMulti</code>, <code>MGET</code>; Redis 80,000 → с pipelining 250,000 (p. 365)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l19-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="before the lesson">
+      <a class="res-title" href="https://www.linuxjournal.com/article/7451" target="_blank" rel="noopener">Distributed Caching with Memcached</a>
+      <span class="res-by">Brad Fitzpatrick, Linux Journal, 2004</span>
+      <p class="res-why">Memcached в объяснении его автора, через год после того, как он написал его для LiveJournal: «глобальная хеш-таблица», которую он хотел для всех веб-процессов, разложенная по множеству независимых серверов, — тот самый пул со слайда (p. 378).</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://codeahoy.com/2017/08/11/caching-strategies-and-how-to-choose-the-right-one/" target="_blank" rel="noopener">Caching Strategies and How to Choose the Right One</a>
+      <span class="res-by">Umer Mansoor, codeahoy</span>
+      <p class="res-why">По диаграмме на каждую схему: cache-aside — форма PHP-кода со слайдов — рядом с read-through, write-through и write-back, и что может пойти не так в каждой. Читай вместе с разделом 5.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/" target="_blank" rel="noopener">Redis persistence</a>
+      <span class="res-by">документация Redis</span>
+      <p class="res-why">RDB и AOF целиком: преимущества и риски каждого, политики сброса на диск и что происходит, когда включены оба, — механика за двумя названиями со слайда (p. 359).</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://redis.io/tutorials/operate/redis-at-scale/scalability/" target="_blank" rel="noopener">Running Redis at Scale: Scalability</a>
+      <span class="res-by">туториалы Redis</span>
+      <p class="res-why">Почему фиксированные 16384 слота вместо «хеш по модулю числа шардов», как решардинг переносит слоты, и практический кластер из шести узлов — топология IV со слайда (p. 364), собранная руками.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Myp8z0ybdzM" target="_blank" rel="noopener">Cache Consistency: Memcached at Facebook</a>
+      <span class="res-by">Robert Morris, MIT 6.824, лекция 16</span>
+      <p class="res-why">Cache-aside в самом крупном масштабе и всё, что идёт не так с инвалидацией: почему запись удаляет копию в кэше, а не обновляет её, и что холодный кэш делает с базой.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>В Redis Cluster всё ещё есть masters и slaves, а ключ всё ещё открывает одно значение. А что, если бы ни один узел не был особенным, а один ключ открывал целую строку столбцов?</p>
+</aside>
+
+</main>
+</body>
+</html>

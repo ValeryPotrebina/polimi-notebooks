@@ -1,5 +1,5 @@
 window.SYLLABUS = {
-  course: { id: 'smbud', title: 'SMBUD Notebook', subtitle: 'Systems and Methods for Big and Unstructured Data · Politecnico di Milano · 2026-27', footer: 'an interactive self-study notebook built from the lecture slides, the exercise sessions and the past exams of Systems and Methods for Big and Unstructured Data (Politecnico di Milano, 2026-27)', sourceLabel: 'Slides, p.', sourceGenitive: 'the slides', redpenLabel: 'Red pen', examLang: 'en',
+  course: { id: 'smbud', alt: { lang: 'ru', label: 'RU', title: 'Русская версия этой страницы', dirs: { course: 'course_ru', smbud: 'smbud-ru' } }, title: 'SMBUD Notebook', subtitle: 'Systems and Methods for Big and Unstructured Data · Politecnico di Milano · 2026-27', footer: 'an interactive self-study notebook built from the lecture slides, the exercise sessions and the past exams of Systems and Methods for Big and Unstructured Data (Politecnico di Milano, 2026-27)', sourceLabel: 'Slides, p.', sourceGenitive: 'the slides', redpenLabel: 'Red pen', examLang: 'en',
     decks: {
       l01: { label: 'lecture 1', title: 'Big data', file: 'SMBUD-01-bigdata.pdf', slides: 59 },
       l03: { label: 'lecture 3', title: 'ER and the relational model', file: 'SMBUD-03-ER-Relational.pdf', slides: 82 },

@@ -1,0 +1,1220 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Spark: RDD, трансформации и действия · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l38">
+
+<header class="lesson-head">
+  <h1>Spark: RDD, трансформации и действия</h1>
+  <p class="lede">После этого урока ты сможешь объяснить, почему один движок заменил три стека, дать определение RDD слово за словом, отличить трансформации от действий и узкие зависимости от широких, проследить Spark-задание от драйвера до его задач — и обратно, от потерянной партиции.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Пример задания из лекции загружает лог из HDFS, оставляет строки с ошибками, вырезает из них сообщение и кэширует результат: четыре строки на Python. Каждая из четырёх возвращается мгновенно. Не потому, что Spark быстрый, — Spark пока не прочитал ни одного байта.</p>
+  <p>Потом идут вопросы: сколько сообщений упоминают mysql, сколько — php. На 60 GB текста Википедии, разложенных по 20 машинам, каждый поиск занимает 0.5 секунды по данным в памяти против 20 секунд по данным на диске (p. 1222).</p>
+  <p>Теперь одна из машин умирает. Её доля закэшированных данных пропала, и Spark нигде не держал их копии. А следующий подсчёт всё равно верный. Две загадки на конец урока: что делали те четыре строки, если не вычисляли? И откуда возвращаются потерянные данные, если их никто не копировал?</p>
+</div>
+
+
+<section id="l38-why">
+  <h2>Один движок вместо трёх стеков</h2>
+
+  <p>Зачем вообще нужны большие данные (p. 1154)? Отчёты следят за бизнес-процессами; диагностика выясняет, почему падает вовлечённость или тормозит система, и обнаруживает спам, червей и <abbr title="distributed denial of service">DDoS</abbr>-атаки; решения выбирают лечение, функцию продукта, рекламу. Смысл слайда: "Data is only as useful as the decisions it enables" (данные полезны ровно настолько, насколько полезны решения, которые они позволяют принять).</p>
+
+  <p>Более быстрые и лучшие решения задают три цели обработки (p. 1155): интерактивные запросы с низкой задержкой по историческим данным ("identify why a site is slow and fix it"); запросы с низкой задержкой по живым данным, то есть стриминг ("a worm may infect 1mil hosts in 1.3sec"); и сложная обработка вроде поиска аномалий — итеративные алгоритмы, машинное обучение, графы. Следующий слайд требует "Single Stack!" для батчевой, интерактивной и потоковой обработки: "Support batch, streaming, and interactive computations… … and make it easy to compose them" (p. 1156).</p>
+
+  <p>Зачем их сочетать? Примеру с DDoS (p. 1158) нужны все три сразу. Чтобы решить, атака ли всплеск трафика, надо "Detect attack pattern in real time" (стриминг), спросить "Is traffic surge expected?" (интерактивный запрос по истории), а быстрым этот запрос делает только "pre-computation (batch)" — "And need to implement complex algos (e.g., ML)!"</p>
+
+  <p>"Today's state-of-art analytics stack" со слайда (p. 1157) состоит из трёх систем: демультиплексор копирует логи в потоковый стек (Storm, <a href="l33.html">урок 33</a>) и в батчевый (Hadoop, <a href="l31.html">урок 31</a>), а тот наполняет интерактивное хранилище (HBase, Impala, <a href="l32.html">урок 32</a>). Цена: три стека, которые надо поддерживать, "Expensive and complex"; "Hard to compute consistent metrics across stacks" — одни и те же «ошибки в минуту» запрограммированы дважды; и "Hard and slow to share data across stacks", потому что данные ходят между стеками в виде файлов.</p>
+
+  <figure class="fig fig--pair" id="l38-fig-stacks">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 300" role="img" aria-label="До: демультиплексор копирует логи в потоковый стек, Storm, и в батчевый стек, Hadoop; Hadoop копирует свои результаты в интерактивное хранилище, HBase и Impala; каждый из трёх стеков держит свою копию данных">
+        <text x="4" y="132" class="tx-sm">логи</text>
+        <line x1="4" y1="146" x2="28" y2="146" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="32" y="40" width="26" height="212" class="fi-paper sw-2"/>
+        <text x="45" y="150" class="tx-sm tx-mid" transform="rotate(-90 45 146)">demux</text>
+        <line x1="58" y1="68" x2="80" y2="68" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="58" y1="146" x2="80" y2="146" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <rect x="84" y="40" width="168" height="56" class="fw-s4 st-s4 sw-2"/>
+        <text x="94" y="63" class="tx-bold">Storm</text>
+        <text x="94" y="83" class="tx-sm">потоковый стек</text>
+        <rect x="226" y="60" width="16" height="16" class="fw-s1 st-s1 sw-2"/>
+        <rect x="84" y="118" width="168" height="56" class="fw-s4 st-s4 sw-2"/>
+        <text x="94" y="141" class="tx-bold">Hadoop</text>
+        <text x="94" y="161" class="tx-sm">батчевый стек</text>
+        <rect x="226" y="138" width="16" height="16" class="fw-s1 st-s1 sw-2"/>
+        <line x1="168" y1="174" x2="168" y2="192" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="176" y="189" class="tx-sm">копия</text>
+        <rect x="84" y="196" width="168" height="56" class="fw-s4 st-s4 sw-2"/>
+        <text x="94" y="219" class="tx-bold">HBase, Impala</text>
+        <text x="94" y="239" class="tx-sm">интерактивный стек</text>
+        <rect x="226" y="216" width="16" height="16" class="fw-s1 st-s1 sw-2"/>
+        <line x1="254" y1="68" x2="290" y2="68" marker-end="url(#arr)"/>
+        <line x1="254" y1="146" x2="290" y2="146" marker-end="url(#arr)"/>
+        <line x1="254" y1="224" x2="290" y2="224" marker-end="url(#arr)"/>
+        <text x="150" y="290" class="tx-hand tx-mid">3 стека, 3 копии</text>
+      </svg>
+      <p class="fig-label">До: три стека (p. 1157)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 300" role="img" aria-label="После: один движок Spark с четырьмя библиотеками сверху, Spark Streaming, Spark SQL, MLlib и GraphX, которые делят одних и тех же воркеров и одну закэшированную копию данных, над слоем хранения вроде HDFS, S3 или Cassandra">
+        <rect x="40" y="40" width="123" height="28" class="fw-s5 st-s5 sw-2"/>
+        <text x="101" y="59" class="tx-sm tx-mid">Spark Streaming</text>
+        <rect x="169" y="40" width="123" height="28" class="fw-s5 st-s5 sw-2"/>
+        <text x="230" y="59" class="tx-sm tx-mid">Spark SQL</text>
+        <rect x="40" y="74" width="123" height="28" class="fw-s5 st-s5 sw-2"/>
+        <text x="101" y="93" class="tx-sm tx-mid">MLlib</text>
+        <rect x="169" y="74" width="123" height="28" class="fw-s5 st-s5 sw-2"/>
+        <text x="230" y="93" class="tx-sm tx-mid">GraphX</text>
+        <rect x="40" y="110" width="252" height="36" class="fw-s5 st-s5 sw-2"/>
+        <text x="166" y="133" class="tx-bold tx-mid">Spark: один движок</text>
+        <rect x="40" y="154" width="252" height="42" class="fi-paper sw-2"/>
+        <text x="50" y="179" class="tx-sm">общие воркеры и кэш</text>
+        <rect x="216" y="167" width="16" height="16" class="fw-s1 st-s1 sw-2"/>
+        <rect x="238" y="167" width="16" height="16" class="fw-s1 st-s1 sw-2"/>
+        <rect x="260" y="167" width="16" height="16" class="fw-s1 st-s1 sw-2"/>
+        <rect x="40" y="204" width="252" height="36" class="fi-paper"/>
+        <text x="166" y="227" class="tx-sm tx-mid">HDFS, S3, Cassandra, …</text>
+        <text x="4" y="210" class="tx-sm">логи</text>
+        <line x1="4" y1="222" x2="36" y2="222" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="166" y="290" class="tx-hand tx-mid">1 движок, 1 копия</text>
+      </svg>
+      <p class="fig-label">После: один движок (pp. 1161, 1199)</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> До: три стека, три кодовые базы и три копии данных, между которыми гуляют файлы. После: один движок, чьи библиотеки делят одних и тех же воркеров и одни и те же закэшированные данные.</figcaption>
+  </figure>
+
+  <p>Ответ Spark — один универсальный движок и библиотеки поверх него, в стеке из трёх слоёв (p. 1159): обработка данных, управление ресурсами, хранение. Berkeley Data Analytics Stack (p. 1161) заполняет их так: Spark и его библиотеки, Mesos для разделения машин, и HDFS или S3 под Tachyon — слоем хранения в памяти. Spark занимает только верхний слой: "You can think of Spark as scalable computation platform", которая использует данные из Cassandra, AWS S3, HDFS "And more" (p. 1201). Сам он ничего не хранит постоянно: его входные данные и результаты живут в этих системах. Табл. 1 выстраивает рядом три рисунка стека: названия меняются, слои — нет.</p>
+
+  <figure class="tbl-fig wide" id="l38-tbl-stack">
+    <figcaption>Табл. 1. Один стек, три слайда; слои взяты со слайда (p. 1159). Mind map (p. 1162) говорит то же самое: Spark покрывает шесть видов нагрузки — стриминг, ETL, машинное обучение, анализ, обработку графов, data lake, — и для каждой иначе понадобились бы свои инструменты (Storm, Flink, Pig, scikit-learn, Mahout, pandas, Jupyter, Giraph, Neo4j, Hive).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Слой</th><th>Berkeley stack (p. 1161)</th><th>Spark in context (p. 1202)</th><th>Spark components (p. 1203)</th></tr></thead>
+        <tbody>
+          <tr><td>Обработка данных: библиотеки</td><td>Spark Streaming, SparkSQL, GraphX, MLlib; BlinkDB, MLPipelines</td><td>Spark SQL, Spark Streaming, MLlib, GraphX</td><td>Structured Streaming, Spark ML, GraphFrames поверх API DataFrames / Datasets / SQL, а те — поверх RDD API</td></tr>
+          <tr class="is-key"><td>Обработка данных: движок</td><td>Spark</td><td>Spark (General execution engine)</td><td>Spark Core</td></tr>
+          <tr><td>Управление ресурсами</td><td>Mesos</td><td>Yarn / Mesos (по желанию); Apache ZooKeeper</td><td>"Environments": YARN, Mesos, Kubernetes, Docker, EC2, OpenStack, Databricks</td></tr>
+          <tr><td>Хранение</td><td>HDFS, S3, … с Tachyon сверху</td><td>Hadoop Filesystem (HDFS)</td><td>"Data Sources": HDFS, Cassandra, Hive, HBase, PostgreSQL, MySQL, Elasticsearch, S3, Parquet, CSV, JSON, Kafka</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>По версии слайдов (p. 1194), Spark начался в 2009 году как исследовательский проект Матея Захарии (Matei Zaharia) в UC Berkeley AMPLab, в 2013-м перешёл в Apache Software Foundation, в феврале 2014-го стал проектом верхнего уровня Apache, а в ноябре 2014-го установил мировой рекорд по крупномасштабной сортировке для Databricks — компании Захарии.</p>
+
+  <aside class="redpen" data-page="1160">
+    <p class="claim">"First released in February 2013 and has exploded in popularity due to it’s ease of use and speed"</p>
+    <p class="fix">Исходный код Spark открыли в начале 2010 года. 2013 — это год перехода в Apache Software Foundation, а февраль 2014-го — месяц, когда он стал проектом верхнего уровня Apache.</p>
+    <p class="because">Это даты со <a href="https://spark.apache.org/history.html" target="_blank" rel="noopener">страницы истории</a> самого проекта. Лекция начинает проект в 2009 году (p. 1194) и повторяет ту же ошибку в другой форме, ставя "open sourced" под 2013 годом. Экзамен может процитировать напечатанную дату: знай её — и знай, что 2013 — это переход в Apache, а не первый релиз.</p>
+  </aside>
+
+  <p>Он обещал быть "Fast: up to 100x faster than Hadoop", "Easy to use: 5-10x less code than Hadoop" и "General: support interactive &amp; iterative apps" (p. 1195). У «100x» есть мелкий шрифт. Через два слайда такое же заявление, сделанное для Shark против Hive, приходит в двух размерах: "Up to 100x when input is in memory", "Up to 5-10x when input is on disk" (p. 1197). Рис. 2 показывает, откуда берутся числа.</p>
+
+  <figure class="fig fig--plain" id="l38-fig-bench">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="Три столбчатых графика, перерисованные со слайда: интерактивный SQL-запрос занимает около 62 секунд на Hive, 17 на Impala и 1 на Shark; итерация машинного обучения — около 110 секунд на Hadoop и 1 на Spark; поток обрабатывается со скоростью около 12 MB в секунду на узел в Storm и 26 в Spark Streaming">
+      <text x="10" y="20" class="tx-bold">Интерактивный SQL-запрос</text>
+      <text x="550" y="20" class="tx-sm tx-muted tx-end">секунды: меньше — лучше</text>
+      <line x1="160" y1="28" x2="160" y2="104" class="st-muted"/>
+      <text x="150" y="45" class="tx-sm tx-end">Hive</text>
+      <rect x="160" y="32" width="310" height="16" class="fi-s4 st-none"/>
+      <text x="478" y="45" class="tx-mono tx-sm">≈ 62</text>
+      <text x="150" y="71" class="tx-sm tx-end">Impala</text>
+      <rect x="160" y="58" width="85" height="16" class="fi-s4 st-none"/>
+      <text x="253" y="71" class="tx-mono tx-sm">≈ 17</text>
+      <text x="150" y="97" class="tx-sm tx-end">Shark</text>
+      <rect x="160" y="84" width="5" height="16" class="fi-s5 st-none"/>
+      <text x="173" y="97" class="tx-mono tx-sm">≈ 1</text>
+
+      <text x="10" y="130" class="tx-bold">Машинное обучение, батч</text>
+      <text x="550" y="130" class="tx-sm tx-muted tx-end">секунд на итерацию</text>
+      <line x1="160" y1="138" x2="160" y2="188" class="st-muted"/>
+      <text x="150" y="155" class="tx-sm tx-end">Hadoop</text>
+      <rect x="160" y="142" width="308" height="16" class="fi-s4 st-none"/>
+      <text x="476" y="155" class="tx-mono tx-sm">≈ 110</text>
+      <text x="150" y="181" class="tx-sm tx-end">Spark</text>
+      <rect x="160" y="168" width="3" height="16" class="fi-s5 st-none"/>
+      <text x="171" y="181" class="tx-mono tx-sm">≈ 1</text>
+
+      <text x="10" y="214" class="tx-bold">Стриминг</text>
+      <text x="550" y="214" class="tx-sm tx-muted tx-end">MB/s на узел: больше — лучше</text>
+      <line x1="160" y1="222" x2="160" y2="272" class="st-muted"/>
+      <text x="150" y="239" class="tx-sm tx-end">Storm</text>
+      <rect x="160" y="226" width="144" height="16" class="fi-s4 st-none"/>
+      <text x="312" y="239" class="tx-mono tx-sm">≈ 12</text>
+      <text x="150" y="265" class="tx-sm tx-end">Spark Streaming</text>
+      <rect x="160" y="252" width="312" height="16" class="fi-s5 st-none"/>
+      <text x="480" y="265" class="tx-mono tx-sm">≈ 26</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Три графика "Performance and Generality" (p. 1198), перерисованные горизонтальными столбиками; значения сняты с графика на слайде, а не напечатаны на нём. Бирюзовый — системы трёх стеков, пурпурный — семейство Spark. Первые два графика измеряют время, третий — пропускную способность.</figcaption>
+  </figure>
+
+  <p>Почему столбик итеративной задачи самый впечатляющий? Итеративный алгоритм читает одни и те же данные на каждом проходе. Логистическая регрессия со слайда (p. 1199) — градиентный спуск из машинного обучения — считает по одному слагаемому градиента на точку через <code>points.map(...)</code>, суммирует слагаемые через <code>.reduce(_ + _)</code> и повторяет. На Hadoop каждый проход — новое MapReduce-задание, которое читает вход из HDFS и пишет выход обратно; Spark читает точки один раз, держит их через <code>features.cache()</code>, и каждый следующий проход идёт в памяти. Признаки получаются SQL-джойном на тех же машинах: библиотеки "All share the same set of workers and caches".</p>
+
+  <p>Библиотеки — это старые стеки, перестроенные на одном движке. Spark Streaming будет "Implement streaming as a sequence of &lt;1s jobs" (p. 1196): маленькие батчи, каждый — обычное Spark-задание, так что поток наследует отказоустойчивость и обработку отстающих задач (stragglers) и учитывает каждую запись ровно один раз ("exactly one semantics" на слайде; в его последней строке дважды напечатано "batch", хотя имеются в виду batch, interactive и streaming). Слайд с заголовком SparkSQL описывает Shark, "Hive over Spark: full support for HQL and UDFs"; его заменил Spark SQL (<a href="l40.html">урок 40</a>). И каждый слой говорит на уже существующем интерфейсе (p. 1200): Kafka, Flume, Twitter и TCP-сокеты питают Spark Streaming; Shark сохраняет Hive API, GraphX — GraphLab API; Mesos запускает ещё и Hadoop, Storm и MPI; Tachyon предлагает HDFS API.</p>
+
+  <div class="pitfall"><p>«Spark заменяет Hadoop». Он заменяет MapReduce — движок. Spark читает HDFS через Hadoop InputFormat API и может работать на YARN (p. 1220) — поэтому лекция и повторяет (pp. 1163–1192) слайды про HDFS и YARN из лекции 11 один в один. Их разбирает <a href="l31.html">урок 31</a>.</p></div>
+
+  <p class="memo"><mark class="key">Spark — вычислительный движок, а не хранилище: один движок с библиотеками заменяет три стека, а данные между шагами остаются в памяти воркеров.</mark></p>
+</section>
+
+
+<section id="l38-rdd">
+  <h2>RDD: рецепт, партиции и кэш</h2>
+
+  <p>Вот задание со слайда (p. 1222) — то самое, из загадки, — в том виде, в каком ты набрал бы его сегодня. Оно должно "Load error messages from a log into memory, then interactively search for various patterns":</p>
+
+<pre><code># sc is the SparkContext of your program (sc = spark.sparkContext)
+lines = sc.textFile("hdfs://...")
+errors = lines.filter(lambda s: s.startswith("ERROR"))
+messages = errors.map(lambda s: s.split("\t")[2])
+messages.cache()
+# two actions: each returns one number to the driver
+messages.filter(lambda s: "mysql" in s).count()
+messages.filter(lambda s: "php" in s).count()</code></pre>
+
+  <aside class="margin-note">На слайде написано <code>spark.textFile</code>: в 2012 году <code>spark</code> так назывался контекст. Сегодня <code>spark</code> — это SparkSession, а её контекст — <code>spark.sparkContext</code>.</aside>
+
+  <p>Читай построчно. <code>textFile</code> возвращает <abbr title="Resilient Distributed Dataset">RDD</abbr> строк, по одной партиции на блок HDFS, — и ничего не читает. <code>filter</code> возвращает новое RDD строк с ошибками, <code>map</code> — RDD, в котором остаётся третье поле, разделённое табуляцией: по-прежнему ничего не выполняется. <code>cache()</code> лишь помечает <code>messages</code>, чтобы после вычисления держать его в памяти. Первый <code>count()</code> запускает работу (рис. 3): одна задача на блок; каждый воркер читает свой блок, фильтрует, применяет map, кэширует свою партицию <code>messages</code> и считает строки с "mysql"; три числа складываются на драйвере. Второй <code>count()</code> стартует с кэшей: ни диска, ни filter, ни map.</p>
+
+  <figure class="fig fig--plain" id="l38-fig-job">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="Драйвер отправляет по одной задаче каждому из трёх воркеров; каждый воркер держит один блок лога в HDFS и, после первого count, одну закэшированную партицию messages; каждый воркер отправляет драйверу обратно одно число">
+      <line x1="178" y1="114" x2="326" y2="36" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="326" y1="56" x2="178" y2="128" class="sw-2 dash" marker-end="url(#arr)"/>
+      <line x1="178" y1="136" x2="326" y2="136" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="326" y1="152" x2="178" y2="152" class="sw-2 dash" marker-end="url(#arr)"/>
+      <line x1="178" y1="160" x2="326" y2="236" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="326" y1="256" x2="178" y2="170" class="sw-2 dash" marker-end="url(#arr)"/>
+      <rect x="16" y="106" width="160" height="70" class="fi-paper st-s6 sw-2 dash"/>
+      <text x="96" y="134" class="tx-bold tx-mid">драйвер</text>
+      <text x="96" y="158" class="tx-mono tx-sm tx-mid">SparkContext</text>
+      <text x="206" y="76" class="tx-sm halo">задачи</text>
+      <text x="262" y="114" class="tx-sm halo">результаты</text>
+
+      <rect x="330" y="14" width="218" height="66" class="fi-paper sw-2"/>
+      <text x="340" y="34" class="tx-sm">воркер 1</text>
+      <rect x="340" y="46" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <text x="366" y="60" class="tx-mono tx-sm">block 1</text>
+      <rect x="452" y="44" width="86" height="24" rx="6" class="fw-s1 st-s1"/>
+      <text x="495" y="61" class="tx-mono tx-sm tx-mid">cache 1</text>
+
+      <rect x="330" y="112" width="218" height="66" class="fi-paper sw-2"/>
+      <text x="340" y="132" class="tx-sm">воркер 2</text>
+      <rect x="340" y="144" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <text x="366" y="158" class="tx-mono tx-sm">block 2</text>
+      <rect x="452" y="142" width="86" height="24" rx="6" class="fw-s1 st-s1"/>
+      <text x="495" y="159" class="tx-mono tx-sm tx-mid">cache 2</text>
+
+      <rect x="330" y="210" width="218" height="66" class="fi-paper sw-2"/>
+      <text x="340" y="230" class="tx-sm">воркер 3</text>
+      <rect x="340" y="242" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <text x="366" y="256" class="tx-mono tx-sm">block 3</text>
+      <rect x="452" y="240" width="86" height="24" rx="6" class="fw-s1 st-s1"/>
+      <text x="495" y="257" class="tx-mono tx-sm tx-mid">cache 3</text>
+
+      <text x="16" y="276" class="tx-hand">назад идут только числа</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Первый <code>count()</code> задания со слайда (p. 1222): одна задача на блок HDFS. Каждый воркер фильтрует и обрабатывает map'ом свой блок, держит свою партицию <code>messages</code> в кэше и отправляет обратно одно число. Второй <code>count()</code> читает только три кэша.</figcaption>
+  </figure>
+
+  <p>«Ничего не читает» — буквально. В PySpark 4.2.0 <code>textFile</code> по несуществующему пути, а за ним filter и map не вызывают вообще никакой ошибки; "Input path does not exist" приходит только с <code>count()</code>.</p>
+
+  <div class="def">
+    <p><dfn>Resilient Distributed Dataset (RDD)</dfn> — основная абстракция Spark: неизменяемая коллекция записей, разбитая на партиции, разложенные по машинам кластера; строится из стабильного хранилища или из других RDD детерминированными трансформациями, вычисляется лениво, может кэшироваться и отказоустойчива, потому что Spark помнит, как была получена каждая партиция.</p>
+  </div>
+
+  <p>Слайды дают ему "4 main features" (p. 1205): "Distributed Collection of Data", "Fault-tolerant", "Parallel operation - partioned" и "Ability to use many data sources"; и три прилагательных: "immutable, lazily evaluated, cacheable" (p. 1208). Каждое слово названия — это механизм. Resilient (устойчивое): потерянная партиция пересчитывается, а не восстанавливается из копии. Distributed (распределённое): партиции лежат на многих машинах и обрабатываются параллельно, по задаче на каждую. Dataset (набор данных): программируешь ты его как одну коллекцию.</p>
+
+  <p>Операции над ним бывают двух видов (p. 1209): "Transformations are a recipe to follow. Actions perform what the recipe says to do and returns something back." <mark class="key">Трансформация (transformation)</mark> строит новое RDD "through deterministic operations on other RDDs" — map, filter, join — и это "lazy operation"; <mark class="key">действие (action)</mark> должно "return value or export data" — count, collect, save — и "triggers execution" (p. 1211). Табл. 2 собирает списки со слайдов.</p>
+
+  <figure class="tbl-fig wide" id="l38-tbl-ops">
+    <figcaption>Табл. 2. Трансформации и действия так, как их перечисляют слайды.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Где</th><th>Трансформации (ленивые): возвращают новое RDD или DataFrame</th><th>Действия: запускают задание, возвращают значение или записывают данные</th></tr></thead>
+        <tbody>
+          <tr><td>Операции над RDD (p. 1211)</td><td><code>map</code>, <code>filter</code>, <code>join</code></td><td><code>count</code>, <code>collect</code>, <code>save</code></td></tr>
+          <tr><td>Таблица "Operations" (p. 1212), DataFrames</td><td><code>select</code>, <code>distinct</code>, <code>groupBy</code>, <code>sum</code>, <code>orderBy</code>, <code>filter</code>, <code>limit</code></td><td><code>show</code>, <code>count</code>, <code>collect</code>, <code>save</code></td></tr>
+          <tr><td>Практическое занятие (p. 1722), RDD</td><td><code>map()</code>, <code>filter()</code>, <code>flatMap()</code>, <code>distinct()</code>, <code>union()</code>, <code>reduceByKey()</code>, <code>groupByKey()</code>, <code>sortBy()</code></td><td><code>collect()</code>, <code>count()</code>, <code>take(n)</code>, <code>reduce()</code>, <code>saveAsTextFile()</code>, <code>first()</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="tip"><p>Чтобы найти строки, которые запускают задание, смотри, что возвращает каждый вызов. Новое RDD или DataFrame — трансформация, ничего не выполнилось. Число, список, напечатанная таблица или файл — действие, задание выполнилось.</p></div>
+
+  <p>Зачем ждать? "With a large dataset, you don't want to calculate all the transformations until you are sure you want to perform them!" (p. 1210). Ленивые вычисления (lazy evaluation) окупаются трижды: не вычисляется ничего, что не нужно ни одному действию; идущие подряд трансформации вроде <code>filter</code> и <code>map</code> выполняются одним проходом по каждой партиции, запись за записью, без сохранения промежуточного RDD; и Spark видит весь план, прежде чем что-то запустить, поэтому может разрезать его на стадии и отправить работу туда, где лежат данные.</p>
+
+  <p>"RDD are immutable, transformations create new RDD" (p. 1213). Поэтому RDD остаётся тем, чем родилось, — родителем и функцией, — а цепочка таких пар до самого файла и есть его <mark class="key">родословная (lineage)</mark> (рис. 4). Spark будет использовать lineage, чтобы восстанавливать потерянные данные, поэтому трансформация должна давать один и тот же результат при каждом запуске: функция, которая вытягивает случайные числа или читает часы, восстановила бы другие данные. Неизменяемость окупается второй раз в кэше: раз закэшированную партицию никто не может изменить, её могут одновременно читать много заданий без блокировок.</p>
+
+  <figure class="fig fig--plain" id="l38-fig-lineage">
+    <svg class="dia" viewBox="0 0 560 190" role="img" aria-label="Lineage со слайда: файл HDFS, затем filter со startswith даёт отфильтрованное RDD, затем map со split даёт преобразованное RDD; у каждого три партиции">
+      <text x="180" y="28" class="tx-mono tx-mid">filter</text>
+      <text x="380" y="28" class="tx-mono tx-mid">map</text>
+      <rect x="10" y="40" width="140" height="64" rx="10" class="fi-paper sw-2"/>
+      <text x="80" y="60" class="tx-sm tx-mid">файл HDFS</text>
+      <rect x="41" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="71" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="101" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <line x1="152" y1="72" x2="206" y2="72" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="210" y="40" width="140" height="64" rx="10" class="fi-paper sw-2"/>
+      <text x="280" y="60" class="tx-sm tx-mid">filtered RDD</text>
+      <rect x="241" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="271" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="301" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <line x1="352" y1="72" x2="406" y2="72" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="410" y="40" width="140" height="64" rx="10" class="fi-paper sw-2"/>
+      <text x="480" y="60" class="tx-sm tx-mid">mapped RDD</text>
+      <rect x="441" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="471" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="501" y="72" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <text x="180" y="130" class="tx-mono tx-sm tx-mid">startswith(…)</text>
+      <text x="380" y="130" class="tx-mono tx-sm tx-mid">split(…)</text>
+      <path d="M10,144 V150 H550 V144 M280,150 V156" class="st-muted"/>
+      <text x="280" y="182" class="tx-hand tx-mid">lineage</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Lineage со слайда (p. 1213), повторённая на следующем (p. 1223): каждая трансформация создаёт новое RDD и записывает его родителя и функцию. Ничего промежуточного не хранится; Spark хранит саму цепочку.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="1213">
+    <p class="claim"><code>msgs = textFile.filter(lambda s: s.startsWith(“ERROR”)) .map(lambda s: s.split(“\t”)[2])</code></p>
+    <p class="fix">В Python строковый метод называется <code>startswith</code>, целиком строчными буквами: <code>lambda s: s.startswith("ERROR")</code>, с прямыми кавычками. <code>startsWith</code> — так пишут в Scala и Java.</p>
+    <p class="because">У строк Python нет метода <code>startsWith</code>. Если набрать напечатанную строку с прямыми кавычками, сначала она ничего не выбросит — она ленивая, — а в PySpark 4.2.0 упадёт на первом действии с <code>AttributeError: 'str' object has no attribute 'startsWith'</code>; с фигурными кавычками слайда это даже не валидный Python. В задании (p. 1222) написано правильно; следующий слайд (p. 1223) повторяет ошибку. Экзамен может процитировать слайд как напечатано; в своём коде пиши <code>startswith</code>, как у метода столбца <code>col("Name").startswith("Care")</code>.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">Трансформации пишут рецепт, действия по нему готовят: до действия RDD — это lineage операций, а не данные.</mark></p>
+</section>
+
+
+<section id="l38-nw">
+  <h2>Узкие и широкие: должны ли данные переезжать?</h2>
+
+  <p>Возьмём показания систем отопления трёх больниц: парное RDD (pair RDD) из пар (больница, кВт·ч) в трёх партициях. <code>filter</code> оставляет или выбрасывает каждую запись там, где она лежит, так что выходная партиция 1 строится только из входной партиции 1, на той же машине, в той же задаче. <code>reduceByKey</code> складывает кВт·ч каждой больницы, поэтому все записи H1 должны встретиться в одной партиции — а лежат они в партициях 1 и 3. Spark не может заранее знать, какие больницы лежат в партиции, поэтому каждая входная партиция режется по ключу на куски, по одному на выходную партицию, и каждая выходная партиция забирает свой кусок у каждой входной: это <mark class="key">shuffle (перемешивание)</mark>.</p>
+
+  <p>Слайд (p. 1214) называет оба случая. <mark class="key">Узкие (narrow)</mark> трансформации, "1 to 1": <code>filter(..)</code>, <code>drop(..)</code>, <code>coalesce()</code>. <mark class="key">Широкие (wide)</mark> трансформации, "(shuffles) 1 to N": <code>distinct()</code>, <code>groupBy(..).sum()</code>, <code>repartition(n)</code>. Его картинки считают со стороны входа: одна входная партиция — в одну выходную, одна входная — в N выходных. Его определения считают со стороны выхода, и определение узкой трансформации получается неверным.</p>
+
+  <aside class="redpen" data-page="1214">
+    <p class="claim">"The data required to compute the records in a single partition reside in at most one partition of the parent RDD."</p>
+    <p class="fix">Узкая — это обратный подсчёт: каждую партицию родительского RDD использует не более одной партиции дочернего RDD, поэтому ни одну родительскую партицию не надо делить и ничего не перемешивается. Широкая: родительскую партицию используют многие дочерние партиции — shuffle.</p>
+    <p class="because">Собственный пример слайда ломает это предложение: <code>coalesce()</code> строит одну новую партицию из нескольких старых — "many partitions of the parent RDD", то есть широкая по напечатанной формулировке, — но в списке она узкая, и это правда: ничего не делится, ничего не перемешивается (попробуй <code>coalesce(2)</code> в виджете ниже; в PySpark 4.2.0 в её lineage нет shuffle). Картинки, "1 to 1" и "1 to N", считают от родителя, как и статья про RDD 2012 года. Экзамен может процитировать напечатанное предложение: знай его — и знай, что настоящая проверка в том, приходится ли делить родительскую партицию.</p>
+  </aside>
+
+  <div class="widget" id="l38-w-nw">
+    <h3 class="widget-title">Узкая или широкая? Следи за стрелками между партициями</h3>
+    <p class="widget-intro">Слева — показания систем отопления трёх больниц, (больница, кВт·ч), в трёх партициях; справа — результат выбранной операции. Стрелка означает «эта выходная партиция зависит от той входной»: Spark читает из неё, чтобы построить выходную партицию. После shuffle каждая больница попадает в свою выходную партицию: идеализированное хеш-партиционирование.</p>
+    <ol class="tasks">
+      <li>Начни с <em>map</em>, потом <em>filter</em>. Прежде чем смотреть: нужно ли выходной партиции 2 что-нибудь из входных партиций 1 или 3? Потом переключись на <em>groupByKey</em>.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>У map и filter по одной стрелке на выходную партицию, из входной партиции на том же месте: каждая партиция вычисляется там, где лежит, ничего не переезжает, перемешано 0 значений. У groupByKey в каждую выходную партицию идёт стрелка из каждой входной — записи H1 лежат в p1 и p3, — и все 9 значений кВт·ч проходят через shuffle. Именно это виджет не даёт пропустить: широкая — значит, входная партиция делится между многими выходными, shuffle, как бы операция ни называлась.</p></details>
+      </li>
+      <li>Выбери <em>coalesce(2)</em>. Сколько входных партиций питают выходную p2? По предложению, напечатанному на слайде (p. 1214), узкая это или широкая? Потом прочитай вердикт.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Две: p2 и p3 целиком уходят в выходную p2. По напечатанному предложению это была бы широкая ("many partitions of the parent RDD"); но каждая входная партиция питает ровно одну выходную, ничего не делится и не перегруппируется, перемешано 0 значений: узкая, как и говорит собственный список примеров на слайде. Считай со стороны входа.</p></details>
+      </li>
+      <li>Сравни <em>groupByKey</em> и <em>reduceByKey</em>. Предскажи, какая из них прогоняет через shuffle меньше значений и почему обе дают одинаковые суммы.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Стрелки одинаковые — обе широкие, — но reduceByKey перемешивает 6 частичных сумм вместо 9 значений: каждая входная партиция сначала складывает свои значения по каждой больнице (p1 отправляет H1 7 и H2 3), как combiner в MapReduce. Суммы в обоих случаях: H1 11, H2 10, H3 9.</p></details>
+      </li>
+      <li>Выбери <em>join(hospitals)</em>, потом включи «входы уже партиционированы по больнице». Что происходит со стрелками и с shuffle?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Выключено: каждая выходная партиция читает каждую партицию обоих входов, и все 12 записей (9 показаний, 3 больницы) перемешиваются. Включено: партиция i показаний встречается с партицией i больниц, по одной стрелке, ничего не перемешивается. Тот же самый join узкий, когда данные уже лежат там, где они нужны результату, — а доставить их туда стоило по одному shuffle на каждый вход, один раз.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l38-w-nw', function (root, ui) {
+    var R = [[['H1', 5], ['H1', 2], ['H2', 3]], [['H2', 6], ['H2', 1], ['H3', 4]], [['H3', 3], ['H1', 4], ['H3', 2]]];
+    var NEWR = [[['H2', 7], ['H3', 1]], [['H1', 6], ['H2', 2]]];
+    var HOSP = [[['H1', 'Care'], ['H3', 'Lake']], [['H2', 'City']]];
+    var RK = [[['H1', 5], ['H1', 2], ['H1', 4]], [['H2', 3], ['H2', 6], ['H2', 1]], [['H3', 4], ['H3', 3], ['H3', 2]]];
+    var HK = [[['H1', 'Care']], [['H2', 'City']], [['H3', 'Lake']]];
+    var NAME = { H1: 'Care', H2: 'City', H3: 'Lake' };
+    var KEYS = ['H1', 'H2', 'H3'];
+    function cells(p) { return p.map(function (r) { return r[0] + ' ' + r[1]; }); }
+    function allTo(nIn, nOut) { var d = []; for (var i = 0; i < nIn; i++) for (var j = 0; j < nOut; j++) d.push([i, j]); return d; }
+    function same(n) { var d = []; for (var i = 0; i < n; i++) d.push([i, i]); return d; }
+    var JOINED = KEYS.map(function (k) {
+      var out = [];
+      R.forEach(function (p) { p.forEach(function (r) { if (r[0] === k) out.push(k + ' (' + r[1] + ', ' + NAME[k] + ')'); }); });
+      return out;
+    });
+
+    var OPS = {
+      map: { code: 'readings.map(lambda r: (r[0], 2 * r[1]))', inputs: [{ name: 'readings', parts: R.map(cells) }],
+        out: R.map(function (p) { return p.map(function (r) { return r[0] + ' ' + 2 * r[1]; }); }),
+        deps: same(3), wide: false, moved: 0, reads: '1 входную партицию', feeds: '1 выходную партицию',
+        note: 'Каждая запись меняется там, где лежит: выходная партиция i вычисляется из входной партиции i, в той же задаче, на той же машине. Узкая по обоим определениям.' },
+      filter: { code: 'readings.filter(lambda r: r[1] >= 3)', inputs: [{ name: 'readings', parts: R.map(cells) }],
+        out: R.map(function (p) { return cells(p.filter(function (r) { return r[1] >= 3; })); }),
+        deps: same(3), wide: false, moved: 0, reads: '1 входную партицию', feeds: '1 выходную партицию',
+        note: 'Записи остаются или выбрасываются там, где лежат: партиции уменьшаются, ничего не переезжает. Узкая по обоим определениям.' },
+      union: { code: 'readings.union(new_readings)', inputs: [{ name: 'readings', parts: R.map(cells) }, { name: 'new_readings', parts: NEWR.map(cells) }],
+        out: R.map(cells).concat(NEWR.map(cells)), deps: same(5), wide: false, moved: 0,
+        reads: '1 входную партицию', feeds: '1 выходную партицию',
+        note: 'Результат просто перечисляет партиции обоих входов: 3 + 2 = 5 партиций, каждая — копия одной входной партиции. Узкая, даже с двумя родителями.' },
+      coalesce: { code: 'readings.coalesce(2)', inputs: [{ name: 'readings', parts: R.map(cells) }],
+        out: [cells(R[0]), cells(R[1]).concat(cells(R[2]))], deps: [[0, 0], [1, 1], [2, 1]], wide: false, moved: 0,
+        reads: '1 или 2 целые входные партиции', feeds: '1 выходную партицию',
+        note: 'Выходная p2 — это входные p2 и p3, сложенные вместе целиком. Предложение, напечатанное на слайде (p. 1214), назвало бы это широкой — данные одной выходной партиции "may reside in many partitions of the parent RDD", — но слайд относит coalesce() к узким, и это правда: ни одна входная партиция не делится, ничего не перегруппируется, shuffle нет. Считай со стороны входа: каждая входная партиция питает ровно одну выходную.' },
+      groupByKey: { code: 'readings.groupByKey()', inputs: [{ name: 'readings', parts: R.map(cells) }],
+        out: KEYS.map(function (k) { var v = []; R.forEach(function (p) { p.forEach(function (r) { if (r[0] === k) v.push(r[1]); }); }); return [k + ' [' + v.join(', ') + ']']; }),
+        deps: allTo(3, 3), wide: true, moved: 9, reads: 'каждую входную партицию', feeds: 'каждую выходную партицию',
+        note: 'Записи H1 лежат в p1 и p3, записи H2 — в p1 и p2. Spark не может заранее знать, какие больницы лежат в партиции, поэтому каждая входная партиция режется на куски, по одному на выходную партицию, и каждая выходная партиция забирает куски у всех входных. Все 9 значений кВт·ч проходят через shuffle. Широкая: здесь начинается новая стадия.' },
+      reduceByKey: { code: 'readings.reduceByKey(lambda a, b: a + b)', inputs: [{ name: 'readings', parts: R.map(cells) }],
+        out: KEYS.map(function (k) { var s = 0; R.forEach(function (p) { p.forEach(function (r) { if (r[0] === k) s += r[1]; }); }); return [k + ' ' + s]; }),
+        deps: allTo(3, 3), wide: true, moved: 6, reads: 'каждую входную партицию', feeds: 'каждую выходную партицию',
+        note: 'Те же стрелки, что у groupByKey, — широкая, shuffle, — но каждая входная партиция сначала складывает свои значения по каждой больнице (p1 отправляет H1 7 и H2 3, p2 — H2 7 и H3 4, p3 — H3 5 и H1 4), так что через shuffle проходят 6 частичных сумм вместо 9 значений: это combiner из MapReduce.' }
+    };
+    function joinSpec(cop) {
+      if (cop) return { code: 'readings.join(hospitals)', interleave: true, inputs: [{ name: 'readings', parts: RK.map(cells) }, { name: 'hospitals', parts: HK.map(cells) }],
+        out: JOINED, deps: [[0, 0], [1, 0], [2, 1], [3, 1], [4, 2], [5, 2]], wide: false, moved: 0,
+        reads: 'по 1 партиции каждого входа', feeds: '1 выходную партицию',
+        note: 'Оба входа уже партиционированы по больнице одним и тем же партиционером: партиция i показаний встречается с партицией i больниц, и ничего не переезжает. Тот же join теперь узкий. (Привести входы к такому виду стоило по одному shuffle на каждый, один раз — partitionBy(3), затем cache(), — и это окупается при каждом следующем join.)' };
+      return { code: 'readings.join(hospitals)', inputs: [{ name: 'readings', parts: R.map(cells) }, { name: 'hospitals', parts: HOSP.map(cells) }],
+        out: JOINED, deps: allTo(5, 3), wide: true, moved: 12, reads: 'каждую партицию обоих входов', feeds: 'каждую выходную партицию',
+        note: 'Spark не знает, где лежит каждая больница ни в одном из входов, поэтому оба перемешиваются по ключу: каждая выходная партиция читает каждую партицию обоих входов, и все 9 + 3 = 12 записей проходят через shuffle. Широкая.' };
+    }
+
+    var op = ui.select('операция', [
+      { value: 'map', label: 'map: удвоить каждое кВт·ч' },
+      { value: 'filter', label: 'filter: оставить кВт·ч ≥ 3' },
+      { value: 'union', label: 'union с new_readings' },
+      { value: 'coalesce', label: 'coalesce(2)' },
+      { value: 'groupByKey', label: 'groupByKey()' },
+      { value: 'reduceByKey', label: 'reduceByKey(add)' },
+      { value: 'join', label: 'join(hospitals)' }
+    ], null, 'map');
+    var cop = ui.toggle('входы уже партиционированы по больнице (только join)', false);
+    var roKind = ui.readout('зависимость'), roReads = ui.readout('выходная партиция читает'),
+        roFeeds = ui.readout('входная партиция питает'), roMoved = ui.readout('значений перемешано', { digits: 0 });
+    var note = ui.note('');
+    ui.legend([
+      { label: 'партиция записей (больница, кВт·ч)', color: 's1', mark: 'square' },
+      { label: 'зависит от (читает из)', color: 's1', mark: 'line' },
+      { label: 'shuffle: граница стадий', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 300, { label: 'Входные партиции слева, выходные справа, и стрелка от каждой входной партиции, которая нужна выходной' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+
+    function spec() { return op.value === 'join' ? joinSpec(cop.value) : OPS[op.value]; }
+    function boxH(n, wideCells) { var rows = wideCells ? n : Math.ceil(n / 3); return 26 + Math.max(1, rows) * 26; }
+    function isWideCell(s) { return s.length > 6; }
+
+    function draw(sp) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var LX = 12, RX = 348, BW = 200, y = 30, inBoxes = [], outBoxes = [];
+      T(LX, 18, 'вход', 'tx-sm tx-muted');
+      T(RX, 18, 'выход', 'tx-sm tx-muted');
+      if (sp.interleave) {
+        /* co-partitioned inputs: partition i of each input side by side, next to output partition i */
+        y += 8;
+        for (var k = 0; k < sp.out.length; k++) {
+          sp.inputs.forEach(function (g) {
+            var p = g.parts[k], wc = p.some(isWideCell), h = boxH(p.length, wc);
+            inBoxes.push({ x: LX, y: y, h: h, recs: p, wc: wc, label: g.name + ' p' + (k + 1) });
+            y += h + 6;
+          });
+          y += 12;
+        }
+      } else {
+        sp.inputs.forEach(function (g, gi) {
+          if (gi) y += 10;
+          T(LX, y + 14, g.name, 'tx-mono tx-sm');
+          y += 22;
+          g.parts.forEach(function (p) {
+            var wc = p.some(isWideCell), h = boxH(p.length, wc);
+            inBoxes.push({ x: LX, y: y, h: h, recs: p, wc: wc, label: 'p' + (inBoxes.filter(function (b) { return b.g === gi; }).length + 1), g: gi });
+            y += h + 8;
+          });
+        });
+      }
+      var leftBottom = y;
+      var narrowAligned = !sp.wide && sp.out.length === inBoxes.length;
+      var oy = 52;
+      var totalOut = 0;
+      sp.out.forEach(function (p) { totalOut += boxH(p.length, p.some(isWideCell)) + 10; });
+      if (!narrowAligned) oy = Math.max(52, 52 + ((leftBottom - 52) - totalOut) / 2);
+      sp.out.forEach(function (p, i) {
+        var wc = p.some(isWideCell), h = boxH(p.length, wc), by;
+        if (narrowAligned) by = inBoxes[i].y;
+        else if (op.value === 'coalesce') by = inBoxes[i].y;
+        else if (sp.interleave) { var a = inBoxes[2 * i], b = inBoxes[2 * i + 1]; by = (a.y + b.y + b.h) / 2 - h / 2; }
+        else { by = oy; oy += h + 10; }
+        outBoxes.push({ x: RX, y: by, h: h, recs: p, wc: wc, label: 'p' + (i + 1) });
+      });
+      var bottom = leftBottom;
+      outBoxes.forEach(function (b) { bottom = Math.max(bottom, b.y + b.h + 8); });
+      var H = Math.round(bottom + 34);
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      if (sp.wide) S('line', { x1: 280, y1: 36, x2: 280, y2: H - 34, 'class': 'hl' });
+      sp.deps.forEach(function (d) {
+        var a = inBoxes[d[0]], b = outBoxes[d[1]];
+        if (!a || !b) return;
+        S('line', { x1: LX + BW, y1: a.y + a.h / 2, x2: RX - 3, y2: b.y + b.h / 2, 'class': 'st-s1' + (sp.wide ? '' : ' sw-2'), 'marker-end': 'url(#arr-s1)' });
+      });
+      function box(b) {
+        S('rect', { x: b.x, y: b.y, width: BW, height: b.h, rx: 6, 'class': 'fi-paper sw-2' });
+        T(b.x + 8, b.y + 16, b.label, 'tx-sm tx-muted');
+        b.recs.forEach(function (s, k) {
+          var cx, cy, w;
+          if (b.wc) { w = 188; cx = b.x + 6; cy = b.y + 22 + k * 26; }
+          else { w = 58; cx = b.x + 6 + (k % 3) * 65; cy = b.y + 22 + Math.floor(k / 3) * 26; }
+          S('rect', { x: cx, y: cy, width: w, height: 22, 'class': 'fw-s1 st-s1' });
+          T(cx + w / 2, cy + 15, s, 'tx-mono tx-sm tx-mid');
+        });
+      }
+      inBoxes.forEach(box);
+      outBoxes.forEach(box);
+      T(280, H - 10, sp.wide ? 'широкая: shuffle, новая стадия' : 'узкая: данные не переезжают', 'tx-sm tx-mid');
+    }
+
+    ui.onChange(function () {
+      var sp = spec();
+      roKind.set(sp.wide ? 'широкая (shuffle)' : 'узкая');
+      roReads.set(sp.reads);
+      roFeeds.set(sp.feeds);
+      roMoved.set(sp.moved);
+      var extra = (cop.value && op.value !== 'join') ? ' <span class="tx-muted">(Переключатель влияет только на join.)</span>' : '';
+      note.set('<code>' + sp.code + '</code> — ' + sp.note + extra);
+      draw(sp);
+    });
+  });
+  </script>
+
+  <p>Эта разница решает три вещи. Стоимость: shuffle пишет куски на локальные диски отправителей и тянет их по сети — это shuffle из MapReduce (<a href="l30.html">урок 30</a>). Планирование: выходной партиции после shuffle нужны куски от всех входных партиций, поэтому сначала должны закончиться все входные задачи; задание режется здесь, а узкие шаги сцепляются внутри одной задачи. Восстановление: потерянная узкая партиция восстанавливается из своей собственной входной партиции, потерянная партиция после shuffle — из кусков всех входных.</p>
+
+  <p>Одна и та же операция может быть и той, и другой. <code>join</code> широкий, когда Spark не знает, где живёт каждый ключ; когда оба входа уже партиционированы по ключу джойна одним и тем же партиционером, партиция i одного встречается с партицией i другого и ничего не переезжает: узкий, как отмечает статья про RDD 2012 года (и как подтверждает PySpark 4.2.0).</p>
+
+  <p class="memo"><mark class="key">Узкая: каждая входная партиция питает не более одной выходной, ничего не переезжает. Широкая: входная партиция делится между многими выходными — shuffle и новая стадия.</mark></p>
+</section>
+
+
+<section id="l38-df">
+  <h2>От RDD к DataFrame</h2>
+
+  <p>"With Spark 2.0, Spark is moving towards a DataFrame based syntax. But the way files are being distributed can still be thought of as RDDs, it is just the typed out syntax that is changing" (p. 1215). <mark class="key">DataFrame</mark> — это "Immutable Data with named columns (built on RDDs)" с "User-friendly API", "Uniform APIs across languages (Scala, Java, Python, R, and SQL)" и "Improved performance via optimizations (Tungsten and Catalyst)" (p. 1216) — это слой выполнения и оптимизатор из <a href="l40.html">урока 40</a>. Партиции, ленивость, lineage, узкие и широкие: всё сказанное выше по-прежнему верно.</p>
+
+  <p>Что изменилось, говорит временная шкала (p. 1204). RDD (2011) — это "Distribute collection of JVM objects" с "Functional Operators (map, filter, etc.)": Spark выполняет твои функции, но не может заглянуть внутрь них. DataFrame (2013) — это "Distribute collection of Row objects" с "Expression-based operations and UDFs" и "Logical plans and optimizer": Spark умеет прочитать <code>col("age") &gt; 30</code>, оптимизировать план и компактно хранить строки. Dataset (2015) — это "Internally rows, externally JVM objects": типизированный и быстрый, "But slower than DF". Годы — со слайда; сам DataFrame API вышел со Spark 1.3, в 2015 году. Начиная со Spark 2.0 это один API (p. 1219): "DataFrame = Dataset[Row]" — нетипизированный псевдоним, "Dataset[T]" — типизированный, для Scala и Java. В Python есть только DataFrame — и это всё, что нужно на экзамене.</p>
+
+  <p>Пример кода (p. 1217) опрашивает "different data sources" двумя способами: зарегистрировать DataFrame как временные представления (temporary views) и написать SQL-строку или выстроить цепочку методов DataFrame. Оба строят один и тот же план. В исправленном виде они выглядят так:</p>
+
+<pre><code># route 1: register views, then a SQL string
+jsonDf = spark.read.json("s3n://…")
+jsonDf.createOrReplaceTempView("json")
+peopleDf.createOrReplaceTempView("people")
+results = spark.sql("""SELECT p.id, p.name, j.country
+                       FROM people p JOIN json j ON p.id = j.id
+                       WHERE p.age &gt; 30""")</code></pre>
+
+<pre><code># route 2: the DataFrame API, the same plan
+results = (peopleDf.join(jsonDf, peopleDf.id == jsonDf.id)
+                   .filter(peopleDf.age &gt; 30)
+                   .select(peopleDf.id, "name", "country"))</code></pre>
+
+  <aside class="redpen" data-page="1217">
+    <p class="claim"><code>jsonDf = context.jsonFile("s3n://…").createOrReplaceTempView("json")</code></p>
+    <p class="fix">Прочитай файл в DataFrame, а представление зарегистрируй отдельной инструкцией: <code>jsonDf = spark.read.json("s3n://…")</code>, затем <code>jsonDf.createOrReplaceTempView("json")</code>.</p>
+    <p class="because"><code>createOrReplaceTempView</code> возвращает <code>None</code> (проверено в PySpark 4.2.0), так что напечатанная строка оставляет <code>jsonDf = None</code>, и второй блок, <code>peopleDf.join(jsonDf, …)</code>, падает. А <code>jsonFile</code>, метод SQLContext из Spark 1.x, удалили в Spark 2.0 — той самой версии, где появился <code>createOrReplaceTempView</code>. Экзамен может процитировать слайд как напечатано; твой собственный код должен держать DataFrame в переменной.</p>
+  </aside>
+
+  <p>Экзамен от 30 января 2026 года принимает только второй путь: "Note that you are not allowed to use SQL syntax. Use PySpark instead." <a href="l39.html">Урок 39</a> отрабатывает его на всех прошлых упражнениях SparkQL.</p>
+
+  <p>Что быстрее? Рис. 5 перерисовывает график "Time to aggregate 10 million integer pairs (in seconds)" (p. 1218). Время кода на RDD зависит от языка — Python около 9.5 s, Scala около 4.2 s, — потому что лямбды Python работают в отдельных процессах Python, и каждую запись надо сериализовать, чтобы до них добраться. Время кода на DataFrame не зависит: около 2 s в SQL, R, Python и Scala одинаково, потому что API только описывает вычисление, а оптимизированный план выполняется внутри <abbr title="Java virtual machine">JVM</abbr>, на каком бы языке его ни написали.</p>
+
+  <figure class="fig fig--plain" id="l38-fig-perf">
+    <svg class="dia" viewBox="0 0 560 252" role="img" aria-label="Столбчатый график, перерисованный со слайда: агрегация 10 миллионов пар целых чисел занимает около 2 секунд с DataFrame в SQL, R, Python и Scala, около 9.5 секунды с RDD в Python и около 4.2 секунды с RDD в Scala">
+      <text x="170" y="27" class="tx-sm tx-end">DataFrame SQL</text>
+      <rect x="180" y="14" width="67" height="18" class="fi-s5 st-none"/>
+      <text x="255" y="27" class="tx-mono tx-sm">≈ 2.1</text>
+      <text x="170" y="57" class="tx-sm tx-end">DataFrame R</text>
+      <rect x="180" y="44" width="67" height="18" class="fi-s5 st-none"/>
+      <text x="255" y="57" class="tx-mono tx-sm">≈ 2.1</text>
+      <text x="170" y="87" class="tx-sm tx-end">DataFrame Python</text>
+      <rect x="180" y="74" width="66" height="18" class="fi-s5 st-none"/>
+      <text x="254" y="87" class="tx-mono tx-sm">≈ 2.05</text>
+      <text x="170" y="117" class="tx-sm tx-end">DataFrame Scala</text>
+      <rect x="180" y="104" width="67" height="18" class="fi-s5 st-none"/>
+      <text x="255" y="117" class="tx-mono tx-sm">≈ 2.1</text>
+      <text x="170" y="147" class="tx-sm tx-end">RDD Python</text>
+      <rect x="180" y="134" width="304" height="18" class="fi-s4 st-none"/>
+      <text x="492" y="147" class="tx-mono tx-sm">≈ 9.5</text>
+      <text x="170" y="177" class="tx-sm tx-end">RDD Scala</text>
+      <rect x="180" y="164" width="134" height="18" class="fi-s4 st-none"/>
+      <text x="322" y="177" class="tx-mono tx-sm">≈ 4.2</text>
+      <line x1="180" y1="194" x2="500" y2="194" class="st-muted"/>
+      <path d="M180,194 v6 M244,194 v6 M308,194 v6 M372,194 v6 M436,194 v6 M500,194 v6" class="st-muted"/>
+      <text x="180" y="216" class="tx-mono tx-sm tx-mid">0</text>
+      <text x="244" y="216" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="308" y="216" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="372" y="216" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="436" y="216" class="tx-mono tx-sm tx-mid">8</text>
+      <text x="500" y="216" class="tx-mono tx-sm tx-mid">10</text>
+      <text x="340" y="242" class="tx-sm tx-mid">секунд на агрегацию 10 млн пар целых чисел</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> График со слайда (p. 1218, "Chart from Databricks"), значения сняты с графика. Пурпурный — код на DataFrame, около 2 s в любом языке. Бирюзовый — код на RDD, время которого зависит от языка.</figcaption>
+  </figure>
+
+  <p>Вот мелкий шрифт к "Available APIs" (p. 1226): "You can write in Java, Scala or Python", "interactive interpreter" — "Scala &amp; Python only", и "Java &amp; Scala are faster thanks to static typing" — верно для кода на RDD, где Python платит за свои отдельные процессы; для DataFrame график никакого разрыва не показывает. (R и SQL, перечисленных на другом слайде (p. 1216), здесь нет.)</p>
+
+  <p class="memo"><mark class="key">DataFrame — это RDD строк с именованными столбцами: те же партиции и ленивость плюс план, который Spark сам может прочитать и оптимизировать.</mark></p>
+</section>
+
+
+<section id="l38-run">
+  <h2>Жизнь задания — и потерянной партиции</h2>
+
+  <p>"Spark runs as a library in your program (1 instance per app)" (p. 1220): в архитектуре со слайдов ты не отправляешь запросы Spark-серверу, как отправлял бы их базе данных. Твоя программа — это <mark class="key">драйвер (driver)</mark>. Её единственный SparkContext запускает задачи в локальных потоках или получает <mark class="key">executor'ы (executors)</mark> — процессы на машинах-воркерах — у cluster manager, в "Mesos, YARN or standalone mode"; задачи сами читают хранилище, "via Hadoop InputFormat API" (HBase, HDFS, S3). Рис. 6 рисует, кто с кем разговаривает (pp. 1206, 1220); "Master" и "Slave" со слайда (p. 1207) — это драйвер и executor'ы.</p>
+
+  <figure class="fig fig--plain" id="l38-fig-parts">
+    <svg class="dia" viewBox="0 0 560 360" role="img" aria-label="Драйвер со своим SparkContext запрашивает executor'ы у cluster manager; cluster manager запускает executor'ы на двух узлах-воркерах; задачи и результаты ходят напрямую между SparkContext и executor'ами; executor'ы обмениваются данными shuffle и читают слой хранения">
+      <path d="M90,116 C90,20 300,8 388,60" class="sw-2 fi-none" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <path d="M90,220 C90,330 300,330 388,262" class="sw-2 fi-none" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <text x="214" y="40" class="tx-sm halo">задачи и результаты</text>
+      <line x1="164" y1="166" x2="196" y2="166" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="196" y1="182" x2="164" y2="182" class="sw-2 dash" marker-end="url(#arr)"/>
+      <line x1="352" y1="156" x2="390" y2="96" class="dash" marker-end="url(#arr)"/>
+      <line x1="352" y1="196" x2="390" y2="236" class="dash" marker-end="url(#arr)"/>
+      <rect x="12" y="120" width="150" height="96" class="fi-paper st-s6 sw-2 dash"/>
+      <text x="87" y="142" class="tx-bold tx-mid">драйвер</text>
+      <text x="87" y="161" class="tx-sm tx-mid">твоя программа</text>
+      <rect x="18" y="172" width="138" height="32" class="fi-paper"/>
+      <text x="87" y="193" class="tx-mono tx-sm tx-mid">SparkContext</text>
+      <rect x="200" y="136" width="150" height="76" class="fi-paper sw-2"/>
+      <text x="275" y="158" class="tx-sm tx-mid">cluster manager</text>
+      <text x="275" y="178" class="tx-sm tx-mid tx-muted">Mesos, YARN</text>
+      <text x="275" y="198" class="tx-sm tx-mid tx-muted">or standalone</text>
+      <text x="275" y="234" class="tx-sm tx-mid">запускает executor'ы</text>
+
+      <rect x="392" y="10" width="156" height="130" class="fi-paper"/>
+      <text x="402" y="28" class="tx-sm tx-muted">узел-воркер</text>
+      <rect x="398" y="36" width="144" height="96" class="fi-paper sw-2"/>
+      <text x="406" y="56" class="tx-sm">executor</text>
+      <rect x="484" y="42" width="56" height="22" class="fw-s1 st-s1"/>
+      <text x="512" y="58" class="tx-sm tx-mid">cache</text>
+      <rect x="406" y="90" width="58" height="30" class="fi-paper"/>
+      <text x="435" y="110" class="tx-sm tx-mid">task</text>
+      <rect x="474" y="90" width="58" height="30" class="fi-paper"/>
+      <text x="503" y="110" class="tx-sm tx-mid">task</text>
+
+      <line x1="470" y1="142" x2="470" y2="162" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="480" y="157" class="tx-sm">shuffle</text>
+
+      <rect x="392" y="166" width="156" height="130" class="fi-paper"/>
+      <text x="402" y="184" class="tx-sm tx-muted">узел-воркер</text>
+      <rect x="398" y="192" width="144" height="96" class="fi-paper sw-2"/>
+      <text x="406" y="212" class="tx-sm">executor</text>
+      <rect x="484" y="198" width="56" height="22" class="fw-s1 st-s1"/>
+      <text x="512" y="214" class="tx-sm tx-mid">cache</text>
+      <rect x="406" y="246" width="58" height="30" class="fi-paper"/>
+      <text x="435" y="266" class="tx-sm tx-mid">task</text>
+      <rect x="474" y="246" width="58" height="30" class="fi-paper"/>
+      <text x="503" y="266" class="tx-sm tx-mid">task</text>
+
+      <line x1="470" y1="314" x2="470" y2="298" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="12" y="316" width="536" height="34" class="fi-paper sw-2"/>
+      <rect x="300" y="324" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="326" y="324" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="352" y="324" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <text x="24" y="338" class="tx-sm">HDFS или другое хранилище</text>
+    </svg>
+    <figcaption><b>Рис. 6.</b> Кто с кем разговаривает (pp. 1206, 1220). Cluster manager только раздаёт executor'ы. Задачи и результаты ходят напрямую между драйвером и executor'ами, данные shuffle — от executor'а к executor'у, и каждый executor сам читает хранилище.</figcaption>
+  </figure>
+
+  <p>Что выполняется на executor'ах? Слайд (p. 1224) показывает на двух уровнях задание из предыдущего примера (p. 1221): <code>log</code>, затем <code>errors</code>. Уровень набора данных показывает объекты: <code>log</code> — это HadoopRDD с <code>path = hdfs://...</code>, <code>errors</code> — FilteredRDD с <code>func = _.contains(…)</code> и <code>shouldCache = true</code>, флагом, который ставит <code>cache()</code>. Уровень партиций показывает работу: четыре партиции <code>log</code> становятся четырьмя партициями <code>errors</code>, по задаче на каждую — Task 1, Task 2, … — и каждая читает свою партицию и фильтрует её за один проход. Стадия запускает одну <mark class="key">задачу (task)</mark> на партицию.</p>
+
+  <p>Слайд (p. 1225) проводит действие через четыре компонента (рис. 7). Трансформации, <code>rdd1.join(rdd2).groupBy(…).filter(…)</code>, построили <abbr title="directed acyclic graph">DAG</abbr> из RDD-объектов. Действие передаёт его DAGScheduler, который будет "split graph into stages of tasks" и "submit each stage as ready": <mark class="key">стадия (stage)</mark> заканчивается там, где начинается широкая зависимость. Каждая стадия уходит — как TaskSet, по задаче на партицию — в TaskScheduler, который будет "launch tasks via cluster manager" и "retry failed or straggling tasks". На каждом воркере потоки "execute tasks", а block manager будет "store and serve blocks": закэшированные партиции и выход shuffle. Слова, которые надо запомнить: <mark class="key">задание (job)</mark> — всё, что запускает одно действие, стадия — его кусок без shuffle, задача — одна стадия на одной партиции.</p>
+
+  <figure class="fig fig--plain" id="l38-fig-sched">
+    <svg class="dia" viewBox="0 0 560 572" role="img" aria-label="Планирование задания по слайду, сверху вниз: RDD-объекты образуют DAG; DAGScheduler режет его на стадии в месте shuffle и передаёт каждую стадию дальше как TaskSet; TaskScheduler запускает задачи через cluster manager и перезапускает упавшие; каждый воркер выполняет задачи в потоках, а его block manager хранит и отдаёт блоки">
+      <rect x="8" y="8" width="544" height="124" rx="10" class="st-line"/>
+      <text x="24" y="36" class="tx-bold">RDD objects</text>
+      <text x="24" y="58" class="tx-sm tx-muted">build the operator DAG</text>
+      <text x="24" y="86" class="tx-mono tx-sm">rdd1.join(rdd2)</text>
+      <text x="48" y="104" class="tx-mono tx-sm">.groupBy(…)</text>
+      <text x="48" y="122" class="tx-mono tx-sm">.filter(…)</text>
+      <rect x="352" y="20" width="40" height="16" rx="4" class="fw-s1 st-s1"/>
+      <rect x="432" y="20" width="40" height="16" rx="4" class="fw-s1 st-s1"/>
+      <rect x="392" y="50" width="40" height="16" rx="4" class="fw-s1 st-s1"/>
+      <rect x="392" y="80" width="40" height="16" rx="4" class="fw-s1 st-s1"/>
+      <rect x="392" y="110" width="40" height="16" rx="4" class="fw-s1 st-s1"/>
+      <line x1="376" y1="36" x2="402" y2="48" marker-end="url(#arr)"/>
+      <line x1="448" y1="36" x2="422" y2="48" marker-end="url(#arr)"/>
+      <line x1="412" y1="66" x2="412" y2="78" marker-end="url(#arr)"/>
+      <line x1="412" y1="96" x2="412" y2="108" marker-end="url(#arr)"/>
+      <text x="344" y="33" class="tx-mono tx-sm tx-end">rdd1</text>
+      <text x="480" y="33" class="tx-mono tx-sm">rdd2</text>
+      <text x="440" y="63" class="tx-mono tx-sm">join</text>
+      <text x="440" y="93" class="tx-mono tx-sm">groupBy</text>
+      <text x="440" y="123" class="tx-mono tx-sm">filter</text>
+
+      <line x1="280" y1="134" x2="280" y2="162" class="sw-3" marker-end="url(#arr)"/>
+      <text x="294" y="153" class="tx-mono tx-sm">DAG</text>
+
+      <rect x="8" y="166" width="544" height="130" rx="10" class="st-line"/>
+      <text x="24" y="194" class="tx-bold">DAGScheduler</text>
+      <text x="24" y="216" class="tx-sm tx-muted">split the graph into stages</text>
+      <text x="24" y="236" class="tx-sm tx-muted">submit each stage when ready</text>
+      <rect x="294" y="172" width="52" height="104" rx="8" class="st-muted dash"/>
+      <rect x="378" y="182" width="144" height="88" rx="8" class="st-muted dash"/>
+      <line x1="362" y1="176" x2="362" y2="272" class="hl"/>
+      <rect x="300" y="176" width="40" height="44" rx="6" class="st-muted"/>
+      <rect x="308" y="182" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="308" y="200" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="300" y="228" width="40" height="44" rx="6" class="st-muted"/>
+      <rect x="308" y="234" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="308" y="252" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="384" y="188" width="40" height="76" rx="6" class="st-muted"/>
+      <rect x="392" y="194" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="392" y="219" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="392" y="244" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="476" y="188" width="40" height="76" rx="6" class="st-muted"/>
+      <rect x="484" y="194" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="484" y="219" width="24" height="14" class="fw-s1 st-s1"/>
+      <rect x="484" y="244" width="24" height="14" class="fw-s1 st-s1"/>
+      <path d="M332,189 L392,201 M332,189 L392,226 M332,189 L392,251 M332,207 L392,201 M332,207 L392,226 M332,207 L392,251 M332,241 L392,201 M332,241 L392,226 M332,241 L392,251 M332,259 L392,201 M332,259 L392,226 M332,259 L392,251" class="st-s1 sw-1"/>
+      <line x1="416" y1="201" x2="480" y2="201" class="st-s1" marker-end="url(#arr-s1)"/>
+      <line x1="416" y1="226" x2="480" y2="226" class="st-s1" marker-end="url(#arr-s1)"/>
+      <line x1="416" y1="251" x2="480" y2="251" class="st-s1" marker-end="url(#arr-s1)"/>
+      <text x="320" y="290" class="tx-sm tx-mid">стадия 1</text>
+      <text x="450" y="290" class="tx-sm tx-mid">стадия 2</text>
+
+      <line x1="280" y1="298" x2="280" y2="326" class="sw-3" marker-end="url(#arr)"/>
+      <text x="294" y="317" class="tx-mono tx-sm">TaskSet</text>
+
+      <rect x="8" y="330" width="544" height="100" rx="10" class="st-line"/>
+      <text x="24" y="358" class="tx-bold">TaskScheduler</text>
+      <text x="24" y="380" class="tx-sm tx-muted">launch tasks, retry failed</text>
+      <text x="24" y="400" class="tx-sm tx-muted">or straggling ones</text>
+      <rect x="330" y="342" width="170" height="36" class="fi-paper sw-2"/>
+      <text x="415" y="365" class="tx-sm tx-mid">cluster manager</text>
+      <line x1="330" y1="394" x2="498" y2="394" marker-end="url(#arr)"/>
+      <line x1="498" y1="410" x2="332" y2="410" class="dash" marker-end="url(#arr)"/>
+
+      <line x1="280" y1="432" x2="280" y2="460" class="sw-3" marker-end="url(#arr)"/>
+      <text x="294" y="451" class="tx-mono tx-sm">task</text>
+
+      <rect x="8" y="464" width="544" height="100" rx="10" class="st-line"/>
+      <text x="24" y="492" class="tx-bold">worker</text>
+      <text x="24" y="514" class="tx-sm tx-muted">execute tasks</text>
+      <text x="24" y="534" class="tx-sm tx-muted">store and serve blocks</text>
+      <rect x="330" y="474" width="170" height="80" class="fi-paper sw-2"/>
+      <rect x="342" y="482" width="146" height="28" class="fi-paper"/>
+      <text x="415" y="501" class="tx-sm tx-mid">threads</text>
+      <rect x="342" y="518" width="146" height="28" class="fw-s1 st-s1"/>
+      <text x="415" y="537" class="tx-sm tx-mid">block manager</text>
+    </svg>
+    <figcaption><b>Рис. 7.</b> Планирование задания (p. 1225), сверху вниз: трансформации построили DAG из RDD-объектов; DAGScheduler режет его на стадии в месте shuffle (перекрещенные стрелки, под маркером) и передаёт каждую стадию дальше как TaskSet. Панель DAGScheduler — это набросок со слайда, с одним shuffle: сколько стадий получит настоящее задание, зависит от того, как данные уже партиционированы. Затем TaskScheduler запускает задачи через cluster manager и перезапускает упавшие или отстающие; на каждом воркере потоки выполняют задачи, а block manager хранит закэшированные партиции и выход shuffle.</figcaption>
+  </figure>
+
+  <p>"RDDs track lineage information that can be used to efficiently recompute lost data" (p. 1223). Когда воркер умирает, партиции, которые он держал в памяти, пропадают. Драйвер смотрит их lineage — файл HDFS, filter и map с рис. 4 — и назначает на другие воркеры задачи, которые заново читают соответствующие блоки (HDFS всё ещё хранит их на других DataNode) и заново применяют функции — только для потерянных партиций. Пока всё хорошо, ничего не копируется, а восстановление стоит пропорционально потерянному. HDFS защищает хранимые блоки репликацией; Spark защищает вычисленные партиции через lineage. (Для общего развития, из статьи про RDD: когда lineage становится очень длинной, RDD можно сохранить контрольной точкой (checkpoint) в стабильное хранилище, чтобы её обрезать.)</p>
+
+  <div class="widget" id="l38-w-dag">
+    <h3 class="widget-title">Построй lineage, потом запусти её</h3>
+    <p class="widget-intro">Лог систем отопления трёх больниц: 12 строк в 3 блоках HDFS, по блоку на воркер — идеализированный кластер, цепочка из примера практического занятия (p. 1723). Добавляй трансформации: каждая добавляет ряд партиций и ничего не запускает. Действие запускает задание: партиции, которые оно вычисляет или читает, подсвечиваются, на границе стадий появляются shuffle-файлы, закэшированные партиции остаются закрашенными. Потом сломай воркер 2 и снова запусти действие. Числа — те же, что у той же программы, запущенной в PySpark 4.2.0.</p>
+    <ol class="tasks">
+      <li>Нажми <em>+ filter</em>, <em>+ map</em> и <em>+ reduceByKey</em>. Перед каждым нажатием предскажи «строк прочитано из HDFS, всего». Потом нажми <em>count()</em>.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Итог остаётся 0: три трансформации, три ряда пустых пунктирных партиций, ни одного задания. <em>count()</em> запускает задание 1 в две стадии, разрезанное там, где стрелки пересекаются: в стадии 1 три задачи, каждая читает блок, фильтрует и обрабатывает его map'ом за один проход и пишет shuffle-файл; в стадии 2 три задачи забирают эти файлы и складывают. Прочитано 12 строк, <code>count() = 3</code>, по записи на больницу. Именно это виджет не даёт пропустить: ничего не выполняется до действия, и задание делится ровно там, где данные должны переехать.</p></details>
+      </li>
+      <li>Нажми <em>count()</em> ещё раз, ничего не кэшируя. Предскажи, сколько строк прочитает это задание.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>0, и стадия 1 пропущена: её выход, shuffle-файлы, всё ещё лежит на дисках воркеров, так что выполняются только 3 задачи стадии 2 (PySpark поступает так же); итог остаётся 12. Без shuffle переиспользовать нечего: <em>начать заново</em>, <em>+ filter</em>, затем <em>count()</em> дважды — оба раза прочитано 12 строк.</p></details>
+      </li>
+      <li><em>Начать заново</em>. Построй <em>filter</em> и <em>map</em>, нажми <em>cache()</em>, потом дважды <em>collect()</em>. Потом добавь <em>reduceByKey</em> и ещё раз <em>collect()</em>. Предскажи, сколько строк прочитается каждый раз.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>12, потом 0: первое действие заполнило кэш <code>pairs</code>, второе читало только память. После reduceByKey всё ещё 0 — стадия 1 теперь стартует с закэшированных pairs, а не с HDFS: это интерактивный сценарий со слайда (p. 1222).</p></details>
+      </li>
+      <li>Теперь нажми <em>воркер 2 падает</em>. Предскажи, что потеряется и что пересчитает следующий <em>count()</em>.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Потеряны: закэшированная партиция 2 у <code>pairs</code> и shuffle-файл воркера 2 (перечёркнуты). Следующий count заново читает только блок 2 — 4 строки — с другой реплики HDFS, заново применяет filter и map к партиции 2 (она снова кэшируется), перезапускает эту одну map-задачу, а потом 3 reduce-задачи. Партиции 1 и 3 не трогаются: их shuffle-файлы всё ещё на воркерах 1 и 3. Lineage восстанавливает ровно то, что потеряно.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l38-w-dag', function (root, ui) {
+    var BLOCKS = [
+      ['ERROR\tH1\tboiler pressure low', 'INFO\tH2\theating on', 'ERROR\tH2\tsensor timeout', 'INFO\tH1\theating off'],
+      ['ERROR\tH3\tboiler pressure low', 'INFO\tH3\theating on', 'ERROR\tH1\tpump failure', 'WARN\tH2\ttemperature high'],
+      ['ERROR\tH1\tsensor timeout', 'INFO\tH1\theating on', 'ERROR\tH2\tpump failure', 'INFO\tH3\theating off']
+    ];
+    var KEYS = ['H1', 'H2', 'H3'];
+    var NAMES = { text: 'lines', filter: 'errors', map: 'pairs', reduce: 'counts' };
+    var OPNAME = { text: 'textFile', filter: 'filter', map: 'map', reduce: 'reduceByKey' };
+    var CX = [270, 380, 490], Y0 = 60, PITCH = 82, BH = 34;
+    var st;
+
+    function mk(kind) { return { kind: kind, cached: false, mem: [false, false, false], files: [false, false, false] }; }
+    function reset() { st = { chain: [mk('text')], jobs: 0, readTotal: 0, last: null, lost: null, failed: false, moved: false, event: 'start' }; }
+    reset();
+    function lastNode() { return st.chain[st.chain.length - 1]; }
+    function dataOf(i, p) {
+      var n = st.chain[i];
+      if (n.kind === 'text') return BLOCKS[p].slice();
+      if (n.kind === 'filter') return dataOf(i - 1, p).filter(function (s) { return s.indexOf('ERROR') === 0; });
+      if (n.kind === 'map') return dataOf(i - 1, p).map(function (s) { return [s.split('\t')[1], 1]; });
+      var sum = 0;
+      for (var q = 0; q < 3; q++) dataOf(i - 1, q).forEach(function (kv) { if (kv[0] === KEYS[p]) sum += kv[1]; });
+      return sum ? [[KEYS[p], sum]] : [];
+    }
+    function label(i, p) {
+      var n = st.chain[i], d = dataOf(i, p);
+      if (n.kind === 'reduce') return d.length ? d[0][0] + ': ' + d[0][1] : '(пусто)';
+      return (n.kind === 'map' ? 'пар: ' : 'строк: ') + d.length;
+    }
+    function runJob(act) {
+      var ch = st.chain, k = ch.length - 1;
+      var info = { act: act, read: 0, mapTasks: 0, resTasks: 0, wide: ch.some(function (n) { return n.kind === 'reduce'; }),
+        touched: ch.map(function () { return [false, false, false]; }), hits: ch.map(function () { return [false, false, false]; }), ranMap: [false, false, false] };
+      function need(i, p) {
+        var n = ch[i];
+        if (n.cached && n.mem[p]) { info.touched[i][p] = true; info.hits[i][p] = true; return; }
+        if (n.kind === 'text') info.read += BLOCKS[p].length;
+        else if (n.kind === 'reduce') {
+          for (var q = 0; q < 3; q++) if (!n.files[q]) { need(i - 1, q); n.files[q] = true; info.mapTasks++; info.ranMap[q] = true; }
+        } else need(i - 1, p);
+        info.touched[i][p] = true;
+        if (n.cached) n.mem[p] = true;
+      }
+      for (var p = 0; p < 3; p++) { need(k, p); info.resTasks++; }
+      var all = [];
+      for (var p2 = 0; p2 < 3; p2++) all = all.concat(dataOf(k, p2));
+      info.value = all;
+      info.recovered = !!st.lost;
+      st.jobs++; info.job = st.jobs; st.last = info; st.readTotal += info.read;
+      if (st.failed) st.moved = true;
+      st.lost = null; st.event = 'job';
+    }
+    function fail() {
+      var lost = [];
+      st.chain.forEach(function (n, i) {
+        if (n.mem[1]) { n.mem[1] = false; lost.push({ row: i, what: 'mem' }); }
+        if (n.files[1]) { n.files[1] = false; lost.push({ row: i, what: 'file' }); }
+      });
+      st.lost = lost; st.failed = true; st.moved = false; st.last = null; st.event = 'fail';
+    }
+    function add(kind) { st.chain.push(mk(kind)); st.last = null; st.event = 'add-' + kind; }
+
+    var bF = ui.button('+ filter', function () { if (lastNode().kind === 'text') add('filter'); });
+    var bM = ui.button('+ map', function () { var k = lastNode().kind; if (k === 'text' || k === 'filter') add('map'); });
+    var bR = ui.button('+ reduceByKey', function () { if (lastNode().kind === 'map') add('reduce'); });
+    var bC = ui.button('cache()', function () { var n = lastNode(); if (!n.cached) { n.cached = true; st.event = 'cache'; } });
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide', text: 'Действия (каждое запускает задание):' }));
+    ui.button('count()', function () { runJob('count'); }, { kind: 'primary' });
+    ui.button('collect()', function () { runJob('collect'); }, { kind: 'primary' });
+    ui.controls.appendChild(Course.el('div', { 'class': 'ctl ctl-wide', text: 'Сбои:' }));
+    var bX = ui.button('воркер 2 падает', function () { if (!st.failed) fail(); }, { icon: 'cross' });
+    ui.button('начать заново', function () { reset(); }, { kind: 'ghost', icon: 'refresh' });
+
+    var roJobs = ui.readout('заданий выполнено', { digits: 0 }), roTotal = ui.readout('строк прочитано из HDFS, всего', { digits: 0 }),
+        roLast = ui.readout('последнее задание'), roRes = ui.readout('результат последнего действия');
+    var note = ui.note(''), prog = ui.note('');
+    ui.legend([
+      { label: 'партиция в памяти (в кэше)', color: 's1', mark: 'square' },
+      { label: 'вычислено или прочитано последним действием', color: 'ink', mark: 'hl' },
+      { label: 'запланировано: данных нет', color: 'muted', mark: 'dash' },
+      { label: 'shuffle-файл на диске воркера', color: 'muted', mark: 'square' },
+      { label: 'потеряно вместе с воркером 2', color: 'bad', mark: 'cross' }
+    ]);
+    var svg = ui.svg(560, 360, { label: 'Lineage программы рядами по три партиции, по столбцу на воркер: lines, затем каждая добавленная трансформация; стрелки между рядами пересекаются на shuffle у reduceByKey; пунктирные рамки отмечают стадии' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+
+    function rowY(i) { return Y0 + i * PITCH; }
+    function isLost(row, what) { return !!(st.lost && st.lost.some(function (l) { return l.row === row && l.what === what; })); }
+    function cross(x, y, w, h) {
+      S('line', { x1: x, y1: y, x2: x + w, y2: y + h, 'class': 'st-bad sw-2' });
+      S('line', { x1: x + w, y1: y, x2: x, y2: y + h, 'class': 'st-bad sw-2' });
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var ch = st.chain, L = st.last, r = -1;
+      ch.forEach(function (n, i) { if (n.kind === 'reduce') r = i; });
+      var H = rowY(ch.length - 1) + BH + 24;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      for (var p = 0; p < 3; p++) {
+        T(CX[p], 16, 'партиция ' + (p + 1), 'tx-sm tx-mid');
+        var w2 = p === 1 && st.failed ? (st.moved ? 'на воркере 3' : 'воркер 2 потерян') : 'воркер ' + (p + 1);
+        T(CX[p], 34, w2, 'tx-sm tx-mid tx-muted');
+      }
+      /* stage frames, with rotated labels */
+      function frame(i0, i1, name) {
+        var y0 = rowY(i0) - 8, y1 = rowY(i1) + BH + 8;
+        S('rect', { x: 210, y: y0, width: 340, height: y1 - y0, rx: 8, 'class': 'st-muted dash' });
+        var cy = (y0 + y1) / 2;
+        S('text', { x: 203, y: cy, 'class': 'tx-sm tx-mid tx-muted', transform: 'rotate(-90 203 ' + cy + ')', text: name });
+      }
+      if (r > 0) { frame(0, r - 1, 'стадия 1'); frame(r, r, 'стадия 2'); } else frame(0, ch.length - 1, 'одна стадия');
+      /* dependencies between the rows */
+      for (var i = 1; i < ch.length; i++) {
+        var yTop = rowY(i - 1) + BH, yBot = rowY(i), n = ch[i];
+        if (n.kind === 'reduce') {
+          var ym = (yTop + yBot) / 2;
+          S('line', { x1: 222, y1: ym, x2: 538, y2: ym, 'class': 'hl' });
+          for (var q = 0; q < 3; q++) for (var p3 = 0; p3 < 3; p3++) {
+            var live = L && L.touched[i][p3] && !L.hits[i][p3];
+            S('line', { x1: CX[q], y1: yTop + 2, x2: CX[p3], y2: yBot - 3, 'class': live ? 'st-s1' : 'st-muted dash', 'marker-end': live ? 'url(#arr-s1)' : 'url(#arr-muted)' });
+          }
+          T(14, ym + 5, 'shuffle', 'tx-sm');
+          for (var f = 0; f < 3; f++) {
+            var fx = CX[f] + 48, fy = rowY(i - 1) + 6;
+            if (n.files[f] || (f === 1 && isLost(i, 'file'))) {
+              S('path', { d: 'M' + fx + ',' + fy + ' h9 l5,5 v15 h-14 z', 'class': 'fi-paper' });
+              S('path', { d: 'M' + (fx + 9) + ',' + fy + ' v5 h5 z', 'class': 'fi-muted st-none' });
+              if (f === 1 && isLost(i, 'file')) cross(fx - 3, fy - 2, 20, 24);
+            }
+          }
+        } else {
+          for (var p4 = 0; p4 < 3; p4++) {
+            var lv = L && L.touched[i][p4] && !L.hits[i][p4];
+            S('line', { x1: CX[p4], y1: yTop + 2, x2: CX[p4], y2: yBot - 3, 'class': lv ? 'st-s1 sw-2' : 'st-muted dash', 'marker-end': lv ? 'url(#arr-s1)' : 'url(#arr-muted)' });
+          }
+        }
+      }
+      /* the rows */
+      ch.forEach(function (n, i) {
+        var y = rowY(i);
+        T(14, y + 14, NAMES[n.kind], 'tx-mono');
+        T(14, y + 31, OPNAME[n.kind] + (n.cached ? ', в кэше' : ''), 'tx-sm tx-muted');
+        for (var p = 0; p < 3; p++) {
+          var x = CX[p] - 46, inMem = n.cached && n.mem[p];
+          if (L && L.touched[i][p]) S('rect', { x: x, y: y, width: 92, height: BH, rx: 6, 'class': 'hl' });
+          S('rect', { x: x, y: y, width: 92, height: BH, rx: 6, 'class': inMem ? 'fw-s1 st-s1 sw-2' : 'st-muted dash' });
+          T(CX[p], y + 22, label(i, p), 'tx-mono tx-sm tx-mid' + (inMem || (L && L.touched[i][p]) ? '' : ' tx-muted'));
+          if (p === 1 && isLost(i, 'mem')) cross(x + 4, y + 2, 84, BH - 4);
+        }
+      });
+    }
+
+    function program() {
+      var ch = st.chain, out = [];
+      ch.forEach(function (n, i) {
+        var nm = NAMES[n.kind], prev = i ? NAMES[ch[i - 1].kind] : '';
+        if (n.kind === 'text') out.push('lines = sc.textFile("hdfs://…/heating.log")');
+        if (n.kind === 'filter') out.push('errors = lines.filter(lambda s: s.startswith("ERROR"))');
+        if (n.kind === 'map') out.push('pairs = ' + prev + '.map(lambda s: (s.split("\\t")[1], 1))');
+        if (n.kind === 'reduce') out.push('counts = pairs.reduceByKey(lambda a, b: a + b)');
+        if (n.cached) out.push(nm + '.cache()');
+      });
+      if (st.last) out.push(NAMES[lastNode().kind] + '.' + st.last.act + '()');
+      return out.map(function (l) { return '<code>' + l + '</code>'; }).join('<br>');
+    }
+    function valueText(info) {
+      var n = lastNode(), v = info.value;
+      if (info.act === 'count') return 'count() = ' + v.length;
+      if (n.kind === 'reduce' || n.kind === 'map') {
+        var s = v.map(function (kv) { return "('" + kv[0] + "', " + kv[1] + ')'; });
+        return '[' + (s.length > 4 ? s.slice(0, 4).join(', ') + ', …' : s.join(', ')) + ']';
+      }
+      return 'строк драйверу: ' + v.length;
+    }
+    function jobNote(info) {
+      var n = lastNode(), parts = [];
+      parts.push('<b>' + info.act + '()</b> запустил задание ' + info.job + '.');
+      if (info.wide) {
+        parts.push(info.mapTasks === 1 ? 'Стадия 1: 1 задача читает свой вход, преобразует его и пишет shuffle-файл.' :
+          info.mapTasks ? 'Стадия 1: задач — ' + info.mapTasks + ', каждая читает свой вход, преобразует его и пишет shuffle-файл.' :
+          'Стадия 1 пропущена: её shuffle-файлы всё ещё лежали на дисках воркеров.');
+        parts.push('Стадия 2: 3 задачи забирают shuffle-файлы и складывают по каждой больнице.');
+      } else parts.push('Одна стадия: 3 задачи, по одной на партицию, каждая выполняет всю цепочку за один проход.');
+      var hit = info.hits.some(function (row) { return row.some(Boolean); });
+      if (hit) parts.push('Закэшированные партиции прочитаны из памяти, а не пересчитаны.');
+      if (info.recovered) parts.push(info.read ? 'Партиция 2 восстановлена по своей lineage на воркере 3: блок 2 заново прочитан с другой реплики HDFS, трансформации применены снова.' : 'Ничего из потерянного не понадобилось.');
+      parts.push('Строк прочитано из HDFS: ' + info.read + '.');
+      return parts.join(' ');
+    }
+    function eventNote() {
+      var n = lastNode(), e = st.event;
+      if (e === 'start') return 'Ничего не выполнялось: <code>lines</code> — лишь описание файла в HDFS. Добавь трансформации или вызови действие.';
+      if (e === 'add-filter') return '<code>filter</code> добавил новое RDD, <code>errors</code>. Ничего не выполнилось: ни одна строка не прочитана.';
+      if (e === 'add-map') return '<code>map</code> добавил <code>pairs</code>, по одной паре (больница, 1) на строку. Задания всё ещё нет.';
+      if (e === 'add-reduce') return '<code>reduceByKey</code> добавил <code>counts</code>. Ему нужны все пары одной больницы в одной партиции, поэтому lineage теперь проходит через shuffle: здесь задание разделится на две стадии. Всё ещё ничего не выполнилось.';
+      if (e === 'cache') return '<code>' + NAMES[n.kind] + '.cache()</code> помечает RDD, чтобы держать его в памяти. Это тоже лениво: кэш заполнит следующее действие, которое его вычислит.';
+      if (e === 'fail') {
+        if (!st.lost.length) return 'Воркер 2 упал, когда ничего не держал: ни закэшированной партиции, ни shuffle-файла. Следующее действие вычисляет как обычно; блок 2 у HDFS по-прежнему есть на других DataNode.';
+        var what = st.lost.map(function (l) { return l.what === 'mem' ? 'закэшированная партиция 2 у <code>' + NAMES[st.chain[l.row].kind] + '</code>' : 'его shuffle-файл'; });
+        return 'Воркер 2 упал. Потеряно: ' + what.join(' и ') + '. Сохранилось: lineage — в драйвере — и блок 2 на других DataNode в HDFS. Запусти действие.';
+      }
+      return st.last ? jobNote(st.last) : '';
+    }
+
+    ui.onChange(function () {
+      var n = lastNode();
+      bF.disabled = n.kind !== 'text';
+      bM.disabled = !(n.kind === 'text' || n.kind === 'filter');
+      bR.disabled = n.kind !== 'map';
+      bC.disabled = n.cached;
+      bX.disabled = st.failed;   /* worker 2 can fail once; start over to bring it back */
+      roJobs.set(st.jobs);
+      roTotal.set(st.readTotal);
+      var L = st.last;
+      roLast.set(L ? 'прочитано строк: ' + L.read + ' · ' + (L.wide ? 'задач: ' + (L.mapTasks + L.resTasks) + ' (стадия 1: ' + (L.mapTasks || 'пропущена') + ', стадия 2: ' + L.resTasks + ')' : 'задач: ' + L.resTasks + ', одна стадия') : '—');
+      roRes.set(L ? valueText(L) : '—');
+      note.set(eventNote());
+      prog.set(program());
+      draw();
+    });
+  });
+  </script>
+
+  <p>Вернёмся к загадке из начала. Четыре строки ничего не вычисляли: каждая добавляла узел в lineage, а <code>cache()</code> только ставил флаг. Первый count выполнил рецепт и оставил партицию <code>messages</code> каждого воркера в его памяти — отсюда полсекунды на поиск вместо прохода по диску. Потерянная партиция вернулась по тому же рецепту: одна задача заново прочитала свой блок с уцелевшей реплики HDFS и снова применила filter и map. Никто её не копировал.</p>
+
+  <p class="memo"><mark class="key">Действие становится заданием (job); DAGScheduler режет его на стадии (stages) в местах shuffle; каждая стадия запускает одну задачу (task) на партицию; потерянная партиция пересчитывается по своей lineage.</mark></p>
+</section>
+
+
+<section id="l38-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Короткие открытые ответы и закрытые вопросы — форматы теоретической части, где неверный ответ может стоить баллов; потом одно упражнение, сформулированное как Spark-упражнения из экзаменов, но на RDD — тему этого урока. Образцы ответов — наши.</p>
+
+  <div class="exam" data-kind="open" id="l38-exam-rdd">
+    <div class="exam-q" lang="en">
+      <p>What is an RDD in Spark? Explain the meaning of each word of the name and the main properties of RDDs, and say why Spark evaluates transformations lazily.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>An RDD (Resilient Distributed Dataset) is the core abstraction of Spark: an immutable collection of records split into partitions that are spread over the nodes of a cluster and processed in parallel. It is created from data in stable storage, such as a file in HDFS, or from other RDDs through deterministic transformations such as map, filter or join. Resilient: it is fault-tolerant, because Spark records its lineage (the parent RDDs and the function applied) and recomputes lost partitions instead of replicating them. Distributed: its partitions live on different worker nodes, and each partition is processed by one task. Dataset: the programmer handles it as one collection of data. RDDs are immutable (a transformation returns a new RDD), lazily evaluated (transformations only build the lineage; an action such as count or collect triggers the computation) and cacheable (cache() keeps the computed partitions in the executors' memory for later actions). Laziness lets Spark see the whole chain before running it: nothing is computed that no action needs, consecutive narrow transformations run in one pass over each partition, and the plan can be cut into stages and sent to where the data is.</p></div>
+      <div class="exam-note"><p>Экзаменатор ищет три слова, привязанные к своим механизмам, — lineage, партиции, — и три прилагательных со слайда (p. 1208); на «почему лениво» — причину, которую даёт слайд (p. 1210): на большом наборе данных трансформации не вычисляют, пока не уверены, что они нужны какому-то действию. «Resilient, потому что реплицируется» — классический неверный ответ.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l38-exam-actions">
+    <div class="exam-q" lang="en">
+      <p>Which of the following Spark operations are actions? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct><code>count()</code> <span class="fb">Возвращает драйверу число элементов и запускает выполнение (p. 1211).</span></li>
+      <li><code>map()</code> <span class="fb">Трансформация: возвращает новое RDD и ничего не запускает.</span></li>
+      <li data-correct><code>collect()</code> <span class="fb">Возвращает драйверу все элементы: действие (pp. 1211–1212).</span></li>
+      <li><code>reduceByKey()</code> <span class="fb">(Широкая) трансформация: возвращает новое RDD пар. Не путай с <code>reduce()</code> — это действие.</span></li>
+      <li data-correct><code>saveAsTextFile()</code> <span class="fb">Экспортирует данные в хранилище: это "save" со слайда (p. 1211).</span></li>
+      <li><code>filter()</code> <span class="fb">Трансформация: новое RDD с записями, прошедшими проверку.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>count(), collect() and saveAsTextFile(). The others are transformations: they return a new RDD and are only executed when an action is called.</p></div>
+      <div class="exam-note"><p>Вопрос «выбери все верные», где неверная галочка может стоить баллов. Ловушка — reduceByKey: звучит как reduce, но возвращает RDD.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l38-exam-df">
+    <div class="exam-q" lang="en">
+      <p>Which statement about Spark DataFrames is correct?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>A DataFrame can be modified in place, row by row. <span class="fb">DataFrame неизменяемы: каждая операция возвращает новый DataFrame (p. 1216).</span></li>
+      <li data-correct>A DataFrame is an immutable distributed collection with named columns, built on RDDs, whose operations Spark can optimize. <span class="fb">Определение со слайда (p. 1216), вместе с "Improved performance via optimizations (Tungsten and Catalyst)".</span></li>
+      <li>DataFrames are available only in Scala and Java. <span class="fb">На слайде (p. 1216) сказано: "Uniform APIs across languages (Scala, Java, Python, R, and SQL)".</span></li>
+      <li>A DataFrame query in Python is about twice as slow as the same query in Scala. <span class="fb">Это верно для кода на RDD (около 9.5 s против 4.2 s на графике (p. 1218)); код на DataFrame занимает около 2 s в любом языке.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The second: a DataFrame is immutable data with named columns, built on RDDs, with a uniform API across languages and performance improved by the Catalyst optimizer and Tungsten.</p></div>
+      <div class="exam-note"><p>Каждый неверный вариант — известная путаница: привычка из pandas править на месте, типизированный Dataset со слайда (p. 1219) (только Scala и Java) и «Python медленный», что верно только для кода на RDD.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l38-exam-nw">
+    <div class="exam-q" lang="en">
+      <p>Explain the difference between narrow and wide transformations in Spark, give two examples of each, and explain how Spark uses this difference when it executes a job.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>A transformation is narrow when each partition of the parent RDD is used by at most one partition of the child RDD: every output partition can be computed from its input partition(s) on the same node, without moving data. Examples: map, filter, union, coalesce. It is wide when a partition of the parent may be needed by many partitions of the child, so the records must be regrouped by key across the cluster with a shuffle. Examples: groupByKey, reduceByKey, distinct, repartition, or a join whose inputs are not co-partitioned. When an action is called, the DAGScheduler splits the DAG of RDDs into stages at the wide dependencies. Inside a stage the narrow transformations are pipelined into one task per partition; a stage that follows a shuffle can start only when all the tasks of its parent stage have written their shuffle output. Wide dependencies are therefore more expensive (disk and network), and a lost partition after a shuffle may need data from all the parent partitions.</p></div>
+      <div class="exam-note"><p>Слайд печатает определение узкой зависимости, отсчитанное от дочернего RDD (см. красную ручку выше); если напишешь стандартное направление или добавишь coalesce как пример, покажешь, что понимаешь суть. Вторая половина — стадии режутся в местах shuffle — делает ответ полным.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l38-exam-lineage">
+    <div class="exam-q" lang="en">
+      <p>A worker node that holds cached partitions of an RDD fails while a Spark application is running. How does Spark recover the lost data? Compare this mechanism with the way HDFS protects data.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Spark does not keep copies of RDD partitions. Every RDD records its lineage: its parent RDDs and the deterministic transformation that produced it, down to the data in stable storage. When a worker fails, the driver uses the lineage to recompute only the lost partitions: it schedules tasks on the surviving workers that re-read the corresponding input blocks, which HDFS still holds on other DataNodes, and re-apply the transformations, for example filter and then map; lost shuffle outputs are recomputed in the same way. The partitions cached on the other workers are not touched. HDFS instead protects stored data by replication: each block is written to three DataNodes by default, so the other copies cover a lost node. Lineage costs nothing while no failure happens and its recovery is proportional to the lost data, while replication multiplies the storage used. This is also why Spark transformations must be deterministic.</p></div>
+      <div class="exam-note"><p>Проверяются три вещи: lineage как рецепт, пересчёт только потерянных партиций и противопоставление репликации. Мысль вдогонку — детерминированные функции — это бонус.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l38-exam-log">
+    <div class="exam-q" lang="en">
+      <p>Consider the hospital heating management system of the exam of 30 Jan 2026: a Hospital (Hospital_ID, Name) has several Heating Systems (Heat_ID, H_KW_Cons, Heat_Power), as in the tables of its Spark exercise. Every heating system writes its events into one log file stored in HDFS, one event per line, in the form <code>LEVEL&lt;TAB&gt;Heat_ID&lt;TAB&gt;message</code>, where LEVEL is INFO, WARN or ERROR. (The log and the questions are ours, in the style of the papers.)</p>
+      <p>Write a Python code with PySpark RDDs that keeps the ERROR events in memory and then computes (a) how many ERROR messages contain the word "boiler" and (b) the number of ERROR events of each heating system. Say which lines start a Spark job.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("HeatingLog").getOrCreate()
+sc = spark.sparkContext                                            # the RDD API lives here
+
+lines = sc.textFile("hdfs://.../heating.log")                      # nothing runs
+errors = lines.filter(lambda s: s.startswith("ERROR"))             # transformation
+errors.cache()                                                     # lazy: filled by the first action
+n_boiler = errors.filter(lambda s: "boiler" in s.split("\t")[2]).count()   # action: job 1
+per_system = (errors.map(lambda s: (s.split("\t")[1], 1))
+                    .reduceByKey(lambda a, b: a + b)
+                    .collect())                                    # action: job 2</code></pre>
+        <p>Only the two actions start jobs: count() runs job 1, a single stage in which each task reads its block, keeps the ERROR lines, stores them in the cache and counts the matches; collect() runs job 2, whose first stage reads the cached errors instead of HDFS and whose second stage, after the shuffle of reduceByKey, adds up the events per Heat_ID. All the other lines only build the lineage.</p>
+      </div>
+      <div class="exam-note"><p>На тестовом логе из шести строк в PySpark 4.2.0 этот код даёт 2 сообщения о котле (boiler) и пары ('HS_1', 2), ('HS_2', 1), ('HS_3', 1) — в том порядке, в каком их вернут партиции. Что надо сделать правильно: <code>startswith</code> строчными буквами, <code>cache()</code> до первого действия, count и collect как единственные строки, запускающие задание, и reduceByKey, а не groupByKey. Собственные Spark-упражнения экзаменов используют DataFrame: их решает <a href="l39.html">урок 39</a>.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l38-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Ты выполняешь <code>lines = sc.textFile(...)</code>, <code>errors = lines.filter(...)</code> и <code>messages = errors.map(...)</code> на файле в 60 GB. Сколько файла прочитал Spark?</p>
+    <ul class="options">
+      <li data-correct>Ничего <span class="fb">Трансформации только добавляют узлы в lineage. Даже неверный путь обнаружится только при первом действии.</span></li>
+      <li>Только первый блок, чтобы проверить формат <span class="fb">До действия Spark даже не проверяет, существует ли файл.</span></li>
+      <li>Только строки с ошибками <span class="fb">Чтобы найти строки с ошибками, ему пришлось бы прочитать всё — а он ещё не начинал.</span></li>
+      <li>Весь, но в фоне <span class="fb">Фоновой работы нет: ничего не выполняется, пока действие не попросит результат.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">За <code>messages.cache()</code> следуют два вызова <code>count()</code> на фильтрах от <code>messages</code>. Когда партиции <code>messages</code> сохраняются в памяти?</p>
+    <ul class="options">
+      <li>Когда вызывается <code>cache()</code> <span class="fb">cache() ленив: он только помечает RDD (shouldCache = true на слайде (p. 1224)).</span></li>
+      <li data-correct>Во время первого <code>count()</code> <span class="fb">Первое задание вычисляет партиции и, раз они помечены, сохраняет их; второе задание их читает.</span></li>
+      <li>Во время второго <code>count()</code> <span class="fb">К тому моменту они уже в памяти: выигрывает именно второе задание.</span></li>
+      <li>Никогда: <code>cache()</code> работает только с DataFrame <span class="fb">RDD — "cacheable" (p. 1208); пример задания кэширует именно RDD.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Каким из этих трансформаций нужен shuffle, а значит, и новая стадия? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct><code>groupByKey()</code> <span class="fb">Значения одного ключа лежат во многих партициях, и их надо собрать вместе.</span></li>
+      <li><code>map()</code> <span class="fb">Каждая партиция преобразуется там, где лежит.</span></li>
+      <li data-correct><code>reduceByKey()</code> <span class="fb">Широкая: сначала она комбинирует внутри каждой партиции, но частичные суммы одного ключа всё равно должны встретиться.</span></li>
+      <li><code>union()</code> <span class="fb">Результат просто перечисляет партиции обоих входов: узкая.</span></li>
+      <li data-correct><code>distinct()</code> <span class="fb">Одинаковые записи из разных партиций должны встретиться: широкая, как и указано на слайде (p. 1214).</span></li>
+      <li><code>coalesce(2)</code> <span class="fb">Целые партиции сливаются, и ни одна не делится: узкая, без shuffle.</span></li>
+    </ul>
+    <p class="q-fb">Проверка: приходится ли делить какую-то входную партицию и рассылать её по нескольким выходным?</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему функции, которые передаются в трансформации Spark, должны быть детерминированными?</p>
+    <ul class="options">
+      <li data-correct>Потому что Spark восстанавливает потерянные партиции, запуская их заново, и должен получить те же данные <span class="fb">Восстановление по lineage предполагает, что рецепт дважды даёт один и тот же результат.</span></li>
+      <li>Потому что лямбды Python не умеют вытягивать случайные числа <span class="fb">Умеют; именно из-за этого восстановление построило бы другие данные.</span></li>
+      <li>Потому что каждое действие запускает каждую функцию дважды, чтобы проверить результат <span class="fb">Такой проверки нет; функция запускается снова только тогда, когда партицию пересчитывают.</span></li>
+      <li>Потому что DAGScheduler сортирует операции по их выходу <span class="fb">DAGScheduler режет стадии в местах shuffle; на значения он никогда не смотрит.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Воркер, который держит партицию 2 закэшированного RDD <code>messages</code>, умирает. Что пересчитает следующее действие?</p>
+    <ul class="options">
+      <li data-correct>Только партицию 2: её блок заново читается из HDFS, и filter и map применяются снова <span class="fb">Lineage восстанавливает то, что потеряно; остальные закэшированные партиции читаются из памяти.</span></li>
+      <li>Все партиции <code>messages</code>, потому что кэш уже неполный <span class="fb">Восстановление идёт по партициям: закэшированные по-прежнему действительны.</span></li>
+      <li>Ничего: Spark держит реплику каждой закэшированной партиции <span class="fb">Кэш по умолчанию держит одну копию; Spark полагается на lineage, а не на реплики.</span></li>
+      <li>Ничего: драйвер хранит копию данных <span class="fb">Драйвер хранит lineage и результаты действий, а не данные партиций.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Какой компонент делит задание на стадии?</p>
+    <ul class="options">
+      <li data-correct>DAGScheduler <span class="fb">"split graph into stages of tasks — submit each stage as ready" (p. 1225).</span></li>
+      <li>TaskScheduler <span class="fb">Он запускает задачи стадии через cluster manager и перезапускает упавшие или отстающие.</span></li>
+      <li>Cluster manager <span class="fb">Он раздаёт машины или executor'ы; об RDD он ничего не знает.</span></li>
+      <li>Block manager <span class="fb">Он хранит и отдаёт блоки на каждом воркере.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">На графике (p. 1218) агрегация, написанная на DataFrame, занимает около 2 s и в Python, и в Scala, а на RDD Python нужно около 9.5 s, а Scala — около 4.2 s. Почему?</p>
+    <ul class="options">
+      <li data-correct>DataFrame API только описывает вычисление, и Spark выполняет оптимизированный план в JVM; лямбды RDD, написанные на Python, работают в процессах Python, запись за записью <span class="fb">Язык пишет план, JVM его выполняет. Только код на RDD отправляет каждую запись в Python.</span></li>
+      <li>Программист переводит DataFrame на Python в исходный код на Scala <span class="fb">Никто ничего не переводит; причина — декларативный API.</span></li>
+      <li>DataFrame всегда кэшируются, RDD — никогда <span class="fb">Ни то, ни другое не кэшируется, пока ты об этом не попросишь.</span></li>
+      <li>Два графика используют разный объём данных <span class="fb">Это один график и одна задача: 10 миллионов пар целых чисел.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l38-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Spark заменяет три специализированных стека — потоковый, батчевый, интерактивный — одним движком и библиотеками для SQL, стриминга, машинного обучения и графов, которые делят одних и тех же воркеров и кэши в памяти; он вычисляет, а данные читает из HDFS, S3, Cassandra и других систем.</li>
+    <li>RDD — неизменяемая, партиционированная, лениво вычисляемая и кэшируемая коллекция; она устойчива (resilient), потому что Spark записывает её lineage и пересчитывает потерянные партиции, а не реплицирует их.</li>
+    <li>Трансформации (map, filter, flatMap, join, reduceByKey …) возвращают новое RDD и ничего не запускают; действия (count, collect, take, reduce, saveAsTextFile …) запускают задание и возвращают значение или записывают данные.</li>
+    <li>Трансформация узкая, когда каждая родительская партиция питает не более одной дочерней, и широкая, когда родительскую партицию приходится делить между многими, — это shuffle; там DAGScheduler режет стадии, и каждая стадия запускает одну задачу на партицию.</li>
+    <li>Когда воркер умирает, Spark восстанавливает только его потерянные партиции — по их lineage и блокам HDFS, которые HDFS всё ещё хранит в других репликах.</li>
+    <li>DataFrame — неизменяемые данные с именованными столбцами, построенные на RDD; декларативный API позволяет Spark оптимизировать план, поэтому из Python он работает так же быстро, как из Scala, — и именно этот API требует экзамен.</li>
+  </ul>
+  <aside class="cheat" id="l38-cheat">
+    <dl>
+      <dt>RDD</dt><dd>Resilient Distributed Dataset: неизменяемое, партиционированное, лениво вычисляемое, кэшируемое; устойчиво благодаря своей lineage</dd>
+      <dt>Трансформация (transformation)</dt><dd>возвращает новое RDD или DataFrame, ничего не запускает: <code>map</code>, <code>filter</code>, <code>flatMap</code>, <code>union</code>, <code>join</code>, <code>distinct</code>, <code>reduceByKey</code>, <code>groupByKey</code>; DataFrame: <code>select</code>, <code>filter</code>, <code>groupBy</code>, <code>orderBy</code>, <code>limit</code></dd>
+      <dt>Действие (action)</dt><dd>запускает задание: <code>count()</code>, <code>collect()</code>, <code>take(n)</code>, <code>first()</code>, <code>reduce(f)</code>, <code>saveAsTextFile(path)</code>; DataFrame: <code>show()</code></dd>
+      <dt><code>rdd.cache()</code></dt><dd>помечает RDD, чтобы держать его в памяти; кэш заполняет следующее действие</dd>
+      <dt>Narrow / wide (узкая / широкая)</dt><dd>каждая родительская партиция питает не более одной дочерней / многие: shuffle и новая стадия</dd>
+      <dt>Job · stage · task</dt><dd>вся работа одного действия · её кусок без shuffle · одна стадия на одной партиции</dd>
+      <dt>Driver · executor · cluster manager</dt><dd>твоя программа с её SparkContext · процесс на воркере, который выполняет задачи и кэширует партиции · раздаёт executor'ы (standalone, YARN, Mesos)</dd>
+      <dt>DAGScheduler · TaskScheduler</dt><dd>режет DAG на стадии в местах shuffle · запускает задачи, перезапускает упавшие или отстающие</dd>
+      <dt>Lineage</dt><dd>родители + функция каждого RDD; по ней пересчитываются потерянные партиции</dd>
+      <dt>DataFrame</dt><dd>"Immutable Data with named columns (built on RDDs)"; DataFrame = Dataset[Row]</dd>
+      <dt>Задание со слайда (p. 1222)</dt><dd><code>sc.textFile(...)</code> → <code>filter</code> → <code>map</code> → <code>cache()</code> → <code>count()</code></dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l38-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="during">
+      <a class="res-title" href="https://www.youtube.com/watch?v=TMb6xJc48zc" target="_blank" rel="noopener">Apache Spark Internals: Understanding Physical Planning (Stages, Tasks &amp; Pipelining)</a>
+      <span class="res-by">Philipp Brunenberg</span>
+      <p class="res-why">Неторопливый наглядный разбор того, как маленькая программа режется на стадии и задачи: слайд про планирование (p. 1225) в движении. Смотри рядом с виджетом из раздела 5.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://spark.apache.org/docs/latest/rdd-programming-guide.html" target="_blank" rel="noopener">RDD Programming Guide</a>
+      <span class="res-by">Документация Apache Spark</span>
+      <p class="res-why">Официальные таблицы трансформаций и действий, раздел "Shuffle operations" — почему reduceByKey, groupByKey и join двигают данные, — и "RDD Persistence" о том, что на самом деле хранит cache().</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia" target="_blank" rel="noopener">Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing</a>
+      <span class="res-by">Zaharia et al., NSDI 2012</span>
+      <p class="res-why">Разделы 1–2 определяют RDD и lineage, а задание по разбору логов со слайда (p. 1222) там — Figure 1; раздел 4 определяет узкие и широкие зависимости, отсчитанные от родителя, раздел 5 — стадии.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=mzIoSW-cInA" target="_blank" rel="noopener">Lecture 15: Big Data: Spark</a>
+      <span class="res-by">MIT 6.824 Distributed Systems, Robert Morris</span>
+      <p class="res-why">Профессор по распределённым системам разбирает статью про RDD: почему lineage выигрывает у репликации и почему итеративные алгоритмы переросли MapReduce. Лучшая подготовка к вопросам «почему».</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://people.eecs.berkeley.edu/~matei/papers/2016/cacm_apache_spark.pdf" target="_blank" rel="noopener">Apache Spark: A Unified Engine for Big Data Processing</a>
+      <span class="res-by">Zaharia et al., Communications of the ACM, 2016</span>
+      <p class="res-why">Десять легко читаемых страниц, которые связывают воедино раздел 1: один движок с библиотеками вместо отдельных стеков, с цифрами в подтверждение.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Теперь ты умеешь читать Spark-программу как lineage и предсказывать её задания, стадии и задачи. Дальше ты будешь их писать: операции над парами ключ-значение и word count, а затем PySpark DataFrame API, на котором надо отвечать на экзаменационные упражнения SparkQL, — без SQL-строк.</p>
+</aside>
+
+</main>
+</body>
+</html>

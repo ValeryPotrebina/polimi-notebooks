@@ -1,0 +1,1349 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Транзакции, партиции и реплики: что обещает одна машина · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: pointer and keyboard focus for the clickable nodes of the partition sandbox (a hand-made SVG interactive); tokens only */
+.l03-node { cursor: pointer; }
+.l03-node:focus { outline: none; }
+.l03-node:focus-visible .l03-frame { stroke: var(--link) !important; stroke-width: 3px !important; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l03">
+
+<header class="lesson-head">
+  <h1>Транзакции, партиции и реплики: что обещает одна машина</h1>
+  <p class="lede">После этого урока ты сможешь прогнать банковский перевод со слайда через commit, rollback и сбой и назвать свойство, которое его спасло, объяснить, почему «купи машину получше» перестаёт работать и когда, и сказать, что даёт и чего стоит партиционирование, а что — репликация.</p>
+</header>
+
+<div class="hook" data-label="Загадка">
+  <p>На счёте 12202 лежит 100, на счёте 42177 — 25. Сервер банка начинает переводить 10 со второго счёта на первый: прибавляет 10 к 12202 — и тут отключается питание, прежде чем он успевает снять 10 с 42177. В этот момент на двух счетах 135 вместо 125, десять единиц денег из ниоткуда, и новый баланс 110, возможно, уже лежит на диске.</p>
+  <p>Когда сервер снова поднимется, у кого окажутся лишние 10? Оставь вопрос открытым. Первая половина урока отвечает на него четырьмя буквами, которые обещает одна реляционная машина. Вторая половина спрашивает: если одна машина так хорошо держит свои обещания, почему слайды всё равно рисуют «купи машину получше» как лестницу, которая кончается, — даже когда у машины 576 ядер и 24 TB памяти?</p>
+</div>
+
+
+<section id="l03-contract">
+  <h2>Реляционный контракт: схема и единица работы</h2>
+
+  <p>Пример на слайдах работает с одной таблицей, <code>Account</code>, с номером счёта <code>AccNum</code> и балансом <code>Balance</code>. Ещё до запуска любой транзакции её схема обещает три вещи, которые слайд "The data schema" (p. 144) перечисляет тремя голыми словами: Typing, Coherence, Uniformity. Рис. 1 показывает, что отвергает каждое из них.</p>
+
+  <figure class="fig fig--plain" id="l03-fig-schema">
+    <svg class="dia" viewBox="0 0 560 270" role="img" aria-label="Таблица Account со столбцами AccNum и Balance, оба integer, и двумя строками; под ней три вставки, которые схема отвергает в момент записи: баланс 'ten' нарушает typing, второй счёт 12202 нарушает coherence, строка с третьим столбцом нарушает uniformity">
+      <text x="20" y="20" class="tx-sm tx-bold">Account</text>
+      <rect x="20" y="28" width="100" height="24" class="fw-s3 st-s3"/>
+      <rect x="120" y="28" width="100" height="24" class="fw-s3 st-s3"/>
+      <rect x="20" y="52" width="100" height="20" class="fw-s3 st-s3"/>
+      <rect x="120" y="52" width="100" height="20" class="fw-s3 st-s3"/>
+      <text x="70" y="45" class="tx-mono tx-sm tx-mid">AccNum</text>
+      <text x="170" y="45" class="tx-mono tx-sm tx-mid">Balance</text>
+      <text x="70" y="67" class="tx-sm tx-muted tx-mid">integer</text>
+      <text x="170" y="67" class="tx-sm tx-muted tx-mid">integer</text>
+      <rect x="20" y="72" width="100" height="24" class="fi-paper"/>
+      <rect x="120" y="72" width="100" height="24" class="fi-paper"/>
+      <rect x="20" y="96" width="100" height="24" class="fi-paper"/>
+      <rect x="120" y="96" width="100" height="24" class="fi-paper"/>
+      <text x="70" y="89" class="tx-mono tx-sm tx-mid">12202</text>
+      <text x="170" y="89" class="tx-mono tx-sm tx-mid">100</text>
+      <text x="70" y="113" class="tx-mono tx-sm tx-mid">42177</text>
+      <text x="170" y="113" class="tx-mono tx-sm tx-mid">25</text>
+      <line x1="258" y1="48" x2="228" y2="48" class="sw-2" marker-end="url(#arr)"/>
+      <text x="266" y="56" class="tx-hand">схема</text>
+      <line x1="258" y1="98" x2="228" y2="98" class="sw-2" marker-end="url(#arr)"/>
+      <text x="266" y="106" class="tx-hand">данные</text>
+      <text x="20" y="152" class="tx-hand">отвергнуто при записи</text>
+      <rect x="20" y="164" width="100" height="24" class="fi-paper st-muted dash"/>
+      <rect x="120" y="164" width="100" height="24" class="fi-paper st-muted dash"/>
+      <line x1="12" y1="176" x2="228" y2="176" class="st-bad sw-2"/>
+      <text x="70" y="181" class="tx-mono tx-sm tx-mid halo">55031</text>
+      <text x="170" y="181" class="tx-mono tx-sm tx-mid halo">'ten'</text>
+      <text x="300" y="181" class="tx-sm"><tspan class="tx-bold">Typing</tspan>: не integer</text>
+      <rect x="20" y="198" width="100" height="24" class="fi-paper st-muted dash"/>
+      <rect x="120" y="198" width="100" height="24" class="fi-paper st-muted dash"/>
+      <line x1="12" y1="210" x2="228" y2="210" class="st-bad sw-2"/>
+      <text x="70" y="215" class="tx-mono tx-sm tx-mid halo">12202</text>
+      <text x="170" y="215" class="tx-mono tx-sm tx-mid halo">50</text>
+      <text x="300" y="215" class="tx-sm"><tspan class="tx-bold">Coherence</tspan>: повтор ключа</text>
+      <rect x="20" y="232" width="100" height="24" class="fi-paper st-muted dash"/>
+      <rect x="120" y="232" width="100" height="24" class="fi-paper st-muted dash"/>
+      <rect x="220" y="232" width="60" height="24" class="fi-paper st-muted dash"/>
+      <line x1="12" y1="244" x2="288" y2="244" class="st-bad sw-2"/>
+      <text x="70" y="249" class="tx-mono tx-sm tx-mid halo">61740</text>
+      <text x="170" y="249" class="tx-mono tx-sm tx-mid halo">70</text>
+      <text x="250" y="249" class="tx-mono tx-sm tx-mid halo">VIP</text>
+      <text x="300" y="249" class="tx-sm"><tspan class="tx-bold">Uniformity</tspan>: лишний столбец</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Три слова со слайда (p. 144) как три отказа. Схема фиксирует имена, типы и ключ <code>Account</code> до того, как придёт хоть одна строка, и СУБД отвергает каждую вставку, которая не подходит, — в момент записи.</figcaption>
+  </figure>
+
+  <p><b>Typing</b> (типизация): у каждого столбца есть тип, поэтому баланс <code>'ten'</code> будет отвергнут. <b>Coherence</b> (согласованность): ограничения целостности — ключи, ссылки, условия — держат данные согласованными сами с собой, поэтому второй счёт 12202 будет отвергнут. <b>Uniformity</b> (однородность): у каждой строки одни и те же столбцы. Слайд даёт только три слова; эти пояснения — их стандартное прочтение. Обрати внимание, <em>когда</em> идут проверки: в момент записи, до того как данные приняты. <a href="l04.html">Урок 4</a> — про системы, которые отказываются от них намеренно.</p>
+
+  <h3>Транзакция — одна единица работы</h3>
+
+  <p>Следующий слайд (p. 145) называет три обстановки, где важны транзакции: "The relational world", "Multi-user", "Distributed systems". Этот урок живёт в первых двух и заканчивается у двери третьей.</p>
+
+  <div class="def">
+    <p><dfn>Транзакция (transaction)</dfn> — "An elementary unit of work performed by an application" (p. 146) — элементарная единица работы, выполняемая приложением. Она заключена между двумя командами, <code>begin transaction</code> (bot) и <code>end transaction</code> (eot); внутри выполняется ровно одна из <code>commit work</code> (commit) или <code>rollback work</code> (abort).</p>
+  </div>
+
+  <p>Пример на слайде (p. 148) переводит 10 со счёта 42177 на счёт 12202:</p>
+
+<pre><code>-- p. 148: transfer 10 from account 42177 to account 12202
+begin transaction;
+update Account
+  set Balance = Balance + 10 where AccNum = 12202;
+update Account
+  set Balance = Balance - 10 where AccNum = 42177;
+commit work;
+end transaction;</code></pre>
+
+  <p>Зачислить на 12202, списать с 42177, сделать оба изменения постоянными. Порядок двух обновлений не важен; важно, что они происходят вместе или не происходят вовсе. Следующий слайд (p. 149) добавляет бизнес-правило — никакого овердрафта — и даёт программе выбрать, чем закончить:</p>
+
+<pre><code>-- p. 149: commit only if 42177 does not go below zero
+begin transaction;
+update Account
+  set Balance = Balance + 10 where AccNum = 12202;
+update Account
+  set Balance = Balance - 10 where AccNum = 42177;
+select Balance into A from Account
+  where AccNum = 42177;
+if (A&gt;=0) then commit work
+          else rollback work;
+end transaction;</code></pre>
+
+  <p>После списания программа читает новый баланс 42177 в переменную <code>A</code>. Если <code>A</code> не меньше нуля, она делает commit; иначе выполняет <code>rollback work</code> — и откат отменяет и зачисление на 12202, хотя это обновление прошло без ошибки. Единица — транзакция, а не оператор.</p>
+
+  <h3>Корректно построенные транзакции и путь состояний</h3>
+
+  <p>Прикладная программа — последовательность таких единиц (p. 147), и каждая должна быть <mark class="key">корректно построенной (well-formed)</mark> (p. 150): <code>begin transaction</code>; код работы с данными (чтения и записи); <code>commit work</code> или <code>rollback work</code>; никакой работы с данными; <code>end transaction</code>. Рис. 2 рисует этот шаблон дважды, по разу для каждого исхода.</p>
+
+  <figure class="fig fig--plain" id="l03-fig-txn">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Прикладная программа в виде скобки, внутри две транзакции одна за другой; каждая начинается с begin transaction, затем блок чтений и записей, затем commit work в первой и rollback work во второй, затем промежуток без работы с данными, затем end transaction">
+      <text x="20" y="18" class="tx-sm tx-bold">прикладная программа</text>
+      <path d="M58 30 H40 V290 H58" class="sw-2"/>
+      <rect x="66" y="32" width="250" height="118" rx="4" class="fi-paper sw-2"/>
+      <text x="82" y="54" class="tx-mono tx-sm">begin transaction</text>
+      <line x1="82" y1="68" x2="250" y2="68" class="st-s1 sw-2"/>
+      <line x1="82" y1="78" x2="220" y2="78" class="st-s1 sw-2"/>
+      <line x1="82" y1="88" x2="236" y2="88" class="st-s1 sw-2"/>
+      <line x1="82" y1="98" x2="204" y2="98" class="st-s1 sw-2"/>
+      <text x="82" y="122" class="tx-mono tx-sm tx-bold">commit work</text>
+      <text x="82" y="142" class="tx-mono tx-sm">end transaction</text>
+      <rect x="66" y="166" width="250" height="118" rx="4" class="fi-paper sw-2"/>
+      <text x="82" y="188" class="tx-mono tx-sm">begin transaction</text>
+      <line x1="82" y1="202" x2="236" y2="202" class="st-s1 sw-2"/>
+      <line x1="82" y1="212" x2="250" y2="212" class="st-s1 sw-2"/>
+      <line x1="82" y1="222" x2="212" y2="222" class="st-s1 sw-2"/>
+      <line x1="82" y1="232" x2="230" y2="232" class="st-s1 sw-2"/>
+      <text x="82" y="256" class="tx-mono tx-sm tx-bold">rollback work</text>
+      <text x="82" y="276" class="tx-mono tx-sm">end transaction</text>
+      <text x="336" y="60" class="tx-bold">транзакция T₁</text>
+      <text x="336" y="86" class="tx-sm tx-muted">чтения и записи</text>
+      <line x1="332" y1="132" x2="296" y2="132" class="sw-2" marker-end="url(#arr)"/>
+      <text x="340" y="140" class="tx-hand">здесь данных нет</text>
+      <text x="336" y="194" class="tx-bold">транзакция T₂</text>
+      <text x="336" y="220" class="tx-sm tx-muted">чтения и записи</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> "Application and Transaction" (p. 147) с шаблоном со слайда (p. 150) внутри: программа — последовательность транзакций; каждая открывается, читает и пишет, завершает работу ровно одним из <code>commit work</code> или <code>rollback work</code>, после этого не трогает данные и закрывается.</figcaption>
+  </figure>
+
+  <div class="pitfall"><p>«<code>commit work</code> завершает транзакцию». Он решает исход; <code>end transaction</code> закрывает единицу после него, а между ними шаблон разрешает "no data manipulation" (никакой работы с данными). Исход решается один раз: commit или rollback выполняется "exactly once" (p. 146), но никогда оба.</p></div>
+
+  <p>Тот же слайд (p. 150) показывает транзакцию и как путь состояний: \(S_0\) до неё, новое состояние после каждой записи W1, W2, … и \(S_r\) — результат. Снаружи должны быть видны только два конца. С балансами из загадки (на слайдах их нет): \(S_0\) = (100, 25), \(S_1\) = (110, 25) после зачисления, \(S_r\) = (110, 15) после списания.</p>
+</section>
+
+
+<section id="l03-acid">
+  <h2>ACID, по одной букве</h2>
+
+  <p>"A transaction is a unit of work enjoying the following properties: Atomicity, Consistency, Isolation, Durability" (p. 188). Слайды дают каждой букве свою страницу (pp. 189–192); здесь каждая встречается с переводом.</p>
+
+  <h3>Атомарность: всё или ничего</h3>
+
+  <p>"A transaction is an atomic transformation from the initial state to the final state" (p. 189). Атомарный (atomic) значит неделимый: снаружи база данных либо перепрыгивает из \(S_0\) в \(S_r\), либо остаётся в \(S_0\), и \(S_1\) — деньги из ниоткуда — никогда не становится конечной точкой. Слайд перечисляет три возможных поведения:</p>
+  <ol>
+    <li>"Commit work: SUCCESS" — база данных приходит в \(S_r\) и остаётся там.</li>
+    <li>"Rollback work or error prior to commit: UNDO" — каждая уже сделанная запись отменяется, начиная с самой новой, обратно до \(S_0\).</li>
+    <li>"Fault after commit: REDO" — зафиксированные записи, которые могли не дойти до диска, применяются заново, до \(S_r\).</li>
+  </ol>
+  <p>UNDO ведёт назад к \(S_0\), REDO — вперёд к \(S_r\). Заставь их случиться.</p>
+
+  <div class="widget" id="l03-w-txn">
+    <h3 class="widget-title">Пошаговая транзакция: перевод со слайда (p. 149) с кнопкой сбоя</h3>
+    <p class="widget-intro">Программа со слайда (p. 149) выполняется по строке на каждое нажатие <b>«Следующий шаг»</b>. Слева вверху — два баланса; справа вверху — журнал, который СУБД ведёт на диске; внизу — цепочка состояний со слайда (p. 189) с балансами каждого состояния над ним. <b>«Rollback work»</b> делает откат от имени приложения, <b>«Сбой сейчас»</b> выдёргивает вилку из розетки. Ползунок задаёт начальный баланс 42177 (12202 всегда начинается со 100); если его сдвинуть, всё начнётся заново.</p>
+    <ol class="tasks">
+      <li>Оставь 42177 на 25. Прежде чем что-то нажимать, предскажи сумму двух счетов в \(S_1\). Потом нажми «Следующий шаг» дважды и прочитай табло.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>135 вместо 125: зачисление создало десять единиц, которые списание ещё не забрало. \(S_1\) — состояние, которое транзакция ни в коем случае не должна оставить после себя; следующие два задания показывают, как СУБД это обеспечивает.</p></details>
+      </li>
+      <li>Нажми «Начать заново», потом дважды «Следующий шаг» (ты в \(S_1\)) и «Сбой сейчас». Предскажи, куда перезапуск вернёт 12202, а потом нажимай «Следующий шаг», пока исход не установится.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Баланс 12202 превращается в «?» — память потеряна, а на диске может быть любое из двух значений, — и в журнале нет записи о commit, поэтому перезапуск отменяет W1: 12202 снова 100, состояние \(S_0\). Ради этого вывода виджет и построен: что бы ни выполнилось, ничего незафиксированного сбой не переживает.</p></details>
+      </li>
+      <li>Поставь 42177 на 5 и прогони всю программу кнопкой «Следующий шаг». Перед строкой с решением предскажи итоговый баланс 12202.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>100. A = −5, проверка выполняет <code>rollback work</code>, и UNDO убирает списание, а затем и зачисление, хотя само зачисление было в порядке. Попробуй и 10: A = 0 проходит <code>A&gt;=0</code>, и перевод фиксируется.</p></details>
+      </li>
+      <li>Вернись к 25, прогони до исхода «commit выполнен», потом нажми «Сбой сейчас». Предскажи: UNDO или REDO?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>REDO. Оба баланса становятся «?», но в журнале есть запись о commit, поэтому перезапуск заново применяет W1 и W2 с их новыми значениями и заканчивается в \(S_r\): 110 и 15. Долговечность и есть этот REDO; сбой после <code>end transaction</code> даёт тот же ответ.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l03-w-txn', function (root, ui) {
+    var SV = Course.svg;
+    var b = 25, st;
+    var CODE = ['', 'begin transaction;', 'update … + 10 where AccNum = 12202;', 'update … - 10 where AccNum = 42177;', 'select Balance into A … ;', 'if (A&gt;=0) then commit work else rollback work;', 'end transaction;'];
+    var SNAME = ['S₀', 'S₁', 'Sᵣ'];
+
+    function money(v) { return v < 0 ? '−' + (-v) : String(v); }
+    function valA() { return st.applied >= 1 ? 110 : 100; }
+    function valC() { return st.applied >= 2 ? b - 10 : b; }
+    function allKnown() { return st.known.a && st.known.c; }
+    function reset() {
+      st = { pc: 0, mode: 'run', applied: 0, written: 0, known: { a: true, c: true }, log: [], committed: false, aborted: false, crashed: false, A: null, act: null };
+      st.msg = 'Нажимай <b>«Следующий шаг»</b>, чтобы выполнять программу со слайда (p. 149) по одной строке. 12202 начинается со 100, 42177 — с ' + money(b) + '.';
+    }
+    reset();
+
+    function finishUndo(prefix) {
+      st.log.push('abort T'); st.aborted = true;
+      if (st.crashed) { st.mode = 'over'; st.msg = prefix + 'Перезапуск завершён: база в S₀, как будто перевод и не начинался.'; }
+      else { st.mode = 'run'; st.pc = 5; st.msg = prefix + 'Снова S₀; запись abort закрывает журнал. Дальше: <code>end transaction</code>.'; }
+    }
+    function undoStep() {
+      if (st.applied >= 2) {
+        st.applied = 1; st.known.c = true; st.act = { k: 'undo', s: 2 };
+        st.msg = 'UNDO W2: старое значение из журнала возвращает 42177 к ' + money(b) + '. Состояние S₁.';
+      } else if (st.applied === 1) {
+        st.applied = 0; st.known.a = true; st.act = { k: 'undo', s: 1 };
+        finishUndo('UNDO W1: 12202 снова 100 — зачисление тоже отменено. ');
+      } else { st.act = null; finishUndo(''); }
+    }
+    function redoStep() {
+      if (st.applied === 0) {
+        st.applied = 1; st.known.a = true; st.act = { k: 'redo', s: 1 };
+        st.msg = 'REDO W1: новое значение из журнала ставит 12202 на 110.';
+      } else {
+        st.applied = 2; st.known.c = true; st.act = { k: 'redo', s: 2 }; st.mode = 'over';
+        st.msg = 'REDO W2: 42177 ставится на ' + money(b - 10) + '. Перезапуск завершён: Sᵣ — зафиксированный перевод пережил сбой.';
+      }
+    }
+    function next() {
+      if (st.mode === 'undo') { undoStep(); return; }
+      if (st.mode === 'redo') { redoStep(); return; }
+      if (st.mode !== 'run') return;
+      if (st.pc === 0) {
+        st.pc = 1; st.log.push('begin T'); st.act = null;
+        st.msg = '<code>begin transaction</code> (bot): в журнал идёт запись begin. База в S₀.';
+      } else if (st.pc === 1) {
+        st.pc = 2; st.applied = 1; st.written = 1; st.log.push('W1 12202: 100→110'); st.act = { k: 'w', s: 1 };
+        st.msg = 'W1: 12202 меняется со 100 на 110, и журнал хранит оба значения. Это S₁: на двух счетах на 10 больше, чем должно быть.';
+      } else if (st.pc === 2) {
+        st.pc = 3; st.applied = 2; st.written = 2; st.log.push('W2 42177: ' + money(b) + '→' + money(b - 10)); st.act = { k: 'w', s: 2 };
+        st.msg = 'W2: 42177 меняется с ' + money(b) + ' на ' + money(b - 10) + '. Это Sᵣ, результат, — но до <code>commit work</code> ничто не постоянно.';
+      } else if (st.pc === 3) {
+        st.pc = 4; st.A = b - 10; st.act = null;
+        st.msg = '<code>select Balance into A</code>: A = ' + money(st.A) + '. Дальше — решение.';
+      } else if (st.pc === 4) {
+        st.pc = 5; st.act = null;
+        if (st.A >= 0) {
+          st.committed = true; st.log.push('commit T');
+          st.msg = 'A = ' + money(st.A) + ' ≥ 0, значит <code>commit work</code>: в журнал идёт запись commit. SUCCESS — отныне перевод должен пережить любой сбой.';
+        } else {
+          st.mode = 'undo';
+          st.msg = 'A = ' + money(st.A) + ' &lt; 0: проверка овердрафта выполняет <code>rollback work</code>. Нажми «Следующий шаг», чтобы увидеть UNDO.';
+        }
+      } else if (st.pc === 5) {
+        st.pc = 6; st.mode = 'over'; st.act = null;
+        st.msg = '<code>end transaction</code> (eot). Между исходом и этой строкой данные никто не трогал: транзакция была корректно построенной (well-formed).';
+      }
+    }
+    function rollback() {
+      if (st.mode !== 'run' || st.pc < 1 || st.pc > 4) return;
+      st.pc = 5; st.act = null;
+      if (st.applied === 0) {
+        st.log.push('abort T'); st.aborted = true;
+        st.msg = '<code>rollback work</code> до любой записи: отменять нечего, запись abort закрывает журнал. Дальше: <code>end transaction</code>.';
+        return;
+      }
+      st.mode = 'undo';
+      st.msg = 'Приложение выполняет <code>rollback work</code>. Нажми «Следующий шаг», чтобы увидеть UNDO.';
+    }
+    function crash() {
+      st.act = null;
+      if (st.pc === 0) { st.msg = 'Пока ничего не выполняется: сбой сейчас ничего не меняет.'; return; }
+      if (st.committed) {
+        st.crashed = true; st.mode = 'redo'; st.applied = 0; st.known = { a: false, c: false };
+        st.msg = 'Сбой после commit! Память потеряна, оба баланса неизвестны — на диске могут быть новые значения, а могут и не быть. В журнале есть запись commit, значит, перезапуск должен сделать REDO. Нажми «Следующий шаг».';
+        return;
+      }
+      if (st.aborted) {
+        st.crashed = true; st.mode = 'over';
+        st.msg = 'Сбой. Журнал говорит, что транзакция откатилась и её записи уже отменены: ни отменять, ни повторять нечего. База остаётся в S₀.';
+        return;
+      }
+      if (st.written === 0) {
+        st.crashed = true; st.aborted = true; st.mode = 'over'; st.log.push('abort T');
+        st.msg = 'Сбой до любой записи: отменять нечего. Транзакции просто не было; база в S₀.';
+        return;
+      }
+      st.crashed = true; st.mode = 'undo'; st.applied = st.written; st.known = { a: false, c: st.written < 2 };
+      st.msg = 'Сбой до commit! Память потеряна, и балансы, которые писала транзакция, неизвестны. В журнале нет записи commit, значит, перезапуск должен сделать UNDO. Нажми «Следующий шаг».';
+    }
+
+    ui.slider({ label: 'начальный баланс 42177', min: 0, max: 30, step: 1, value: 25, onInput: function (v) { b = Math.round(v); reset(); } });
+    var bNext = ui.button('Следующий шаг', next, { kind: 'primary', icon: 'next' });
+    var bRoll = ui.button('Rollback work', rollback);
+    var bCrash = ui.button('Сбой сейчас', crash);
+    ui.button('Начать заново', reset, { kind: 'ghost', icon: 'refresh' });
+    var svg = ui.svg(560, 290, { label: 'Балансы счетов 12202 и 42177, журнал транзакции и цепочка состояний S0, S1, Sr со стрелками записей W1 и W2, а во время отката или перезапуска — стрелки UNDO или REDO' });
+    var roLine = ui.readout('сейчас выполняется'), roA = ui.readout('A'), roState = ui.readout('состояние'), roTot = ui.readout('сумма двух счетов'), roOut = ui.readout('исход');
+    var note = ui.note('');
+
+    function render() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      SV('text', { x: 20, y: 18, 'class': 'tx-sm tx-bold', text: 'Account' }, svg);
+      SV('rect', { x: 20, y: 26, width: 100, height: 26, 'class': 'fw-s3 st-s3' }, svg);
+      SV('rect', { x: 120, y: 26, width: 100, height: 26, 'class': 'fw-s3 st-s3' }, svg);
+      SV('text', { x: 70, y: 44, 'class': 'tx-mono tx-sm tx-mid', text: 'AccNum' }, svg);
+      SV('text', { x: 170, y: 44, 'class': 'tx-mono tx-sm tx-mid', text: 'Balance' }, svg);
+      [{ id: '12202', key: 'a', y: 52, seg: 1 }, { id: '42177', key: 'c', y: 80, seg: 2 }].forEach(function (r) {
+        var hot = st.act && st.act.s === r.seg;
+        SV('rect', { x: 20, y: r.y, width: 100, height: 28, 'class': 'fi-paper' }, svg);
+        SV('rect', { x: 120, y: r.y, width: 100, height: 28, 'class': hot ? 'fw-key' : 'fi-paper' }, svg);
+        SV('text', { x: 70, y: r.y + 19, 'class': 'tx-mono tx-mid', text: r.id }, svg);
+        var v = st.known[r.key] ? money(r.key === 'a' ? valA() : valC()) : '?';
+        SV('text', { x: 170, y: r.y + 19, 'class': 'tx-mono tx-mid tx-bold', text: v }, svg);
+      });
+      SV('path', { d: 'M270 26 H300 L310 36 V76 H270 Z', 'class': 'fi-paper' }, svg);
+      SV('path', { d: 'M300 26 V36 H310 Z', 'class': 'fi-soft' }, svg);
+      SV('text', { x: 290, y: 96, 'class': 'tx-mono tx-sm tx-mid', text: 'журнал' }, svg);
+      if (!st.log.length) SV('text', { x: 326, y: 40, 'class': 'tx-sm tx-muted', text: '(пусто)' }, svg);
+      st.log.forEach(function (rec, i) { SV('text', { x: 326, y: 40 + 22 * i, 'class': 'tx-mono tx-sm', text: rec }, svg); });
+
+      var CX = [110, 280, 450], CY = 212, defs = [[100, b], [110, b], [110, b - 10]];
+      defs.forEach(function (d, i) { SV('text', { x: CX[i], y: 164, 'class': 'tx-mono tx-sm tx-mid', text: d[0] + ' · ' + money(d[1]) }, svg); });
+      [1, 2].forEach(function (s) {
+        var x1 = CX[s - 1] + 27, x2 = CX[s] - 29;
+        if (st.act && st.act.k === 'w' && st.act.s === s) SV('line', { x1: x1, y1: CY, x2: x2 - 4, y2: CY, 'class': 'hl' }, svg);
+        SV('line', { x1: x1, y1: CY, x2: x2, y2: CY, 'class': 'st-s1 sw-2', 'marker-end': 'url(#arr-s1)' }, svg);
+        SV('text', { x: (CX[s - 1] + CX[s]) / 2, y: CY - 12, 'class': 'tx-sm tx-mid', text: 'W' + s }, svg);
+      });
+      var cur = allKnown() ? st.applied : -1;
+      CX.forEach(function (x, i) {
+        if (i === cur) SV('circle', { cx: x, cy: CY, r: 24, 'class': 'hl' }, svg);
+        SV('circle', { cx: x, cy: CY, r: 24, 'class': 'fi-paper st-s1 sw-2' }, svg);
+        if (i === 2 && st.committed) SV('circle', { cx: x, cy: CY, r: 31, 'class': 'sw-2' }, svg);
+        SV('text', { x: x, y: CY + 7, 'class': 'tx-lg tx-mid tx-bold', text: SNAME[i] }, svg);
+      });
+      var showUndo = st.mode === 'undo' || (st.aborted && st.written > 0);
+      var showRedo = !showUndo && (st.mode === 'redo' || (st.crashed && st.committed));
+      if (showUndo || showRedo) {
+        [1, 2].forEach(function (s) {
+          if (s > st.written) return;
+          var xa = CX[s - 1] + 4, xb = CX[s] - 4, AY = 254, active = st.act && st.act.s === s && st.act.k === (showUndo ? 'undo' : 'redo');
+          var from = showUndo ? xb : xa, to = showUndo ? xa : xb;
+          SV('line', { x1: CX[s], y1: CY + 26, x2: CX[s], y2: AY, 'class': 'st-muted' }, svg);
+          SV('line', { x1: CX[s - 1], y1: CY + 26, x2: CX[s - 1], y2: AY, 'class': 'st-muted' }, svg);
+          if (active) SV('line', { x1: from, y1: AY, x2: to + (showUndo ? 8 : -8), y2: AY, 'class': 'hl' }, svg);
+          SV('line', { x1: from, y1: AY, x2: to, y2: AY, 'class': 'sw-2', 'marker-end': 'url(#arr)' }, svg);
+          SV('text', { x: (xa + xb) / 2, y: AY + 24, 'class': 'tx-sm tx-mid tx-bold', text: showUndo ? 'UNDO' : 'REDO' }, svg);
+        });
+      }
+    }
+
+    ui.onChange(function () {
+      render();
+      var line;
+      if ((st.mode === 'undo' || st.mode === 'redo' || st.crashed) && st.act && st.act.k !== 'w') line = st.act.k.toUpperCase() + ' W' + st.act.s;
+      else if (st.crashed && st.mode !== 'over') line = 'перезапуск';
+      else line = st.pc ? '<code>' + CODE[st.pc] + '</code>' : '—';
+      roLine.set(line);
+      roA.set(st.A === null ? '—' : money(st.A));
+      roState.set(allKnown() ? SNAME[st.applied] + ' (' + money(valA()) + ' · ' + money(valC()) + ')' : 'неизвестно до конца перезапуска');
+      var tot = allKnown() ? valA() + valC() : null;
+      roTot.set(tot === null ? '?' : (tot === 100 + b ? String(tot) : tot + ', а не ' + (100 + b)), tot !== null && tot !== 100 + b ? 'key' : undefined);
+      var out;
+      if (st.pc === 0) out = 'не начата';
+      else if (st.mode === 'undo') out = st.crashed ? 'сбой: идёт UNDO' : 'идёт откат';
+      else if (st.mode === 'redo') out = 'сбой: идёт REDO';
+      else if (st.committed) out = st.crashed ? 'восстановлено: перевод в силе' : 'commit выполнен';
+      else if (st.aborted) out = st.crashed ? 'восстановлено: снова S₀' : 'откат выполнен';
+      else out = 'выполняется';
+      roOut.set(out, st.committed && st.mode !== 'redo' ? 'good' : undefined);
+      note.set(st.msg);
+      bNext.disabled = st.mode === 'over';
+      bRoll.disabled = !(st.mode === 'run' && st.pc >= 1 && st.pc <= 4);
+      bCrash.disabled = st.pc === 0;
+    });
+  });
+  </script>
+
+  <p>Откуда перезапущенный сервер знает, что отменять и что повторять? Слайды только называют механизмы: "Abort-rollback-restart" для атомарности, "Recovery management" для долговечности (p. 193). Виджет показывает ответ из учебников — это контекст, а не материал слайдов: <mark class="key">журнал (log)</mark>. Каждая запись сначала фиксируется в журнале на надёжном носителе, со старым и новым значением, и только потом изменённый баланс может попасть на диск; <code>commit work</code> добавляет в журнал запись о commit. При перезапуске транзакцию без записи о commit отменяют по старым значениям, а транзакцию с такой записью повторяют по новым.</p>
+
+  <h3>Согласованность: ограничения на входе, ограничения на выходе</h3>
+
+  <p>"The transaction satisfies the integrity constraints"; следствие: "If the initial state is consistent, Then the final state is also consistent" (p. 190). Считаются только два конца. При правиле «сумма всех балансов никогда не меняется» \(S_1\) было бы незаконным — 135 вместо 125, — и это допустимо, потому что \(S_1\) не начало и не конец.</p>
+
+  <aside class="margin-note">Это не C из CAP: в уроке 5 согласованность значит, что все узлы видят одни и те же данные. Здесь она значит, что выполняются ограничения целостности.</aside>
+
+  <p>Какие ограничения? Объявленные в схеме проверяет сама СУБД; слайд (p. 193) называет это "integrity checking of the DBMS". Правило, которое никто не объявил, как здесь «никакого овердрафта», — забота приложения: тот самый <code>if (A&gt;=0)</code> со слайда (p. 149). Если бы банк объявил на столбце «баланс не меньше нуля», СУБД отвергла бы списание с ошибкой, и эта ошибка до commit запустила бы UNDO.</p>
+
+  <h3>Изоляция: никаких полуготовых состояний напоказ</h3>
+
+  <p>"A transaction is not affected by the behavior of other, concurrent transactions"; следствие: "Its intermediate states are not exposed" и “The ‘domino effect’ is avoided” (p. 191). Слайд не объясняет домино; рис. 3 показывает их стандартное прочтение — каскад откатов.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l03-fig-domino">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Без изоляции: T1 пишет 110 и потом откатывается; T2 прочитала незафиксированные 110 и тоже должна откатиться; T3 прочитала результат T2 и тоже должна откатиться — цепочка вынужденных откатов">
+        <line x1="40" y1="226" x2="288" y2="226" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="286" y="244" class="tx-sm tx-muted tx-end">время</text>
+        <text x="10" y="65" class="tx-bold">T₁</text>
+        <text x="10" y="129" class="tx-bold">T₂</text>
+        <text x="10" y="193" class="tx-bold">T₃</text>
+        <line x1="40" y1="60" x2="276" y2="60" class="st-muted dots"/>
+        <line x1="40" y1="124" x2="276" y2="124" class="st-muted dots"/>
+        <line x1="40" y1="188" x2="276" y2="188" class="st-muted dots"/>
+        <circle cx="70" cy="60" r="6" class="fi-s1"/>
+        <text x="70" y="46" class="tx-sm tx-mid">пишет 110</text>
+        <line x1="200" y1="50" x2="200" y2="70" class="sw-3"/>
+        <text x="200" y="44" class="tx-sm tx-mid">rollback</text>
+        <line x1="74" y1="66" x2="104" y2="114" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+        <path d="M104 118 l12 12 M116 118 l-12 12" class="st-s2 sw-3"/>
+        <text x="122" y="110" class="tx-sm">читает 110</text>
+        <line x1="228" y1="114" x2="228" y2="134" class="st-bad sw-3"/>
+        <text x="234" y="110" class="tx-sm tx-bad">rollback!</text>
+        <line x1="116" y1="130" x2="144" y2="178" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+        <path d="M144 182 l12 12 M156 182 l-12 12" class="st-s2 sw-3"/>
+        <text x="162" y="176" class="tx-sm">читает T₂</text>
+        <line x1="258" y1="178" x2="258" y2="198" class="st-bad sw-3"/>
+        <text x="258" y="214" class="tx-sm tx-mid tx-bad">rollback!</text>
+        <line x1="204" y1="72" x2="224" y2="110" class="st-bad sw-2" marker-end="url(#arr-bad)"/>
+        <line x1="232" y1="136" x2="254" y2="174" class="st-bad sw-2" marker-end="url(#arr-bad)"/>
+        <text x="40" y="214" class="tx-hand">домино</text>
+      </svg>
+      <p class="fig-label">До: без изоляции</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="С изоляцией: T1 пишет 110 и потом откатывается, но T2 читает только зафиксированные 100 и фиксируется, а T3 читает зафиксированный результат T2 и фиксируется; каскада нет">
+        <line x1="40" y1="226" x2="288" y2="226" class="st-muted" marker-end="url(#arr-muted)"/>
+        <text x="286" y="244" class="tx-sm tx-muted tx-end">время</text>
+        <text x="10" y="65" class="tx-bold">T₁</text>
+        <text x="10" y="129" class="tx-bold">T₂</text>
+        <text x="10" y="193" class="tx-bold">T₃</text>
+        <line x1="40" y1="60" x2="276" y2="60" class="st-muted dots"/>
+        <line x1="40" y1="124" x2="276" y2="124" class="st-muted dots"/>
+        <line x1="40" y1="188" x2="276" y2="188" class="st-muted dots"/>
+        <circle cx="70" cy="60" r="6" class="fi-s1"/>
+        <text x="70" y="46" class="tx-sm tx-mid">пишет 110</text>
+        <line x1="200" y1="50" x2="200" y2="70" class="sw-3"/>
+        <text x="200" y="44" class="tx-sm tx-mid">rollback</text>
+        <path d="M104 118 l12 12 M116 118 l-12 12" class="st-s2 sw-3"/>
+        <text x="100" y="148" class="tx-sm">читает 100</text>
+        <line x1="160" y1="114" x2="160" y2="134" class="st-good sw-3"/>
+        <text x="160" y="108" class="tx-sm tx-mid tx-good">commit</text>
+        <line x1="164" y1="130" x2="196" y2="178" class="st-s2 dash" marker-end="url(#arr-s2)"/>
+        <path d="M196 182 l12 12 M208 182 l-12 12" class="st-s2 sw-3"/>
+        <text x="214" y="212" class="tx-sm">читает T₂</text>
+        <line x1="256" y1="178" x2="256" y2="198" class="st-good sw-3"/>
+        <text x="256" y="172" class="tx-sm tx-mid tx-good">commit</text>
+        <text x="40" y="214" class="tx-hand">S1 никто не видит</text>
+      </svg>
+      <p class="fig-label">После: с изоляцией</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> "Domino effect" со слайда (p. 191). Слева: T₂ читает незафиксированные 110, поэтому, когда T₁ откатывается, T₂ тоже должна откатиться, а с ней и T₃. Справа: T₂ видит только зафиксированные 100, откат T₁ никого больше не задевает, и остальные фиксируются.</figcaption>
+  </figure>
+
+  <p>Без изоляции транзакция начисления процентов T₂ могла бы прочитать 110 из 12202, пока перевод T₁ стоит в \(S_1\). Если T₁ потом откатится, T₂ начислит проценты на деньги, которых никогда не было, и тоже должна будет откатиться — а за ней и T₃, которая читала результат T₂. С изоляцией T₂ читает зафиксированные 100 или ждёт, пока T₁ закончит, и первая костяшка домино не падает. Изоляция не значит «по одной транзакции за раз»: они по-прежнему выполняются параллельно, и разводит их управление параллелизмом, "concurrency control" (p. 193).</p>
+
+  <h3>Долговечность: зафиксировано — значит навсегда</h3>
+
+  <p>“The effect of a transaction that has successfully committed will last ‘forever’”, "Independently of any system fault" (p. 192). Когда <code>commit work</code> выполнен, никакой сбой не может вернуть счёту 42177 его 25. Долговечность (durability) — это обещание, а REDO — способ, которым перезапущенный сервер его держит; поэтому слайд (p. 193) относит её к "recovery management". Этот слайд и стоит выучить в виде таблицы:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>"Transaction Properties and Mechanisms" (p. 193) и что делает каждый механизм в переводе.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Свойство</th><th>Механизм (p. 193)</th><th>В переводе</th></tr></thead>
+        <tbody>
+          <tr><td><b>Atomicity</b></td><td>Abort-rollback-restart; Commit protocols</td><td>откат со слайда (p. 149) отменяет и зачисление</td></tr>
+          <tr><td><b>Consistency</b></td><td>Integrity checking of the DBMS</td><td>объявленное ограничение, например ключ <code>AccNum</code>, выполняется в конце</td></tr>
+          <tr><td><b>Isolation</b></td><td>Concurrency control</td><td>никто не читает 110 до commit</td></tr>
+          <tr><td><b>Durability</b></td><td>Recovery management</td><td>на сбой после commit отвечают REDO</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>"Commit protocols" стоят под атомарностью из-за третьей обстановки со слайда (p. 145): когда два счёта живут на двух машинах, обе должны зафиксировать или обе откатить, и договориться им помогает протокол — классический пример двухфазный commit (two-phase commit), здесь это контекст. <a href="l05.html">Урок 5</a> показывает, чего стоит держать машины в согласии, когда сеть между ними может отказать.</p>
+
+  <div class="story" data-year="1981–1983"><p>Сначала в ACID было три буквы. Статья Джима Грея 1981 года «The Transaction Concept: Virtues and Limitations» определяет транзакцию через атомарность, согласованность и долговечность; изоляция присоединилась, а четырёхбуквенную аббревиатуру придумали в обзоре Хердера и Ройтера 1983 года.</p></div>
+
+  <h3>Где живёт ACID: OLTP, и почему реляционные базы остались</h3>
+
+  <aside class="margin-note">Слайд (p. 146) даёт только аббревиатуры. Слайды урока 23 их расшифровывают (p. 483): On Line Transaction Processing, "processing at operational sites", и On Line Analytical Processing, "processing at large, integrated data warehouses".</aside>
+
+  <p>Слайд с определением называет систему, которая выполняет транзакции "on behalf of multiple, concurrent applications", транзакционной системой (OLTP), "As opposed to OLAP" (p. 146). OLTP — это банковское окошко: много коротких транзакций вроде перевода, каждая трогает несколько строк текущих данных. OLAP — это аналитик: длинные запросы только на чтение, которые просматривают и агрегируют историю, например средний баланс по отделениям за десять лет. ACID строили для первого; второе обслуживают хранилища данных из <a href="l23.html">урока 23</a>.</p>
+
+  <p>Это и ответ слайдов на вопрос "Why didn't we change Relational?" (p. 205): реляционная модель "Consolidated" (устоявшаяся), она "Integration platform" — одна база, которую делят многие приложения, — и она "Granting ACID properties!". В этой половине урока ничего не сломано. Ломается размер.</p>
+</section>
+
+
+<section id="l03-scale">
+  <h2>Насколько большое — большое? Масштабирование вверх или вширь</h2>
+
+  <p>Слайд (p. 158) задаёт повестку: "How big is big?", "Not only scaling up", "Elasticity". Ответ начинается на слайде (p. 177) с двух намеренно параллельных фраз:</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="«Традиционные» SQL-системы масштабируются вертикально">
+      <p>“Adding data to a ‘traditional’ SQL system may degrade its performances.” Когда машина "no longer performs as required, the solution is to buy a better machine (with more RAM, more cores and more disk)" (купить машину получше: больше памяти, ядер и дисков).</p>
+    </div>
+    <div class="compare-col" data-label="Решения для больших данных масштабируются горизонтально">
+      <p>"Adding data to a Big Data solution may degrade its performances." Когда машины "no longer performs as required, the solution is to add another machine" (добавить ещё одну машину).</p>
+    </div>
+  </div>
+
+  <p>Обе деградируют с ростом данных; отличается только лекарство. <mark class="key">Вертикальное масштабирование (vertical scaling)</mark> — scaling up — заменяет машину на более мощную. <mark class="key">Горизонтальное масштабирование (horizontal scaling)</mark> — scaling out — ставит ещё одну машину рядом с теми, что есть. Рис. 4 — картинка, которую стоит запомнить.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l03-fig-updown">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="Scale up: маленький обычный сервер заменяется шкафом appliance, а тот — ещё большей исключительной машиной; заменённые машины нарисованы пунктиром">
+        <text x="12" y="30" class="tx-hand">купи получше</text>
+        <rect x="14" y="150" width="44" height="28" class="fi-paper st-muted dash"/>
+        <line x1="20" y1="158" x2="52" y2="158" class="st-muted"/>
+        <line x1="20" y1="164" x2="52" y2="164" class="st-muted"/>
+        <line x1="20" y1="170" x2="52" y2="170" class="st-muted"/>
+        <line x1="64" y1="160" x2="96" y2="142" class="sw-2" marker-end="url(#arr)"/>
+        <rect x="102" y="100" width="56" height="78" class="fi-paper st-muted dash"/>
+        <line x1="108" y1="110" x2="152" y2="110" class="st-muted"/>
+        <line x1="108" y1="122" x2="152" y2="122" class="st-muted"/>
+        <line x1="108" y1="134" x2="152" y2="134" class="st-muted"/>
+        <line x1="108" y1="146" x2="152" y2="146" class="st-muted"/>
+        <line x1="108" y1="158" x2="152" y2="158" class="st-muted"/>
+        <line x1="164" y1="128" x2="196" y2="104" class="sw-2" marker-end="url(#arr)"/>
+        <rect x="202" y="44" width="76" height="134" class="fi-paper sw-2"/>
+        <line x1="208" y1="56" x2="272" y2="56" class="st-muted"/>
+        <line x1="208" y1="70" x2="272" y2="70" class="st-muted"/>
+        <line x1="208" y1="84" x2="272" y2="84" class="st-muted"/>
+        <line x1="208" y1="98" x2="272" y2="98" class="st-muted"/>
+        <line x1="208" y1="112" x2="272" y2="112" class="st-muted"/>
+        <line x1="208" y1="126" x2="272" y2="126" class="st-muted"/>
+        <line x1="208" y1="140" x2="272" y2="140" class="st-muted"/>
+        <line x1="208" y1="154" x2="272" y2="154" class="st-muted"/>
+        <line x1="208" y1="168" x2="272" y2="168" class="st-muted"/>
+        <text x="36" y="198" class="tx-sm tx-mid">commodity</text>
+        <text x="130" y="198" class="tx-sm tx-mid">appliance</text>
+        <text x="240" y="198" class="tx-sm tx-mid">exceptional</text>
+      </svg>
+      <p class="fig-label">Scale up: замени машину</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 210" role="img" aria-label="Scale out: один обычный сервер, потом два одинаковых, потом четыре одинаковых; ничего не заменяется, машины только добавляются">
+        <text x="8" y="30" class="tx-hand">only more commodity hardware</text>
+        <rect x="14" y="136" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="20" y1="144" x2="52" y2="144" class="st-muted"/>
+        <line x1="20" y1="150" x2="52" y2="150" class="st-muted"/>
+        <line x1="20" y1="156" x2="52" y2="156" class="st-muted"/>
+        <line x1="64" y1="150" x2="90" y2="150" class="sw-2" marker-end="url(#arr)"/>
+        <rect x="96" y="118" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="102" y1="126" x2="134" y2="126" class="st-muted"/>
+        <line x1="102" y1="132" x2="134" y2="132" class="st-muted"/>
+        <line x1="102" y1="138" x2="134" y2="138" class="st-muted"/>
+        <rect x="96" y="154" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="102" y1="162" x2="134" y2="162" class="st-muted"/>
+        <line x1="102" y1="168" x2="134" y2="168" class="st-muted"/>
+        <line x1="102" y1="174" x2="134" y2="174" class="st-muted"/>
+        <line x1="146" y1="150" x2="172" y2="150" class="sw-2" marker-end="url(#arr)"/>
+        <rect x="178" y="118" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="184" y1="126" x2="216" y2="126" class="st-muted"/>
+        <line x1="184" y1="132" x2="216" y2="132" class="st-muted"/>
+        <line x1="184" y1="138" x2="216" y2="138" class="st-muted"/>
+        <rect x="228" y="118" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="234" y1="126" x2="266" y2="126" class="st-muted"/>
+        <line x1="234" y1="132" x2="266" y2="132" class="st-muted"/>
+        <line x1="234" y1="138" x2="266" y2="138" class="st-muted"/>
+        <rect x="178" y="154" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="184" y1="162" x2="216" y2="162" class="st-muted"/>
+        <line x1="184" y1="168" x2="216" y2="168" class="st-muted"/>
+        <line x1="184" y1="174" x2="216" y2="174" class="st-muted"/>
+        <rect x="228" y="154" width="44" height="28" class="fi-paper sw-2"/>
+        <line x1="234" y1="162" x2="266" y2="162" class="st-muted"/>
+        <line x1="234" y1="168" x2="266" y2="168" class="st-muted"/>
+        <line x1="234" y1="174" x2="266" y2="174" class="st-muted"/>
+        <text x="36" y="198" class="tx-sm tx-mid">один</text>
+        <text x="118" y="198" class="tx-sm tx-mid">два</text>
+        <text x="225" y="198" class="tx-sm tx-mid">четыре</text>
+      </svg>
+      <p class="fig-label">Scale out: добавь машины</p>
+    </div>
+    <figcaption><b>Рис. 4.</b> Два лекарства со слайда (p. 177). Масштабирование вверх выбрасывает старую машину и покупает следующий класс, пока классы не кончатся. Масштабирование вширь оставляет каждую машину и добавляет такие же дешёвые — “‘only more’ commodity hardware” (p. 181).</figcaption>
+  </figure>
+
+  <p>У вертикального масштабирования есть кривая стоимости (p. 178): стоимость в зависимости от объёма данных, растущая через "commodity hardware" (обычное серийное железо), потом "appliance" (специализированный программно-аппаратный комплекс), потом "exceptional hardware" (исключительное железо), и каждый отрезок круче предыдущего. Для первых двух классов слайды дают числа:</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Обычный сервер против appliance (pp. 179–180).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Commodity hardware (p. 179)</th><th>Appliance (p. 180): Oracle Exadata Database Machine X6-8</th></tr></thead>
+        <tbody>
+          <tr><td><b>CPU</b></td><td class="num">8–32 ядра</td><td class="num">576 ядер</td></tr>
+          <tr><td><b>RAM</b></td><td class="num">16–64 GB</td><td class="num">24 TB</td></tr>
+          <tr><td><b>Диск</b></td><td class="num">1–3 TB</td><td class="num">360 TB флеш-памяти на стойку</td></tr>
+          <tr><td><b>Сеть</b></td><td class="num">10 GE</td><td class="num">40 Gb/s InfiniBand</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="margin-note">Конспект курса (раздел 3.1.4) говорит, что вертикальная стоимость "scales exponentially". Слайд рисует прямые отрезки, которые становятся всё круче: говори «всё быстрее и быстрее, а потом кончается», а не «экспоненциально».</aside>
+
+  <p>У одной стойки appliance в 18–72 раза больше ядер и в 375–1,500 раз больше памяти, чем у одного обычного сервера. На кривой слайда каждый класс стоит дороже за терабайт, чем класс под ним, а после "exceptional hardware" покупать больше нечего.</p>
+
+  <p>Горизонтальное масштабирование (p. 181) — одна прямая с подписью “‘only more’ commodity hardware”: каждый следующий кусок данных стоит примерно ещё одну дешёвую машину. Прямая начинается не с нуля; слайд этот зазор не объясняет, и естественное прочтение — цена того, чтобы вообще иметь кластер: несколько машин, сеть, софт и люди, которые всё это обслуживают.</p>
+
+  <p>Наложи одно на другое (p. 182), и график делится: "Use vertically scalable solutions" для малых данных, где одна машина дешевле любого кластера; "Use horizontally scalable solutions" для больших, где лестница уже взлетела выше прямой. Вокруг пересечения лежит серая зона, “The ‘grey area’” (p. 183), где ни один вариант не дешевле явно и решают другие причины. Последний слайд серии — тот, что надо запомнить: “The ‘grey area’ is time dependent” (p. 184): серая зона зависит от времени.</p>
+
+  <div class="widget" id="l03-w-scale">
+    <h3 class="widget-title">Исследователь стоимости масштабирования: когда кластер выгоднее одной машины?</h3>
+    <p class="widget-intro">Идеализированные кривые по мотивам слайдов (pp. 178–184): бирюзовая лестница — вертикальное масштабирование, пурпурная прямая — горизонтальное в выбранном году, бледные линии — остальные три года, серая полоса — серая зона. Как на слайде (p. 184), на оси размера одна отметка на каждый множитель десять, на оси стоимости чисел нет, а линии прямые: читай их порядок и пересечение, а не цены. Где лестница изгибается — допущение виджета: там, где кончаются диски самих слайдов, 3 TB у обычного сервера (p. 179) и 360 TB у стойки Exadata (p. 180), — и оно согласуется со слайдом (p. 184), где изгибы нарисованы ниже 10 TB и между 100 TB и 1 PB.</p>
+    <ol class="tasks">
+      <li>Год 2006, объём данных 100 TB. Предскажи, какой способ масштабирования дешевле, потом прочитай табло.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Вертикальный: один appliance. В 2006 году серая зона была около 10 PB, так что 100 TB — в сто раз меньше, чем нужно, чтобы кластер окупился.</p></details>
+      </li>
+      <li>Оставь 100 TB и передвинь год на «сегодня?». Предскажи, прежде чем двигать.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Горизонтальный. Данные не изменились — изменилась прямая. Серая зона съехала с 10 PB через 1 PB и 100 TB примерно до 10 TB, и 100 TB перешли с одной стороны на другую, не прибавив ни байта. В этом и вывод виджета: "how big is big" — движущаяся мишень, а не размер.</p></details>
+      </li>
+      <li>Останься в 2013 году и веди объём данных от 1 TB до 10 PB, следя за строкой «одна машина, которая их вместит». Где лестница изгибается и что после каждого изгиба происходит с разрывом между двумя кривыми?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>На 3 TB она уходит от commodity hardware к appliance, а на 360 TB — от appliance к exceptional hardware (пороги виджета). Каждый отрезок круче предыдущего, а у горизонтальной прямой наклон один, поэтому за пересечением разрыв растёт всё быстрее: большие данные на одной машине не просто дороже — их стоимость убегает.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l03-w-scale', function (root, ui) {
+    var ERAS = [
+      { label: '2006', slide: 'Hadoop 2.x using clusters on premises (2006)', star: 4, b: 0.9 },
+      { label: '2010', slide: 'Hadoop 2.x using cloud-based services (2010)', star: 3, b: 0.7 },
+      { label: '2013', slide: 'Spark 1.6 using cloud-based service (2013)', star: 2, b: 0.45 },
+      { label: 'сегодня?', slide: 'Spark on HDInsight (today)?', star: 1, b: 0.3 }
+    ];
+    var TICKS = ['1 TB', '10 TB', '100 TB', '1 PB', '10 PB'];
+    var U1 = Math.log(3) / Math.LN10, U2 = Math.log(360) / Math.LN10, UMAX = 4.4;
+    // the slide's staircase in (log10 of terabytes, cost without units): commodity, appliance, exceptional hardware
+    var V = [[0, 0.3], [U1, 0.6], [U2, 3.4], [UMAX, 3.4 + (UMAX - U2) * (10 - 3.4) / (4 - U2)]];
+    function Cv(u) {
+      for (var i = 0; i < V.length - 1; i++) if (u <= V[i + 1][0]) return V[i][1] + (u - V[i][0]) * (V[i + 1][1] - V[i][1]) / (V[i + 1][0] - V[i][0]);
+      return V[V.length - 1][1];
+    }
+    ERAS.forEach(function (e) { e.a = Cv(e.star) - e.b * e.star; });     // each line crosses the staircase exactly at its grey area
+    function Ch(e, u) { return e.a + e.b * u; }
+    function fmtSize(u) {
+      var tb = Math.pow(10, u);
+      if (tb < 999.5) return (tb < 9.95 ? tb.toFixed(1) : String(Math.round(tb))) + ' TB';
+      var pb = tb / 1000;
+      return (pb < 9.95 ? pb.toFixed(1) : String(Math.round(pb))) + ' PB';
+    }
+    function era() { return ERAS[Course.clamp(Math.round(year.value), 0, 3)]; }
+
+    var size = ui.slider({ label: 'объём данных', min: 0, max: 4, step: 0.05, value: 2, format: fmtSize });
+    var year = ui.slider({ label: 'год (четыре прямые со слайда, p. 184)', min: 0, max: 3, step: 1, value: 2, format: function (v) { return ERAS[Course.clamp(Math.round(v), 0, 3)].label; } });
+    var plot = ui.plot({ x: [-0.22, 4.5], y: [-1.7, 12.4], axes: false, grid: false, aspect: 1.7, label: 'Стоимость в зависимости от объёма данных на шкале степеней десяти: выпуклая лестница вертикального масштабирования, прямая горизонтального для выбранного года (остальные годы бледно), серая зона вокруг их пересечения и отметка выбранного объёма' });
+    plot.draw(function (g) {
+      var e = era(), u = size.value, cy = Cv(e.star);
+      g.rect(e.star - 0.3, 0, e.star + 0.3, cy + 1.3, { color: 'muted', alpha: 0.22, stroke: false });
+      g.line([[0, 0], [UMAX, 0]], { color: 'muted', width: 1.25 });
+      g.line([[0, 0], [0, 12.2]], { color: 'muted', width: 1.25 });
+      for (var t = 0; t <= 4; t++) {
+        g.line([[t, 0], [t, -0.28]], { color: 'muted', width: 1.25 });
+        g.text(t, -0.5, TICKS[t], { align: 'center', baseline: 'top', color: 'soft', size: 11.5 });
+      }
+      g.text(0.07, 11.9, '$', { color: 'soft', size: 13, weight: 600 });
+      g.text(UMAX, 0.5, 'объём данных', { align: 'right', color: 'soft', size: 11.5 });
+      ERAS.forEach(function (o) { if (o !== e) g.line([[0, Ch(o, 0)], [UMAX, Ch(o, UMAX)]], { color: 's5', width: 1.5, alpha: 0.3 }); });
+      g.line(V, { color: 's4', width: 2.5 });
+      g.line([[0, Ch(e, 0)], [UMAX, Ch(e, UMAX)]], { color: 's5', width: 2.5 });
+      g.text(0.08, Ch(e, 0.08) + 0.55, e.label, { color: 'ink', size: 12, weight: 600 });
+      g.points([[e.star, cy]], { color: 'soft', r: 6 });
+      g.line([[u, 0], [u, 12.2]], { color: 'soft', dash: true, width: 1.25 });
+      g.points([[u, Cv(u)]], { color: 's4', r: 5 });
+      g.points([[u, Ch(e, u)]], { color: 's5', shape: 'square', r: 5 });
+    });
+    ui.legend([
+      { label: 'вертикальное: одна машина получше (идеализировано)', color: 's4', mark: 'line' },
+      { label: 'горизонтальное: больше обычных машин, этот год (идеализировано)', color: 's5', mark: 'line' },
+      { label: 'горизонтальное, остальные три года', color: 's5', mark: 'area' },
+      { label: 'серая зона вокруг пересечения', color: 'muted', mark: 'area' },
+      { label: 'выбранный объём данных', color: 'soft', mark: 'dash' }
+    ]);
+    var roSize = ui.readout('объём данных'), roClass = ui.readout('одна машина, которая их вместит (диски, pp. 179–180)'), roWin = ui.readout('дешевле здесь, в этой модели'), roGrey = ui.readout('серая зона в этом году (по p. 184)');
+    var note = ui.note('');
+    ui.onChange(function () {
+      var e = era(), u = size.value;
+      roSize.set(fmtSize(u));
+      roClass.set(u <= U1 + 1e-9 ? 'commodity hardware' : u <= U2 + 1e-9 ? 'appliance' : 'exceptional hardware');
+      var d = u - e.star;
+      if (Math.abs(d) <= 0.3 + 1e-9) roWin.set('серая зона: явно ни то ни другое', 'key');
+      else if (d < 0) roWin.set('вертикальное: одна машина побольше');
+      else roWin.set('горизонтальное: больше обычных машин');
+      roGrey.set('около ' + TICKS[e.star]);
+      note.set('Слайд (p. 184): "' + e.slide + '" — на слайде эта прямая встречает лестницу около ' + TICKS[e.star] + '. Ниже серой зоны дешевле одна машина, выше — кластер.');
+    });
+  });
+  </script>
+
+  <aside class="margin-note">Читай годы как эпохи: Hadoop 2.x вышел в 2013 году, а Spark 1.6 — в 2016-м, так что названия версий не совпадают с годами, напечатанными рядом. Учи тенденцию, а не годы.</aside>
+
+  <p>Слайд (p. 184) рисует четыре прямые горизонтального масштабирования, по одной на поколение распределённых платформ. "Hadoop 2.x using clusters on premises (2006)" пересекает лестницу около 10 PB, "Hadoop 2.x using cloud-based services (2010)" — около 1 PB, "Spark 1.6 using cloud-based service (2013)" — около 100 TB, а "Spark on HDInsight (today)?" — около 10 TB. Каждое поколение делало кластер дешевле на старте и дешевле за терабайт — его арендуют в облаке, а не покупают, и софт поверх лучше, — поэтому прямая опускалась, а пересечение каждый раз сдвигалось влево в десять раз.</p>
+
+  <p class="memo"><mark class="key">У "How big is big?" нет фиксированного ответа: большое начинается там, где много дешёвых машин стоят меньше одной хорошей, и на слайде (p. 184) этот порог упал в тысячу раз, примерно с 10 PB до 10 TB.</mark></p>
+
+  <p>"Not only scaling up" указывает и в другую сторону: что масштабируется вширь, может и сжаться обратно. <mark class="key">Эластичность (elasticity)</mark> — слайд называет её без определения, смысл взят из облачных вычислений — это добавление машин, когда нагрузка растёт, и освобождение, когда падает, чтобы стоимость следовала за нагрузкой. Горизонтальному масштабированию она даётся естественно: там машина — единица, которую можно арендовать на месяц; а пол-appliance никто обратно не принимает.</p>
+</section>
+
+
+<section id="l03-split">
+  <h2>Разрежь и скопируй: партиционирование и репликация</h2>
+
+  <p>Чтобы разложить данные по многим машинам, нужны два хода, и заголовок раздела слайдов называет оба: partitioning и replication. Оба начинаются с "the traditional tabular view of a database" (p. 152), где таблицу можно разрезать по столбцам или по строкам.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l03-fig-cuts">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Вертикальное партиционирование: таблица счетов разрезана по столбцам; узел 1 хранит AccNum, Owner и Branch, узел 2 — AccNum и Balance; ключ AccNum есть в обоих кусках">
+        <rect x="4" y="22" width="162" height="112" rx="6" class="fw-s1 st-s1"/>
+        <rect x="178" y="22" width="112" height="112" rx="6" class="fw-s1 st-s1"/>
+        <rect x="10" y="28" width="50" height="20" class="fw-s3 st-s3"/>
+        <rect x="60" y="28" width="50" height="20" class="fw-s3 st-s3"/>
+        <rect x="110" y="28" width="50" height="20" class="fw-s3 st-s3"/>
+        <rect x="184" y="28" width="50" height="20" class="fw-s3 st-s3"/>
+        <rect x="234" y="28" width="50" height="20" class="fw-s3 st-s3"/>
+        <rect x="10" y="48" width="150" height="80" class="fi-paper"/>
+        <rect x="184" y="48" width="100" height="80" class="fi-paper"/>
+        <line x1="10" y1="68" x2="160" y2="68" class="st-muted"/>
+        <line x1="10" y1="88" x2="160" y2="88" class="st-muted"/>
+        <line x1="10" y1="108" x2="160" y2="108" class="st-muted"/>
+        <line x1="184" y1="68" x2="284" y2="68" class="st-muted"/>
+        <line x1="184" y1="88" x2="284" y2="88" class="st-muted"/>
+        <line x1="184" y1="108" x2="284" y2="108" class="st-muted"/>
+        <text x="35" y="42" class="tx-mono tx-sm tx-mid">AccNum</text>
+        <text x="85" y="42" class="tx-mono tx-sm tx-mid">Owner</text>
+        <text x="135" y="42" class="tx-mono tx-sm tx-mid">Branch</text>
+        <text x="209" y="42" class="tx-mono tx-sm tx-mid">AccNum</text>
+        <text x="259" y="42" class="tx-mono tx-sm tx-mid">Balance</text>
+        <text x="35" y="62" class="tx-mono tx-sm tx-mid">12202</text>
+        <text x="85" y="62" class="tx-mono tx-sm tx-mid">Rossi</text>
+        <text x="135" y="62" class="tx-mono tx-sm tx-mid">Milano</text>
+        <text x="35" y="82" class="tx-mono tx-sm tx-mid">42177</text>
+        <text x="85" y="82" class="tx-mono tx-sm tx-mid">Trenti</text>
+        <text x="135" y="82" class="tx-mono tx-sm tx-mid">Como</text>
+        <text x="35" y="102" class="tx-mono tx-sm tx-mid">30411</text>
+        <text x="85" y="102" class="tx-mono tx-sm tx-mid">Bianchi</text>
+        <text x="135" y="102" class="tx-mono tx-sm tx-mid">Milano</text>
+        <text x="35" y="122" class="tx-mono tx-sm tx-mid">51876</text>
+        <text x="85" y="122" class="tx-mono tx-sm tx-mid">Neri</text>
+        <text x="135" y="122" class="tx-mono tx-sm tx-mid">Como</text>
+        <text x="209" y="62" class="tx-mono tx-sm tx-mid">12202</text>
+        <text x="259" y="62" class="tx-mono tx-sm tx-mid">100</text>
+        <text x="209" y="82" class="tx-mono tx-sm tx-mid">42177</text>
+        <text x="259" y="82" class="tx-mono tx-sm tx-mid">25</text>
+        <text x="209" y="102" class="tx-mono tx-sm tx-mid">30411</text>
+        <text x="259" y="102" class="tx-mono tx-sm tx-mid">70</text>
+        <text x="209" y="122" class="tx-mono tx-sm tx-mid">51876</text>
+        <text x="259" y="122" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="85" y="152" class="tx-sm tx-mid">узел 1</text>
+        <text x="234" y="152" class="tx-sm tx-mid">узел 2</text>
+        <text x="60" y="190" class="tx-hand">AccNum в обоих</text>
+      </svg>
+      <p class="fig-label">Вертикально: по столбцам</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Горизонтальное партиционирование: та же таблица разрезана по строкам; узел 1 хранит счета Milano, узел 2 — счета Como, и у обоих кусков все четыре столбца">
+        <rect x="10" y="16" width="56" height="20" class="fw-s3 st-s3"/>
+        <rect x="66" y="16" width="56" height="20" class="fw-s3 st-s3"/>
+        <rect x="122" y="16" width="56" height="20" class="fw-s3 st-s3"/>
+        <rect x="178" y="16" width="56" height="20" class="fw-s3 st-s3"/>
+        <text x="38" y="30" class="tx-mono tx-sm tx-mid">AccNum</text>
+        <text x="94" y="30" class="tx-mono tx-sm tx-mid">Owner</text>
+        <text x="150" y="30" class="tx-mono tx-sm tx-mid">Branch</text>
+        <text x="206" y="30" class="tx-mono tx-sm tx-mid">Balance</text>
+        <rect x="4" y="42" width="236" height="52" rx="6" class="fw-s1 st-s1"/>
+        <rect x="10" y="48" width="224" height="40" class="fi-paper"/>
+        <line x1="10" y1="68" x2="234" y2="68" class="st-muted"/>
+        <text x="38" y="62" class="tx-mono tx-sm tx-mid">12202</text>
+        <text x="94" y="62" class="tx-mono tx-sm tx-mid">Rossi</text>
+        <text x="150" y="62" class="tx-mono tx-sm tx-mid">Milano</text>
+        <text x="206" y="62" class="tx-mono tx-sm tx-mid">100</text>
+        <text x="38" y="82" class="tx-mono tx-sm tx-mid">30411</text>
+        <text x="94" y="82" class="tx-mono tx-sm tx-mid">Bianchi</text>
+        <text x="150" y="82" class="tx-mono tx-sm tx-mid">Milano</text>
+        <text x="206" y="82" class="tx-mono tx-sm tx-mid">70</text>
+        <rect x="4" y="102" width="236" height="52" rx="6" class="fw-s1 st-s1"/>
+        <rect x="10" y="108" width="224" height="40" class="fi-paper"/>
+        <line x1="10" y1="128" x2="234" y2="128" class="st-muted"/>
+        <text x="38" y="122" class="tx-mono tx-sm tx-mid">42177</text>
+        <text x="94" y="122" class="tx-mono tx-sm tx-mid">Trenti</text>
+        <text x="150" y="122" class="tx-mono tx-sm tx-mid">Como</text>
+        <text x="206" y="122" class="tx-mono tx-sm tx-mid">25</text>
+        <text x="38" y="142" class="tx-mono tx-sm tx-mid">51876</text>
+        <text x="94" y="142" class="tx-mono tx-sm tx-mid">Neri</text>
+        <text x="150" y="142" class="tx-mono tx-sm tx-mid">Como</text>
+        <text x="206" y="142" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="248" y="72" class="tx-sm">узел 1</text>
+        <text x="248" y="132" class="tx-sm">узел 2</text>
+        <text x="40" y="190" class="tx-hand">разрез по Branch</text>
+      </svg>
+      <p class="fig-label">Горизонтально: по строкам</p>
+    </div>
+    <figcaption><b>Рис. 5.</b> Два разреза со слайда (p. 152) на таблице счетов из четырёх строк. Вертикальное партиционирование даёт каждому узлу часть столбцов, а ключ едет с обоими кусками; горизонтальное даёт каждому узлу часть целых строк — здесь по отделениям, — и каждый кусок сохраняет все столбцы.</figcaption>
+  </figure>
+
+  <aside class="margin-note">Два разных «горизонтальных»: горизонтальное партиционирование режет таблицу по строкам, горизонтальное масштабирование добавляет машины. На практике они встречаются: база масштабируется вширь, когда её разрезают по строкам и реплицируют.</aside>
+
+  <p><mark class="key">Вертикальное партиционирование (vertical partitioning)</mark> даёт каждому куску группу столбцов, а ключ <code>AccNum</code> повторяется, чтобы строки можно было собрать обратно. <mark class="key">Горизонтальное партиционирование (horizontal partitioning)</mark> даёт каждому куску группу целых строк с одинаковыми столбцами — здесь счета Милана на одном узле, а счета Комо на другом. Какая строка куда идёт, решает правило; в следующих уроках его вход называется shard key (MongoDB, <a href="l16.html">урок 16</a>) и partition key — ключ партиционирования (Cassandra, <a href="l21.html">урок 21</a>).</p>
+
+  <p>Партиционирование — "Aim: scalability, distribution." — "splits the data in the database and partitions pieces of it to different storage nodes" (p. 153): делит данные базы и раскладывает куски по разным узлам хранения. Тот же слайд добавляет две фразы, которые тянут в разные стороны: "Databases can be sharded horizontally (by rows) or vertically (by columns)" и "See also: Sharding (as horizontal partitioning)".</p>
+
+  <div class="pitfall"><p>«Шардинг и партиционирование — одно и то же». Партиционирование — общий ход, по строкам или по столбцам. <mark class="key">Шардинг (sharding)</mark> — его горизонтальная форма: целые строки разложены по узлам, как говорит последняя строка самого слайда. Фраза перед ней использует "sharded" вольно, в смысле «партиционированная». Знай обе фразы в напечатанном виде — экзамен сверяют со слайдами, — а в своих ответах оставляй слово "sharding" для строк на разных машинах.</p></div>
+
+  <p>Репликация — "Aim: fault-tolerance, backup" (p. 154) — копирует вместо того, чтобы делить. Определение на слайде нуждается в поправке.</p>
+
+  <aside class="redpen" data-page="154">
+    <p class="claim">"Replication copies the entire database across all nodes in the distributed system."</p>
+    <p class="fix">Репликация хранит несколько копий одних и тех же данных на разных узлах. Это не обязательно вся база и не обязательно на всех узлах: реальные системы хранят каждую партицию фиксированное число раз — её фактор репликации (replication factor), обычно 3 — на некоторых узлах.</p>
+    <p class="because">Картинки самих слайдов с этой фразой не сходятся. На слайде (p. 155) каждый из шести итоговых узлов держит один кусок, A, B или C, — никогда не всю базу, — и каждый кусок живёт на двух узлах из шести, а не на всех; слайды об HDFS из урока 31 кладут три реплики блока на три выбранных узла (p. 857). Скопировать всё везде — один частный случай, и вместе с партиционированием он свёл бы на нет весь смысл деления. На экзамене могут процитировать фразу слайда: знай её в напечатанном виде, а в открытом ответе давай точную версию.</p>
+  </aside>
+
+  <p>"Partitioning + Replication — Possible?" — спрашивает слайд (p. 155), и его картинка отвечает: скопируй базу A/B/C в две одинаковые базы, потом разрежь каждую копию на A, B и C — шесть узлов, каждый кусок на двух из них. Если сначала разрезать, а потом скопировать каждый кусок, получится та же раскладка, и реальные системы описывают её именно так: несколько шардов, каждый хранится фиксированное число раз — его <mark class="key">фактор репликации (replication factor)</mark> (термин следующих уроков, не этих слайдов). Затем слайды взвешивают оба хода (p. 156):</p>
+
+  <figure class="tbl-fig">
+    <figcaption>"Pros / Cons of Each" (p. 156), ячейка за ячейкой, как напечатано.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Partitioning</th><th>Replication</th></tr></thead>
+        <tbody>
+          <tr><td><b>Pros</b></td><td>Fast data writing / reading. Low memory overhead.</td><td>Fast data reading. High data reliability.</td></tr>
+          <tr><td><b>Cons</b></td><td>Potential data loss</td><td>High network overhead. High memory overhead.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>За каждой ячейкой стоит механизм. Узел с партицией хранит и обслуживает только свой кусок, так что работа распределяется и каждый элемент данных хранится один раз — но мёртвый узел уносит свой кусок с собой. Реплицированный элемент можно прочитать с любой копии, и он живёт, пока жива хоть одна копия, — но каждая запись должна дойти до каждой копии, а \(N\) копий занимают в \(N\) раз больше места. Песочница показывает оба столбца сразу.</p>
+
+  <div class="widget" id="l03-w-shard">
+    <h3 class="widget-title">Партиционируй и реплицируй: шесть блоков, k шардов, N копий</h3>
+    <p class="widget-intro">База данных из шести блоков. Выбери, на сколько шардов \(k\) её разрезать и сколько копий \(N\) каждого шарда держать; каждая копия стоит на своём узле, так что узлов \(k \times N\), и пронумерованы они копия за копией. Сплошные квадраты — первые копии, пунктирные — реплики. <b>«Отключить узел»</b> роняет работающий узел с наименьшим номером; нажми на узел (или поставь на него фокус и нажми Enter), чтобы уронить или перезапустить именно его. Стрелки клиента показывают, куда должна пойти одна запись блока 1. Начальная раскладка — как на слайде (p. 155).</p>
+    <ol class="tasks">
+      <li>Поставь \(k = 3\) и \(N = 1\). Предскажи, сколько блоков стоит один отказ, потом нажми «Отключить узел».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Два: узел 1 был единственным домом блоков 1 и 2. Одно партиционирование быстрое и экономное — хранение × 1, одно сообщение на запись, — но каждый узел — единственная точка потери: "potential data loss" из таблицы, около 3 % за период на табло.</p></details>
+      </li>
+      <li>Теперь \(N = 2\) (шесть узлов). Предскажи, сколько узлов может отказать без потери блока. Нажми «Отключить узел» три раза, потом ещё раз.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Зависит от того, каких именно. Три узла — целая копия — отказывают, и ничего не теряется; четвёртое отключение забирает узел 4, второй дом блоков 1 и 2, и они пропадают. Теперь перезапусти все и нажми прямо на узлы 1 и 4: двух отказов достаточно, если это не те два. Данные теряются, только когда лежат все копии шарда, — в этом вывод песочницы, — так что \(N\) копий гарантируют, что любые \(N - 1\) отказов будут пережиты: здесь — один.</p></details>
+      </li>
+      <li>Сравни \(k = 1\), \(N = 3\) с \(k = 3\), \(N = 1\). Предскажи, где хранится больше и где больше сообщений на запись.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>\(k = 1\), \(N = 3\): 18 хранимых блоков и три сообщения на запись, зато шанс потери около одного на миллион — столбец репликации в таблице. \(k = 3\), \(N = 1\): шесть блоков, одно сообщение, 3 % — столбец партиционирования. \(k = 3\), \(N = 3\) распределяет работу и сохраняет надёжность, а платит хранением × 3.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l03-w-shard', function (root, ui) {
+    var SV = Course.svg, P_NODE = 0.01, dead = {};
+    var sk = ui.slider({ label: 'шардов k', min: 1, max: 3, step: 1, value: 3, onInput: function () { dead = {}; } });
+    var sn = ui.slider({ label: 'копий каждого шарда N (фактор репликации)', min: 1, max: 3, step: 1, value: 2, onInput: function () { dead = {}; } });
+    function K() { return Course.clamp(Math.round(sk.value), 1, 3); }
+    function N() { return Course.clamp(Math.round(sn.value), 1, 3); }
+    ui.button('Отключить узел', function () {
+      var M = K() * N();
+      for (var id = 1; id <= M; id++) if (!dead[id]) { dead[id] = true; break; }
+    }, { icon: 'cross' });
+    ui.button('Перезапустить все узлы', function () { dead = {}; }, { kind: 'ghost', icon: 'refresh' });
+    var svg = ui.svg(560, 252, { label: 'Узлы кластера сеткой, по столбцу на шард и по строке на копию, у каждого узла свои блоки; клиент со стрелками к каждой копии шарда 1; отказавшие узлы пунктиром, потерянные блоки перечёркнуты' });
+    var roNodes = ui.readout('узлов'), roStore = ui.readout('хранится блоков'), roPer = ui.readout('блоков на узел'), roWrite = ui.readout('одна запись идёт на'), roLost = ui.readout('потеряно блоков сейчас'), roP = ui.readout('шанс потерять блок (каждый узел лежит с вероятностью 1 %)');
+    var note = ui.note('');
+
+    function lostShards() {
+      var k = K(), n = N(), out = [];
+      for (var c = 0; c < k; c++) {
+        var all = true;
+        for (var r = 0; r < n; r++) if (!dead[r * k + c + 1]) { all = false; break; }
+        if (all) out.push(c);
+      }
+      return out;
+    }
+    function fmtP(P) {
+      if (P >= 0.001) return (P * 100).toFixed(1) + ' %';
+      var e = Math.floor(Math.log(P) / Math.LN10), m = Math.round(P / Math.pow(10, e));
+      if (m >= 10) { m = 1; e += 1; }
+      return 'около ' + m + ' на ' + Math.pow(10, -e).toLocaleString('en-US');
+    }
+    function toggle(id) { if (dead[id]) delete dead[id]; else dead[id] = true; ui.changed(); }
+
+    function render() {
+      var k = K(), n = N(), m = 6 / k, H = 44 + n * 104, lost = lostShards();
+      var had = svg.contains(document.activeElement) && document.activeElement.getAttribute ? document.activeElement.getAttribute('data-id') : null;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var x0 = 70 + (480 - (k * 146 + (k - 1) * 14)) / 2;
+      function colX(c) { return x0 + c * 160; }
+      for (var c = 0; c < k; c++) SV('text', { x: colX(c) + 73, y: 26, 'class': 'tx-sm tx-bold tx-mid', text: 'шард ' + (c + 1) }, svg);
+      var yMid = 40 + (n * 104 - 20) / 2;
+      for (var r = 0; r < n; r++) {
+        var id1 = r * k + 1;
+        SV('line', { x1: 50, y1: yMid, x2: colX(0) - 5, y2: 40 + r * 104 + 42, 'class': dead[id1] ? 'st-muted dash' : 'st-s2 sw-2', 'marker-end': dead[id1] ? 'url(#arr-muted)' : 'url(#arr-s2)' }, svg);
+      }
+      SV('rect', { x: 10, y: yMid - 12, width: 40, height: 24, rx: 6, 'class': 'fi-paper' }, svg);
+      SV('text', { x: 30, y: yMid - 22, 'class': 'tx-sm tx-mid', text: 'запись' }, svg);
+      SV('text', { x: 30, y: yMid + 32, 'class': 'tx-sm tx-mid', text: 'клиент' }, svg);
+      for (r = 0; r < n; r++) for (c = 0; c < k; c++) {
+        (function (r, c) {
+          var id = r * k + c + 1, x = colX(c), y = 40 + r * 104, isDead = !!dead[id], gone = lost.indexOf(c) >= 0;
+          var grp = SV('g', { 'class': 'l03-node', 'data-id': String(id), tabindex: '0', role: 'button', 'aria-pressed': isDead ? 'true' : 'false',
+            'aria-label': 'узел ' + id + ', копия ' + (r + 1) + ' шарда ' + (c + 1) + (isDead ? ', отказал; нажми, чтобы перезапустить' : ', работает; нажми, чтобы он отказал'),
+            onclick: function () { toggle(id); },
+            onkeydown: function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(id); } } }, svg);
+          SV('rect', { x: x, y: y, width: 146, height: 84, rx: 6, 'class': 'l03-frame ' + (isDead ? 'fi-soft st-muted dash' : 'fi-paper sw-2') }, grp);
+          SV('rect', { x: x + 8, y: y + 8, width: 44, height: 28, 'class': isDead ? 'fi-soft st-muted' : 'fi-paper' }, grp);
+          [16, 22, 28].forEach(function (dy) { SV('line', { x1: x + 14, y1: y + dy, x2: x + 46, y2: y + dy, 'class': 'st-muted' }, grp); });
+          SV('text', { x: x + 60, y: y + 22, 'class': 'tx-sm tx-bold', text: 'узел ' + id }, grp);
+          SV('text', { x: x + 60, y: y + 39, 'class': 'tx-sm ' + (isDead ? 'tx-bad' : 'tx-muted'), text: isDead ? 'отказал' : 'копия ' + (r + 1) }, grp);
+          for (var i = 0; i < m; i++) {
+            var bx = x + 8 + i * 22, by = y + 54, blockId = c * m + i + 1;
+            var cls = gone ? 'fw-s1 st-s1' : isDead ? 'fi-soft st-muted dash' : (r === 0 ? 'fw-s1 st-s1 sw-2' : 'fw-s1 st-s1 sw-2 dash');
+            SV('rect', { x: bx, y: by, width: 18, height: 18, 'class': cls }, grp);
+            SV('text', { x: bx + 9, y: by + 13.5, 'class': 'tx-mono tx-sm tx-mid', text: String(blockId) }, grp);
+            if (gone) {
+              SV('line', { x1: bx - 2, y1: by - 2, x2: bx + 20, y2: by + 20, 'class': 'st-bad sw-2' }, grp);
+              SV('line', { x1: bx + 20, y1: by - 2, x2: bx - 2, y2: by + 20, 'class': 'st-bad sw-2' }, grp);
+            }
+          }
+        })(r, c);
+      }
+      if (had) { var back = svg.querySelector('[data-id="' + had + '"]'); if (back) back.focus(); }
+    }
+
+    ui.onChange(function () {
+      render();
+      var k = K(), n = N(), m = 6 / k, M = k * n, d = 0, lost = lostShards();
+      for (var id = 1; id <= M; id++) if (dead[id]) d++;
+      roNodes.set(M + (d ? ', отказало: ' + d : ''));
+      roStore.set(6 * n + ' (6 × ' + n + ')');
+      roPer.set(String(m));
+      roWrite.set(n + (n > 1 ? ' узла' : ' узел'));
+      var lostBlocks = [];
+      lost.forEach(function (c) { for (var i = 1; i <= m; i++) lostBlocks.push(c * m + i); });
+      roLost.set(lostBlocks.length ? lostBlocks.length + ' (' + lostBlocks.join(', ') + ')' : '0', lostBlocks.length ? 'bad' : (d ? 'good' : undefined));
+      roP.set(fmtP(1 - Math.pow(1 - Math.pow(P_NODE, n), k)));
+      var msg;
+      if (k === 1 && n === 1) msg = 'Один узел, одна копия: классический одиночный сервер. Всё живёт или умирает вместе с одной машиной.';
+      else if (n === 1) msg = 'Шардов: ' + k + ', копий нет: каждый узел — единственный дом своих блоков (' + m + ' шт.). Хранение × 1 и одно сообщение на запись — плюсы партиционирования, — но любой отказ теряет данные: его минус.';
+      else if (k === 1) msg = 'Полных копий всей базы: ' + n + '. Чтение может обслужить любая копия, и один выживший узел сохраняет всё — плюсы репликации, — а каждая запись путешествует ' + n + ' раза, и хранение × ' + n + ': её минусы.';
+      else msg = k + ' шарда × ' + n + ' копии, раскладка со слайда (p. 155): блок теряется, только когда лежат все копии его шарда.';
+      if (lostBlocks.length) msg += ' <b>Лежат все копии шард' + (lost.length > 1 ? 'ов ' : 'а ') + lost.map(function (c) { return c + 1; }).join(' и ') + '.</b>';
+      note.set(msg);
+    });
+  });
+  </script>
+
+  <p>Насколько «надёжнее» — надёжнее? Слайды останавливаются на таблице. Прикидочная модель, не со слайдов, даёт числа при одном допущении: узлы отказывают независимо, каждый с вероятностью \(p\).</p>
+
+  <ol class="steps" id="l03-steps-loss">
+    <li><p>Шард потерян, только если все \(N\) его копий стоят на отказавших узлах. При независимых отказах: \[ P(\text{shard lost}) = p^N . \]</p></li>
+    <li><p>Значит, шард выживает с вероятностью \(1 - p^N\), а все \(k\) шардов выживают вместе — они стоят на разных узлах, так что их судьбы тоже независимы — с вероятностью \[ (1 - p^N)^k . \]</p></li>
+    <li><p>Потерять хоть что-то — дополнение: \[ P(\text{data lost}) = 1 - (1 - p^N)^k . \]</p></li>
+    <li><p>Одно партиционирование, \(N = 1\): \(1 - (1 - p)^k\) растёт с \(k\), примерно как \(k\) раз по \(p\). При \(p = 0.01\) и \(k = 3\) это 2.97 %: больше кусков — больше способов потерять один; это и есть "potential data loss" из таблицы.</p></li>
+    <li><p>Одна репликация, \(k = 1\): \(p^N\) обваливается — 0.01, потом 0.0001, потом 0.000001 при \(N\) = 1, 2, 3. Оба хода, \(k = N = 3\): около 3 на миллион, за втрое большее хранение.</p></li>
+  </ol>
+
+  <p>Независимость — то же допущение, что стоит за испытаниями Бернулли в статистике, и это слабое место: пожар или отключение питания кладут всю стойку разом. Поэтому слайды об HDFS из <a href="l31.html">урока 31</a> ставят вторую реплику на удалённую стойку: "Second replica on a remote rack" (p. 857). И одной цены в таблице нет вовсе: копии должны совпадать. Запись доходит до всех копий не в один и тот же миг, так что на какое-то время две копии одной строки могут различаться — запомни это до последнего раздела.</p>
+</section>
+
+
+<section id="l03-ingest">
+  <h2>Как данные попадают внутрь: ingestion и wrangling</h2>
+
+  <p>Лекция "Data Architecture Concepts" закрывает раздел о масштабировании с другого конца трубы (pp. 157–160, "Scale and Ingestion"): прежде чем данные можно делить и копировать, они должны прийти и стать пригодными. <mark class="key">Приём данных (data ingestion)</mark> — это "The process of importing, transferring and loading data for storage and later use"; "It involves loading data from a variety of sources" и "can involve altering and modification of individual files to fit into a format that optimizes the storage" (p. 159).</p>
+
+  <p>Пример на слайде — чистая инженерия: "in Big Data small files are concatenated to form files of 100s of MBs and large files are broken down in files of 100s of MB." Сотни мегабайт — это то, чего хочет распределённая файловая система из <a href="l31.html">урока 31</a>: "Typically 100MB or more per file", "Millions as opposed to billions of files" (p. 847), — потому что один сервер, NameNode, хранит запись о каждом файле: "The entire metadata is in main memory" (p. 855). Вокруг «шины» (bus), которая собирает источники, "Integration services" выполняют "Transportation management, message routing, message brokering, transaction management, security, and transformation" — это верхняя полоса рис. 6.</p>
+
+  <figure class="fig fig--plain" id="l03-fig-bands">
+    <svg class="dia" viewBox="0 0 560 282" role="img" aria-label="Две полосы. Ingestion: источники данных 1, 2 … n отправляют данные в шину (bus), вокруг которой интеграционные сервисы маршрутизируют, передают и преобразуют их, стремясь к файлам в сотни мегабайт. Wrangling: принятые данные проходят четыре шага — understand, cleanse, augment и shape">
+      <text x="20" y="18" class="tx-sm tx-bold">Data ingestion (p. 159)</text>
+      <rect x="20" y="28" width="100" height="34" class="fi-paper sw-2"/>
+      <rect x="136" y="28" width="100" height="34" class="fi-paper sw-2"/>
+      <rect x="296" y="28" width="100" height="34" class="fi-paper sw-2"/>
+      <text x="70" y="50" class="tx-sm tx-mid">источник #1</text>
+      <text x="186" y="50" class="tx-sm tx-mid">источник #2</text>
+      <text x="266" y="50" class="tx-mid">[…]</text>
+      <text x="346" y="50" class="tx-sm tx-mid">источник #n</text>
+      <line x1="70" y1="62" x2="70" y2="84" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="186" y1="62" x2="186" y2="84" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="346" y1="62" x2="346" y2="84" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="20" y="88" width="376" height="30" rx="15" class="fi-soft sw-2"/>
+      <text x="208" y="108" class="tx-mid tx-bold">bus</text>
+      <line x1="200" y1="120" x2="200" y2="144" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="216" y1="146" x2="216" y2="122" class="sw-2" marker-end="url(#arr)"/>
+      <rect x="20" y="148" width="376" height="44" class="fi-paper sw-2"/>
+      <text x="208" y="166" class="tx-sm tx-bold tx-mid">Integration services</text>
+      <text x="208" y="184" class="tx-sm tx-mid">routing, brokering, transformation, …</text>
+      <text x="414" y="96" class="tx-hand">файлы</text>
+      <text x="414" y="124" class="tx-hand">по 100s MB</text>
+      <text x="150" y="224" class="tx-sm tx-bold">Data wrangling (p. 160)</text>
+      <line x1="76" y1="194" x2="76" y2="234" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <rect x="20" y="238" width="112" height="34" class="fi-paper sw-2"/>
+      <rect x="156" y="238" width="112" height="34" class="fi-paper sw-2"/>
+      <rect x="292" y="238" width="112" height="34" class="fi-paper sw-2"/>
+      <rect x="428" y="238" width="112" height="34" class="fi-paper sw-2"/>
+      <text x="76" y="260" class="tx-sm tx-mid">Understand</text>
+      <text x="212" y="260" class="tx-sm tx-mid">Cleanse</text>
+      <text x="348" y="260" class="tx-sm tx-mid">Augment</text>
+      <text x="484" y="260" class="tx-sm tx-mid">Shape</text>
+      <line x1="134" y1="255" x2="152" y2="255" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="270" y1="255" x2="288" y2="255" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="406" y1="255" x2="424" y2="255" class="sw-2" marker-end="url(#arr)"/>
+    </svg>
+    <figcaption><b>Рис. 6.</b> Две полосы в основании архитектуры больших данных. Сверху — приём данных, как его рисует слайд (p. 159): источники вливаются в шину, интеграционные сервисы маршрутизируют и преобразуют. Снизу — четыре блока со слайда (p. 160), выстроенные в pipeline.</figcaption>
+  </figure>
+
+  <aside class="margin-note">Слайд дважды пишет "outliner"; имеется в виду outlier — выброс, значение, далёкое от всех остальных.</aside>
+
+  <p><mark class="key">Подготовка данных (data wrangling)</mark> превращает пришедшее в то, что стоит анализировать: “cleansing ‘raw’ data”, чтобы их "can be analysed to generate valid actionable insights", через "understanding, cleansing, augmenting and shaping data", с результатом "in the best format (e.g., columnar) for the analysis to perform" (p. 160). Четыре шага: <b>понять (understand)</b>, какие типы данных есть (качественные, количественные, категориальные), есть ли выбросы, не пропущены ли данные; <b>очистить (cleanse)</b> — убрать выбросы, добавить пропущенные значения, превратить количественные значения в категориальные; <b>обогатить (augment)</b> — агрегировать данные внутри одного источника, добавить данные из других источников по точным или нечётким совпадениям; <b>придать форму (shape)</b> — дать данным лучший формат для анализа.</p>
+
+  <p>Если это похоже на предобработку перед обучением нейросети — так и есть, только делается один раз для всей компании и постоянно работает как pipeline. <a href="l04.html">Урок 4</a> помещает обе полосы в архитектуру системы больших данных; <a href="l33.html">урок 33</a> открывает инструменты приёма данных, а уроки <a href="l35.html">35</a>–<a href="l37.html">37</a> — wrangling.</p>
+</section>
+
+
+<section id="l03-back">
+  <h2>Назад к пропавшим 10</h2>
+
+  <p>Теперь загадка. У кого лишние 10, когда сервер возвращается? Ни у кого. Питание пропало до <code>commit work</code>, так что в журнале есть зачисление и нет записи о commit: перезапуск отменяет зачисление, 12202 снова 100, и на двух счетах опять 125. Если бы питание пропало на строку позже commit, перезапуск повторил бы обе записи, и перевод остался бы в силе — 110 и 15, что бы ни успело попасть на диск. \(S_1\) никогда не бывает исходом и никогда не видно — атомарность и изоляция, — а зафиксированный исход остаётся — долговечность.</p>
+
+  <p>Тогда зачем отказываться от машины, которая держит такие обещания? Не из-за обещаний, а из-за машины. Её лестница кончается, а размер, с которого выигрывает кластер, всё падал — на слайде (p. 184) примерно с 10 PB до 10 TB. Дальше данные партиционируют и реплицируют — и вопрос из загадки возвращается в новой форме.</p>
+
+  <figure class="fig fig--plain" id="l03-fig-copies">
+    <svg class="dia" viewBox="0 0 560 210" role="img" aria-label="Две копии счёта 12202 на двух узлах: узел A, копия 1, уже хранит зафиксированные 110; запись ещё в пути к узлу B, копии 2, где лежит 100; клиент читает с узла B">
+      <line x1="10" y1="96" x2="78" y2="96" class="sw-2" marker-end="url(#arr)"/>
+      <text x="40" y="84" class="tx-sm tx-mid">commit</text>
+      <rect x="84" y="50" width="136" height="92" rx="6" class="fi-paper sw-2"/>
+      <rect x="94" y="60" width="44" height="28" class="fi-paper"/>
+      <line x1="100" y1="68" x2="132" y2="68" class="st-muted"/>
+      <line x1="100" y1="74" x2="132" y2="74" class="st-muted"/>
+      <line x1="100" y1="80" x2="132" y2="80" class="st-muted"/>
+      <text x="146" y="80" class="tx-sm">копия 1</text>
+      <rect x="94" y="104" width="64" height="26" class="fw-s3 st-s3"/>
+      <rect x="158" y="104" width="52" height="26" class="fi-paper"/>
+      <text x="126" y="122" class="tx-mono tx-sm tx-mid">12202</text>
+      <text x="184" y="122" class="tx-mono tx-mid tx-bold">110</text>
+      <text x="152" y="162" class="tx-sm tx-mid">узел A</text>
+      <line x1="226" y1="96" x2="310" y2="96" class="st-s1 sw-2 dash" marker-end="url(#arr-s1)"/>
+      <text x="268" y="84" class="tx-sm tx-mid halo">копирование</text>
+      <rect x="316" y="50" width="136" height="92" rx="6" class="fi-paper sw-2"/>
+      <rect x="326" y="60" width="44" height="28" class="fi-paper"/>
+      <line x1="332" y1="68" x2="364" y2="68" class="st-muted"/>
+      <line x1="332" y1="74" x2="364" y2="74" class="st-muted"/>
+      <line x1="332" y1="80" x2="364" y2="80" class="st-muted"/>
+      <text x="378" y="80" class="tx-sm">копия 2</text>
+      <rect x="326" y="104" width="64" height="26" class="fw-s3 st-s3"/>
+      <rect x="390" y="104" width="52" height="26" class="fi-paper"/>
+      <text x="358" y="122" class="tx-mono tx-sm tx-mid">12202</text>
+      <text x="416" y="122" class="tx-mono tx-mid tx-bold">100</text>
+      <text x="384" y="162" class="tx-sm tx-mid">узел B</text>
+      <rect x="508" y="84" width="36" height="24" rx="6" class="fi-paper"/>
+      <line x1="504" y1="96" x2="458" y2="96" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="482" y="80" class="tx-sm tx-mid">чтение</text>
+      <text x="526" y="130" class="tx-sm tx-mid">клиент</text>
+      <text x="384" y="198" class="tx-hand tx-mid">100 или 110?</text>
+    </svg>
+    <figcaption><b>Рис. 7.</b> Один счёт, две копии. Перевод зафиксирован на узле A; узел B запись ещё не получил. Клиент, который сейчас читает узел B, снова встречает вопрос из загадки: баланс 100 или 110?</figcaption>
+  </figure>
+
+  <p>Какая копия права — и когда 12202 и 42177 лежат на разных шардах, кто проследит, чтобы произошли обе записи или ни одной? Это третья обстановка со слайда (p. 145), "Distributed systems". <a href="l05.html">Урок 5</a> берётся за первый вопрос: теорема CAP и свойства BASE, которые многие распределённые хранилища предлагают вместо ACID.</p>
+</section>
+
+
+<section id="l03-exam" class="no-num">
+  <h2>Вопросы в формате экзамена</h2>
+  <p>Теоретические вопросы в форме письменного экзамена — открытые, с ответом в несколько предложений, и закрытые (выбор из вариантов, верно/неверно), где за неверный ответ может быть штраф, — плюс два небольших упражнения: одно на транзакцию с самих слайдов, другое на арифметику партиционирования и репликации.</p>
+
+  <div class="exam" data-kind="open" id="l03-exam-txn">
+    <div class="exam-q" lang="en">
+      <p>Define a transaction. Which commands delimit it, which commands decide its outcome, and when is a transaction well-formed?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>A transaction is an elementary unit of work performed by an application. It is encapsulated between begin transaction (bot) and end transaction (eot), and within it exactly one of commit work (commit) or rollback work (abort) is executed. A transaction is well-formed when it has the structure: begin transaction; code for data manipulation (reads and writes); commit work or rollback work; no data manipulation; end transaction — that is, no read or write happens after the outcome has been decided. A system that provides the definition and execution of transactions on behalf of multiple, concurrent applications is a transactional system (OLTP), as opposed to OLAP.</p>
+      </div>
+      <div class="exam-note"><p>В полном ответе три части: определение со слайда, "exactly once" для commit или rollback и шаг "no data manipulation" между исходом и <code>end transaction</code>. Фраза про OLTP покажет, что ты дочитал слайд (p. 146) до конца.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l03-exam-acid">
+    <div class="exam-q" lang="en">
+      <p>List the ACID properties of a transaction. For each one, give a one-sentence definition and the mechanism the DBMS uses to guarantee it.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Atomicity: a transaction is an atomic transformation from the initial to the final state — all of its effects or none; commit work means success, rollback work or an error before the commit means UNDO, a fault after the commit means REDO. Mechanisms: abort-rollback-restart and commit protocols. Consistency: the transaction satisfies the integrity constraints, so if the initial state is consistent the final state is consistent too (intermediate states may violate them). Mechanism: integrity checking of the DBMS. Isolation: a transaction is not affected by the behaviour of other, concurrent transactions; its intermediate states are not exposed, so the domino effect of cascading rollbacks is avoided. Mechanism: concurrency control. Durability: the effects of a committed transaction last forever, independently of any system fault. Mechanism: recovery management.</p>
+      </div>
+      <div class="exam-note"><p>Соответствие со слайда (p. 193) так же хорошо подходит для закрытого вопроса: учи его как таблицу. Лёгкая ошибка — поставить "commit protocols" под долговечность; слайд ставит их под атомарность.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l03-exam-redo">
+    <div class="exam-q" lang="en">
+      <p>True or false: when a system fault happens after a transaction has executed commit work, the DBMS undoes the transaction's writes at restart.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Это правило для сбоя до commit. После commit слайд предписывает REDO: зафиксированные результаты должны сохраниться.</span></li>
+      <li data-correct>False <span class="fb">"Fault after commit: REDO" (p. 189): записи применяются заново, так что зафиксированное состояние выживает — долговечность.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. A fault after the commit requires REDO, not UNDO (p. 189): the effects of a committed transaction must survive any system fault (durability, p. 192). UNDO applies to rollback work and to errors before the commit.</p></div>
+      <div class="exam-note"><p>Если возможен штраф, отвечай, только если можешь сказать, по какую сторону от commit случился сбой: один этот факт решает между UNDO и REDO.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l03-exam-scale">
+    <div class="exam-q" lang="en">
+      <p>Explain the difference between vertical and horizontal scalability, and say which one traditional SQL systems use and which one Big Data solutions use. What is the "grey area", and why is it time dependent?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>In both kinds of system adding data may degrade performance; the difference is the remedy. Vertical scalability (scaling up), used by traditional SQL systems, replaces the machine with a better one, with more RAM, more cores and more disk; its cost rises in a convex staircase from commodity hardware to appliances (for example an Oracle Exadata X6-8 rack: 576 cores, 24 TB of RAM) to exceptional hardware, and then there is nothing bigger to buy. Horizontal scalability (scaling out), used by Big Data solutions, adds another machine; its cost is a straight line of "only more" commodity hardware with a fixed starting cost. So for small data one machine is cheaper, for big data the cluster is. The grey area is the band of data sizes around the crossing of the two cost curves, where neither is clearly cheaper. It is time dependent because distributed platforms keep getting cheaper and easier (Hadoop on premises, Hadoop in the cloud, Spark in the cloud, Spark on a managed service), so the horizontal line sinks and the crossing moves to smaller sizes: roughly 10 PB, 1 PB, 100 TB and 10 TB on the slide.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ называет различием лекарство (а не «SQL медленный»), две формы стоимости и сдвиг влево. Цитируй тенденцию, а не годы: годы и номера версий на слайде не совпадают.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l03-exam-split">
+    <div class="exam-q" lang="en">
+      <p>Compare data partitioning and replication: the aim of each, one advantage and one disadvantage of each, and whether the two can be combined.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Partitioning splits the data and places the pieces on different storage nodes, horizontally by rows (sharding) or vertically by columns; its aim is scalability and distribution. Pros: fast data writing and reading, because each node handles only its piece, and low memory overhead, because each datum is stored once. Con: potential data loss, because a failed node takes its piece with it. Replication keeps copies of the same data on several nodes; its aim is fault tolerance and backup. Pros: fast data reading, because any copy can answer, and high data reliability. Cons: high network overhead, because every write must reach every copy, and high memory overhead, because every copy costs storage. The two combine: split the data into partitions and store each partition on several nodes (or copy, then split), so that every piece survives the failure of a node — the usual layout of distributed databases.</p>
+      </div>
+      <div class="exam-note"><p>Половина ответа — четыре ячейки таблицы со слайда (p. 156), другая половина — «потому что» за каждой ячейкой. Если используешь определение репликации со слайда ("the entire database across all nodes"), добавь, что реальные системы копируют каждую партицию фиксированное число раз.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l03-exam-run">
+    <div class="exam-q" lang="en">
+      <p>A bank stores its accounts in the table Account(AccNum, Balance). Account 12202 holds 100 and account 42177 holds 5. The following transaction (the slides' "Example with Alternative", p. 149) runs to its end without failures. Which balances does the database hold after end transaction?</p>
+<pre><code>begin transaction;
+update Account
+  set Balance = Balance + 10 where AccNum = 12202;
+update Account
+  set Balance = Balance - 10 where AccNum = 42177;
+select Balance into A from Account
+  where AccNum = 42177;
+if (A&gt;=0) then commit work
+          else rollback work;
+end transaction;</code></pre>
+    </div>
+    <ul class="options" lang="en">
+      <li>12202: 110, 42177: −5 <span class="fb">Это состояние после двух обновлений. A = −5 заставляет программу выполнить rollback work, так что это состояние никогда не фиксируется.</span></li>
+      <li data-correct>12202: 100, 42177: 5 <span class="fb">Проверка не проходит, rollback work отменяет оба обновления — и зачисление тоже, — и база возвращается в исходное состояние.</span></li>
+      <li>12202: 110, 42177: 5 <span class="fb">Отменено только списание? Откат отменяет всю транзакцию, а не её последний оператор.</span></li>
+      <li>12202: 100, 42177: −5 <span class="fb">Списание — то самое обновление, которое нарушило правило; UNDO убирает его первым.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>12202 holds 100 and 42177 holds 5. After the two updates A = 5 − 10 = −5, the condition A &gt;= 0 is false, the program executes rollback work, and the DBMS undoes both writes (atomicity): the database returns to its initial state.</p></div>
+      <div class="exam-note"><p>Ловушка — зачисление: оно прошло без ошибки, но откат его отменяет. Третье задание пошаговой транзакции репетирует ровно этот прогон.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l03-exam-storage">
+    <div class="exam-q" lang="en">
+      <p>A hospital keeps its patient records in a database of 2 TB. The database is horizontally partitioned into 4 shards of equal size, and every shard is stored with a replication factor of 3, each copy on a different node. How much data does the cluster store in total?</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>2 TB <span class="fb">Одно партиционирование оставило бы в сумме 2 TB, но репликация хранит каждый шард трижды.</span></li>
+      <li data-correct>6 TB: 0.5 TB on each of 12 nodes <span class="fb">Каждый шард весит 2 / 4 = 0.5 TB и хранится 3 раза на своих узлах: 4 × 3 × 0.5 = 6 TB, то есть 3 × 2 TB.</span></li>
+      <li>8 TB <span class="fb">Это умножение базы на число шардов; но шарды — куски этих 2 TB, а не их копии.</span></li>
+      <li>24 TB <span class="fb">Это умножение и на шарды, и на копии. Данные умножает только фактор репликации.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>6 TB. Each shard holds 2 / 4 = 0.5 TB and is stored 3 times, so 4 × 3 = 12 nodes hold 0.5 TB each: 12 × 0.5 = 6 TB. The number of shards does not change the total; only the replication factor does: total storage = replication factor × database size = 3 × 2 TB.</p></div>
+      <div class="exam-note"><p>Партиционирование распределяет данные, репликация их умножает: ячейки "low memory overhead" и "high memory overhead" со слайда (p. 156) в одном числе. Обычная ошибка — умножить ещё и на число шардов.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l03-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Питание пропадает сразу после первого обновления перевода: на 12202 зачислено, с 42177 ещё не списано. После перезапуска на двух счетах…</p>
+    <ul class="options">
+      <li>110 и 25, потому что зачисление записано, а записанные данные остаются <span class="fb">Долговечность защищает только зафиксированные записи. Эта не была зафиксирована, поэтому её отменяют.</span></li>
+      <li data-correct>100 и 25: зачисление отменено <span class="fb">Ошибка до commit означает UNDO обратно к \(S_0\) (p. 189): атомарность.</span></li>
+      <li>110 и 15, потому что перезапуск доводит перевод до конца <span class="fb">REDO повторяет только зафиксированные транзакции; перезапуск никогда не завершает транзакцию за приложение.</span></li>
+      <li>то, что успело попасть на диск до сбоя <span class="fb">Именно это восстановление и предотвращает: журнал говорит перезапуску, что отменить, что бы ни попало на диск.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Во время перевода база проходит через \(S_1\): на 12202 зачислено, с 42177 ещё не списано. Какие утверждения верны? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Оно может нарушать правило вроде «сумма всех балансов постоянна», не нарушая ACID <span class="fb">Согласованность требуется только от начального и конечного состояний (p. 190).</span></li>
+      <li data-correct>Параллельные транзакции не могут прочитать 110 для 12202, пока идёт перевод <span class="fb">Изоляция: "Its intermediate states are not exposed" (p. 191).</span></li>
+      <li>Если сервер упадёт сейчас, после перезапуска ты найдёшь \(S_1\) <span class="fb">Сбой до commit ведёт к UNDO, обратно к \(S_0\).</span></li>
+      <li>Откат отсюда возвращает только на одно состояние назад, к состоянию до последней записи <span class="fb">Откат отменяет все записи транзакции, обратно к \(S_0\).</span></li>
+    </ul>
+    <p class="q-fb">\(S_1\) существует, но только внутри транзакции: его никто не видит, и никакой сбой его не оставляет.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Две транзакции одновременно начисляют проценты на счёт 12202. Какое свойство и какой механизм со слайда (p. 193) делают результат таким же, как если бы они выполнились одна за другой?</p>
+    <ul class="options">
+      <li>Atomicity — commit protocols <span class="fb">Атомарность — это «всё или ничего» для одной транзакции; о чередовании двух транзакций она ничего не говорит.</span></li>
+      <li data-correct>Isolation — concurrency control <span class="fb">Транзакция "is not affected by the behavior of other, concurrent transactions" (p. 191); обеспечивает это управление параллелизмом.</span></li>
+      <li>Durability — recovery management <span class="fb">Долговечность сохраняет зафиксированные результаты при сбое; здесь сбоя нет.</span></li>
+      <li>Consistency — integrity checking of the DBMS <span class="fb">Каждая транзакция по отдельности может быть согласованной, а чередование — всё равно неверным: потерянное обновление (lost update) — проблема изоляции.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Банк делит счета по отделениям между четырьмя серверами и не держит копий. Диск одного сервера уничтожен. Что произошло в терминах таблицы со слайда (p. 156)?</p>
+    <ul class="options">
+      <li data-correct>"Potential data loss" партиционирования стала реальной: счета одного отделения пропали <span class="fb">Каждый счёт хранился один раз, и его единственный дом погиб.</span></li>
+      <li>Ничего, ведь партиционирование даёт высокую надёжность данных <span class="fb">Высокая надёжность данных — плюс репликации, а не партиционирования.</span></li>
+      <li>Чтение стало медленнее, но ничего не потеряно <span class="fb">Без копий эти счета больше неоткуда прочитать.</span></li>
+      <li>Остальные три сервера восстановят потерянные строки <span class="fb">Для восстановления нужна копия, а её нет.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Ты поднимаешь фактор репликации с 1 до 3 и оставляешь те же шарды. Что становится хуже? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Нужный объём хранения <span class="fb">Три копии занимают втрое больше места: "high memory overhead" из таблицы.</span></li>
+      <li data-correct>Сетевой трафик каждой записи <span class="fb">Каждая запись должна дойти до трёх узлов: "high network overhead".</span></li>
+      <li>Скорость чтения <span class="fb">Чтение становится быстрее: ответить может любая из трёх копий.</span></li>
+      <li>Шанс потерять данные <span class="fb">Он падает — с \(p\) примерно до \(p^3\) на шард.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Что было дешевле для базы в 300 TB на прямой 2006 года (Hadoop on premises) со слайда (p. 184)?</p>
+    <ul class="options">
+      <li data-correct>Одна машина побольше: вертикальное масштабирование <span class="fb">В 2006 году серая зона была около 10 PB, так что 300 TB были далеко на вертикальной стороне.</span></li>
+      <li>Кластер обычных машин: горизонтальное масштабирование <span class="fb">Это верно на прямой 2013 года и позже; в 2006-м кластер окупался только около 10 PB.</span></li>
+      <li>Примерно одинаково: 300 TB были в серой зоне <span class="fb">Серая зона 2006 года — около 10 PB, больше чем в тридцать раз.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Интернет-магазину нужно десять серверов в декабре и три в июле. Каким словом со слайда (p. 158) называется аренда десяти на декабрь и возврат семи в январе?</p>
+    <ul class="options">
+      <li data-correct>Elasticity <span class="fb">Масштабирование вширь и обратно вслед за нагрузкой, чтобы стоимость следовала за ней.</span></li>
+      <li>Vertical scaling <span class="fb">Вертикальное масштабирование заменяет одну машину на большую; машины оно никогда не возвращает.</span></li>
+      <li>Replication <span class="fb">Репликация копирует данные ради надёжности; за нагрузкой она не следует.</span></li>
+      <li>Partitioning <span class="fb">Партиционирование решает, куда идут данные, а не сколько машин ты арендуешь.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l03-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Реляционная схема обещает typing, coherence и uniformity с проверкой в момент записи. Транзакция — "an elementary unit of work" между <code>begin transaction</code> и <code>end transaction</code> ровно с одним <code>commit work</code> или <code>rollback work</code>, и корректно построенная (well-formed) транзакция после исхода не трогает данные.</li>
+    <li>Атомарность переводит базу из \(S_0\) в \(S_r\) или не переводит вовсе: commit даёт SUCCESS, rollback или ошибка до commit — UNDO, сбой после commit — REDO; и откат отменяет зачисление на 12202 тоже.</li>
+    <li>Согласованность проверяет два конца по ограничениям целостности, изоляция прячет промежуточные состояния и останавливает эффект домино, долговечность сохраняет зафиксированные результаты при любом сбое. Механизмы: abort-rollback-restart и commit protocols; integrity checking of the DBMS; concurrency control; recovery management.</li>
+    <li>Вертикальное масштабирование покупает машину получше по выпуклой лестнице, которая кончается; горизонтальное добавляет "only more" обычных машин по прямой со стартовой стоимостью. Серая зона вокруг их пересечения сдвинулась примерно с 10 PB до 10 TB: насколько большое — большое, зависит от того, когда спрашивать.</li>
+    <li>Партиционирование (scalability, distribution) делит данные по строкам — шардинг — или по столбцам: быстро и экономно, но потерянный узел теряет данные. Репликация (fault tolerance, backup) копирует данные: быстрое чтение и надёжность ценой нагрузки на сеть и память. Реальные системы сочетают оба хода, у каждого шарда свой фактор репликации.</li>
+    <li>Приём данных (ingestion) импортирует и загружает данные из многих источников, переформатируя файлы в сотни мегабайт; wrangling понимает, очищает, обогащает и придаёт им форму для анализа.</li>
+  </ul>
+  <aside class="cheat" id="l03-cheat">
+    <dl>
+      <dt>Схема (p. 144)</dt><dd>typing · coherence · uniformity, всё проверяется в момент записи</dd>
+      <dt>Транзакция (p. 146)</dt><dd>"an elementary unit of work performed by an application"</dd>
+      <dt>Границы</dt><dd><code>begin transaction</code> (bot) … <code>end transaction</code> (eot)</dd>
+      <dt>Исход</dt><dd>ровно один раз: <code>commit work</code> (commit) или <code>rollback work</code> (abort)</dd>
+      <dt>Well-formed (p. 150)</dt><dd>begin · чтения и записи · commit или rollback · no data manipulation · end</dd>
+      <dt>Atomicity (p. 189)</dt><dd>commit: SUCCESS · rollback или ошибка до commit: UNDO · сбой после commit: REDO</dd>
+      <dt>Consistency (p. 190)</dt><dd>согласованное начальное состояние → согласованное конечное; промежуточные не проверяются</dd>
+      <dt>Isolation (p. 191)</dt><dd>промежуточные состояния не видны; никакого "domino effect"</dd>
+      <dt>Durability (p. 192)</dt><dd>зафиксированные результаты живут "forever", независимо от любого сбоя</dd>
+      <dt>Механизмы (p. 193)</dt><dd>A: abort-rollback-restart, commit protocols · C: integrity checking of the DBMS · I: concurrency control · D: recovery management</dd>
+      <dt>OLTP vs OLAP</dt><dd>много коротких транзакций на текущих данных vs длинные аналитические запросы по истории</dd>
+      <dt>Почему реляционные остались (p. 205)</dt><dd>consolidated · integration platform · ACID</dd>
+      <dt>Вертикальное масштабирование (p. 177)</dt><dd>купить машину получше: commodity hardware → appliance → exceptional hardware</dd>
+      <dt>Горизонтальное масштабирование (p. 177)</dt><dd>добавить ещё машину: "only more" commodity hardware</dd>
+      <dt>Обычный узел (p. 179)</dt><dd>8–32 ядра, 16–64 GB RAM, 1–3 TB диска, 10 GE</dd>
+      <dt>Appliance (p. 180)</dt><dd>Exadata X6-8: 576 ядер, 24 TB RAM, 360 TB флеш-памяти на стойку, 40 Gb/s InfiniBand</dd>
+      <dt>Серая зона (p. 184)</dt><dd>≈ 10 PB → 1 PB → 100 TB → 10 TB, от Hadoop on premises до "Spark on HDInsight (today)?"</dd>
+      <dt>Эластичность (p. 158)</dt><dd>масштабироваться вширь и обратно, чтобы стоимость следовала за нагрузкой</dd>
+      <dt>Партиционирование (p. 153)</dt><dd>цель: scalability, distribution · горизонтальное (строки) = sharding · вертикальное (столбцы)</dd>
+      <dt>Репликация (p. 154)</dt><dd>цель: fault-tolerance, backup · копии одних и тех же данных на нескольких узлах (напечатано: "the entire database across all nodes")</dd>
+      <dt>Плюсы / минусы (p. 156)</dt><dd>партиционирование: быстро, low memory overhead / potential data loss · репликация: быстрое чтение, надёжность / network and memory overhead</dd>
+      <dt>Хранение</dt><dd>всего = фактор репликации × размер базы</dd>
+      <dt>Модель потерь (не со слайдов)</dt><dd>\(P = 1 - (1 - p^N)^k\) для \(k\) шардов, \(N\) копий</dd>
+      <dt>Ingestion (p. 159)</dt><dd>импорт, передача, загрузка для хранения и дальнейшего использования; файлы по сотни MB</dd>
+      <dt>Wrangling (p. 160)</dt><dd>understand → cleanse → augment → shape</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l03-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Y6Ev8GIlbxc" target="_blank" rel="noopener">Distributed Systems in One Lesson</a>
+      <span class="res-by">Tim Berglund, Devoxx Poland</span>
+      <p class="res-why">База данных, которая перерастает одну машину, рассказанная как история: почему большая коробка перестаёт помогать, затем шардинг и репликация и что ломается в тот момент, когда данные живут на двух машинах, — вторая половина этого урока в одном докладе.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.mongodb.com/docs/manual/sharding/" target="_blank" rel="noopener">Sharding</a>
+      <span class="res-by">MongoDB manual</span>
+      <p class="res-why">Найди часть, где каждый шард сам является replica set: ответ на "Possible?" со слайда (p. 155) в реальном продукте, с картинками горизонтального партиционирования по хешу и по диапазонам. Ты встретишь это снова в уроке 16.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=5ZjhNTM8XU8" target="_blank" rel="noopener">Transactions: myths, surprises and opportunities</a>
+      <span class="res-by">Martin Kleppmann, Strange Loop 2015</span>
+      <p class="res-why">Что на самом деле гарантирует каждая буква ACID и почему согласованность — белая ворона: она принадлежит правилам приложения, как проверка овердрафта со слайда (p. 149).</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://jimgray.azurewebsites.net/papers/thetransactionconcept.pdf" target="_blank" rel="noopener">The Transaction Concept: Virtues and Limitations</a>
+      <span class="res-by">Jim Gray, VLDB 1981</span>
+      <p class="res-why">Статья, на которой основана врезка-история: транзакции, определённые через атомарность, согласованность и долговечность, ещё до того, как присоединилась изоляция и ACID получил своё имя.</p>
+    </li>
+    <li class="res" data-kind="book" data-when="after">
+      <a class="res-title" href="http://book.mixu.net/distsys/" target="_blank" rel="noopener">Distributed systems: for fun and profit</a>
+      <span class="res-by">Mikito Takada</span>
+      <p class="res-why">Глава 1 на нескольких страницах разбирает масштабируемость, партиционирование и репликацию в терминах следующих уроков; главы 4–5 переходят к тому, как держать реплики в согласии, — мостик к уроку 5.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Этот урок принимал обещания схемы как данность: typing, coherence и uniformity, всё проверяется до того, как строка принята. Большие данные часто приходят раньше, чем кто-то знает их схему. Что, если база сначала принимала бы всё, а вопросы задавала потом?</p>
+</aside>
+
+</main>
+</body>
+</html>

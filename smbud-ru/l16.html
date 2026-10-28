@@ -1,0 +1,1109 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Горизонтальное масштабирование MongoDB: шарды, чанки, mongos и угол CAP · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l16">
+
+<header class="lesson-head">
+  <h1>Горизонтальное масштабирование MongoDB: шарды, чанки, mongos и угол CAP</h1>
+  <p class="lede">После этого урока ты сможешь назвать части шардированного кластера MongoDB и сказать, что знает каждая из них, проследить путь чанка от первого разделения до переноса на другой шард, выбрать для нагрузки range-, hash- или tag-aware-шардирование и объяснить, почему слайды ставят MongoDB на ребро CP, — причём с исправленными устаревшими числами слайдов.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Системы отопления больницы раз в минуту присылают показание — <code>{ deviceId, timestamp, kwh }</code>, — и коллекция переросла свой сервер. Команда шардирует её на три сервера и, раз каждый отчёт запрашивает временное окно, берёт ключом шардирования <code>timestamp</code>. Остальное MongoDB делает сама: коллекция начинается как один чанк, чанк режется надвое, когда становится слишком большим, а куски переезжают на более свободные серверы, пока приложение продолжает писать.</p>
+  <p>Через неделю на каждом из трёх серверов одинаковое число чанков. И всё же в любой момент все новые показания попадают на один сервер, а два других не получают ничего. Ничего не сломано: каждая часть делает ровно свою работу. Как данные могут быть сбалансированы, а записи — нет? И какой один выбор распределил бы их?</p>
+  <p>Второй вопрос оставь на конец: что будет с показаниями, которые хранит загруженный сервер, когда он умрёт?</p>
+</div>
+
+
+<section id="l16-why">
+  <h2>Шардирование: партиционирование, которое работает само</h2>
+
+  <p>В <a href="l03.html#l03-split">уроке 3</a> шардирование появилось как горизонтальное партиционирование: целые строки, разложенные по нескольким машинам. Лекция по MongoDB называет его "A new word: Sharding" (p. 287), "Essentially Data Partitioning", и перечисляет, что "Different in NoSQL": "Fully automatic", "Configurable", "Transparent", "BASE principles" — "See for example MongoDB".</p>
+
+  <p>Читай это как разделение труда: база данных сама режет, перемещает и маршрутизирует (automatic); человек выбирает, по чему и как резать, — ключ и стратегию из раздела 4 (configurable); приложение видит одну базу данных (transparent). "BASE principles" относит шардирование к семейству из <a href="l05.html">урока 5</a>; для MongoDB слайд лекции про CAP точнее (раздел 5).</p>
+
+  <p>Сквозной пример — система отопления больницы из экзамена 30 января 2026 года плюс то, чего нет в её ER-диаграмме: показания, которые присылает каждая Heating System, по одному документу в коллекции <code>readings</code>, а <code>Heater_Sys_ID</code> обогревателя хранится как <code>deviceId</code>, как на слайдах. Показания растут без конца, поэтому у них своя коллекция (стоп-сигнал неограниченного роста из <a href="l13.html">урока 13</a>).</p>
+
+  <h3>Четыре причины шардировать</h3>
+  <p>Их перечисляет лекция (p. 288), а ближе к концу (p. 335) возвращается ко всем четырём. "Sharding is a means of partitioning data across servers to enable":</p>
+  <ul>
+    <li>"Scale: needed by Modern applications to support massive workloads and data volume." Каждый сервер хранит и обслуживает только свою часть.</li>
+    <li>"Geo-Locality: to support geographically distributed deployments to support optimal UX for customers across vast geographies." Показания Милана — на сервере в Милане, Палермо — в Палермо.</li>
+    <li>"Hardware Optimizations: on Performance vs. Cost". Показания этого месяца — на быстрых серверах с SSD, прошлогодние — на дешёвых дисках.</li>
+    <li>"Lower Recovery Times: to make 'Recovery Time Objectives' (RTO) feasible." RTO — самый долгий простой, который бизнес готов принять; три маленьких шарда восстанавливаются параллельно, гораздо быстрее одной большой базы.</li>
+  </ul>
+
+  <h3>Shard key, чанк, шард</h3>
+  <p>"Sharding involves a shard key defined by a data modeler that describes the partition space of a data set. Data is partitioned into data chunks by the shard key, and these chunks are distributed evenly across shards that reside across many physical servers" (p. 289). Ключ шардирования задаёт проектировщик данных, данные режутся по нему на чанки, и чанки равномерно расходятся по шардам на разных физических серверах. И картинка, которую надо запомнить (p. 324): "Key space is like points on a line", "Range is a segment of that line".</p>
+
+  <div class="def">
+    <p><dfn>Shard key</dfn> (ключ шардирования) — поле или поля, значение которых решает, где живёт документ; "User defines shard key for partitioning" (p. 324).</p>
+    <p><dfn>Чанк</dfn> (chunk) — непрерывный диапазон значений shard key, отрезок прямой ключей, вместе со всеми документами, чей ключ в него попадает; единица, которую делят и перемещают.</p>
+    <p><dfn>Шард</dfn> (shard) — "a node of the cluster" (p. 327), узел кластера, который хранит часть чанков.</p>
+  </div>
+
+  <figure class="fig fig--plain" id="l16-fig-line">
+    <svg class="dia" viewBox="0 0 560 216" role="img" aria-label="Shard key deviceId в виде прямой от MinKey до MaxKey, разрезанной в точках 250 и 600 на три чанка: от MinKey до 250 и от 600 до MaxKey на шарде 1, от 250 до 600 на шарде 2; девять документов лежат на прямой точками, и документ с deviceId 560 попадает в чанк на шарде 2">
+      <path d="M44,66 V58 H166 V66" class="st-s3 sw-2"/>
+      <path d="M174,66 V58 H320 V66" class="st-s3 sw-2"/>
+      <path d="M328,66 V58 H516 V66" class="st-s3 sw-2"/>
+      <line x1="40" y1="92" x2="520" y2="92" class="sw-2"/>
+      <line x1="170" y1="80" x2="170" y2="104" class="sw-2"/>
+      <line x1="324" y1="80" x2="324" y2="104" class="sw-2"/>
+      <circle cx="306" cy="92" r="11" class="hl"/>
+      <circle cx="76" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="112" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="149" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="188" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="216" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="262" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="306" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="402" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <circle cx="460" cy="92" r="6" class="fi-s1 st-paper sw-2"/>
+      <text x="105" y="46" class="tx-sm tx-mid">[MinKey, 250)</text>
+      <text x="247" y="46" class="tx-sm tx-mid">[250, 600)</text>
+      <text x="422" y="46" class="tx-sm tx-mid">[600, MaxKey)</text>
+      <text x="40" y="126" class="tx-sm">MinKey</text>
+      <text x="170" y="126" class="tx-sm tx-mid">250</text>
+      <text x="324" y="126" class="tx-sm tx-mid">600</text>
+      <text x="520" y="126" class="tx-sm tx-end">MaxKey</text>
+      <text x="105" y="158" class="tx-sm tx-mid">на шарде 1</text>
+      <text x="247" y="158" class="tx-sm tx-mid">на шарде 2</text>
+      <text x="422" y="158" class="tx-sm tx-mid">на шарде 1</text>
+      <text x="306" y="198" class="tx-mid">deviceId 560 → чанк [250, 600) → шард 2</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> "Key space is like points on a line", "Range is a segment of that line" (p. 324), нарисовано для shard key <code>deviceId</code>. Два разреза дают три чанка; каждый чанк включает своё начало и не включает конец. На шарде 1 лежат два чанка, которые не соседи: шард владеет набором отрезков, а запись о том, какой отрезок где живёт, — это карта чанков (chunk map) из раздела 2. Два конца прямой — особые значения MongoDB MinKey и MaxKey, которые сортируются ниже и выше всего остального; на одном слайде (p. 331) они нарисованы как −∞ и ∞, на другом (p. 334) названы по имени.</figcaption>
+  </figure>
+
+  <div class="pitfall"><p>«Fully automatic (p. 287) значит, что решать нечего». Та же лекция говорит "User defines shard key" (p. 324): резка, перемещение и маршрутизация автоматические, а ключ — твой, и никакая автоматика плохой ключ не исправит.</p></div>
+
+  <p class="memo"><mark class="key">Шардирование режет прямую shard key на чанки и раскладывает чанки по шардам: ключ выбираешь ты, MongoDB режет, перемещает и маршрутизирует.</mark></p>
+</section>
+
+
+<section id="l16-parts">
+  <h2>Кто есть кто: mongod, mongos и config servers</h2>
+
+  <p>Шардированный кластер обслуживают три вида процессов: "Mongod – Database instance", "Mongos - Sharding processes" (p. 321) и config servers (p. 326). Третья программа со слайда (p. 321), "Mongo", — это shell из <a href="l14.html">урока 14</a>.</p>
+
+  <h3>mongod и что такое шард</h3>
+  <p><mark class="key">mongod</mark> — "main daemon" (p. 329), главный демон, — хранит документы и отвечает на запросы. Шард "is a node of the cluster" и "can be a single mongod or a replica set" (p. 327). <mark class="key">Replica set</mark> — группа процессов mongod с одними и теми же данными: один <em>primary</em>, который принимает каждую запись, и <em>secondaries</em>, которые копируют эти записи и могут занять его место.</p>
+
+  <aside class="redpen" data-page="327">
+    <p class="claim">"Shard can be a single mongod or a replica set"</p>
+    <p class="fix">Начиная с MongoDB 3.6 шард обязан быть replica set; одиночный mongod больше не принимается.</p>
+    <p class="because">Шард хранит чанки, которых нет ни у одного другого шарда: если его единственный сервер умирает, эта часть коллекции пропадает, пока он не вернётся, — включи сбой в виджете раздела 3. На экзамене ответ могут сверять с напечатанной фразой, так что знай оба варианта: "a single mongod or a replica set" — как напечатано, "a replica set" — как сегодня.</p>
+  </aside>
+
+  <p>Рис. 2 перерисовывает картинку кластера из лекции со слайда "MongoDB is fast and scalable" (p. 295). Вниз по столбцу — "Replication /HA": одни и те же данные на трёх серверах, которые переживут один отказ. Вдоль ряда — "Horizontal Scaling": в каждом столбце свои данные, так что ещё один столбец добавляет ёмкость. Столбец — это replica set; ряд — это набор шардов.</p>
+
+  <figure class="fig fig--plain" id="l16-fig-axes">
+    <svg class="dia" viewBox="0 0 560 276" role="img" aria-label="Маршрутизатор над тремя шардами. Каждый шард — столбец из трёх серверов: primary сверху и два secondary, все с одними и теми же двумя чанками. Шард 1 хранит чанки 1 и 2, шард 2 — чанки 3 и 4, шард 3 — чанки 5 и 6. Вертикальная стрелка вдоль столбцов подписана replication / HA, горизонтальная стрелка под рядом — horizontal scaling">
+      <rect x="263" y="12" width="44" height="28" class="fi-paper"/>
+      <line x1="270" y1="20" x2="300" y2="20" class="st-muted"/>
+      <line x1="270" y1="26" x2="300" y2="26" class="st-muted"/>
+      <line x1="270" y1="32" x2="300" y2="32" class="st-muted"/>
+      <line x1="285" y1="42" x2="285" y2="58" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <text x="315" y="31" class="tx-sm">mongos</text>
+      <text x="155" y="80" class="tx-sm tx-mid">шард 1</text>
+      <text x="285" y="80" class="tx-sm tx-mid">шард 2</text>
+      <text x="415" y="80" class="tx-sm tx-mid">шард 3</text>
+      <rect x="110" y="90" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+      <rect x="110" y="140" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="110" y="190" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="240" y="90" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+      <rect x="240" y="140" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="240" y="190" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="370" y="90" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+      <rect x="370" y="140" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <rect x="370" y="190" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+      <path d="M118,98 H146 M118,104 H146 M118,110 H146 M118,148 H146 M118,154 H146 M118,160 H146 M118,198 H146 M118,204 H146 M118,210 H146" class="st-muted"/>
+      <path d="M248,98 H276 M248,104 H276 M248,110 H276 M248,148 H276 M248,154 H276 M248,160 H276 M248,198 H276 M248,204 H276 M248,210 H276" class="st-muted"/>
+      <path d="M378,98 H406 M378,104 H406 M378,110 H406 M378,148 H406 M378,154 H406 M378,160 H406 M378,198 H406 M378,204 H406 M378,210 H406" class="st-muted"/>
+      <rect x="160" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="182" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="160" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="182" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="160" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="182" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="290" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="312" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="290" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="312" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="290" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="312" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="420" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="442" y="95" width="18" height="18" class="fw-s1 st-s1 sw-2"/>
+      <rect x="420" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="442" y="145" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="420" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <rect x="442" y="195" width="18" height="18" class="fw-s1 st-s1 sw-2 dash"/>
+      <text x="169" y="108" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="191" y="108" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="169" y="158" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="191" y="158" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="169" y="208" class="tx-mono tx-sm tx-mid">1</text>
+      <text x="191" y="208" class="tx-mono tx-sm tx-mid">2</text>
+      <text x="299" y="108" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="321" y="108" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="299" y="158" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="321" y="158" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="299" y="208" class="tx-mono tx-sm tx-mid">3</text>
+      <text x="321" y="208" class="tx-mono tx-sm tx-mid">4</text>
+      <text x="429" y="108" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="451" y="108" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="429" y="158" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="451" y="158" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="429" y="208" class="tx-mono tx-sm tx-mid">5</text>
+      <text x="451" y="208" class="tx-mono tx-sm tx-mid">6</text>
+      <text x="472" y="108" class="tx-sm">primary</text>
+      <text x="472" y="183" class="tx-sm">secondary</text>
+      <line x1="72" y1="218" x2="72" y2="96" class="sw-2" marker-end="url(#arr)"/>
+      <text x="58" y="157" class="tx-sm tx-mid" transform="rotate(-90 58 157)">replication / HA</text>
+      <line x1="110" y1="238" x2="456" y2="238" class="sw-2" marker-end="url(#arr)"/>
+      <text x="285" y="264" class="tx-sm tx-mid">horizontal scaling</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Кластер со слайда "MongoDB is fast and scalable" (p. 295), перерисованный с чанками в ячейках. Вниз по столбцу — "Replication /HA" — копируются одни и те же чанки: primary (сплошные квадраты) и два secondary (пунктирные квадраты), один replica set. Вдоль ряда — "Horizontal Scaling" — в каждом столбце свои чанки: это и есть шарды.</figcaption>
+  </figure>
+
+  <p>"In-Memory Caching" с того же слайда держит используемые данные в RAM и пишет их на диск в фоне — "Operates at in-memory speed wherever possible" (p. 294). Третий пункт, локальность данных (data locality), разобран в <a href="l13.html#l13-fig-locality">уроке 13</a>.</p>
+
+  <h3>mongos, маршрутизатор</h3>
+  <p>Приложения не разговаривают с шардами: они разговаривают с <mark class="key">mongos</mark>, "Analogous to a database router", который "Processes all requests", "Decides how many and which mongod should receive the query" и "Collates the results, and sends it back to the client" (p. 321). Главная фраза здесь — "how many and which", сколько и какие:</p>
+
+<pre><code>// targeted: has the shard key
+db.readings.find(
+  { "deviceId": 512 }
+)</code></pre>
+
+<pre><code>// broadcast: no shard key
+db.readings.find(
+  { "kwh": { "$gt": 5 } }
+)</code></pre>
+
+  <p>Первый фильтр содержит shard key: mongos ищет 512 в карте чанков и спрашивает тот единственный шард, где он лежит, — это <mark class="key">адресный запрос (targeted query)</mark>. Второй фильтр ключа не содержит, поэтому mongos спрашивает все шарды и сливает ответы — это <mark class="key">широковещательный запрос (broadcast)</mark>, он же scatter-gather, и он нагружает работой каждый шард. Оба названия взяты из документации MongoDB; слайды говорят "routed to specific shards" (p. 326). Фильтр по первому полю составного ключа тоже адресный. Рис. 3 прослеживает оба запроса.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l16-fig-route">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 280" role="img" aria-label="Адресный запрос: клиент отправляет find deviceId 512 в mongos (1), mongos пересылает его только на шард 2 (2), шард 2 отвечает mongos (3), mongos отвечает клиенту (4); дорогу mongos знает из карты чанков на config server">
+        <rect x="128" y="10" width="44" height="24" rx="6" class="fi-paper"/>
+        <text x="180" y="27" class="tx-sm">клиент</text>
+        <line x1="144" y1="36" x2="144" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="82" x2="156" y2="40" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="136" y="64" class="tx-sm tx-end">1</text>
+        <text x="164" y="64" class="tx-sm">4</text>
+        <rect x="128" y="84" width="44" height="28" class="fi-paper"/>
+        <path d="M135,92 H165 M135,98 H165 M135,104 H165" class="st-muted"/>
+        <text x="122" y="103" class="tx-sm tx-end">mongos</text>
+        <rect x="232" y="84" width="44" height="28" class="fi-paper st-s6 sw-3 dash"/>
+        <path d="M239,92 H269 M239,98 H269 M239,104 H269" class="st-muted"/>
+        <line x1="174" y1="98" x2="228" y2="98" class="st-muted dash"/>
+        <text x="201" y="91" class="tx-sm tx-mid">карта</text>
+        <text x="254" y="128" class="tx-sm tx-mid">config server</text>
+        <line x1="144" y1="114" x2="144" y2="192" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="194" x2="156" y2="118" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="136" y="160" class="tx-sm tx-end">2</text>
+        <text x="164" y="160" class="tx-sm">3</text>
+        <rect x="40" y="196" width="44" height="28" class="fi-paper"/>
+        <rect x="128" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="216" y="196" width="44" height="28" class="fi-paper"/>
+        <path d="M47,204 H77 M47,210 H77 M47,216 H77 M135,204 H165 M135,210 H165 M135,216 H165 M223,204 H253 M223,210 H253 M223,216 H253" class="st-muted"/>
+        <text x="62" y="242" class="tx-sm tx-mid">шард 1</text>
+        <text x="150" y="242" class="tx-sm tx-mid">шард 2</text>
+        <text x="238" y="242" class="tx-sm tx-mid">шард 3</text>
+        <text x="196" y="178" class="tx-hand">один шард</text>
+        <text x="150" y="270" class="tx-mono tx-sm tx-mid">find({ deviceId: 512 })</text>
+      </svg>
+      <p class="fig-label">Targeted: фильтр называет shard key</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 280" role="img" aria-label="Широковещательный запрос: клиент отправляет find kwh больше 5 в mongos, mongos пересылает его на все три шарда, все три отвечают, и mongos собирает ответы, прежде чем ответить клиенту">
+        <rect x="128" y="10" width="44" height="24" rx="6" class="fi-paper"/>
+        <text x="180" y="27" class="tx-sm">клиент</text>
+        <line x1="144" y1="36" x2="144" y2="80" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="82" x2="156" y2="40" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="136" y="64" class="tx-sm tx-end">1</text>
+        <text x="164" y="64" class="tx-sm">4</text>
+        <rect x="128" y="84" width="44" height="28" class="fi-paper"/>
+        <path d="M135,92 H165 M135,98 H165 M135,104 H165" class="st-muted"/>
+        <text x="122" y="103" class="tx-sm tx-end">mongos</text>
+        <rect x="232" y="84" width="44" height="28" class="fi-paper st-s6 sw-3 dash"/>
+        <path d="M239,92 H269 M239,98 H269 M239,104 H269" class="st-muted"/>
+        <line x1="174" y1="98" x2="228" y2="98" class="st-muted dash"/>
+        <text x="201" y="91" class="tx-sm tx-mid">карта</text>
+        <text x="254" y="128" class="tx-sm tx-mid">config server</text>
+        <line x1="144" y1="114" x2="76" y2="190" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="48" y1="194" x2="122" y2="116" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="146" y1="114" x2="146" y2="192" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="158" y1="194" x2="158" y2="118" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="156" y1="114" x2="224" y2="190" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <line x1="252" y1="194" x2="178" y2="116" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="96" y="148" class="tx-sm tx-end">2</text>
+        <text x="216" y="148" class="tx-sm">3</text>
+        <rect x="40" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="128" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <rect x="216" y="196" width="44" height="28" class="fi-paper sw-2"/>
+        <path d="M47,204 H77 M47,210 H77 M47,216 H77 M135,204 H165 M135,210 H165 M135,216 H165 M223,204 H253 M223,210 H253 M223,216 H253" class="st-muted"/>
+        <text x="62" y="242" class="tx-sm tx-mid">шард 1</text>
+        <text x="150" y="242" class="tx-sm tx-mid">шард 2</text>
+        <text x="238" y="242" class="tx-sm tx-mid">шард 3</text>
+        <text x="184" y="74" class="tx-hand">collates</text>
+        <text x="150" y="270" class="tx-mono tx-sm tx-mid">find({ kwh: { $gt: 5 } })</text>
+      </svg>
+      <p class="fig-label">Broadcast: фильтр его не называет</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Слайд про маршрутизацию (p. 326), нарисованный дважды. Слева — его пронумерованный путь: ① запрос клиента приходит в mongos, ② mongos отправляет его в тот единственный шард, чей чанк содержит deviceId 512, — какой именно, он знает из карты чанков на config server, — ③ этот шард отвечает, ④ mongos отвечает клиенту. Справа — фильтр без shard key: искать должен каждый шард, а mongos "Collates the results" (p. 321), прежде чем ответить.</figcaption>
+  </figure>
+
+  <aside class="margin-note">"Router / balancer" со слайда устарел: в современной MongoDB balancer работает на primary из config servers, а не в mongos.</aside>
+
+  <p>mongos "Acts as a router / balancer", у него "No local data (persists to config database)", и их "Can have 1 or many" (p. 329): "one mongos for the whole system" или "one local mongos for every client if you wanted to minimize network latency" (p. 321) — две схемы со слайда (p. 329). Локальный mongos экономит один сетевой переход; упавший mongos ничего не теряет и просто заново загружает карту.</p>
+
+  <h3>Config servers — хранители карты</h3>
+  <p>Карта живёт на <mark class="key">config servers</mark>, которые "Stores cluster chunk ranges and locations" (p. 326): диапазон каждого чанка и его шард. mongos держит её в кэше. Раз config servers — единственный источник правды о том, где лежат данные, им нужна такая же защита, как самим данным.</p>
+
+  <aside class="redpen" data-page="326">
+    <p class="claim">"Can have only 1 or 3 (production must have 3)"</p>
+    <p class="fix">Начиная с MongoDB 3.4 config servers обязаны образовывать replica set, в production обычно из трёх членов; одиночные или зеркальные config servers больше не поддерживаются.</p>
+    <p class="because">mongos только кэширует карту: если потеряны все config servers, кластер может перестать работать, поэтому карта получает ту же защиту, что и данные, — replica set, как на слайде (p. 327). На экзамене могут процитировать напечатанную фразу: на вопрос, что сказано на слайде, отвечай "1 or 3, 3 in production" и добавь, что сегодня они образуют replica set.</p>
+  </aside>
+
+  <p class="memo"><mark class="key">mongod хранит, mongos маршрутизирует, config servers помнят, где лежит каждый чанк.</mark></p>
+</section>
+
+
+<section id="l16-chunks">
+  <h2>Жизнь чанка: разделение, потом перенос</h2>
+
+  <p>Слайд "Distribution" (p. 325) рассказывает историю в три строки: "Initially 1 chunk", "Default max chunk size: 64mb", "MongoDB automatically splits &amp; migrates chunks when max reached".</p>
+
+  <p>В "splits &amp; migrates" спрятаны два разных события. <mark class="key">Разделение (split)</mark> режет диапазон чанка надвое по значению shard key: обе половины остаются на месте, меняется только карта чанков, ни один документ не двигается. <mark class="key">Перенос (migration)</mark> перемещает один чанк целиком на другой шард: его документы копируются, карта обновляется, старая копия удаляется. Переносы решает <mark class="key">balancer</mark> (балансировщик): "MongoDB balances cluster", "MongoDB migrates data to new nodes" (p. 326).</p>
+
+  <aside class="redpen" data-page="325">
+    <p class="claim">"Default max chunk size: 64mb"</p>
+    <p class="fix">64 MB было значением по умолчанию до MongoDB 5.0. С версии 6.0 это 128 MB, balancer сравнивает объёмы данных, а не считает чанки, и чанки делятся только тогда, когда их нужно перенести; в современной документации chunk называется <em>range</em>.</p>
+    <p class="because">Механизм слайда — разрезать прямую, перенести куски, вести карту — не изменился; сдвинулись только число и момент срабатывания. Ответ на экзамене могут сверять с напечатанным "64mb": называй его как значение со слайда и одной фразой добавь, что в современных версиях это 128 MB.</p>
+  </aside>
+
+  <div class="widget" id="l16-w-chunks">
+    <h3 class="widget-title">Split, migrate, balance: коллекция растёт</h3>
+    <p class="widget-intro">Коллекция readings, шардированная по <code>deviceId</code> (от 0 до 999) на три шарда. Каждая дорожка — шард; каждый чанк нарисован поперёк ключей, которые он покрывает, и заполнен по своему объёму (полный = 64 MB со слайда). <b>Вставить</b> добавляет 40 MB показаний со случайными deviceId, а чанк больше 64 MB делится по своему среднему документу. Balancer, когда включён, переносит по одному чанку с шарда, где чанков больше всего, на тот, где их меньше всего, пока никакие два шарда не различаются на два чанка и больше, — правило времён слайдов. Ползунок спрашивает у mongos, где живёт данный deviceId. Главное, что надо увидеть: каждый чанк живёт ровно на одном шарде — split режет чанки, balancer их перемещает, и ни тот ни другой их не копирует.</p>
+    <ol class="tasks">
+      <li>Нажми <em>Вставить</em> один раз: один чанк на 40 MB на шарде 1. Прежде чем нажать ещё раз, предскажи, сколько чанков будет при 80 MB и на каких шардах.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Два. Чанк [MinKey, MaxKey) переходит за 64 MB и делится по deviceId 496 на два чанка по 40 MB, оба по-прежнему на шарде 1: split ничего не перемещает. Потом balancer видит 2 – 0 – 0 и переносит [MinKey, 496) на шард 2; при 1 – 1 – 0 никакие два шарда не различаются на два, и он останавливается.</p></details>
+      </li>
+      <li>Нажми <em>Сначала</em>, выключи balancer и вставь шесть раз. Предскажи, где окажутся 240 MB. Потом включи balancer.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Четыре чанка, все на шарде 1: разделения только перерисовывают карту. С включённым balancer следуют два переноса — [MinKey, 260) на шард 2, [260, 496) на шард 3, — и остаётся 2 – 1 – 1 по числу чанков, 124 – 58 – 58 MB. Разделение держит чанки маленькими; распределяет данные только перенос.</p></details>
+      </li>
+      <li>Начни сначала с включённым balancer, вставь шесть раз и прочитай табло. Потом нажми <em>Добавить шард</em>: предскажи, сколько чанков получит новый шард.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>После шести вставок на шардах 1 – 2 – 1 по числу чанков, но 63 – 116 – 61 MB: balancer, который считает чанки, называет это сбалансированным. Новый пустой шард 4 получает один чанк, [MinKey, 260) с шарда 2, и счёт становится 1 – 1 – 1 – 1 — "MongoDB migrates data to new nodes" (p. 326). Считать мегабайты вместо чанков — ровно то, что MongoDB изменила в версии 6.0.</p></details>
+      </li>
+      <li>Нажми <em>Сначала</em>, вставь шесть раз, выбери «одиночный mongod», включи сбой шарда 2 и поставь deviceId 300. Предскажи ответ mongos, потом нажми <em>Вставить</em>. Наконец снова выбери «replica set».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>deviceId 300 лежит в [260, 496), чанк на шарде 2, поэтому поиск не удаётся, а следующей вставке отказывают в 19 MB из 40: шард 2 хранил deviceId от 0 до 495, примерно половину пространства ключей, и копии больше ни у кого нет. С replica set один из secondary на шарде 2 становится primary, и ничего не теряется: шардирование делит, репликация копирует, и шарду нужно и то и другое.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l16-w-chunks', function (root, ui) {
+    var MAXMB = 64, BATCH = 40, MAXINS = 12, SEED = 16, X0 = 160, X1 = 540, TOP = 64, LANE = 66;
+    var rng, chunks, nShards, inserted, events, moved, acted = false;
+    function reset() {
+      rng = Course.rng(SEED);
+      chunks = [{ lo: -Infinity, hi: Infinity, shard: 0, keys: [] }];
+      nShards = 3; inserted = 0; events = []; moved = [];
+    }
+    reset();
+    function act() { events = []; moved = []; acted = true; }
+    function fk(v) { return v === -Infinity ? 'MinKey' : v === Infinity ? 'MaxKey' : String(v); }
+    function rs(c) { return '[' + fk(c.lo) + ', ' + fk(c.hi) + ')'; }
+    function chunkOf(k) { for (var i = 0; i < chunks.length; i++) if (k >= chunks[i].lo && k < chunks[i].hi) return chunks[i]; return chunks[chunks.length - 1]; }
+
+    ui.button('Вставить 40 MB показаний', function () {
+      act();
+      if (inserted >= MAXINS) { events.push('Демо останавливается на ' + (MAXINS * BATCH) + ' MB: нажми «Сначала».'); return; }
+      var refused = 0;
+      for (var i = 0; i < BATCH; i++) {
+        var k = rng.int(0, 999), c = chunkOf(k);
+        if (isDown(c.shard)) refused++; else c.keys.push(k);
+      }
+      inserted++;
+      events.push('Вставлено ' + (BATCH - refused) + ' MB.' + (refused ? ' Отклонено ' + refused + ' MB: эти deviceId принадлежат чанкам на шарде 2, который лежит, а у других шардов их нет.' : ''));
+      splitAll();
+    }, { kind: 'primary' });
+    ui.button('Добавить шард', function () {
+      act();
+      if (nShards >= 4) { events.push('Демо останавливается на четырёх шардах.'); return; }
+      nShards++;
+      events.push('Шард ' + nShards + ' вошёл в кластер, пустой.' + (balancer.value ? '' : ' Balancer выключен: на него ничего не переезжает.'));
+    });
+    ui.button('Сначала', function () { act(); reset(); events.push('Один пустой чанк, [MinKey, MaxKey), на шарде 1.'); }, { kind: 'ghost', icon: 'refresh' });
+
+    var balancer = ui.toggle('balancer работает', true);
+    var kind = ui.select('каждый шард —', [
+      { value: 'rs', label: 'replica set: primary + 2 secondary' },
+      { value: 'one', label: 'одиночный mongod (допустимо на слайде)' }
+    ], null, 'rs');
+    var fail = ui.toggle('шард 2: его primary-сервер отказывает', false);
+    var look = ui.slider({ label: 'mongos, где лежит deviceId…', min: 0, max: 999, step: 1, value: 600 });
+
+    function isDown(s) { return fail.value && kind.value === 'one' && s === 1; }
+    function split(c) {
+      var ks = c.keys.slice().sort(function (a, b) { return a - b; });
+      var m = ks[Math.floor(ks.length / 2)];
+      if (!(m > c.lo)) { m = null; for (var i = 0; i < ks.length; i++) if (ks[i] > c.lo) { m = ks[i]; break; } }
+      if (m === null || !(m < c.hi) || ks[0] === ks[ks.length - 1]) return false;
+      var L = { lo: c.lo, hi: m, shard: c.shard, keys: ks.filter(function (k) { return k < m; }) };
+      var R = { lo: m, hi: c.hi, shard: c.shard, keys: ks.filter(function (k) { return k >= m; }) };
+      chunks.splice(chunks.indexOf(c), 1, L, R);
+      events.push('Split ' + rs(c) + ' (' + ks.length + ' MB) по deviceId ' + m + ': ' + L.keys.length + ' + ' + R.keys.length + ' MB, оба по-прежнему на шарде ' + (c.shard + 1) + '.');
+      return true;
+    }
+    function splitAll() {
+      var guard = 0, again = true;
+      while (again && guard++ < 100) {
+        again = false;
+        for (var i = 0; i < chunks.length; i++) if (chunks[i].keys.length > MAXMB && split(chunks[i])) { again = true; break; }
+      }
+    }
+    function counts() { var c = []; for (var s = 0; s < nShards; s++) c.push(0); chunks.forEach(function (ch) { c[ch.shard]++; }); return c; }
+    function mbs() { var m = []; for (var s = 0; s < nShards; s++) m.push(0); chunks.forEach(function (ch) { m[ch.shard] += ch.keys.length; }); return m; }
+    function balance() {
+      var out = [], guard = 0;
+      while (guard++ < 60) {
+        var c = counts(), mx = -1, mn = -1;
+        for (var s = 0; s < nShards; s++) {
+          if (isDown(s)) continue;
+          if (mx < 0 || c[s] > c[mx]) mx = s;
+          if (mn < 0 || c[s] < c[mn]) mn = s;
+        }
+        if (mx < 0 || c[mx] - c[mn] < 2) break;
+        var pick = null;
+        for (var i = 0; i < chunks.length; i++) if (chunks[i].shard === mx) { pick = chunks[i]; break; }
+        if (!pick) break;
+        pick.shard = mn;
+        out.push({ chunk: pick, text: 'Balancer: перенёс ' + rs(pick) + ' (' + pick.keys.length + ' MB) с шарда ' + (mx + 1) + ' на шард ' + (mn + 1) + '.' });
+      }
+      return out;
+    }
+
+    var roC = ui.readout('чанки по шардам'), roM = ui.readout('мегабайты по шардам'), roF = ui.readout('mongos ищет');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'чанк, заполнен по объёму (полный = 64 MB)', color: 's1', mark: 'square' },
+      { label: 'deviceId, который ищет mongos, и его чанк', color: 's2', mark: 'dash' },
+      { label: 'primary', color: 's4', mark: 'square' },
+      { label: 'secondary', color: 's5', mark: 'square' },
+      { label: 'только что перенесён', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 266, { label: 'Пространство ключей deviceId — прямая от MinKey до MaxKey над дорожками, по одной на шард; каждый чанк — прямоугольник поперёк покрываемых ключей, заполненный по объёму; у каждого шарда показаны серверы: primary и два secondary или одиночный mongod; пунктир отмечает deviceId, который ищет mongos' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function xOf(v) { return v === -Infinity ? X0 : v === Infinity ? X1 : X0 + 10 + v * (X1 - X0 - 20) / 1000; }
+    function rack(x, y, role, dead) {
+      S('rect', { x: x, y: y, width: 36, height: 20, 'class': 'fi-paper' + (role === 'P' ? ' st-s4 sw-2' : role === 'S' ? ' st-s5 sw-2' : '') });
+      [6, 10, 14].forEach(function (dy) { S('line', { x1: x + 4, y1: y + dy, x2: x + 16, y2: y + dy, 'class': 'st-muted' }); });
+      if (role && !dead) T(x + 27, y + 15, role, 'tx-sm tx-mid');
+      if (dead) {
+        S('line', { x1: x - 2, y1: y - 2, x2: x + 38, y2: y + 22, 'class': 'st-bad sw-2' });
+        S('line', { x1: x + 38, y1: y - 2, x2: x - 2, y2: y + 22, 'class': 'st-bad sw-2' });
+      }
+    }
+    function draw(hit) {
+      var H = TOP + nShards * LANE + 4;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      S('line', { x1: X0, y1: 34, x2: X1, y2: 34, 'class': 'sw-2' });
+      chunks.forEach(function (c) { if (c.lo !== -Infinity) S('line', { x1: xOf(c.lo), y1: 27, x2: xOf(c.lo), y2: 41, 'class': 'sw-2' }); });
+      T(X0, 56, 'MinKey', 'tx-sm');
+      T(X1, 56, 'MaxKey', 'tx-sm tx-end');
+      for (var s = 0; s < nShards; s++) {
+        var top = TOP + s * LANE;
+        if (s > 0) S('line', { x1: 8, y1: top - 6, x2: 552, y2: top - 6, 'class': 'st-grid' });
+        T(10, top + 20, 'шард ' + (s + 1), 'tx-bold');
+        if (kind.value === 'rs') {
+          var f = fail.value && s === 1;
+          rack(10, top + 28, f ? '' : 'P', f);
+          rack(52, top + 28, f ? 'P' : 'S', false);
+          rack(94, top + 28, 'S', false);
+        } else {
+          rack(10, top + 28, '', isDown(s));
+        }
+        var dead = isDown(s);
+        chunks.forEach(function (c) {
+          if (c.shard !== s) return;
+          var x0 = xOf(c.lo) + 2, w = Math.max(1, xOf(c.hi) - xOf(c.lo) - 4), y = top + 4, h = 46;
+          if (moved.indexOf(c) >= 0) S('rect', { x: x0, y: y, width: w, height: h, 'class': 'hl' });
+          var fh = Math.min(1, c.keys.length / MAXMB) * (h - 4);
+          if (fh > 0) S('rect', { x: x0, y: y + h - fh, width: w, height: fh, 'class': 'fw-s1 st-none' });
+          S('rect', { x: x0, y: y, width: w, height: h, 'class': dead ? 'st-muted dash' : 'st-s1 sw-2' });
+          if (dead) {
+            S('line', { x1: x0, y1: y, x2: x0 + w, y2: y + h, 'class': 'st-bad sw-2' });
+            S('line', { x1: x0 + w, y1: y, x2: x0, y2: y + h, 'class': 'st-bad sw-2' });
+          }
+          if (c === hit) S('rect', { x: x0 - 3, y: y - 3, width: w + 6, height: h + 6, 'class': 'st-s2 sw-2 dash' });
+        });
+      }
+      var lx = xOf(look.value);
+      S('line', { x1: lx, y1: 24, x2: lx, y2: H - 4, 'class': 'st-s2 dash' });
+      T(Course.clamp(lx, X0 + 58, X1 - 58), 16, 'deviceId ' + look.value, 'tx-sm tx-mid');
+    }
+
+    ui.onChange(function () {
+      var mv = balancer.value ? balance() : [];
+      if (mv.length) {
+        if (!acted) { events = []; moved = []; }
+        mv.forEach(function (m) { events.push(m.text); moved.push(m.chunk); });
+      }
+      acted = false;
+      var c = counts(), m = mbs(), lc = [], lm = [];
+      for (var s = 0; s < nShards; s++) { lc.push('шард ' + (s + 1) + ': ' + c[s]); lm.push('шард ' + (s + 1) + ': ' + m[s]); }
+      roC.set(lc.join(' · '));
+      roM.set(lm.join(' · '));
+      var hit = chunkOf(Math.round(look.value)), sh = hit.shard + 1;
+      if (isDown(hit.shard)) roF.set(look.value + ' лежит в ' + rs(hit) + ' на шарде ' + sh + ': ошибка, шард ' + sh + ' недоступен', 'bad');
+      else roF.set(look.value + ' лежит в ' + rs(hit) + ' на шарде ' + sh + ': ответ получен' + (fail.value && hit.shard === 1 ? ' от нового primary' : ''));
+      note.set(events.length ? events.join('<br>') : 'Нажми «Вставить»: задания ниже говорят, что предсказать сначала.');
+      draw(hit);
+    });
+  });
+  </script>
+
+  <p>Split дешёвый — это изменение карты; migration гонит мегабайты по сети, поэтому balancer переносит как можно меньше. И ни один чанк не лежит на двух шардах: шардирование делит, репликация копирует, — вот почему переключатель сбоя бьёт только по шарду из одиночного mongod.</p>
+
+  <h3>Auto-sharding в два шага</h3>
+  <p>"Auto-sharding" (p. 328) обещает "Minimal effort required" в "Two steps": "Enable Sharding for a database" и "Shard collection within database". В shell это выглядит так (названия команд — из документации MongoDB; слайды дают только шаги):</p>
+
+<pre><code>// step 1: the database
+sh.enableSharding("hospital")</code></pre>
+
+<pre><code>// step 2: the collection, on
+// the composite key of p. 331
+sh.shardCollection(
+  "hospital.readings",
+  {
+    "deviceId": 1,
+    "timestamp": 1
+  }
+)</code></pre>
+
+  <p>Всё, что после шага 2, происходит без тебя; ключ — единственное решение, которое MongoDB не может принять за тебя.</p>
+
+  <p class="memo"><mark class="key">Split только перерисовывает карту; migration переносит чанк целиком; balancer переносит, пока шарды не выровняются.</mark></p>
+</section>
+
+
+<section id="l16-strategies">
+  <h2>Range, hash или tag: три способа разрезать прямую</h2>
+
+  <p>"MongoDB Sharding Strategies" (p. 330) называет три: "Ranged", "Hashed", "Tag-aware". Все режут прямую ключей на чанки; различаются они тем, что ставит документ на определённое место прямой, и тем, кто решает, какие шарды хранят тот или иной её участок. (Слайд называет mongos "Query Router".)</p>
+
+  <h3>Range sharding</h3>
+  <p>Шардирование по диапазонам (range sharding) "Splits shards based on sub-range of a key (or also multiple keys combined)" (p. 331) — читай «делит данные». Слайд даёт "Simple Shard Key: {deviceId}" и "Composite Shard Key: {deviceId, timestamp}" (в документации — compound): пары упорядочены по <code>deviceId</code>, а внутри одного устройства — по <code>timestamp</code>, как телефонная книга, отсортированная по фамилии, а потом по имени. Два чанка этого слайда (рис. 4) разрезаны внутри показаний устройства 1000, между двумя соседними секундами.</p>
+
+  <figure class="fig fig--plain" id="l16-fig-composite">
+    <svg class="dia" viewBox="0 0 560 162" role="img" aria-label="Два чанка составного shard key deviceId, timestamp, как на слайде: первый от минус бесконечности до устройства 1000 в момент 1418244824, второй от устройства 1000 в момент 1418244825 до бесконечности; разрез проходит внутри показаний устройства 1000">
+      <rect x="30" y="34" width="240" height="52" class="fw-s1 st-s1 sw-2"/>
+      <rect x="290" y="34" width="240" height="52" class="fw-s1 st-s1 sw-2"/>
+      <text x="44" y="66" class="tx-sm">−∞</text>
+      <text x="258" y="66" class="tx-sm tx-end">(1000, 1418244824)</text>
+      <text x="302" y="66" class="tx-sm">(1000, 1418244825)</text>
+      <text x="518" y="66" class="tx-sm tx-end">∞</text>
+      <text x="150" y="110" class="tx-sm tx-mid">чанк 1</text>
+      <text x="410" y="110" class="tx-sm tx-mid">чанк 2</text>
+      <text x="280" y="148" class="tx-hand tx-mid">разрез проходит внутри устройства 1000</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Два чанка со слайда (p. 331), "-∞ …1000,1418244824" и "…1000,1418244825 ∞". Timestamp — это Unix-время: 1418244824 — это 10 декабря 2014 года, 20:53:44 UTC (посчитано нами). Чанк 1 содержит все устройства меньше 1000 и устройство 1000 до этой секунды; чанк 2 — устройство 1000 начиная со следующей секунды и все устройства больше него.</figcaption>
+  </figure>
+
+  <p>Ключ по диапазонам держит соседей вместе: запрос по участку ключей — устройство 1000 за прошлую неделю — доходит до одного шарда или нескольких. В этом же и его слабость. Когда ключ только растёт, как timestamp, каждый новый документ попадает в последний чанк, тот, что кончается на MaxKey: один чанк, один шард, все записи — горячая точка (hot spot). Слайды это не обсуждают; об этом предупреждает документация MongoDB.</p>
+
+  <h3>Hash sharding</h3>
+  <p>Хеш-шардирование (hash sharding) — это "A subset of Range Sharding": "MongoDB apples a MD5 hash on the key when a hash shard key is used" (читай "applies"), что "Ensures data is distributed randomly within the range of MD5 values" (p. 332). Единственная формула слайда:</p>
+
+  <div class="formula" data-label="p. 332">
+    \[ \begin{aligned} &amp;\text{Hash Shard Key}(\mathit{deviceId}) \\ &amp;\quad = \text{MD5}(\mathit{deviceId}) \end{aligned} \]
+    <dl class="legend">
+      <dt>MD5</dt><dd>хеш-функция: один и тот же вход всегда даёт один и тот же выход, а соседние входы дают никак не связанные выходы</dd>
+    </dl>
+  </div>
+
+  <p>"Subset" значит, что резка по-прежнему идёт по диапазонам — только диапазонам хешей. Соседние ключи получают несвязанные хеши и разлетаются по всем чанкам, поэтому вставки распределяются равномерно, даже когда ключ только растёт. Цена — то же самое перемешивание: запрос по диапазону ключа рассылается широковещательно на каждый шард. Запрос на равенство остаётся адресным: mongos может захешировать то единственное значение, о котором спрашивают.</p>
+
+  <div class="widget" id="l16-w-keys">
+    <h3 class="widget-title">Один поток показаний, три shard key</h3>
+    <p class="widget-intro">Шесть обогревателей, deviceId от 1000 до 1005, присылают по одному показанию в минуту начиная с timestamp со слайда, 1418244825. <b>Пуск</b> вставляет полчаса показаний (точки) в три шарда по одному чанку в каждом. Переключай shard key когда угодно: те же показания раскладываются заново, как если бы их с самого начала шардировали так. Выбери запрос, чтобы увидеть, какие шарды спрашивает mongos (оранжевая обводка) и какие показания подходят (кольца); хеш здесь — простая замена MD5 с тем же эффектом. Главное, что надо увидеть: shard key решает сразу и то, куда попадает каждая запись, и то, какие запросы доходят до одного шарда.</p>
+    <ol class="tasks">
+      <li>Оставь <code>{ timestamp: 1 }</code>, ключ по диапазонам из загадки. Прежде чем нажать <em>Пуск</em>, предскажи, как 180 показаний за полчаса разделятся между тремя шардами.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>0 – 0 – 180: шард 3 забирает все. Каждый новый timestamp больше всех предыдущих, так что каждое показание падает в чанк, который кончается на MaxKey, — горячая точка. Зато запрос по временному окну дешёвый: mongos отправляет его только на шард 3.</p></details>
+      </li>
+      <li>Переключись на <code>{ timestamp: "hashed" }</code>. Предскажи долю самого загруженного шарда и сколько шардов mongos должен спросить для «последних 10 минут».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>62 – 63 – 55: самый загруженный шард берёт 35 %, близко к трети. Но 60 показаний за последние 10 минут лежат на всех трёх шардах, поэтому запрос широковещательный. Теперь выбери «одна точная секунда»: mongos хеширует 1418244825 и спрашивает только шард 3 — равенство по хешированному ключу остаётся адресным.</p></details>
+      </li>
+      <li>Переключись на составной ключ со слайда <code>{ deviceId: 1, timestamp: 1 }</code>. Предскажи записи, а потом маршрутизацию для «устройство 1003, последние 10 минут» и для «последние 10 минут».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>60 – 60 – 60: по два устройства на шард. Окно устройства 1003 — один участок прямой внутри чанка на шарде 2: адресный запрос, 10 показаний. Без deviceId простое временное окно не содержит префикса ключа и рассылается широковещательно. Этот ключ распределяет записи и держит повседневный запрос на одном шарде.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l16-w-keys', function (root, ui) {
+    var T0 = 1418244825, DEV = [1000, 1001, 1002, 1003, 1004, 1005], X0 = 160, X1 = 540, TOP = 58, LANE = 66, MAXT = 30;
+    var key = ui.select('shard key', [
+      { value: 'range', label: '{ timestamp: 1 } — по диапазонам' },
+      { value: 'hash', label: '{ timestamp: "hashed" }' },
+      { value: 'comp', label: '{ deviceId: 1, timestamp: 1 } — по диапазонам, составной' }
+    ], null, 'range');
+    var query = ui.select('запрос к mongos', [
+      { value: 'last', label: 'последние 10 минут' },
+      { value: 'dev', label: 'устройство 1003, последние 10 минут' },
+      { value: 'exact', label: 'одна точная секунда' }
+    ], null, 'last');
+    var player = ui.player({ ms: 140, max: MAXT, label: 'Пуск', stepLabel: 'Одна минута' });
+
+    function ts(k, d) { return T0 + 60 * k + (d - 1000) * 7; }
+    function h32(x) {
+      var h = x | 0;
+      h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
+      h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+      h ^= h >>> 16;
+      return h >>> 0;
+    }
+    function place(d, t) {
+      var g = (t - T0) / (60 * MAXT + 60);
+      if (key.value === 'range') return { f: 2 / 3 + 0.03 + g * (1 / 3 - 0.06), s: 2 };
+      if (key.value === 'hash') { var u = h32(t) / 4294967296; return { f: u, s: Math.min(2, Math.floor(u * 3)) }; }
+      var b = d - 1000;
+      return { f: (b + 0.1 + 0.8 * g) / 6, s: b < 2 ? 0 : b < 4 ? 1 : 2 };
+    }
+    function state() {
+      var n = Course.clamp(player.ticks || 0, 0, MAXT), now = T0 + 60 * n, from = now - 600;
+      var pts = [], w = [0, 0, 0], hits = [0, 0, 0];
+      for (var k = 0; k < n; k++) DEV.forEach(function (d) {
+        var t = ts(k, d), p = place(d, t);
+        var m = query.value === 'last' ? t >= from : query.value === 'dev' ? (d === 1003 && t >= from) : t === T0;
+        pts.push({ d: d, t: t, f: p.f, s: p.s, hit: m });
+        w[p.s]++; if (m) hits[p.s]++;
+      });
+      var ask;
+      if (key.value === 'range') ask = [2];
+      else if (key.value === 'hash') ask = query.value === 'exact' ? [Math.min(2, Math.floor(h32(T0) / 4294967296 * 3))] : [0, 1, 2];
+      else ask = query.value === 'dev' ? [1] : [0, 1, 2];
+      return { n: n, from: from, pts: pts, w: w, hits: hits, ask: ask };
+    }
+
+    var roW = ui.readout('новые показания по шардам'), roB = ui.readout('доля самого загруженного шарда'), roQ = ui.readout('mongos отправляет запрос'), roH = ui.readout('подходящие показания');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'показание (один документ)', color: 's1', mark: 'dot' },
+      { label: 'показание, подходящее под запрос', color: 's2', mark: 'ring' },
+      { label: 'шард, который mongos должен спросить', color: 's2', mark: 'dash' }
+    ]);
+    var svg = ui.svg(560, 256, { label: 'Пространство ключей — прямая над тремя дорожками, по одной на шард, в каждой один чанк; показания — точки на своём месте прямой ключей; шарды, которые mongos спрашивает для выбранного запроса, обведены, подходящие показания обведены кольцами' });
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function xOf(f) { return X0 + f * (X1 - X0); }
+
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      S('rect', { x: 8, y: 4, width: 44, height: 28, 'class': 'fi-paper' });
+      [12, 18, 24].forEach(function (y) { S('line', { x1: 15, y1: y, x2: 45, y2: y, 'class': 'st-muted' }); });
+      T(58, 24, 'mongos', 'tx-sm');
+      T(X0, 16, key.value === 'range' ? '{ timestamp: 1 }: старее → новее' : key.value === 'hash' ? '{ timestamp: "hashed" }: по хешу' : '{ deviceId: 1, timestamp: 1 }', 'tx-sm');
+      S('line', { x1: X0, y1: 30, x2: X1, y2: 30, 'class': 'sw-2' });
+      [1 / 3, 2 / 3].forEach(function (f) { S('line', { x1: xOf(f), y1: 23, x2: xOf(f), y2: 37, 'class': 'sw-2' }); });
+      if (key.value === 'comp') DEV.forEach(function (d, i) { T(xOf((i + 0.5) / 6), 48, String(d), 'tx-sm tx-mid'); });
+      else { T(X0, 48, 'MinKey', 'tx-sm'); T(X1, 48, 'MaxKey', 'tx-sm tx-end'); }
+      var last = Math.max.apply(null, st.ask), mids = [];
+      for (var s = 0; s < 3; s++) {
+        var top = TOP + s * LANE, mid = top + 28;
+        mids.push(mid);
+        T(66, top + 33, 'шард ' + (s + 1), 'tx-bold');
+        S('rect', { x: xOf(s / 3) + 2, y: top + 4, width: (X1 - X0) / 3 - 4, height: 48, 'class': 'st-s1' });
+        if (st.ask.indexOf(s) >= 0) {
+          S('rect', { x: X0 - 4, y: top, width: X1 - X0 + 8, height: 56, 'class': 'st-s2 sw-2 dash' });
+          S('line', { x1: 30, y1: mid, x2: 60, y2: mid, 'class': 'st-s2 sw-2', 'marker-end': 'url(#arr-s2)' });
+        }
+      }
+      S('line', { x1: 30, y1: 34, x2: 30, y2: mids[last], 'class': 'st-s2 sw-2' });
+      st.pts.forEach(function (p) {
+        var cx = xOf(p.f), cy = TOP + p.s * LANE + 12 + (p.d - 1000) * 6.6;
+        S('circle', { cx: cx, cy: cy, r: 2.6, 'class': 'fi-s1 st-none' });
+        if (p.hit) S('circle', { cx: cx, cy: cy, r: 5.2, 'class': 'st-s2 sw-2' });
+      });
+    }
+
+    ui.onChange(function () {
+      var st = state(), tot = st.w[0] + st.w[1] + st.w[2], nh = st.hits[0] + st.hits[1] + st.hits[2];
+      roW.set('шард 1: ' + st.w[0] + ' · шард 2: ' + st.w[1] + ' · шард 3: ' + st.w[2]);
+      roB.set(tot ? Math.round(100 * Math.max(st.w[0], st.w[1], st.w[2]) / tot) + ' %' : '—');
+      roQ.set(st.ask.length === 1 ? 'только на шард ' + (st.ask[0] + 1) + ': адресный' : 'на все 3 шарда: широковещательный, потом collates');
+      roH.set(nh + (nh ? ' (шард 1: ' + st.hits[0] + ' · шард 2: ' + st.hits[1] + ' · шард 3: ' + st.hits[2] + ')' : ''));
+      var filter = query.value === 'last' ? '{ timestamp: { $gte: ' + st.from + ' } }'
+        : query.value === 'dev' ? '{ deviceId: 1003, timestamp: { $gte: ' + st.from + ' } }' : '{ timestamp: ' + T0 + ' }';
+      var why = {
+        'range last': 'Фильтр называет shard key, а окно лежит внутри последнего чанка: только шард 3.',
+        'range dev': 'Timestamp в фильтре достаточно, чтобы адресовать последний чанк; deviceId не входит в ключ и лишь фильтрует внутри шарда 3.',
+        'range exact': 'Один timestamp — одно место на прямой, один чанк: адресный запрос.',
+        'hash last': 'У соседних timestamp несвязанные хеши, поэтому окно разбросано по всем чанкам: широковещательный запрос.',
+        'hash dev': 'deviceId не входит в ключ, а timestamp окна разбросаны хешем: широковещательный запрос.',
+        'hash exact': 'Равенство по ключу: mongos хеширует единственное значение и находит его чанк на шарде 3: адресный запрос.',
+        'comp last': 'Без deviceId в фильтре нет префикса ключа, а у каждого устройства есть показания в окне: широковещательный запрос.',
+        'comp dev': 'deviceId стоит в ключе первым, поэтому окно устройства 1003 — один участок прямой, в чанке на шарде 2: адресный запрос.',
+        'comp exact': 'Точный timestamp без deviceId — не префикс ключа: широковещательный запрос, хотя показание лежит только на одном шарде.'
+      }[key.value + ' ' + query.value];
+      var writes = key.value === 'range' ? 'Записи: каждый новый timestamp — самый большой на данный момент, поэтому он падает в чанк, кончающийся на MaxKey, на шарде 3.'
+        : key.value === 'hash' ? 'Записи: хеш каждого timestamp попадает куда угодно на прямой, поэтому записи распределяются.'
+        : 'Записи: каждое устройство пишет в свой участок прямой, по два устройства на шард.';
+      note.set(writes + '<br>Фильтр <code>' + filter + '</code> — ' + why);
+      draw(st);
+    });
+  });
+  </script>
+
+  <figure class="tbl-fig" id="l16-tbl-keys">
+    <figcaption>Что показывает виджет через полчаса (180 показаний, 6 обогревателей, 3 шарда): записи на шардах 1 · 2 · 3 и шарды, которые mongos спрашивает для каждого запроса; один шард — адресный запрос, все 3 — широковещательный.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Shard key</th><th>Записи</th><th>Последние 10 мин</th><th>Устройство 1003, последние 10 мин</th><th>Одна точная секунда</th></tr></thead>
+        <tbody>
+          <tr><td>timestamp, по диапазонам</td><td class="num">0&nbsp;·&nbsp;0&nbsp;·&nbsp;180</td><td>шард&nbsp;3</td><td>шард&nbsp;3</td><td>шард&nbsp;3</td></tr>
+          <tr><td>timestamp, хешированный</td><td class="num">62&nbsp;·&nbsp;63&nbsp;·&nbsp;55</td><td>все&nbsp;3</td><td>все&nbsp;3</td><td>шард&nbsp;3</td></tr>
+          <tr class="is-key"><td>deviceId + timestamp, по диапазонам</td><td class="num">60&nbsp;·&nbsp;60&nbsp;·&nbsp;60</td><td>все&nbsp;3</td><td>шард&nbsp;2</td><td>все&nbsp;3</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Строка за строкой: timestamp делает временные окна дешёвыми и отправляет каждую вставку на один шард; его хеш распределяет вставки и рассылает каждое окно на все шарды; составной ключ распределяет вставки и держит «одно устройство, одно окно» на одном шарде.</p>
+
+  <h3>Tag-aware sharding</h3>
+  <p>Третья стратегия решает, какие шарды могут хранить тот или иной участок прямой: "Tag-aware sharding allows subset of shards to be tagged, and assigned to a sub-range of the shard-key" (p. 333) — часть шардов помечают тегом и закрепляют за поддиапазоном ключа. Пример: пользователи из 100 «регионов», "Collection: Users, Shard Key: {uId, regionCode}", "Tag based on macro regions". Следующий слайд (p. 334) помечает "Shard1" и "Shard2" как West, "Shard3" и "Shard4" как East и назначает диапазоны ключей из первой строки таблицы ниже; balancer держит каждый диапазон на шардах с его тегом. С версии 3.4 MongoDB называет теги <em>zones</em>; на экзамене используй слово со слайда.</p>
+
+  <figure class="tbl-fig" id="l16-tbl-tags">
+    <figcaption>"Tag Sharding Example" (p. 334): диапазоны в напечатанном виде для "Assign Regions 1-50 to the West" и "Assign Regions 51-100 to the East" — и исправленная версия (см. красную ручку ниже). Диапазон включает своё начало и не включает конец.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th></th><th>Shard key</th><th>West: Shard1, Shard2</th><th>East: Shard3, Shard4</th></tr></thead>
+        <tbody>
+          <tr><td>Как напечатано</td><td>{uId, regionCode}</td><td>MinKey, MinKey → MaxKey,50</td><td>MinKey, 50 → MaxKey, MaxKey</td></tr>
+          <tr class="is-key"><td>Исправлено</td><td>{regionCode, uId}</td><td>(MinKey, MinKey) → (51, MinKey)</td><td>(51, MinKey) → (MaxKey, MaxKey)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <aside class="redpen" data-page="334">
+    <p class="claim">"Shard Key: {uId, regionCode}" — West: "MinKey, MinKey" to "MaxKey,50"; East: "MinKey, 50" to "MaxKey, MaxKey"; "Assign Regions 1-50 to the West"</p>
+    <p class="fix">Когда uId стоит первым, оба напечатанных диапазона содержат всех пользователей, из какого бы региона они ни были. Чтобы закрепить регионы, регион должен стоять в ключе первым: shard key {regionCode, uId}, West от (MinKey, MinKey) до (51, MinKey), East от (51, MinKey) до (MaxKey, MaxKey).</p>
+    <p class="because">Составной ключ сравнивается поле за полем, как в телефонной книге: второе поле упорядочивает только те документы, у которых совпадает первое. Каждый настоящий uId лежит между MinKey и MaxKey, поэтому West, кончающийся на (MaxKey, 50), содержит всех пользователей, и East, начинающийся с (MinKey, 50), тоже, — пересекающиеся диапазоны, которые современная MongoDB отвергает. Правило из документации: "the range must include the prefix of the shard key" (рис. 5). На экзамене могут процитировать напечатанную таблицу: знай её и знай, почему она не может работать.</p>
+  </aside>
+
+  <figure class="fig fig--pair fig--plain" id="l16-fig-tags">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="При shard key uId, regionCode шесть пользователей стоят в порядке uId, и их регионы чередуются между West и East; оба напечатанных диапазона тянутся от точки до первого пользователя до точки после последнего, так что оба покрывают всех шестерых">
+        <line x1="20" y1="48" x2="280" y2="48" class="sw-2"/>
+        <circle cx="40" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="78" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <circle cx="128" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="166" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <circle cx="216" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="254" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <text x="40" y="30" class="tx-sm tx-mid">u1, 12</text>
+        <text x="84" y="30" class="tx-sm tx-mid">u2, 63</text>
+        <text x="128" y="30" class="tx-sm tx-mid">u3, 7</text>
+        <text x="172" y="30" class="tx-sm tx-mid">u4, 88</text>
+        <text x="216" y="30" class="tx-sm tx-mid">u5, 31</text>
+        <text x="260" y="30" class="tx-sm tx-mid">u6, 51</text>
+        <text x="20" y="68" class="tx-sm">MinKey</text>
+        <text x="280" y="68" class="tx-sm tx-end">MaxKey</text>
+        <path d="M20,76 V82 H280 V76" class="st-s3 sw-2"/>
+        <text x="150" y="98" class="tx-sm tx-mid">West кончается на (MaxKey, 50)</text>
+        <path d="M20,110 V116 H280 V110" class="st-s3 sw-2 dash"/>
+        <text x="150" y="132" class="tx-sm tx-mid">East начинается с (MinKey, 50)</text>
+        <text x="150" y="166" class="tx-hand tx-mid">оба покрывают всех шестерых</text>
+      </svg>
+      <p class="fig-label">Как напечатано (p. 334): <code>{uId, regionCode}</code></p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 180" role="img" aria-label="При shard key regionCode, uId пользователи стоят в порядке регионов: сначала три пользователя West, за ними три пользователя East, и один разрез в точке 51, MinKey отделяет диапазон West от диапазона East">
+        <line x1="20" y1="48" x2="280" y2="48" class="sw-2"/>
+        <line x1="150" y1="36" x2="150" y2="60" class="sw-2"/>
+        <circle cx="40" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="84" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <circle cx="128" cy="48" r="6" class="fi-s1 st-paper sw-2"/>
+        <rect x="166" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <rect x="210" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <rect x="254" y="42" width="12" height="12" class="fi-paper st-s1 sw-2"/>
+        <text x="40" y="30" class="tx-sm tx-mid">7, u3</text>
+        <text x="84" y="30" class="tx-sm tx-mid">12, u1</text>
+        <text x="128" y="30" class="tx-sm tx-mid">31, u5</text>
+        <text x="172" y="30" class="tx-sm tx-mid">51, u6</text>
+        <text x="216" y="30" class="tx-sm tx-mid">63, u2</text>
+        <text x="260" y="30" class="tx-sm tx-mid">88, u4</text>
+        <text x="20" y="68" class="tx-sm">MinKey</text>
+        <text x="150" y="74" class="tx-sm tx-mid">(51, MinKey)</text>
+        <text x="280" y="68" class="tx-sm tx-end">MaxKey</text>
+        <path d="M20,84 V90 H146 V84" class="st-s3 sw-2"/>
+        <path d="M154,84 V90 H280 V84" class="st-s3 sw-2 dash"/>
+        <text x="83" y="108" class="tx-sm tx-mid">West: регионы 1–50</text>
+        <text x="217" y="108" class="tx-sm tx-mid">East: 51–100</text>
+        <text x="150" y="146" class="tx-hand tx-mid">их разделяет один разрез</text>
+      </svg>
+      <p class="fig-label">Исправлено: <code>{regionCode, uId}</code></p>
+    </div>
+    <figcaption><b>Рис. 5.</b> Шесть пользователей из примера слайда в порядке shard key. Кружки — пользователи регионов 1–50, которых слайд отдаёт West; квадраты — регионы 51–100, East. Слева, когда uId первый, пользователи стоят в порядке uId, и регионы чередуются: ни один участок прямой не содержит только пользователей West, а оба напечатанных диапазона тянутся от точки до первого пользователя до точки после последнего. Справа, когда первый regionCode, все пользователи West идут раньше всех пользователей East, и их разделяет один разрез.</figcaption>
+  </figure>
+
+  <h3>Какое шардирование выбрать?</h3>
+  <p>Таблица в конце лекции (p. 335) замыкает круг четырьмя причинами из её начала (p. 288); третий столбец добавлен нами.</p>
+
+  <figure class="tbl-fig" id="l16-tbl-which">
+    <figcaption>"Which Sharding to use?" (p. 335) с добавленными причинами.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Usage</th><th>Required Strategy</th><th>Почему</th></tr></thead>
+        <tbody>
+          <tr><td>Scale</td><td>Range or Hash</td><td>больше шардов хранят и обслуживают больше данных; объём распределяет любой разрез прямой</td></tr>
+          <tr><td>Geo-Locality</td><td>Tag-aware</td><td>участок прямой, принадлежащий региону, должен жить на шардах этого региона</td></tr>
+          <tr><td>Hardware Optimization</td><td>Tag-aware</td><td>горячие диапазоны — на быстрых шардах, холодные — на дешёвых: это решение о размещении</td></tr>
+          <tr><td>Lower Recovery Times</td><td>Range or Hash</td><td>маленькие шарды восстанавливаются быстрее, как ни режь</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Правило: чтобы распределить объём (масштаб, восстановление), годится любой разрез; чтобы положить определённые данные на определённые машины (регионы, уровни железа), нужны теги.</p>
+
+  <p class="memo"><mark class="key">Range держит соседей вместе, hash их разбрасывает, теги закрепляют диапазоны за выбранными шардами.</mark></p>
+</section>
+
+
+<section id="l16-cap">
+  <h2>Угол CAP</h2>
+
+  <p>Последний содержательный слайд лекции, "CAP Theorem and Mongo" (p. 336), ставит MongoDB на ребро C–P треугольника: "Focus on Consistency and Partition tolerance". Его определения: "Consistency – all replicas contain the same version of the data", "Availability – system remains operational on failing nodes" и "Partition tolarence" (читай "tolerance") — "multiple entry points", "system remains operational on system split". Конспект курса согласен: MongoDB "built using a CP architecture".</p>
+
+  <figure class="fig fig--pair fig--plain" id="l16-fig-cap">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="Треугольник CAP: C сверху, A слева внизу, P справа внизу; слово MongoDB лежит вдоль выделенного ребра от C к P; внутри молния — разделение сети">
+        <line x1="150" y1="40" x2="240" y2="192" class="hl"/>
+        <polygon points="150,40 60,192 240,192" class="sw-2"/>
+        <polyline points="152,96 136,126 154,124 140,156" class="st-bad sw-3"/>
+        <text x="150" y="30" class="tx-lg tx-bold tx-mid">C</text>
+        <text x="50" y="200" class="tx-lg tx-bold tx-end">A</text>
+        <text x="250" y="200" class="tx-lg tx-bold">P</text>
+        <text x="211" y="107" class="tx-bold tx-mid" transform="rotate(59.4 211 107)">MongoDB</text>
+        <text x="150" y="226" class="tx-sm tx-mid">Focus on Consistency and Partition tolerance</text>
+      </svg>
+      <p class="fig-label">p. 336: MongoDB на ребре C–P</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="Разделение сети режет replica set из трёх членов на одного и двух. На маленькой стороне старый primary слагает полномочия, и запись его клиента отклоняется. На большой стороне, два члена из трёх, один стал новым primary, принимает запись и реплицирует её на secondary">
+        <line x1="110" y1="26" x2="110" y2="190" class="st-bad sw-2 dash"/>
+        <text x="110" y="16" class="tx-sm tx-mid">partition</text>
+        <rect x="38" y="30" width="36" height="24" rx="6" class="fi-paper"/>
+        <line x1="56" y1="56" x2="56" y2="104" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <path d="M49,73 L63,87 M63,73 L49,87" class="st-bad sw-2"/>
+        <text x="44" y="84" class="tx-sm tx-end">отказ</text>
+        <rect x="34" y="108" width="44" height="28" class="fi-paper st-muted dash"/>
+        <path d="M41,116 H71 M41,122 H71 M41,128 H71" class="st-muted"/>
+        <text x="56" y="154" class="tx-sm tx-mid">слагает роль</text>
+        <text x="56" y="170" class="tx-sm tx-mid">1 из 3</text>
+        <rect x="142" y="30" width="36" height="24" rx="6" class="fi-paper"/>
+        <line x1="160" y1="56" x2="160" y2="104" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+        <text x="168" y="84" class="tx-sm">принято</text>
+        <rect x="138" y="108" width="44" height="28" class="fi-paper st-s4 sw-2"/>
+        <rect x="220" y="108" width="44" height="28" class="fi-paper st-s5 sw-2"/>
+        <path d="M145,116 H175 M145,122 H175 M145,128 H175 M227,116 H257 M227,122 H257 M227,128 H257" class="st-muted"/>
+        <line x1="184" y1="122" x2="214" y2="122" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="160" y="154" class="tx-sm tx-mid">новый primary</text>
+        <text x="242" y="154" class="tx-sm tx-mid">secondary</text>
+        <text x="200" y="174" class="tx-sm tx-mid">2 из 3: большинство</text>
+        <text x="150" y="222" class="tx-hand tx-mid">выживает одна версия</text>
+      </svg>
+      <p class="fig-label">Почему: один primary, выбранный большинством</p>
+    </div>
+    <figcaption><b>Рис. 6.</b> Слева — картинка слайда (p. 336): MongoDB сидит на ребре между C и P; молния посередине — это разделение сети (partition). Справа — механизм за ней (контекст, не со слайда): разделение режет replica set из трёх членов на одного и двух. Держать primary может только сторона с большинством: двое выбирают его и продолжают принимать записи, а одинокий старый primary слагает полномочия, как только это замечает, и его клиенты получают ошибки. На маленькой стороне теряется доступность; всё, что старый primary принял за эти секунды, откатывается, так что выживает только одна версия данных.</figcaption>
+  </figure>
+
+  <p>Почему CP? Из-за replica set. Записи принимает только его primary. Если разделение сети расщепляет replica set, primary может быть только у той стороны, которая всё ещё видит большинство членов: она его сохраняет или выбирает нового среди своих secondary. Primary, оставшийся на стороне меньшинства, слагает полномочия, как только это замечает, и отказывает в записях. Его клиенты получают ошибки — от доступности отказались, — но выживают только записи стороны большинства, так что данные остаются согласованными: это строка CP из <a href="l05.html#l05-choose">урока 5</a>, "a timeout error or an error, otherwise". (Выборы большинством — контекст; слайды их не описывают.)</p>
+
+  <div class="pitfall"><p>«Partition tolerance означает multiple entry points». Эта строка под P (p. 336) в определение не входит: устойчивость к разделению (partition tolerance) значит, что система продолжает работать, когда сеть между узлами распадается на части (p. 195, урок 5). Цитируй эту строку как то, что напечатано на слайде, а не как определение. И читай "all replicas contain the same version" как обещание про чтение через primary: secondary могут немного отставать.</p></div>
+
+  <p>"CP" описывает путь по умолчанию — через primary; каждая операция может выбрать иначе — "It's at operation level!" из урока 5 (p. 198). В терминах документации (контекст): запись может ждать, пока её получит большинство, — write concern <code>"majority"</code>, — или только primary; чтение может пойти на secondary, который ближе, но, возможно, отстаёт.</p>
+
+  <div class="story" data-year="2013">
+    <p>Тесты Jepsen Кайла Кингсбери разделяли сеть replica set на MongoDB 2.4, пока клиенты продолжали писать. Какое-то время изолированный primary продолжал принимать записи, пока не замечал, что потерял большинство, и не слагал полномочия; когда разделение заживало, эти записи откатывались. С тогдашним write concern "safe" из 5 900 подтверждённых записей потерялось 2 208 — 37 %; с write concern majority — 2 из 5 700. Что выживет, зависит от того, как ты пишешь.</p>
+  </div>
+
+  <p class="memo"><mark class="key">MongoDB — CP, потому что у каждого replica set один primary, а сторона разделения без большинства перестаёт принимать записи.</mark></p>
+</section>
+
+
+<section id="l16-back">
+  <h2>Снова о загруженном сервере</h2>
+
+  <p>Кластер из загадки сделал всё, что обещают слайды: один чанк, разделения, переносы, пока на каждом шарде не оказалось одинаковое число чанков. Но ключом был timestamp, а timestamp только растёт: каждое новое показание падает в чанк, кончающийся на MaxKey, — на одном шарде. Balancer выравнивает то, что хранится, а не то, куда пойдёт следующая запись: он сбалансировал прошлое, пока настоящее падало в одно место.</p>
+
+  <p>Тот один выбор, который распределил бы записи, — это ключ. Хешированный timestamp их распределяет, но рассылает каждый отчёт по временному окну на все шарды; составной ключ со слайда <code>{deviceId, timestamp}</code> распределяет их по обогревателям и держит «один обогреватель, одно окно» на одном шарде — выделенная строка таблицы.</p>
+
+  <p>И второй вопрос: шард из одиночного mongod умирает вместе со своими чанками — дыра в первом виджете, — а шард, который является replica set, выбирает нового primary и работает дальше. Вот почему сегодня каждый шард обязан быть replica set.</p>
+</section>
+
+
+<section id="l16-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>«Верно/неверно», выбор вариантов и короткие открытые ответы, как в теоретической части, где за неправильную галочку могут снять баллы. Ни в одном прошлом экзамене нет задачи на шардирование.</p>
+
+  <div class="exam" data-kind="mcq" id="l16-exam-hash">
+    <div class="exam-q" lang="en">
+      <p>True or false: with a hashed shard key, documents with consecutive shard-key values are stored in the same chunk, so a range query on the shard key is routed to a single shard.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Хеш MD5 перемешивает порядок: соседние значения получают несвязанные хеши и поэтому разлетаются по чанкам (p. 332).</span></li>
+      <li data-correct>False <span class="fb">Хеш-шардирование распределяет данные "randomly within the range of MD5 values" (p. 332), поэтому запрос по диапазону ключа приходится рассылать на все шарды; адресным остаётся только запрос на равенство.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. Hash sharding applies an MD5 hash to the shard key and partitions the data by ranges of hash values. Consecutive key values have unrelated hashes, so they are spread over different chunks and shards, and a range query on the key has to be broadcast to all shards. It is range sharding that keeps neighbouring values in the same chunk.</p></div>
+      <div class="exam-note"><p>Утверждение проверяет цену хеширования. Зеркальное утверждение — range sharding держит соседей вместе — именно оно делает запросы по диапазону дешёвыми, а постоянно растущий ключ опасным.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l16-exam-facts">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about a sharded MongoDB cluster agree with the lecture? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Sharding spreads different chunks of the data over different shards to scale, while replication keeps copies of the same data for high availability. <span class="fb">p. 295: "Horizontal Scaling" — вдоль ряда шардов, "Replication /HA" — вниз по каждому столбцу.</span></li>
+      <li data-correct>The config servers store the chunk ranges of the cluster and their locations. <span class="fb">p. 326: "Stores cluster chunk ranges and locations".</span></li>
+      <li>mongos stores a copy of the documents it routes, so adding mongos instances adds storage capacity. <span class="fb">У mongos "No local data (persists to config database)" (p. 329); ёмкость растёт добавлением шардов.</span></li>
+      <li data-correct>Geo-locality and hardware optimization require tag-aware sharding. <span class="fb">p. 335; для масштаба и меньшего времени восстановления — "Range or Hash".</span></li>
+      <li>A chunk that exceeds the maximum chunk size is moved, whole, to the shard with the fewest chunks. <span class="fb">Сначала он делится (p. 325); перенос чанков — отдельное решение balancer, которое принимается, когда шарды неравномерны.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The first, second and fourth statements.</p></div>
+      <div class="exam-note"><p>Вопрос «выбери все верные», где за неправильную галочку могут снять баллы. Два неверных варианта — классические ловушки: mongos не хранит данных, а split и migrate — два разных события.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-procs">
+    <div class="exam-q" lang="en">
+      <p>Describe the roles of mongod, mongos and the config servers in a sharded MongoDB cluster. Explain the difference between a targeted and a broadcast query, and why a cluster can run several mongos instances.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>mongod is the database instance, the main daemon that stores the documents and executes queries on them. A shard is a node of the cluster: according to the slides a single mongod or a replica set of mongod processes (one primary and secondaries); current versions require a replica set. mongos is the router: it processes all client requests, decides how many and which shards must receive each query, and collates their results before answering the client. The config servers store the cluster metadata: the chunk ranges of the shard key and the shard that holds each chunk; mongos reads and caches this map to route requests. A query whose filter contains the shard key (or a prefix of a composite shard key) is targeted to the shards owning the matching chunks; a query without it is broadcast to all shards and the partial results are merged (scatter-gather). mongos keeps no local data, since its state persists in the config database, so it can be replicated freely: one shared mongos, or one local mongos per application server to save a network hop.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ покрывает четыре роли: кто хранит (mongod и шард), кто маршрутизирует (mongos: "how many and which", потом collates), кто помнит (config servers: диапазоны чанков и их расположение) и почему mongos может быть много (нет локальных данных). "1 or 3" config servers со слайда — устаревшая деталь: сегодня они образуют replica set.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-chunk">
+    <div class="exam-q" lang="en">
+      <p>Define shard key and chunk. Describe what MongoDB does as a sharded collection grows, and when a new shard is added to the cluster.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>The shard key is the field, or combination of fields, chosen by the data modeler that defines the partition space of the collection: its values are ordered like points on a line, from MinKey to MaxKey. A chunk is a contiguous range of shard-key values, a segment of that line, together with the documents whose key falls in it. A newly sharded collection starts as a single chunk. When a chunk exceeds the maximum chunk size — 64 MB by default according to the slides, 128 MB in current versions — MongoDB splits it at a shard-key value into two chunks; a split only changes the metadata on the config servers and moves no data. The balancer then migrates whole chunks from the shards that hold more to the shards that hold fewer, so that the chunks are distributed evenly; when a new shard is added, chunks are migrated to it. The application keeps working throughout, because mongos routes with the updated chunk map.</p>
+      </div>
+      <div class="exam-note"><p>Полный ответ разводит два механизма — split (только метаданные) и migration (данные двигаются) — и называет число. Назови 64 MB со слайда и одной фразой упомяни сегодняшние 128 MB.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-key">
+    <div class="exam-q" lang="en">
+      <p>A hospital heating management system stores one document per sensor reading, <code>{ deviceId, timestamp, kwh }</code>, in a sharded MongoDB collection. Readings arrive continuously from many devices; most queries ask for the readings of one device in a time window. Compare a ranged shard key on <code>timestamp</code>, a hashed shard key on <code>timestamp</code>, and the composite shard key <code>{ deviceId, timestamp }</code>. Which would you choose, and why?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>A ranged key on timestamp keeps time windows together, so a time-window query is targeted, but timestamps grow monotonically: every new reading falls into the last chunk, the one bounded by MaxKey, so all inserts hit a single shard — a hot spot — and adding shards does not increase write throughput. A hashed key on timestamp applies MD5 to the value: inserts are spread evenly over chunks and shards, but neighbouring timestamps are scattered, so every time-window query must be broadcast to all shards; only an equality on one exact timestamp is targeted. The composite key { deviceId, timestamp } orders documents by device first and by time within a device: inserts from many devices spread over many chunks, and a query for one device in a time window covers one contiguous range of the key, so mongos targets one shard or a few. I would choose { deviceId, timestamp }; a query on time alone, without deviceId, would be broadcast, which is acceptable if it is rare.</p>
+      </div>
+      <div class="exam-note"><p>Это загадка урока в виде экзаменационного вопроса, а составной ключ — тот самый, что на слайде (p. 331). Для каждого ключа назови три эффекта — куда идут вставки, какие запросы адресные, какие широковещательные, — и сравнение напишется само.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l16-exam-cap">
+    <div class="exam-q" lang="en">
+      <p>According to the lecture, which two CAP properties does MongoDB focus on? Explain how a MongoDB replica set behaves during a network partition, and which property it gives up.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>The lecture places MongoDB on the C–P edge of the CAP triangle: it focuses on Consistency and Partition tolerance, and the course notes call it a CP architecture. Each replica set has a single primary that accepts all writes, while the secondaries replicate them. If a network partition splits a replica set, only the side that can reach a majority of the members keeps or elects a primary; a primary left on the minority side steps down and refuses writes. Clients that can reach only the minority side receive errors, so availability is sacrificed there. In exchange, only the majority side's writes survive: whatever the old primary accepted before stepping down is rolled back when the partition heals, so the data stays consistent, and the system keeps operating on the majority side despite the partition. What survives a failover therefore depends on the write concern: writes acknowledged by a majority are not lost.</p>
+      </div>
+      <div class="exam-note"><p>Сначала дай классификацию со слайда (C и P, p. 336), потом механизм. Единственный primary и правило большинства — контекст, а не текст слайда: это «почему» за меткой слайда.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l16-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">На шарде 1 лежит чанк на 70 MB — больше максимума 64 MB со слайда, — и MongoDB его делит. Сколько данных переехало на другие шарды, прежде чем вмешался balancer?</p>
+    <ul class="options">
+      <li>Половина чанка, около 35 MB, на самый пустой шард <span class="fb">Это был бы перенос (migration) — отдельный шаг, который позже решает balancer.</span></li>
+      <li data-correct>Нисколько: обе половины остаются на шарде 1, меняется только карта чанков на config servers <span class="fb">Split режет диапазон по значению ключа; ни один документ не покидает шард.</span></li>
+      <li>Весь чанк на 70 MB, на шард с наименьшим числом чанков <span class="fb">Чанки переносятся целиком, но только balancer, и только когда шарды неравномерны.</span></li>
+      <li>Копия каждой половины на каждый другой шард, для надёжности <span class="fb">Шардирование никогда не держит чанк на двух шардах; копии — работа replica set.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">На каждом из двух твоих серверов приложения запущен свой mongos. Один mongos падает и перезапускается. Что потеряно?</p>
+    <ul class="options">
+      <li data-correct>Ничего: у mongos нет своих данных, и он заново читает карту чанков с config servers <span class="fb">"No local data (persists to config database)" (p. 329).</span></li>
+      <li>Документы, записанные через него за последние минуты <span class="fb">Записи хранят процессы mongod на шардах, а не маршрутизатор.</span></li>
+      <li>Карта чанков, так что коллекцию придётся шардировать заново <span class="fb">Карта живёт на config servers; mongos её только кэширует.</span></li>
+      <li>Чанки, которые через него маршрутизировались, пока balancer не перенесёт их обратно <span class="fb">Чанки живут на шардах; маршрутизатору не принадлежит ни один.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Коллекция readings шардирована по <code>{ deviceId: 1, timestamp: 1 }</code>. Какой фильтр mongos может отправить на один шард?</p>
+    <ul class="options">
+      <li><code>{ timestamp: { $gte: 1418246025 } }</code> <span class="fb">Нет deviceId — значит, нет префикса ключа: у каждого устройства есть показания в этом окне, и запрос широковещательный.</span></li>
+      <li data-correct><code>{ deviceId: 1003, timestamp: { $gte: 1418246025 } }</code> <span class="fb">Показания устройства 1003 образуют один участок прямой, упорядоченный по времени: адресный запрос.</span></li>
+      <li><code>{ kwh: { $gt: 5 } }</code> <span class="fb">Это вообще не поле shard key: широковещательный.</span></li>
+      <li><code>{ timestamp: 1418244825 }</code> <span class="fb">Точный timestamp, но без deviceId показания этой секунды могут лежать в любом чанке: широковещательный.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Согласно "Which Sharding to use?" (p. 335), каким целям нужно tag-aware-шардирование? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>Geo-locality <span class="fb">Держать данные каждого региона на серверах в этом регионе — значит закреплять диапазоны ключей за выбранными шардами.</span></li>
+      <li data-correct>Hardware optimization <span class="fb">Свежие данные — на быстрых шардах, старые — на дешёвых: опять решение о размещении.</span></li>
+      <li>Scale <span class="fb">Чтобы распределить объём, годится любой разрез: "Range or Hash".</span></li>
+      <li>Lower recovery times <span class="fb">Маленькие шарды восстанавливаются быстрее, как ни режь: "Range or Hash".</span></li>
+    </ul>
+    <p class="q-fb">Правило: теги — когда диапазон должен жить на определённых машинах; range или hash — когда его нужно только распределить.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В replica set три члена, и разделение сети отрезает primary от двух secondary. Что происходит?</p>
+    <ul class="options">
+      <li data-correct>Два secondary выбирают нового primary; старый primary слагает полномочия и отказывает в записях — на его стороне теряется доступность, согласованность сохраняется <span class="fb">Держать primary может только сторона большинства; всё, что старый primary принял до того, как сложить полномочия, откатывается, так что выживает одна версия данных.</span></li>
+      <li>Обе стороны держат по primary и принимают записи, а когда разделение заживает, записи сливаются <span class="fb">Это поведение AP: два primary, принимающие конфликтующие записи.</span></li>
+      <li>Весь replica set перестаёт принимать записи, пока разделение не заживёт <span class="fb">Сторона большинства по-прежнему может выбрать primary и продолжать работу.</span></li>
+      <li>Старый primary продолжает принимать записи, потому что он был primary первым <span class="fb">Primary, который не видит большинства, слагает полномочия; старшинство не считается.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему хешированный shard key равномерно распределяет по шардам постоянно растущий timestamp?</p>
+    <ul class="options">
+      <li data-correct>Соседние timestamp получают несвязанные хеши, поэтому новые показания падают во все чанки, а не только в последний <span class="fb">Чанки — это диапазоны хешей, а хеш разбрасывает соседей.</span></li>
+      <li>Потому что balancer чаще переносит хешированные чанки <span class="fb">Balancer тот же; меняется то, куда каждая вставка попадает с самого начала.</span></li>
+      <li>Потому что MongoDB отправляет хешированные документы на шарды по очереди, round-robin <span class="fb">Место решает хеш, а не порядок прихода.</span></li>
+      <li>Потому что хеширование делает чанки меньше, и на каждый шард их помещается больше <span class="fb">Размер чанка не меняется; перемешиваются только позиции на прямой.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему диапазоны из примера с тегами на слайде не могут выделить регионы при shard key <code>{uId, regionCode}</code>?</p>
+    <ul class="options">
+      <li data-correct>Составной ключ сравнивается поле за полем, поэтому диапазон от MinKey до MaxKey по uId содержит всех пользователей, из какого бы региона они ни были <span class="fb">Регион только упорядочивает пользователей с одинаковым uId; чтобы по нему резать, он должен стоять в ключе первым.</span></li>
+      <li>Потому что MinKey и MaxKey не могут встречаться в диапазонах тегов <span class="fb">Могут: это два конца прямой.</span></li>
+      <li>Потому что regionCode — число, а uId — строка <span class="fb">Дело не в типах, а в порядке полей.</span></li>
+      <li>Потому что диапазон тега обязан начинаться с MinKey <span class="fb">Тегом можно пометить любой участок прямой: исправленный диапазон East начинается с (51, MinKey).</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l16-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Шардирование — это партиционирование данных, которое ведёт сама база, — "Fully automatic", "Configurable", "Transparent" (p. 287), — по четырём причинам: масштаб, геолокальность, оптимизация железа и меньшее время восстановления (p. 288).</li>
+    <li>Shard key, выбранный проектировщиком данных, упорядочивает документы на прямой от MinKey до MaxKey; чанк — отрезок этой прямой, а шард — узел кластера, который хранит часть чанков (pp. 289, 324).</li>
+    <li>mongod хранит; mongos маршрутизирует, решает, "how many and which" шарды получат запрос, собирает результаты (collates) и не хранит локальных данных, поэтому его экземпляров может быть один или много; config servers хранят диапазоны чанков и их расположение. Слайды допускают шард из одиночного mongod и 1 или 3 config servers; сегодня и то и другое — replica set.</li>
+    <li>Коллекция начинается с одного чанка; за пределом максимального размера (64 MB на слайде, 128 MB сегодня) чанк делится, что меняет только карту, а balancer переносит целые чанки, пока шарды не выровняются, в том числе на новые шарды. Auto-sharding — два шага: включить шардирование для базы данных и шардировать коллекцию.</li>
+    <li>Range держит соседей вместе: запросы по диапазону адресные, но постоянно растущий ключ отправляет каждую вставку на один шард. Hash — это range по значениям MD5: равномерные записи, широковещательные запросы по диапазону, адресное равенство. Tag-aware закрепляет диапазоны ключей за шардами с тегами, и поле тега должно стоять в ключе первым.</li>
+    <li>Слайд ставит MongoDB на ребро C–P (p. 336): у каждого replica set один primary, а сторона разделения без большинства отказывает в записях — доступностью жертвуют, согласованность сохраняют.</li>
+  </ul>
+  <aside class="cheat" id="l16-cheat">
+    <dl>
+      <dt>Sharding (p. 287)</dt><dd>"Essentially Data Partitioning": fully automatic, configurable, transparent</dd>
+      <dt>Зачем шардировать (p. 288)</dt><dd>scale · geo-locality · hardware optimizations · lower recovery times (RTO)</dd>
+      <dt>Shard key</dt><dd>поле или поля, которые выбирает проектировщик данных; пространство ключей — прямая, MinKey … MaxKey</dd>
+      <dt>Чанк (chunk)</dt><dd>диапазон [low, high) shard key; максимум 64 MB на слайде, 128 MB сегодня</dd>
+      <dt>Шард (shard)</dt><dd>узел кластера: одиночный mongod или replica set (слайд); replica set (сегодня)</dd>
+      <dt>Replica set</dt><dd>один primary (все записи) + secondaries (копии); "Replication /HA"</dd>
+      <dt>mongod</dt><dd>экземпляр базы данных, главный демон (main daemon)</dd>
+      <dt>mongos</dt><dd>маршрутизатор: сколько и какие шарды, собирает результаты; нет локальных данных; 1 или много</dd>
+      <dt>Config servers</dt><dd>диапазоны чанков и их расположение; 1 или 3 (слайд), replica set (сегодня)</dd>
+      <dt>Split / migrate</dt><dd>split: только карта, данные не двигаются · migrate: balancer переносит чанк целиком</dd>
+      <dt>Targeted / broadcast</dt><dd>фильтр с shard key (или его префиксом): часть шардов · без него: все шарды, потом слияние</dd>
+      <dt>Auto-sharding (p. 328)</dt><dd>включить шардирование для базы, потом шардировать коллекцию: <code>sh.enableSharding("db")</code> · <code>sh.shardCollection("db.coll", { key: 1 })</code></dd>
+      <dt>Range sharding</dt><dd>соседи делят чанки: запросы по диапазону адресные; монотонный ключ → горячая точка</dd>
+      <dt>Hash sharding (p. 332)</dt><dd>Hash Shard Key(deviceId) = MD5(deviceId): равномерные записи, запросы по диапазону широковещательные, равенство адресное</dd>
+      <dt>Tag-aware (zones)</dt><dd>шарды с тегами владеют диапазонами ключей; поле тега должно быть префиксом ключа</dd>
+      <dt>Какая стратегия (p. 335)</dt><dd>Scale, Lower Recovery Times → Range or Hash · Geo-Locality, Hardware Optimization → Tag-aware</dd>
+      <dt>CAP (p. 336)</dt><dd>C + P: один primary на replica set; сторона меньшинства отказывает в записях</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l16-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="before the lesson">
+      <a class="res-title" href="https://www.youtube.com/watch?v=Y6Ev8GIlbxc" target="_blank" rel="noopener">Distributed Systems in One Lesson</a>
+      <span class="res-by">Tim Berglund, Devoxx Poland</span>
+      <p class="res-why">Кофейня перерастает одну машину: почему «купи коробку побольше» перестаёт работать, потом шардирование, репликация и выбор между тем, чтобы ждать, и тем, чтобы ответить устаревшими данными, — весь контекст этого урока, рассказанный одной историей.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://www.mongodb.com/docs/manual/sharding/" target="_blank" rel="noopener">Sharding</a>
+      <span class="res-by">MongoDB manual</span>
+      <p class="res-why">Собственные картинки производителя: шардированный кластер (шарды как replica set, mongos, config servers) и шардирование по диапазонам против хешированного. Читай рядом с рис. 2 и вторым виджетом; помни, что числа там сегодняшние, а не со слайдов.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="during">
+      <a class="res-title" href="https://thesecretlivesofdata.com/raft/" target="_blank" rel="noopener">The Secret Lives of Data: Raft</a>
+      <span class="res-by">thesecretlivesofdata.com</span>
+      <p class="res-why">Прощёлкай выборы лидера и разделение сети: записи стороны меньшинства откатываются, когда сеть восстанавливается. Raft — семейство, из которого происходит протокол replica set в MongoDB, — механизм рис. 6 в анимации.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://aphyr.com/posts/284-call-me-maybe-mongodb" target="_blank" rel="noopener">Call me maybe: MongoDB</a>
+      <span class="res-by">Kyle Kingsbury (Jepsen), 2013</span>
+      <p class="res-why">Тест, стоящий за историей 2013 года: replica set с разделённой сетью, откат и сравнение разных write concern. Что «CP» значит на практике, когда сеть действительно рвётся.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="after">
+      <a class="res-title" href="https://martin.kleppmann.com/2015/05/11/please-stop-calling-databases-cp-or-ap.html" target="_blank" rel="noopener">Please stop calling databases CP or AP</a>
+      <span class="res-by">Martin Kleppmann, 2015</span>
+      <p class="res-why">От автора учебника курса: почему система с одним лидером, такая как MongoDB, не вписывается чисто ни в один угол и как для каждой операции сказать, что гарантируется. На экзамене называй "CP" со слайда; читай это, чтобы знать его границы.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>MongoDB заглядывает внутрь каждого документа: shard key — чтобы его маршрутизировать, поля — чтобы фильтровать, pipeline — чтобы агрегировать. Следующее семейство от всего этого отказывается: значение непрозрачно, а ключ — единственный вход. Что остаётся делать с данными и почему это самое быстрое из всего?</p>
+</aside>
+
+</main>
+</body>
+</html>

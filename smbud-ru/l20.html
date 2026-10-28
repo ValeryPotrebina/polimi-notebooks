@@ -1,0 +1,1241 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Колоночные хранилища и модель данных Cassandra · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l20">
+
+<header class="lesson-head">
+  <h1>Колоночные хранилища и модель данных Cassandra</h1>
+  <p class="lede">После этого урока ты сможешь объяснить, что колоночное хранилище выигрывает и чем за это платит, раскодировать столбец, сжатый кодированием длин серий (run-length encoding), нарисовать данные Cassandra так, как их рисуют слайды, — keyspace, column family, ключ строки (row key), столбцы из имени, значения и временной метки, суперстолбцы (super columns), — и сказать, почему таблицы Cassandra проектируют, начиная с запросов.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Лекция этого урока называется "Columnar Databases – Cassandra" (p. 396). Первая её половина определяет семейство: "The Column Oriented Database stores data in columns", "mainly used in OLAP" (p. 401). График (p. 405) показывает зачем: чтобы прочитать 4 байта из каждой 148-байтовой записи, строковому хранилищу нужно около 51 секунды — и столько же, около 51 секунды, чтобы прочитать все 148. Колоночное хранилище читает эти 4 байта примерно за секунду.</p>
+  <p>Потом лекция переходит к Cassandra — той самой базе из её заголовка, — и на слайде написано: "think of cassandra as row-oriented" (p. 417). А ещё раньше (p. 412) — "Often write-heavy workloads": нагрузка с преобладанием записи, полная противоположность аналитике.</p>
+  <p>Так колоночное хранилище Cassandra или нет? Правы оба слайда. К концу урока ты будешь знать, в каком смысле сказано каждое утверждение и как это сформулировать на экзамене.</p>
+</div>
+
+
+<section id="l20-workload">
+  <h2>Wide-column stores и нагрузка, для которой они созданы</h2>
+
+  <p>Представь сервис сообщений: множество пользователей весь день пишут и читают короткие сообщения, без всякого порядка, и нет двух одинаковых почтовых ящиков. Слайд "Issues with today's workloads" (p. 399) описывает ровно это:</p>
+
+  <ul>
+    <li>"Data large and unstructured" — данных слишком много для одной машины, и фиксированного набора полей нет;</li>
+    <li>"Lots of random reads and writes" — много мелких операций, а не одно длинное сканирование;</li>
+    <li>"Foreign keys rarely needed" — каждая запись читается сама по себе.</li>
+  </ul>
+
+  <p>Его "Actual Needs" (реальные потребности): "Incremental Scalability", "Speed", "No Single point of failure", "Low cost (TCO) and admin" (TCO — total cost of ownership, совокупная стоимость владения) и "Scale out, not up" — добавлять обычные машины, а не покупать одну побольше (<a href="l03.html">урок 3</a>).</p>
+
+  <p>Следующий слайд (p. 397) помещает системы, построенные под такую нагрузку, среди семейств NoSQL из <a href="l05.html">урока 5</a>: "Data stored in 4 types: Document, Graph, Key-value, Wide-column". Эта часть лекции называется "Big Column Stores" (p. 398); конспект курса объясняет название: в одной строке может быть "a huge number of different columns and that is why columnar db are also often called Big Column stores" — огромное число разных столбцов.</p>
+
+  <figure class="tbl-fig" id="l20-tbl-families">
+    <figcaption>"Overview – NoSQL Family" (p. 397): семейства и их системы, с уроками этой тетради.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Семейство на слайде</th><th>Системы на слайде</th><th>Уроки</th></tr></thead>
+        <tbody>
+          <tr><td>Document Database</td><td>CouchDB, Couchbase, MarkLogic, mongoDB</td><td class="num">13–16</td></tr>
+          <tr><td>Graph Databases</td><td>Neo4j, InfiniteGraph</td><td class="num">10–12</td></tr>
+          <tr><td>Key-value Databases</td><td>redis, Amazon DynamoDB, Aerospike, riak</td><td class="num">17–19</td></tr>
+          <tr class="is-key"><td>Wide Column Stores</td><td>Accumulo, Hypertable, Cassandra, Apache HBase, Amazon SimpleDB</td><td class="num">20–22</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Слайд (p. 400) напоминает теорему CAP из <a href="l05.html#l05-cap">урока 5</a> — "Consistency: all nodes have same data at any time", "Availability: the system allows operations all the time", "Partition-tolerance: the system continues to work in spite of network partitions" — и указывает место Cassandra: "Eventual (weak) consistency, Availability, Partition-tolerance". Для почтового ящика это правильный выбор: сообщение, пришедшее на секунду позже, никому не вредит, а ящик, который не открывается, — вредит.</p>
+
+  <aside class="redpen" data-page="400">
+    <p class="claim">"at most 2 out of the 3 guarantees"</p>
+    <p class="fix">От устойчивости к разделению (partition tolerance) отказаться нельзя: в распределённой системе разделения сети обязательно случаются. Пока разделение длится, система жертвует либо согласованностью, либо доступностью — Cassandra по умолчанию жертвует согласованностью.</p>
+    <p class="because">Узел, отрезанный от остальных, может только отказать (нет доступности) или ответить из своей копии (нет согласованности) — это рассуждение из <a href="l05.html#l05-cap">урока 5</a>, где слайд (p. 195) делает то же утверждение, а следующий (p. 196) его исправляет ("CA doesn't make any sense"). Экзамен могут проверять по напечатанной формулировке: знай её, а отвечай с поправкой.</p>
+  </aside>
+
+  <p>"Eventual" — лишь значение по умолчанию: каждое чтение или запись указывает, сколько копий должно ответить (CL из раздела 4), так что отдельная операция может купить согласованность ценой ожидания — это и есть "tuneably consistent" со слайда (p. 438) (<a href="l22.html">урок 22</a>).</p>
+</section>
+
+
+<section id="l20-colstore">
+  <h2>Колоночное хранение: читаем меньше, пишем больше</h2>
+
+  <p>Прежде чем дойти до Cassandra, слайды (pp. 401–408) описывают другую конструкцию, у которой общее с ней только слово «column». Возьмём сеть магазинов, которая записывает каждую продажу в пять столбцов со слайда (p. 402): дата, магазин, товар, покупатель, цена. Кассир добавляет продажу каждые несколько секунд. Аналитик раз в ночь спрашивает выручку каждого магазина — два столбца из пяти, по всем продажам за всё время.</p>
+
+  <p>Слайд (p. 401): "The Column Oriented Database stores data in columns", "mainly used in OLAP(online Analytical Processing), Data Mining operations". <mark class="key">OLAP</mark> — это вопрос аналитика: мало столбцов, очень много строк. Противоположность — OLTP (online transaction processing), вопрос кассира: целые записи, по одной за раз.</p>
+
+  <p>Следующий слайд (p. 402) сравнивает две раскладки. <mark class="key">Строковое хранилище (row store)</mark> держит каждую запись одним куском: "+ easy to add/modify a record", "- might read in unnecessary data". <mark class="key">Колоночное хранилище (column store)</mark> держит каждый столбец отдельным куском: "+ only need to read in relevant data", "- tuple writes require multiple accesses" (tuple, кортеж, — это запись). Вердикт: "suitable for read-mostly, read-intensive, large data repositories" — подходит для больших хранилищ, которые в основном читают.</p>
+
+  <div class="widget" id="l20-w-layout">
+    <h3 class="widget-title">Одна таблица, два способа положить её на диск</h3>
+    <p class="widget-intro">Шестнадцать продаж по восемь столбцов (квартал, дата, магазин, товар, покупатель, количество, цена, канал), по четыре байта на значение. Сверху — строковое хранилище: продажи одна за другой, по две в строке. Снизу — колоночное: по файлу на столбец. В ячейках напечатаны только квартал и цена. Выбери запрос: пунктирные рамки показывают, что каждая раскладка читает с диска, а подкрашенные ячейки — что нужно запросу. Два переключателя сжимают столбец квартала и меняют порядок строк.</p>
+    <ol class="tasks">
+      <li>Оставь запрос «сумма price по кварталам». Прежде чем смотреть на показания, предскажи: какую долю байтов, прочитанных строковым хранилищем, запрос действительно использует? Потом сравни пунктирные рамки сверху и снизу.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Четверть: 128 из 512 байт. Строковое хранилище вынуждено прочитать все шестнадцать записей целиком; колоночное читает два файла, 128 байт, и больше ничего. Ради этого виджет и сделан: колоночное хранилище читает только те столбцы, которые называет запрос, — здесь 2 из 8.</p></details>
+      </li>
+      <li>Переключи на «вся запись продажи 7», затем на «вставить новую продажу». Для каждого случая предскажи, сколько отдельных мест на диске затрагивает каждая раскладка.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>1 против 8, оба раза. Запись — один кусок в строковом хранилище и восемь кусков в колоночном: восемь позиционирований головки (seek) и сборка по позиции, чтобы прочитать её, восемь записей, чтобы добавить. Это и есть минусы со слайда (p. 404) — время позиционирования, стоимость вставок, восстановление кортежей — и причина слов "read-mostly".</p></details>
+      </li>
+      <li>Вернись к «сумма price по кварталам» и включи кодирование длин серий. Предскажи, сколько серий (runs) получится из столбца квартала, затем посмотри показание для 1,750 строк. Напоследок отсортируй строки по покупателю и предскажи снова.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Четыре серии, (Q1, 1, 3) (Q2, 4, 3) (Q3, 7, 5) (Q4, 12, 5): 48 байт вместо 64. На 1,750 строках они превращаются в тройки со слайда (p. 407), и 7,000 байт сжимаются до 48. При сортировке по покупателю соседние кварталы всегда различаются: 16 серий длины 1 заняли бы 192 байта, втрое больше сырого столбца, поэтому он остаётся несжатым (те же 1,750 кварталов (p. 407) в смоделированном случайном порядке: 1,306 серий, 15,672 байта). Кодирование длин серий окупается только на отсортированных или сгруппированных столбцах.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l20-w-layout', function (root, ui) {
+    var COLS = ['qtr', 'date', 'store', 'prod', 'cust', 'qty', 'price', 'chan'];
+    var R = [
+      ['Q1', '01-12', 'S1', 'P1', 'C4', 2, 5, 'shop'], ['Q1', '02-03', 'S2', 'P1', 'C1', 1, 7, 'web'],
+      ['Q1', '03-20', 'S1', 'P2', 'C3', 1, 2, 'shop'], ['Q2', '04-02', 'S3', 'P1', 'C2', 3, 9, 'web'],
+      ['Q2', '05-15', 'S1', 'P2', 'C5', 1, 6, 'shop'], ['Q2', '06-08', 'S2', 'P3', 'C1', 2, 8, 'shop'],
+      ['Q3', '07-01', 'S2', 'P1', 'C3', 1, 5, 'web'], ['Q3', '07-19', 'S3', 'P2', 'C4', 2, 3, 'shop'],
+      ['Q3', '08-05', 'S1', 'P3', 'C2', 1, 8, 'web'], ['Q3', '08-30', 'S2', 'P1', 'C5', 4, 1, 'shop'],
+      ['Q3', '09-14', 'S3', 'P2', 'C1', 1, 4, 'web'], ['Q4', '10-03', 'S1', 'P1', 'C2', 2, 6, 'shop'],
+      ['Q4', '10-27', 'S2', 'P3', 'C4', 1, 2, 'web'], ['Q4', '11-11', 'S3', 'P1', 'C3', 3, 7, 'shop'],
+      ['Q4', '12-02', 'S1', 'P2', 'C5', 1, 9, 'web'], ['Q4', '12-18', 'S2', 'P2', 'C1', 2, 4, 'shop']
+    ];
+    var NEW = ['Q4', '12-29', 'S3', 'P1', 'C3', 1, 5, 'web'];
+    var BYQ = R.map(function (r, i) { return i + 1; });
+    var BYC = [2, 6, 11, 16, 4, 9, 12, 3, 7, 14, 1, 8, 13, 5, 10, 15];   // sorted by customer, then by sale number
+    var B = 4, N = 16, M = 8, REC = B * M, BIG = 1750;
+    var BIGRUNS = [['Q1', 1, 300], ['Q2', 301, 350], ['Q3', 651, 500], ['Q4', 1151, 600]];   // p. 407
+    var bigShuffled = (function () {          // runs of the 1,750 quarters when the rows follow the customers instead
+      var q = [];
+      BIGRUNS.forEach(function (p) { for (var i = 0; i < p[2]; i++) q.push(p[0]); });
+      var s = Course.rng(20).shuffle(q), runs = 1;
+      for (var i = 1; i < s.length; i++) if (s[i] !== s[i - 1]) runs++;
+      return runs;
+    })();
+    var Q = {
+      sum: { label: 'сумма price по кварталам (2 из 8)', cols: [0, 6], kind: 'scan' },
+      avg: { label: 'средняя цена (1 из 8)', cols: [6], kind: 'scan' },
+      rec: { label: 'вся запись продажи 7', cols: [0, 1, 2, 3, 4, 5, 6, 7], kind: 'rec' },
+      ins: { label: 'вставить новую продажу (продажа 17)', cols: [0, 1, 2, 3, 4, 5, 6, 7], kind: 'ins' }
+    };
+    var qSel = ui.select('запрос', ['sum', 'avg', 'rec', 'ins'].map(function (k) { return { value: k, label: Q[k].label }; }), null, 'sum');
+    var rle = ui.toggle('кодировать столбец квартала длинами серий (RLE)', false);
+    var cust = ui.toggle('сортировать строки по покупателю, а не по кварталу', false);
+    var roRow = ui.readout('строковое хранилище'), roCol = ui.readout('колоночное хранилище'), roQ = ui.readout('столбец квартала'), roBig = ui.readout('в масштабе 1,750 строк (p. 407), расчёт');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'нужно запросу', color: 's2', mark: 'area' },
+      { label: 'читается с диска', color: 's2', mark: 'dash' },
+      { label: 'записывается вставкой', color: 's1', mark: 'area' }
+    ]);
+    var svg = ui.svg(560, 480, { label: 'Одни и те же шестнадцать продаж, дважды разложенные на диске. Сверху строковое хранилище, по две записи в строке; снизу колоночное, по строке на столбец. Пунктирные рамки показывают, что читает выбранный запрос, подкрашенные ячейки — что ему нужно или что пишет вставка.' });
+
+    function n(x) { return String(x).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+    function state() {
+      var q = Q[qSel.value] || Q.sum, order = cust.value ? BYC : BYQ;
+      var recs = order.map(function (r) { return R[r - 1]; });
+      if (q.kind === 'ins') recs = recs.concat([NEW]);
+      var runs = [];
+      recs.forEach(function (r, i) {
+        var last = runs[runs.length - 1];
+        if (last && last.v === r[0]) last.l++; else runs.push({ v: r[0], s: i + 1, l: 1 });
+      });
+      var rawQ = recs.length * B, rleQ = runs.length * 3 * B;
+      return { q: q, order: order, recs: recs, runs: runs, rawQ: rawQ, rleQ: rleQ, useRle: rle.value && rleQ < rawQ, pos7: order.indexOf(7) };
+    }
+    function runTxt(r) { return '(' + r.v + ', ' + r.s + ', ' + r.l + ')'; }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls, text: s }); }
+    var X0 = 76, CW = 28, CH = 20, LH = 24, RY = 30, CY = 282;
+    function shown(rec, c) { return c === 0 ? rec[0] : c === 6 ? String(rec[6]) : ''; }
+
+    function draw(st) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var q = st.q, slots = st.recs.length, need = {};
+      q.cols.forEach(function (c) { need[c] = true; });
+      T(10, 18, 'строковое хранилище: продажа за продажей, по две в строке', 'tx-sm tx-bold');
+      T(10, CY - 14, 'колоночное хранилище: по файлу на столбец', 'tx-sm tx-bold');
+      /* row store */
+      for (var k = 0; k < Math.ceil(slots / 2); k++) {
+        var y = RY + k * LH, a = 2 * k + 1, b = Math.min(2 * k + 2, slots);
+        T(66, y + 15, a === b ? String(a) : a + '–' + b, 'tx-sm tx-end');
+        for (var c = 0; c < 16; c++) {
+          var slot = 2 * k + (c >= 8 ? 1 : 0);
+          if (slot >= slots) continue;
+          var col = c % 8, x = X0 + c * CW, cls = 'fi-paper st-muted';
+          if (q.kind === 'scan' && need[col]) cls = 'fw-s2 st-s2';
+          if (q.kind === 'rec' && slot === st.pos7) cls = 'fw-s2 st-s2';
+          if (q.kind === 'ins' && slot === slots - 1) cls = 'fw-s1 st-s1';
+          S('rect', { x: x + 1, y: y, width: CW - 2, height: CH, 'class': cls });
+          var v = shown(st.recs[slot], col);
+          if (v) T(x + CW / 2, y + 15, v, 'tx-mono tx-sm tx-mid');
+        }
+        if (2 * k + 1 < slots) S('line', { x1: X0 + 8 * CW, y1: y - 2, x2: X0 + 8 * CW, y2: y + CH + 2, 'class': 'sw-2' });
+      }
+      if (q.kind === 'scan') S('rect', { x: X0 - 3, y: RY - 4, width: 16 * CW + 6, height: 7 * LH + CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+      if (q.kind === 'rec') {
+        var kk = Math.floor(st.pos7 / 2), half = st.pos7 % 2;
+        S('rect', { x: X0 + half * 8 * CW - 3, y: RY + kk * LH - 4, width: 8 * CW + 6, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+      }
+      /* column store */
+      for (var j = 0; j < M; j++) {
+        var y2 = CY + j * LH;
+        T(66, y2 + 15, COLS[j], 'tx-mono tx-sm tx-end');
+        if (j === 0 && st.useRle) {
+          st.runs.forEach(function (r, i) {
+            var x = X0 + i * 3 * CW, cls = 'fi-paper';
+            var hit = q.kind === 'rec' && st.pos7 + 1 >= r.s && st.pos7 + 1 <= r.s + r.l - 1;
+            if ((q.kind === 'scan' && need[0]) || hit) cls = 'fw-s2 st-s2';
+            if (q.kind === 'ins' && i === st.runs.length - 1) cls = 'fw-s1 st-s1';
+            S('rect', { x: x + 1, y: CY, width: 3 * CW - 2, height: CH, 'class': cls });
+            T(x + 1.5 * CW, CY + 15, '(' + r.v + ',' + r.s + ',' + r.l + ')', 'tx-sm tx-mid');
+            if (hit) S('rect', { x: x - 2, y: CY - 4, width: 3 * CW + 4, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+          });
+          if (q.kind === 'scan' && need[0]) S('rect', { x: X0 - 3, y: CY - 4, width: st.runs.length * 3 * CW + 6, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+          continue;
+        }
+        for (var p = 0; p < slots; p++) {
+          var xx = X0 + p * CW, cl = 'fi-paper st-muted';
+          if (q.kind === 'scan' && need[j]) cl = 'fw-s2 st-s2';
+          if (q.kind === 'rec' && p === st.pos7) cl = 'fw-s2 st-s2';
+          if (q.kind === 'ins' && p === slots - 1) cl = 'fw-s1 st-s1';
+          S('rect', { x: xx + 1, y: y2, width: CW - 2, height: CH, 'class': cl });
+          var vv = shown(st.recs[p], j);
+          if (vv) T(xx + CW / 2, y2 + 15, vv, 'tx-mono tx-sm tx-mid');
+        }
+        if (q.kind === 'scan' && need[j]) S('rect', { x: X0 - 3, y: y2 - 4, width: N * CW + 6, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+        if (q.kind === 'rec') S('rect', { x: X0 + st.pos7 * CW - 2, y: y2 - 4, width: CW + 4, height: CH + 8, 'class': 'fi-none st-s2 sw-2 dash' });
+      }
+    }
+
+    ui.onChange(function () {
+      var st = state(), q = st.q;
+      if (q.kind === 'scan') {
+        var k = q.cols.length, need = N * k * B, read = N * REC;
+        var colB = q.cols.reduce(function (s, c) { return s + (c === 0 && st.useRle ? st.rleQ : N * B); }, 0);
+        roRow.set('читает все 16 записей: ' + read + ' B в 1 месте; запросу нужно ' + need + ' B (' + Math.round(100 * need / read * 10) / 10 + ' %)');
+        roCol.set('читает ' + k + (k > 1 ? ' файла: ' : ' файл: ') + colB + ' B в ' + k + (k > 1 ? ' местах' : ' месте') + (st.useRle && q.cols.indexOf(0) >= 0 ? ' (квартал сериями)' : ''));
+        var bigQ = rle.value && !cust.value ? BIGRUNS.length * 3 * B : BIG * B;
+        var bigCol = q.cols.reduce(function (s, c) { return s + (c === 0 ? bigQ : BIG * B); }, 0);
+        var extra = '';
+        if (rle.value && q.cols.indexOf(0) >= 0) extra = cust.value
+          ? ' · квартал в случайном порядке (симуляция): серий ' + n(bigShuffled) + ' = ' + n(bigShuffled * 3 * B) + ' B, остаётся сырым'
+          : ' · квартал = тройки со слайда (p. 407), ' + BIGRUNS.map(function (r) { return '(' + r[0] + ', ' + r[1] + ', ' + r[2] + ')'; }).join(' ') + ': 48 B вместо 7,000 B';
+        roBig.set('строковое ' + n(BIG * REC) + ' B · колоночное ' + n(bigCol) + ' B' + extra);
+      } else if (q.kind === 'rec') {
+        roRow.set('читает продажу 7: ' + REC + ' B в 1 месте');
+        roCol.set('читает позицию ' + (st.pos7 + 1) + ' в 8 файлах: ' + ((M - 1) * B + (st.useRle ? 3 * B : B)) + ' B в 8 местах, затем собирает запись');
+        roBig.set('одна запись: 1 место против 8, какой бы длинной ни была таблица');
+      } else {
+        roRow.set('пишет продажу 17: ' + REC + ' B в 1 место');
+        roCol.set('пишет 8 значений в 8 файлов: 8 мест' + (st.useRle ? ', последняя серия квартала растёт' : ''));
+        roBig.set('одна запись: 1 место против 8, какой бы длинной ни была таблица');
+      }
+      if (!rle.value) roQ.set('значений ' + st.recs.length + ' = ' + st.rawQ + ' B, хранятся как есть');
+      else if (st.useRle) roQ.set('серий ' + st.runs.length + ' = ' + st.rleQ + ' B вместо ' + st.rawQ + ' B: ' + st.runs.map(runTxt).join(' '));
+      else roQ.set('серий ' + st.runs.length + ', это заняло бы ' + st.rleQ + ' B, больше сырых ' + st.rawQ + ' B: остаётся сырым');
+      var t = '';
+      if (qSel.value === 'sum') t = 'Запросу нужны qtr и price, 2 из 8 значений каждой продажи. Строковое хранилище читает каждую запись целиком — "might read in unnecessary data" (p. 402); колоночное читает два файла — "only need to read in relevant data". Результат: Q1 14 · Q2 23 · Q3 21 · Q4 28.';
+      else if (qSel.value === 'avg') t = 'Один столбец из восьми: колоночное хранилище читает восьмую часть байтов строкового. Результат: 86 / 16 = 5.375.';
+      else if (qSel.value === 'rec') t = 'Теперь запись — один кусок в строковом хранилище и восемь кусков в колоночном: по одному позиционированию на файл ("Increased Disk Seek Time", p. 404), затем шаг Construct склеивает позицию ' + (st.pos7 + 1) + ' всех файлов ("tuple reconstruction", p. 405). Продажа 7 = (Q3, 07-01, S2, P1, C3, 1, 5, web).';
+      else t = 'Одна новая продажа: строковое хранилище дописывает один кусок, колоночное — дописывает в восемь файлов: "tuple writes require multiple accesses" (p. 402), "Increased cost of Inserts" (p. 404).' + (st.useRle ? ' С сериями меняется одна тройка: (Q4, 12, 5) становится (Q4, 12, 6).' : '');
+      note.set(t);
+      draw(st);
+    });
+  });
+  </script>
+
+  <p>В числах: при \(N\) записях из \(m\) столбцов по \(w\) байт запрос, которому нужны \(k\) столбцов, читает</p>
+
+  <div class="formula">
+    \[ \begin{aligned} \text{row store:}\quad &amp; N \cdot m \cdot w \\ \text{column store:}\quad &amp; N \cdot k \cdot w \end{aligned} \]
+  </div>
+
+  <p>то есть колоночное хранилище читает долю \(k/m\): 2 столбца из 8 — четверть. Слайд (p. 403) перечисляет четыре "Pros" только по названиям; их механизмы (дополнительно, не со слайдов):</p>
+
+  <ul>
+    <li>"Data compression": значения одного столбца одного типа и повторяются (см. ниже).</li>
+    <li>"Improved Bandwidth Utilization": каждый перемещённый байт принадлежит нужному столбцу.</li>
+    <li>"Improved Code Pipelining": один плотный цикл по массиву одного типа — по той же причине операция NumPy над целым массивом обгоняет цикл на Python.</li>
+    <li>"Improved cache locality": соседние значения в памяти — как раз те, что будут прочитаны следующими.</li>
+  </ul>
+
+  <p>"Cons" со слайда (p. 404) — цена разрезания записей на части, и виджет показал каждый: "Increased Disk Seek Time" (запись живёт в \(m\) файлах), "Increased cost of Inserts" (одна запись — \(m\) операций записи), "Increases tuple reconstruction costs" (целые записи приходится склеивать обратно).</p>
+
+  <p>Слайд "Tuple Reconstruction" (p. 405) измеряет этот компромисс (рис. 1). Строковое хранилище тратит одно и то же время, что бы ни выбирал запрос, потому что всегда читает кортежи целиком; время колоночного растёт с числом выбранных байтов и догоняет строковое только около 125 из 148. Пункт "Large prefetch hides disk seeks in columns" отвечает на первый минус: если читать каждый файл столбца большими кусками, множество мелких прыжков превращается в несколько длинных чтений.</p>
+
+  <figure class="fig fig--plain" id="l20-fig-chart">
+    <svg class="dia" viewBox="0 0 560 300" role="img" aria-label="Время выполнения в зависимости от числа выбранных байтов на кортеж. Линия строкового хранилища ровная, около 51 секунды. Линия колоночного растёт примерно от 1 секунды при 4 байтах до примерно 63 секунд при 148 байтах и пересекает строковую около 125 байт. Две пунктирные линии CPU остаются ниже 13 секунд.">
+      <line x1="70" y1="176.7" x2="536" y2="176.7" class="st-grid"/>
+      <line x1="70" y1="103.3" x2="536" y2="103.3" class="st-grid"/>
+      <line x1="70" y1="30" x2="536" y2="30" class="st-grid"/>
+      <line x1="70" y1="250" x2="536" y2="250" class="st-muted"/>
+      <line x1="70" y1="250" x2="70" y2="22" class="st-muted"/>
+      <line x1="456.5" y1="250" x2="456.5" y2="66" class="st-muted dash"/>
+      <line x1="70" y1="221.4" x2="530" y2="221.4" class="st-s4 sw-3 dots"/>
+      <polyline points="70,246.3 140.3,235.3 223.3,230.2 248.9,227.6 466.1,215.2 530,206" class="st-s5 sw-3 dots"/>
+      <line x1="70" y1="64.8" x2="530" y2="64.8" class="st-s4 sw-3"/>
+      <polyline points="70,246 82.8,237.2 95.6,230.9 108.3,224.3 121.1,217 133.9,210.4 140.3,208.9 223.3,171.2 248.9,152.1 466.1,58.2 478.9,50.9 491.7,42.8 504.4,34.8 517.2,27.4 530,19.7" class="st-s5 sw-3"/>
+      <polygon points="70,58.8 76,64.8 70,70.8 64,64.8" class="fi-s4"/>
+      <polygon points="223.3,58.8 229.3,64.8 223.3,70.8 217.3,64.8" class="fi-s4"/>
+      <polygon points="376.7,58.8 382.7,64.8 376.7,70.8 370.7,64.8" class="fi-s4"/>
+      <polygon points="530,58.8 536,64.8 530,70.8 524,64.8" class="fi-s4"/>
+      <polygon points="70,240 76,251 64,251" class="fi-s5"/>
+      <polygon points="140.3,202.9 146.3,213.9 134.3,213.9" class="fi-s5"/>
+      <polygon points="248.9,146.1 254.9,157.1 242.9,157.1" class="fi-s5"/>
+      <polygon points="466.1,52.2 472.1,63.2 460.1,63.2" class="fi-s5"/>
+      <polygon points="530,13.7 536,24.7 524,24.7" class="fi-s5"/>
+      <text x="10" y="14" class="tx-sm tx-muted">время (s)</text>
+      <text x="60" y="254" class="tx-sm tx-end">0</text>
+      <text x="60" y="181" class="tx-sm tx-end">20</text>
+      <text x="60" y="107" class="tx-sm tx-end">40</text>
+      <text x="60" y="34" class="tx-sm tx-end">60</text>
+      <text x="70" y="270" class="tx-sm tx-mid">4</text>
+      <text x="172.2" y="270" class="tx-sm tx-mid">36</text>
+      <text x="274.4" y="270" class="tx-sm tx-mid">68</text>
+      <text x="376.7" y="270" class="tx-sm tx-mid">100</text>
+      <text x="478.9" y="270" class="tx-sm tx-mid">132</text>
+      <text x="530" y="270" class="tx-sm tx-mid">148</text>
+      <text x="300" y="292" class="tx-sm tx-mid">выбрано байт на кортеж (кортеж — 148 байт)</text>
+      <text x="90" y="54" class="tx-sm halo">row store</text>
+      <text x="448" y="40" class="tx-sm tx-end halo">пересечение около 125 байт</text>
+      <text x="332" y="138" class="tx-sm halo">column store</text>
+      <text x="534" y="194" class="tx-sm tx-end halo">column CPU</text>
+      <text x="520" y="242" class="tx-sm tx-end halo">row CPU</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> График со слайда (p. 405), перерисованный; значения сняты с графика на слайде, а не напечатаны на нём. Строковому хранилищу (бирюзовый, ромбы) нужно около 51 с, что бы ни выбирал запрос. Колоночному (пурпурный, треугольники) нужно время пропорционально выбранным байтам — от примерно 1 с для 4 байт, — и проигрывает оно только около 125 из 148 байт. Пунктирные линии — доля CPU в каждом времени: меньше 13 с даже у колоночного хранилища, так что сборка кортежей дешева по сравнению со сэкономленным чтением.</figcaption>
+  </figure>
+
+  <p>Тот же слайд показывает, как записи собираются обратно ("Construct"). Позиция \(i\) каждого столбца принадлежит записи \(i\): восстановление — это склейка (zip) по позиции, без всяких ключей. А prodID хранится одной серией (4,1,4) — значение 4, начиная с позиции 1, четыре раза: это сжатие со следующих двух слайдов.</p>
+
+  <figure class="tbl-fig" id="l20-tbl-construct">
+    <figcaption>Construct (p. 405): четыре хранимых столбца, склеенные строка за строкой (позиции с 1 по 4) в четыре кортежа. prodID хранится одной серией, (4,1,4).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>prodID</th><th>storeID</th><th>custID</th><th>price</th><th>кортеж</th></tr></thead>
+        <tbody>
+          <tr><td class="num">4</td><td class="num">2</td><td class="num">2</td><td class="num">7</td><td class="num">(4, 2, 2, 7)</td></tr>
+          <tr><td class="num">4</td><td class="num">1</td><td class="num">3</td><td class="num">13</td><td class="num">(4, 1, 3, 13)</td></tr>
+          <tr><td class="num">4</td><td class="num">3</td><td class="num">3</td><td class="num">42</td><td class="num">(4, 3, 3, 42)</td></tr>
+          <tr><td class="num">4</td><td class="num">1</td><td class="num">3</td><td class="num">80</td><td class="num">(4, 1, 3, 80)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Слайд (p. 406): сжатие "Trades I/O for CPU" — меньше байтов читать, немного декодировать, — а сканирование ждёт диск, так что обмен выгоден. Больше всех выигрывают колоночные хранилища: "Higher data value locality in column stores" (соседи принадлежат одному атрибуту), "Techniques such as run length encoding far more useful", а сэкономленное место "Can use extra space to store multiple copies of data in different sort orders" — по копии на каждый вид запроса.</p>
+
+  <div class="def">
+    <p><dfn>Кодирование длин серий (run-length encoding, RLE)</dfn> — серия одинаковых соседних значений хранится одной тройкой (value, start_pos, run_length): значение, его первая позиция, число строк.</p>
+  </div>
+
+  <aside class="margin-note">Конспект курса записывает серию двумя полями, ("Q1", 200): значение и сколько раз оно повторяется. Третье поле слайда, начальная позиция, позволяет найти строку, не суммируя предыдущие серии.</aside>
+
+  <p>Слайд (p. 407) кодирует таблицу продаж, отсортированную по кварталу (рис. 2): Quarter схлопывается в четыре тройки, Product ID — в короткие серии, а Price остаётся несжатым — соседние цены редко повторяются, и кодировку выбирают для каждого столбца отдельно.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l20-fig-rle">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 330" role="img" aria-label="Три сырых столбца таблицы продаж: Quarter — Q1 семь раз, пропуск, затем Q2 четыре раза; Product ID — 1, 1, 1, 1, 1, 2, 2, затем 1, 1, 1, 2; Price — 5, 7, 2, 9, 6, 8, 5, затем 3, 8, 1, 4. Слева пронумерованы позиции с 1 по 7 и с 301 по 304.">
+        <text x="64" y="20" class="tx-sm tx-bold tx-mid">Quarter</text>
+        <text x="156" y="20" class="tx-sm tx-bold tx-mid">Product ID</text>
+        <text x="247" y="20" class="tx-sm tx-bold tx-mid">Price</text>
+        <rect x="36" y="30" width="56" height="20" class="fi-paper"/><rect x="128" y="30" width="56" height="20" class="fi-paper"/><rect x="222" y="30" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="52" width="56" height="20" class="fi-paper"/><rect x="128" y="52" width="56" height="20" class="fi-paper"/><rect x="222" y="52" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="74" width="56" height="20" class="fi-paper"/><rect x="128" y="74" width="56" height="20" class="fi-paper"/><rect x="222" y="74" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="96" width="56" height="20" class="fi-paper"/><rect x="128" y="96" width="56" height="20" class="fi-paper"/><rect x="222" y="96" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="118" width="56" height="20" class="fi-paper"/><rect x="128" y="118" width="56" height="20" class="fi-paper"/><rect x="222" y="118" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="140" width="56" height="20" class="fi-paper"/><rect x="128" y="140" width="56" height="20" class="fi-paper"/><rect x="222" y="140" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="162" width="56" height="20" class="fi-paper"/><rect x="128" y="162" width="56" height="20" class="fi-paper"/><rect x="222" y="162" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="206" width="56" height="20" class="fi-paper"/><rect x="128" y="206" width="56" height="20" class="fi-paper"/><rect x="222" y="206" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="228" width="56" height="20" class="fi-paper"/><rect x="128" y="228" width="56" height="20" class="fi-paper"/><rect x="222" y="228" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="250" width="56" height="20" class="fi-paper"/><rect x="128" y="250" width="56" height="20" class="fi-paper"/><rect x="222" y="250" width="50" height="20" class="fi-paper"/>
+        <rect x="36" y="272" width="56" height="20" class="fi-paper"/><rect x="128" y="272" width="56" height="20" class="fi-paper"/><rect x="222" y="272" width="50" height="20" class="fi-paper"/>
+        <text x="30" y="44" class="tx-sm tx-end tx-muted">1</text><text x="64" y="44" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="44" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="44" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="30" y="66" class="tx-sm tx-end tx-muted">2</text><text x="64" y="66" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="66" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="66" class="tx-mono tx-sm tx-mid">7</text>
+        <text x="30" y="88" class="tx-sm tx-end tx-muted">3</text><text x="64" y="88" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="88" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="88" class="tx-mono tx-sm tx-mid">2</text>
+        <text x="30" y="110" class="tx-sm tx-end tx-muted">4</text><text x="64" y="110" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="110" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="110" class="tx-mono tx-sm tx-mid">9</text>
+        <text x="30" y="132" class="tx-sm tx-end tx-muted">5</text><text x="64" y="132" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="132" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="132" class="tx-mono tx-sm tx-mid">6</text>
+        <text x="30" y="154" class="tx-sm tx-end tx-muted">6</text><text x="64" y="154" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="154" class="tx-mono tx-sm tx-mid">2</text><text x="247" y="154" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="30" y="176" class="tx-sm tx-end tx-muted">7</text><text x="64" y="176" class="tx-mono tx-sm tx-mid">Q1</text><text x="156" y="176" class="tx-mono tx-sm tx-mid">2</text><text x="247" y="176" class="tx-mono tx-sm tx-mid">5</text>
+        <text x="64" y="198" class="tx-mid">…</text><text x="156" y="198" class="tx-mid">…</text><text x="247" y="198" class="tx-mid">…</text>
+        <text x="30" y="220" class="tx-sm tx-end tx-muted">301</text><text x="64" y="220" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="220" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="220" class="tx-mono tx-sm tx-mid">3</text>
+        <text x="30" y="242" class="tx-sm tx-end tx-muted">302</text><text x="64" y="242" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="242" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="242" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="30" y="264" class="tx-sm tx-end tx-muted">303</text><text x="64" y="264" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="264" class="tx-mono tx-sm tx-mid">1</text><text x="247" y="264" class="tx-mono tx-sm tx-mid">1</text>
+        <text x="30" y="286" class="tx-sm tx-end tx-muted">304</text><text x="64" y="286" class="tx-mono tx-sm tx-mid">Q2</text><text x="156" y="286" class="tx-mono tx-sm tx-mid">2</text><text x="247" y="286" class="tx-mono tx-sm tx-mid">4</text>
+        <text x="64" y="310" class="tx-mid">…</text><text x="156" y="310" class="tx-mid">…</text><text x="247" y="310" class="tx-mid">…</text>
+      </svg>
+      <p class="fig-label">До: столбцы как они хранятся, позиция за позицией</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 330" role="img" aria-label="Те же столбцы в закодированном виде. Quarter — четыре тройки (Q1, 1, 300), (Q2, 301, 350), (Q3, 651, 500), (Q4, 1151, 600). Product ID — (1, 1, 5), (2, 6, 2), затем (1, 301, 3), (2, 304, 1). Price без изменений.">
+        <text x="70" y="20" class="tx-sm tx-bold tx-mid">Quarter</text>
+        <text x="190" y="20" class="tx-sm tx-bold tx-mid">Product ID</text>
+        <text x="270" y="20" class="tx-sm tx-bold tx-mid">Price</text>
+        <rect x="10" y="30" width="120" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="58" width="120" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="86" width="120" height="24" class="fw-s1 st-s1"/>
+        <rect x="10" y="114" width="120" height="24" class="fw-s1 st-s1"/>
+        <text x="70" y="46" class="tx-mono tx-sm tx-mid">(Q1, 1, 300)</text>
+        <text x="70" y="74" class="tx-mono tx-sm tx-mid">(Q2, 301, 350)</text>
+        <text x="70" y="102" class="tx-mono tx-sm tx-mid">(Q3, 651, 500)</text>
+        <text x="70" y="130" class="tx-mono tx-sm tx-mid">(Q4, 1151, 600)</text>
+        <rect x="142" y="30" width="96" height="24" class="fw-s1 st-s1"/>
+        <rect x="142" y="58" width="96" height="24" class="fw-s1 st-s1"/>
+        <text x="190" y="98" class="tx-mid">…</text>
+        <rect x="142" y="110" width="96" height="24" class="fw-s1 st-s1"/>
+        <rect x="142" y="138" width="96" height="24" class="fw-s1 st-s1"/>
+        <text x="190" y="178" class="tx-mid">…</text>
+        <text x="190" y="46" class="tx-mono tx-sm tx-mid">(1, 1, 5)</text>
+        <text x="190" y="74" class="tx-mono tx-sm tx-mid">(2, 6, 2)</text>
+        <text x="190" y="126" class="tx-mono tx-sm tx-mid">(1, 301, 3)</text>
+        <text x="190" y="154" class="tx-mono tx-sm tx-mid">(2, 304, 1)</text>
+        <rect x="252" y="30" width="36" height="20" class="fi-paper"/><rect x="252" y="52" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="74" width="36" height="20" class="fi-paper"/><rect x="252" y="96" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="118" width="36" height="20" class="fi-paper"/><rect x="252" y="140" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="162" width="36" height="20" class="fi-paper"/><rect x="252" y="206" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="228" width="36" height="20" class="fi-paper"/><rect x="252" y="250" width="36" height="20" class="fi-paper"/>
+        <rect x="252" y="272" width="36" height="20" class="fi-paper"/>
+        <text x="270" y="44" class="tx-mono tx-sm tx-mid">5</text><text x="270" y="66" class="tx-mono tx-sm tx-mid">7</text>
+        <text x="270" y="88" class="tx-mono tx-sm tx-mid">2</text><text x="270" y="110" class="tx-mono tx-sm tx-mid">9</text>
+        <text x="270" y="132" class="tx-mono tx-sm tx-mid">6</text><text x="270" y="154" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="270" y="176" class="tx-mono tx-sm tx-mid">5</text><text x="270" y="198" class="tx-mid">…</text>
+        <text x="270" y="220" class="tx-mono tx-sm tx-mid">3</text><text x="270" y="242" class="tx-mono tx-sm tx-mid">8</text>
+        <text x="270" y="264" class="tx-mono tx-sm tx-mid">1</text><text x="270" y="286" class="tx-mono tx-sm tx-mid">4</text>
+        <text x="270" y="310" class="tx-mid">…</text>
+        <text x="10" y="214" class="tx-sm tx-muted">каждый блок:</text>
+        <text x="10" y="230" class="tx-sm tx-muted">(value, start_pos, run_length)</text>
+        <text x="10" y="290" class="tx-hand">1,750 строк, 4 блока</text>
+      </svg>
+      <p class="fig-label">После: Quarter и Product ID в виде серий, Price без изменений</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Кодирование длин серий на слайде (p. 407). Таблица отсортирована по кварталу, поэтому Quarter — это четыре серии: (Q1, 1, 300) читается как «Q1, с позиции 1, 300 раз», и 1,750 строк помещаются в четыре блока. У Product ID короткие серии внутри каждого квартала. В Price нет серий, которые стоило бы кодировать, и он остаётся сырым.</figcaption>
+  </figure>
+
+  <p>Прочитаем одну строку таблицы со слайда (p. 407), не раскодируя ничего лишнего:</p>
+
+  <ol class="steps" id="l20-steps-rle">
+    <li><p>Тройка \((v, s, l)\) означает \(l\) копий \(v\), начиная с позиции \(s\):</p> \[ c[i] = v \quad \text{for } s \le i \le s + l - 1 \] <p>(Q1, 1, 300) покрывает 1–300, (Q2, 301, 350) покрывает 301–650.</p></li>
+    <li><p>Каждая серия начинается там, где закончилась предыдущая, \(s_{j+1} = s_j + l_j\): 1 + 300 = 301, 301 + 350 = 651, 651 + 500 = 1151. Последняя заканчивается на 1151 + 600 − 1 = 1750: в таблице 1,750 строк.</p></li>
+    <li><p>Запросим строку 304. Она лежит в 301–650: квартал — Q2.</p></li>
+    <li><p>Product ID: (2, 304, 1) покрывает ровно 304, значит, товар — 2.</p></li>
+    <li><p>Price не сжат: берём его 304-е значение. Блок Q2 на слайде начинается с 301 значениями 3, 8, 1, 4, так что цена — 4.</p></li>
+    <li><p>Склеиваем по позиции: строка 304 — это (Q2, 2, 4). Снова восстановление кортежа.</p></li>
+  </ol>
+
+  <p>Кодированию длин серий нужны серии. Отсортируй шестнадцать продаж виджета по покупателю — и никакие два соседних квартала не совпадут: шестнадцать серий длины 1, втрое больше сырого столбца. Это последнее задание виджета.</p>
+
+  <p class="memo"><mark class="key">Колоночное хранилище читает только те столбцы, которые называет запрос, и платит по одному обращению на столбец всякий раз, когда целая запись читается или пишется.</mark></p>
+
+  <p>Слайд (p. 408) заканчивается списком "List of Databases": Cassandra, Vertica, SybaseIQ, C-Store, BigTable, MonetDB, LucidDB. Пять из них — колоночные хранилища в смысле слайдов (pp. 401–407) (C-Store, университетский прототип, живёт дальше как Vertica — это дополнительно), как и Snowflake (<a href="l23.html">урок 23</a>) и колоночные файлы Spark (<a href="l40.html">урок 40</a>). Cassandra и BigTable — нечто другое.</p>
+</section>
+
+
+<section id="l20-cassandra">
+  <h2>Cassandra: модель данных Bigtable на кольце Dynamo</h2>
+
+  <p>Слайд (p. 410): Cassandra была "Originally designed at Facebook" и сейчас "Open-sourced and now within Apache foundation".</p>
+
+  <div class="story" data-year="2007–2010">
+    <p>Авинаш Лакшман — один из авторов статьи Amazon о Dynamo — и Прашант Малик написали Cassandra в Facebook для поиска по входящим сообщениям: те самые случайные чтения и записи со слайда (p. 399). Её код открыли в июле 2008 года, а в феврале 2010-го она стала проектом верхнего уровня Apache. Название — в честь троянской пророчицы, которой никто не верил. (Дополнительно: Wikipedia, «Apache Cassandra».)</p>
+  </div>
+
+  <p>Слайд "innovation at scale" (p. 411) даёт родословную. "google bigtable (2006)": "consistency model: strong", "data model: sparse map", "clones: hbase, hypertable". "amazon dynamo (2007)": "O(1) dht", "consistency model: client tune-able", "clones: riak, voldemort". Итог: "cassandra ~= bigtable + dynamo".</p>
+
+  <p>Модель данных взята у Bigtable, распределение — у Dynamo. <mark class="key">Разреженная карта (sparse map)</mark> — это таблица, в строках которой заполнены только те ячейки, что у них есть; пустые ячейки ничего не стоят. DHT (distributed hash table, распределённая хеш-таблица) раскладывает ключи по машинам, хешируя их; O(1) значит, что любой узел добирается до владельца ключа за один переход, потому что каждый узел знает всё кольцо (<a href="l22.html">урок 22</a>). «~=» тут честное: в отличие от Bigtable, у Cassandra вообще нет мастера.</p>
+
+  <p>Слайд (p. 412) рисует модель на примере "blog keyspace" (рис. 3): "Column Families: Like SQL tables; but may be unstructured (client-specified); Can have index tables", "No schemas", "Some columns missing from some entries", "Supports get(key) and put(key, value) operations", "Often write-heavy workloads".</p>
+
+  <figure class="fig fig--plain" id="l20-fig-blog">
+    <svg class="dia" viewBox="0 0 560 452" role="img" aria-label="Три column families из blog keyspace. users: строки jbellis и dhutch со столбцами name и state, строка egilmore только с name. time_ordered_blogs_by_user: у строки каждого пользователя один столбец, имя которого — временная метка, а значение — id записи блога. blog entries: три строки со столбцами body, user и category; у user и category звёздочка — вторичные индексы.">
+      <text x="10" y="18" class="tx-sm tx-bold">users</text>
+      <line x1="54" y1="30" x2="54" y2="194" class="hl"/>
+      <rect x="10" y="28" width="88" height="52" class="fi-none"/>
+      <text x="54" y="59" class="tx-sm tx-mid">jbellis</text>
+      <rect x="100" y="28" width="84" height="26" class="fw-s3 st-s3"/><rect x="100" y="54" width="84" height="26" class="fi-paper"/>
+      <text x="142" y="46" class="tx-mono tx-sm tx-mid">name</text><text x="142" y="72" class="tx-sm tx-mid">jonathan</text>
+      <rect x="186" y="28" width="84" height="26" class="fw-s3 st-s3"/><rect x="186" y="54" width="84" height="26" class="fi-paper"/>
+      <text x="228" y="46" class="tx-mono tx-sm tx-mid">state</text><text x="228" y="72" class="tx-sm tx-mid">TX</text>
+      <rect x="10" y="86" width="88" height="52" class="fi-none"/>
+      <text x="54" y="117" class="tx-sm tx-mid">dhutch</text>
+      <rect x="100" y="86" width="84" height="26" class="fw-s3 st-s3"/><rect x="100" y="112" width="84" height="26" class="fi-paper"/>
+      <text x="142" y="104" class="tx-mono tx-sm tx-mid">name</text><text x="142" y="130" class="tx-sm tx-mid">daria</text>
+      <rect x="186" y="86" width="84" height="26" class="fw-s3 st-s3"/><rect x="186" y="112" width="84" height="26" class="fi-paper"/>
+      <text x="228" y="104" class="tx-mono tx-sm tx-mid">state</text><text x="228" y="130" class="tx-sm tx-mid">CA</text>
+      <rect x="10" y="144" width="88" height="52" class="fi-none"/>
+      <text x="54" y="175" class="tx-sm tx-mid">egilmore</text>
+      <rect x="100" y="144" width="84" height="26" class="fw-s3 st-s3"/><rect x="100" y="170" width="84" height="26" class="fi-paper"/>
+      <text x="142" y="162" class="tx-mono tx-sm tx-mid">name</text><text x="142" y="188" class="tx-sm tx-mid">eric</text>
+      <text x="190" y="188" class="tx-hand">нет state</text>
+      <text x="290" y="18" class="tx-sm tx-bold">time_ordered_blogs_by_user</text>
+      <line x1="334" y1="30" x2="334" y2="194" class="hl"/>
+      <rect x="290" y="28" width="88" height="52" class="fi-none"/>
+      <text x="334" y="59" class="tx-sm tx-mid">jbellis</text>
+      <rect x="380" y="28" width="168" height="26" class="fw-s3 st-s3"/><rect x="380" y="54" width="168" height="26" class="fi-paper"/>
+      <text x="464" y="46" class="tx-mono tx-sm tx-mid">1289847840615</text><text x="464" y="72" class="tx-sm tx-mid tx-mono">92dbeb5</text>
+      <rect x="290" y="86" width="88" height="52" class="fi-none"/>
+      <text x="334" y="117" class="tx-sm tx-mid">dhutch</text>
+      <rect x="380" y="86" width="168" height="26" class="fw-s3 st-s3"/><rect x="380" y="112" width="168" height="26" class="fi-paper"/>
+      <text x="464" y="104" class="tx-mono tx-sm tx-mid">1289847840615</text><text x="464" y="130" class="tx-sm tx-mid tx-mono">d418a66</text>
+      <rect x="290" y="144" width="88" height="52" class="fi-none"/>
+      <text x="334" y="175" class="tx-sm tx-mid">egilmore</text>
+      <rect x="380" y="144" width="168" height="26" class="fw-s3 st-s3"/><rect x="380" y="170" width="168" height="26" class="fi-paper"/>
+      <text x="464" y="162" class="tx-mono tx-sm tx-mid">1289847844275</text><text x="464" y="188" class="tx-sm tx-mid tx-mono">6a0b483</text>
+      <text x="464" y="222" class="tx-hand tx-mid">индексная таблица</text>
+      <text x="10" y="238" class="tx-sm tx-bold">blog entries</text>
+      <line x1="54" y1="250" x2="54" y2="414" class="hl"/>
+      <rect x="10" y="248" width="88" height="52" class="fi-none"/>
+      <text x="54" y="279" class="tx-sm tx-mid">92dbeb5</text>
+      <rect x="100" y="248" width="144" height="26" class="fw-s3 st-s3"/><rect x="100" y="274" width="144" height="26" class="fi-paper"/>
+      <text x="172" y="266" class="tx-mono tx-sm tx-mid">body</text><text x="172" y="292" class="tx-sm tx-mid">Today I …</text>
+      <rect x="246" y="248" width="108" height="26" class="fw-s3 st-s3"/><rect x="246" y="274" width="108" height="26" class="fi-paper"/>
+      <text x="300" y="266" class="tx-mono tx-sm tx-mid">user*</text><text x="300" y="292" class="tx-sm tx-mid">jbellis</text>
+      <rect x="356" y="248" width="122" height="26" class="fw-s3 st-s3"/><rect x="356" y="274" width="122" height="26" class="fi-paper"/>
+      <text x="417" y="266" class="tx-mono tx-sm tx-mid">category*</text><text x="417" y="292" class="tx-sm tx-mid">tech</text>
+      <rect x="10" y="306" width="88" height="52" class="fi-none"/>
+      <text x="54" y="337" class="tx-sm tx-mid">d418a66</text>
+      <rect x="100" y="306" width="144" height="26" class="fw-s3 st-s3"/><rect x="100" y="332" width="144" height="26" class="fi-paper"/>
+      <text x="172" y="324" class="tx-mono tx-sm tx-mid">body</text><text x="172" y="350" class="tx-sm tx-mid">I am …</text>
+      <rect x="246" y="306" width="108" height="26" class="fw-s3 st-s3"/><rect x="246" y="332" width="108" height="26" class="fi-paper"/>
+      <text x="300" y="324" class="tx-mono tx-sm tx-mid">user</text><text x="300" y="350" class="tx-sm tx-mid">dhutch</text>
+      <rect x="356" y="306" width="122" height="26" class="fw-s3 st-s3"/><rect x="356" y="332" width="122" height="26" class="fi-paper"/>
+      <text x="417" y="324" class="tx-mono tx-sm tx-mid">category</text><text x="417" y="350" class="tx-sm tx-mid">fashion</text>
+      <rect x="10" y="364" width="88" height="52" class="fi-none"/>
+      <text x="54" y="395" class="tx-sm tx-mid">6a0b483</text>
+      <rect x="100" y="364" width="144" height="26" class="fw-s3 st-s3"/><rect x="100" y="390" width="144" height="26" class="fi-paper"/>
+      <text x="172" y="382" class="tx-mono tx-sm tx-mid">body</text><text x="172" y="408" class="tx-sm tx-mid">This is …</text>
+      <rect x="246" y="364" width="108" height="26" class="fw-s3 st-s3"/><rect x="246" y="390" width="108" height="26" class="fi-paper"/>
+      <text x="300" y="382" class="tx-mono tx-sm tx-mid">user</text><text x="300" y="408" class="tx-sm tx-mid">egilmore</text>
+      <rect x="356" y="364" width="122" height="26" class="fw-s3 st-s3"/><rect x="356" y="390" width="122" height="26" class="fi-paper"/>
+      <text x="417" y="382" class="tx-mono tx-sm tx-mid">category</text><text x="417" y="408" class="tx-sm tx-mid">sports</text>
+      <text x="10" y="440" class="tx-sm">* = secondary indexes</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Три из пяти column families в "blog keyspace" (p. 412), перерисованные. Каждая строка — это ключ строки (под маркером), за которым идут её собственные столбцы, и каждый столбец — это имя (фиолетовая полоска) над значением. У egilmore нет state, и для него не хранится вообще ничего. time_ordered_blogs_by_user — индексная таблица: имена её столбцов — временные метки в миллисекундах, а значения — id записей блога. Не показаны subscribes_to и subscribers_of: имена столбцов в них — имена пользователей, а значения пустые.</figcaption>
+  </figure>
+
+  <p>Строки находят по ключу — здесь это имена пользователей. time_ordered_blogs_by_user — не сущность, а заранее подготовленный ответ: «записи jbellis по времени» — это чтение одной строки. Звёздочки отмечают вторичные индексы (secondary indexes) на двух столбцах: запомни их до раздела 4.</p>
+
+  <div class="pitfall"><p>«На слайде (p. 412) написано "column-oriented databases", значит, Cassandra хранит каждый столбец в отдельном файле, как Vertica». Нет: ярлык идёт от column families. Строка Cassandra хранит все свои столбцы вместе под ключом строки — "think of cassandra as row-oriented" (p. 417). Клеппман, учебник курса, называет этот ярлык для данного семейства «очень вводящим в заблуждение» (гл. 3, дополнительно). Оставь слово курса, но говори, какой смысл имеешь в виду.</p></div>
+
+  <p>Слайды (pp. 413–417) дают словарь, снаружи внутрь:</p>
+
+  <div class="def">
+    <p><dfn>Keyspace</dfn> (пространство ключей) — "~= database", "typically one per application", "some settings are configurable only per keyspace" (p. 415): прежде всего репликация — сколько копий каждой строки хранится и где (<a href="l21.html">урок 21</a>).</p>
+    <p><dfn>Column family</dfn> (семейство столбцов) — "group records of similar kind", "not same kind, because CFs are sparse tables" (p. 416); настройки: компаратор (comparator) и тип, standard или super (p. 413). Примеры: User, Address, Tweet, PointOfInterest, HotelRoom.</p>
+    <p><dfn>Row</dfn> (строка) — "each row is uniquely identifiable by key"; "rows group columns and super columns" (p. 417).</p>
+    <p><dfn>Column</dfn> (столбец) — имя, значение и часы (clock) (p. 413): раздел 4.</p>
+  </div>
+
+  <aside class="redpen" data-page="413">
+    <p class="claim">"settings (eg, partitioner)"</p>
+    <p class="fix">Партиционер (partitioner) — не настройка keyspace: у кластера Cassandra один партиционер на все его keyspaces. Keyspace задаёт свою репликацию — стратегию и число копий каждой строки.</p>
+    <p class="because">Партиционер превращает ключ строки в позицию на кольце узлов, а все keyspaces кластера делят это одно кольцо. В современной Cassandra партиционер — одна строка в конфигурации узла (дополнительно), а <code>CREATE KEYSPACE</code> принимает параметр репликации и никакого партиционера (<a href="l21.html">урок 21</a>). Экзамен могут проверять по напечатанной рамке: знай её, а на вопрос, что настраивает keyspace, называй репликацию.</p>
+  </aside>
+
+  <aside class="margin-note">На двух слайдах (pp. 418 и 419) пользователи переставлены: строка 123 — это eben на одном и alison на другом. Виджет следует слайду (p. 419).</aside>
+
+  <p>Слайд (p. 417) — тот самый из загадки: "think of cassandra as row-oriented" — один ключ открывает строку, и её столбцы возвращаются вместе. Слайд (p. 414) сопоставляет "Row Key" пары "Column Keys/Names" и "Column Values"; слайд (p. 418) показывает две строки одного семейства с разными столбцами; слайд (p. 419) записывает их как вложенные карты:</p>
+
+<pre><code>// p. 419: User as nested maps
+User {
+  123 : { email: alison@foo.com,
+          icon:  [the Cassandra eye] },
+  456 : { email: eben@bar.com,
+          location: The Danger Zone }
+}</code></pre>
+
+  <p class="memo"><mark class="key">Думай о column family как о карте карт: ключ строки → столбцы этой строки, отсортированные по имени, каждый из которых — имя, значение и временная метка.</mark></p>
+</section>
+
+
+<section id="l20-column">
+  <h2>У столбца три части, у суперстолбца — столбцы</h2>
+
+  <p>Приблизимся к одной ячейке. Слайд "a column has 3 parts" (p. 420):</p>
+
+  <div class="def">
+    <p><dfn>name</dfn> — "byte[]", "determines sort order", "used in queries", "indexed".</p>
+    <p><dfn>value</dfn> — "byte[]", "you don't query on column values".</p>
+    <p><dfn>timestamp</dfn> — "long (clock)", "last write wins conflict resolution".</p>
+  </div>
+
+  <p>Имя — это ключ внутренней карты строки: оно отсортировано, так что диапазон имён — одно непрерывное чтение, и проиндексировано внутри строки, так что имя находится без сканирования. Значение — непрозрачные байты: строка, число, картинка с глазом со слайда (p. 418) — хранится как пришло и никогда не сортируется.</p>
+
+  <p><mark class="key">Временная метка (timestamp)</mark> разрешает разногласия между копиями. Одна реплика строки 456 хранит email = eben@bar.com с меткой 1004, другая — email = eben@new.com с меткой 1010: когда их сравнивают, на обеих побеждает 1010. Часы клиент передаёт с каждой записью (p. 428); удаление тоже несёт метку, поэтому оно может победить более старое значение. Просто и быстро, но есть цена: из двух одновременных записей одна молча теряется.</p>
+
+  <aside class="redpen" data-page="420">
+    <p class="claim">"you don’t query on column values"</p>
+    <p class="fix">Читай это как правило проектирования, а не как ограничение системы: Cassandra умеет находить строки по значению столбца через вторичные индексы — слайд (p. 412) этой же лекции отмечает два из них, "* = secondary indexes", — а в CQL есть <code>CREATE INDEX</code> и <code>ALLOW FILTERING</code> (<a href="l21.html">урок 21</a>).</p>
+    <p class="because">Эта фраза старше вторичных индексов (2011, версия 0.7 — дополнительно). Каждый узел индексирует только свои строки, поэтому запрос по значению опрашивает все узлы, а column family с ключом по этому значению (p. 431) читается на одном. Экзамен могут проверять по напечатанной формулировке: в теоретическом ответе процитируй её и добавь нюанс; в упражнении "If any further operation is required" обычно означает <code>CREATE INDEX</code>.</p>
+  </aside>
+
+  <p>Порядок сортировки задаёт <mark class="key">компаратор (comparator)</mark> column family (p. 421): "byte", "utf8", "long", "timeuuid", "lexicaluuid", "&lt;pluggable&gt;", "ex: lat/long" — тип имён столбцов. Для имён 2 и 10 utf8 сравнивает символы и ставит "10" первым, long сравнивает числа и ставит первым 2; timeuuid упорядочивает идентификаторы на основе времени по времени — естественный выбор для ленты событий.</p>
+
+  <p>Слайд (p. 422) добавляет уровень: "super columns group columns under a common name". У <mark class="key">суперстолбца (super column)</mark> есть имя, "name: byte[]", а вместо значения — карта столбцов, "cols: Map&lt;byte[], IColumn&gt;". Column family бывает standard или super ("type" со слайда (p. 413)); в super column family каждая строка содержит суперстолбцы.</p>
+
+  <p>Слайды (pp. 423–424) заполняют одно такое семейство: PointOfInterest с ключом по почтовому индексу (ZIP). Строка 85255 содержит суперстолбцы Phoenix Zoo и Spring Training, строка 10019 — Central Park и Empire State Building; в каждом есть phone и desc — или только desc, как у Central Park: "flexible schema".</p>
+
+<pre><code>// p. 424: a super column family as nested maps
+PointOfInterest {
+  key: 85255 {
+    Phoenix Zoo { phone: 480-555-5555,
+      desc: They have animals here. },
+    Spring Training { phone: 623-333-3333,
+      desc: Fun for baseball fans. },
+  }, //end phx
+  key: 10019 {
+    Central Park { desc: Walk around. It's pretty.} ,
+    Empire State Building { phone: 212-777-7777,
+      desc: Great view from 102nd floor. }
+  } //end nyc
+}</code></pre>
+
+  <aside class="margin-note">Слайд (p. 423) рисует то же семейство с ключом 10017 и другими телефонами. Этот урок следует полной версии со слайда (p. 424).</aside>
+
+  <p>Слайд (p. 425): "sub-column names in a SCF are not indexed", а "top level columns (SCF Name) are always indexed" — скобку читай как имена суперстолбцов. Значит, один подстолбец стоит чтения всего его суперстолбца. Super column families "often used for denormalizing data from standard CFs": данные копируют туда, где их читает запрос.</p>
+
+  <p>Чтобы запросить часть столбцов строки, ты отправляешь <mark class="key">предикат среза (slice predicate)</mark> — "data structure describing columns to return" (p. 426). Его SliceRange: "start column name", "finish column name (can be empty to stop on count)", "reverse", "count (like LIMIT)". Имена отсортированы, поэтому срез — это один непрерывный участок строки:</p>
+
+  <div class="widget" id="l20-w-map">
+    <h3 class="widget-title">Вложенная карта: от keyspace до одного столбца</h3>
+    <p class="widget-intro">Keyspace (здесь он называется app) содержит три column families со слайдов. Выбери строку: ты увидишь её ключ и её столбцы в порядке компаратора, каждый со своим именем, часами и значением. Затем задай предикат среза: возвращённые столбцы подкрашиваются и нумеруются в том порядке, в каком приходят. Строки User объединяют два слайда (pp. 418–419); значения часов придуманы, а две из трёх записей ленты добавлены, чтобы срезу было что отрезать.</p>
+    <ol class="tasks">
+      <li>Выбери «User › строка 123», start и finish оставь пустыми, count 4. Предскажи, в каком порядке вернутся четыре столбца.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>email, icon, n, user: по алфавиту, потому что компаратор — utf8. Решает порядок имён — не часы и не значения. В этом главная мысль виджета: чтение называет ключ строки и участок отсортированных имён столбцов, но никогда — значение.</p></details>
+      </li>
+      <li>Поставь start = icon и count = 2. Затем включи reverse, оставив start на icon. Предскажи оба ответа.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Вперёд: icon, n. С reverse: icon, email — когда reverse включён, start становится верхней границей участка, и имена проходятся вниз.</p></details>
+      </li>
+      <li>Выбери «time_ordered_blogs_by_user › строка jbellis», start и finish пустые, reverse включён, count 1. Что вернётся и почему это именно то чтение, которое нужно ленте?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>1290020640615 = e03a9d7, самая новая запись. Имена — временные метки, сравниваемые как числа (компаратор long), поэтому reverse с count читает «последние N» — то, что в SQL пишут как ORDER BY … DESC LIMIT.</p></details>
+      </li>
+      <li>Выбери «PointOfInterest › строка 10019», поставь start = Empire State Building и count = 1. Предскажи, что вернётся.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Весь суперстолбец Empire State Building, desc и phone вместе. Срез идёт по именам суперстолбцов, которые проиндексированы; подстолбцы — нет, поэтому суперстолбец возвращается целиком (p. 425).</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l20-w-map', function (root, ui) {
+    var CF = {
+      User: { name: 'User', title: 'column family User · comparator utf8 · type standard', type: 'std', cmp: 'utf8', rows: {
+        '123': [{ n: 'email', v: 'alison@foo.com', t: 1001 }, { n: 'icon', v: '[картинка с глазом]', t: 1003 }, { n: 'n', v: '42', t: 1002 }, { n: 'user', v: 'alison', t: 1000 }],
+        '456': [{ n: 'email', v: 'eben@bar.com', t: 1004 }, { n: 'location', v: 'The Danger Zone', t: 1006 }, { n: 'nickname', v: 'The Situation', t: 1005 }, { n: 'user', v: 'eben', t: 1004 }]
+      } },
+      TL: { name: 'time_ordered_blogs_by_user', title: 'column family time_ordered_blogs_by_user · comparator long', type: 'std', cmp: 'long', rows: {
+        'jbellis': [{ n: '1289847840615', v: '92dbeb5', t: 1007 }, { n: '1289934240615', v: 'b6f1c02', t: 1012 }, { n: '1290020640615', v: 'e03a9d7', t: 1015 }]
+      } },
+      POI: { name: 'PointOfInterest', title: 'super column family PointOfInterest · type super', type: 'super', cmp: 'utf8', rows: {
+        '85255': [{ n: 'Phoenix Zoo', sub: [{ n: 'desc', v: 'They have animals here.', t: 1020 }, { n: 'phone', v: '480-555-5555', t: 1020 }] },
+                  { n: 'Spring Training', sub: [{ n: 'desc', v: 'Fun for baseball fans.', t: 1021 }, { n: 'phone', v: '623-333-3333', t: 1021 }] }],
+        '10019': [{ n: 'Central Park', sub: [{ n: 'desc', v: "Walk around. It's pretty.", t: 1022 }] },
+                  { n: 'Empire State Building', sub: [{ n: 'desc', v: 'Great view from 102nd floor.', t: 1023 }, { n: 'phone', v: '212-777-7777', t: 1023 }] }]
+      } }
+    };
+    var rowSel = ui.select('какую строку читать (column family › row key)', [
+      { value: 'User|123', label: 'User › строка 123' },
+      { value: 'User|456', label: 'User › строка 456' },
+      { value: 'TL|jbellis', label: 'time_ordered_blogs_by_user › строка jbellis' },
+      { value: 'POI|85255', label: 'PointOfInterest › строка 85255' },
+      { value: 'POI|10019', label: 'PointOfInterest › строка 10019' }
+    ], null, 'User|123');
+    var startSel = ui.select('start (имя столбца)', [{ value: '', label: '(пусто)' }], null, '');
+    var finishSel = ui.select('finish (имя столбца)', [{ value: '', label: '(пусто)' }], null, '');
+    var rev = ui.toggle('reverse', false);
+    var cnt = ui.slider({ label: 'count (как LIMIT)', min: 1, max: 4, step: 1, value: 4 });
+    var roMap = ui.readout('карта'), roCall = ui.readout('вызов'), roRet = ui.readout('возвращает');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'ключ строки', color: 'ink', mark: 'hl' },
+      { label: 'имя столбца', color: 's3', mark: 'area' },
+      { label: 'возвращено срезом', color: 's2', mark: 'area' }
+    ]);
+    var H = 330;
+    var svg = ui.svg(560, H, { label: 'Вложенные прямоугольники: keyspace содержит column family, а та — выбранную строку: слева её ключ строки, дальше её столбцы, отсортированные по имени, каждый — имя с часами и значение; в super column family — именованные группы столбцов. Столбцы, возвращённые предикатом среза, подкрашены и пронумерованы в порядке возврата.' });
+
+    function current() {
+      var p = String(rowSel.value || 'User|123').split('|'), cf = CF[p[0]] || CF.User, key = cf.rows[p[1]] ? p[1] : Object.keys(cf.rows)[0];
+      var c = cf.cmp === 'long' ? function (a, b) { return Number(a) - Number(b); } : function (a, b) { return a < b ? -1 : a > b ? 1 : 0; };
+      var items = cf.rows[key].slice().sort(function (a, b) { return c(a.n, b.n); });
+      return { cf: cf, key: key, items: items, cmp: c };
+    }
+    var lastRow = null;
+    function syncNames(cur) {
+      if (lastRow === rowSel.value) return;
+      lastRow = rowSel.value;
+      [startSel, finishSel].forEach(function (sel) {
+        sel.el.textContent = '';
+        sel.el.appendChild(Course.el('option', { value: '', text: '(пусто)' }));
+        cur.items.forEach(function (it) { sel.el.appendChild(Course.el('option', { value: it.n, text: it.n })); });
+        sel.el.value = '';
+      });
+    }
+    function slice(cur) {
+      var s = startSel.value || '', f = finishSel.value || '', r = rev.value, k = Math.max(1, Math.round(cnt.value)), c = cur.cmp, out = [];
+      if (s && f && (r ? c(s, f) < 0 : c(s, f) > 0)) return { err: true, out: out };
+      var list = r ? cur.items.slice().reverse() : cur.items;
+      for (var i = 0; i < list.length && out.length < k; i++) {
+        var nm = list[i].n;
+        if (s && (r ? c(nm, s) > 0 : c(nm, s) < 0)) continue;
+        if (f && (r ? c(nm, f) < 0 : c(nm, f) > 0)) break;
+        out.push(list[i]);
+      }
+      return { err: false, out: out };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function column(c, x, y) {
+      S('rect', { x: x, y: y, width: 256 - x, height: 44, 'class': 'fw-s3 st-s3' });
+      T((x + 256) / 2, y + 18, c.n, 'tx-mono tx-sm tx-mid');
+      T((x + 256) / 2, y + 38, 'clock ' + c.t, 'tx-mono tx-sm tx-mid tx-muted');
+      S('rect', { x: 256, y: y, width: 290, height: 44, 'class': 'fi-paper' });
+      T(264, y + 27, c.v, 'tx-sm');
+    }
+    function draw(cur, res) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var order = {};
+      res.out.forEach(function (it, i) { order[it.n] = i + 1; });
+      var y = 86, y0 = y, blocks = [];
+      cur.items.forEach(function (it) {
+        if (cur.cf.type === 'super') { var top = y; y += 30 + 48 * it.sub.length; blocks.push({ it: it, top: top, bottom: y - 4 }); y += 8; }
+        else { blocks.push({ it: it, top: y, bottom: y + 44 }); y += 48; }
+      });
+      var yEnd = blocks[blocks.length - 1].bottom, H = yEnd + 26;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      S('rect', { x: 4, y: 4, width: 552, height: H - 8, rx: 14, 'class': 'fi-none st-muted sw-2' });
+      T(18, 24, 'keyspace app · настройки: replication', 'tx-sm');
+      S('rect', { x: 12, y: 34, width: 536, height: H - 46, rx: 10, 'class': 'fi-none' });
+      T(24, 54, cur.cf.title, 'tx-sm tx-bold');
+      T(56, 77, 'row key', 'tx-sm tx-mid tx-muted');
+      T(188, 77, 'name · clock', 'tx-sm tx-mid tx-muted');
+      T(404, 77, 'value', 'tx-sm tx-mid tx-muted');
+      S('line', { x1: 56, y1: y0 + 2, x2: 56, y2: yEnd - 2, 'class': 'hl' });
+      S('rect', { x: 18, y: y0, width: 76, height: yEnd - y0, rx: 4, 'class': 'fi-none' });
+      T(56, (y0 + yEnd) / 2 + 5, cur.key, 'tx-mono tx-sm tx-mid');
+      blocks.forEach(function (b) {
+        var k = order[b.it.n];
+        if (k) {
+          S('rect', { x: 116, y: b.top - 2, width: 436, height: b.bottom - b.top + 4, rx: 4, 'class': 'fw-s2 st-s2 sw-2 dash' });
+          S('circle', { cx: 104, cy: b.top + 20, r: 11, 'class': 'fi-paper st-s2 sw-2' });
+          T(104, b.top + 26, String(k), 'tx-sm tx-mid');
+        }
+        if (cur.cf.type === 'super') {
+          S('rect', { x: 120, y: b.top + 1, width: 428, height: b.bottom - b.top - 2, rx: 4, 'class': 'fi-none' });
+          T(128, b.top + 21, b.it.n, 'tx-sm tx-bold');
+          T(540, b.top + 21, 'super column', 'tx-sm tx-end tx-muted');
+          var yy = b.top + 30;
+          b.it.sub.forEach(function (sc) { column(sc, 134, yy); yy += 48; });
+        } else column(b.it, 122, b.top);
+      });
+    }
+    function show(it) { return it.sub ? it.n + ' {' + it.sub.map(function (s) { return s.n; }).join(', ') + '}' : it.n + ' = ' + it.v; }
+
+    ui.onChange(function () {
+      var cur = current();
+      syncNames(cur);
+      var res = slice(cur), sup = cur.cf.type === 'super';
+      roMap.set('app › ' + cur.cf.name + ' › ' + cur.key + ' → ' + cur.items.map(function (i) { return i.n; }).join(', '));
+      roCall.set('get_slice("' + cur.key + '", ' + cur.cf.name + ', SliceRange(start "' + (startSel.value || '') + '", finish "' + (finishSel.value || '') + '", reverse ' + rev.value + ', count ' + Math.round(cnt.value) + '), CL)');
+      roRet.set(res.err ? 'отказ' : res.out.length ? res.out.map(show).join(' · ') : 'ничего', res.err ? 'bad' : undefined);
+      var t;
+      if (res.err) t = rev.value ? 'Cassandra отвергает этот срез: при включённом reverse start — верхняя граница и не должен сортироваться раньше finish.' : 'Cassandra отвергает этот срез: при выключенном reverse start не должен сортироваться позже finish.';
+      else {
+        t = sup ? 'Срез идёт по именам суперстолбцов, которые проиндексированы; каждый суперстолбец возвращается целиком, потому что "sub-column names in a SCF are not indexed" (p. 425).'
+          : cur.cf.cmp === 'long' ? 'Имена столбцов — временные метки, сравниваемые как числа (компаратор long): строка — это лента, и reverse проходит её с новейшего конца.'
+          : 'Столбцы возвращаются в порядке своих имён (компаратор utf8) — не в порядке записи и никогда не фильтруются по значению.';
+        if (rev.value) t += ' Reverse включён: имена проходятся вниз, так что start — верхняя граница участка, а finish — нижняя.';
+        if (res.out.length >= Math.round(cnt.value) && res.out.length < cur.items.length) t += ' Count останавливает срез после ' + Math.round(cnt.value) + ', как LIMIT.';
+      }
+      note.set(t);
+      draw(cur, res);
+    });
+  });
+  </script>
+
+  <p>Слайды (pp. 427–428) перечисляют вызовы API того времени — Thrift RPC. Каждый вызов на этих слайдах называет свои строки по ключу — один ключ, список ключей или диапазон, — но никогда по значению, и заканчивается на CL, <mark class="key">уровень согласованности (consistency level)</mark>: сколько реплик должно ответить (<a href="l22.html">урок 22</a>). Это и есть "tuneably consistent" на практике.</p>
+
+  <figure class="tbl-fig" id="l20-tbl-api">
+    <figcaption>API чтения и записи со слайдов (pp. 427–428) (Thrift, Cassandra 2010 года).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Вызов</th><th>Что делает</th></tr></thead>
+        <tbody>
+          <tr><td><code>get(key, path, CL)</code></td><td>один столбец или суперстолбец одной строки по его пути (column path) ("get the Col or SC at given ColPath"); возвращает ColumnOrSuperColumn</td></tr>
+          <tr class="is-key"><td><code>get_slice(key, parent, predicate, CL)</code></td><td>столбцы одной строки, выбранные предикатом среза ("get Cols in one row")</td></tr>
+          <tr><td><code>multiget_slice(rowKeys, parent, predicate, CL)</code></td><td>тот же срез для списка ключей: карта ключ → столбцы</td></tr>
+          <tr><td><code>get_range_slices(parent, predicate, keyRange, CL)</code></td><td>срез каждой строки в диапазоне: "range is startkey, endkey, starttoken, endtoken"</td></tr>
+          <tr><td><code>insert(key, parent, Column, CL)</code></td><td>записывает один столбец: имя, значение, часы</td></tr>
+          <tr><td><code>batch_mutate(map&lt;byte[], map&lt;String, List&lt;Mutation&gt;&gt;&gt;, CL)</code></td><td>много вставок и удалений — по ключу строки, по column family — одним вызовом</td></tr>
+          <tr><td><code>remove(byte[], ColumnPath column_path, Clock, CL)</code></td><td>удаляет столбец, суперстолбец или строку, с часами: удаление соревнуется с записями по временной метке</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+<pre><code>// p. 428: write one column (name, value, clock)
+client.insert(userKeyBytes, parent,
+    new Column("band".getBytes(UTF8),
+    "Funkadelic".getBytes(), clock), CL);</code></pre>
+
+  <p>Insert — это слайд (p. 420) в виде кода: имя, значение, часы. Отдельного update нет: запись в существующий столбец сохраняет новое значение с более новыми часами, и более новые часы побеждают.</p>
+
+  <p>Всё это — Cassandra 2010 года. Современная Cassandra предлагает ту же модель через таблицы CQL — язык практических занятий и прошлых экзаменов (<a href="l21.html">урок 21</a>); Thrift убрали в версии 4.0 (2021), а суперстолбцов больше не существует. Теоретические вопросы пользуются словами слайдов, упражнения — словами CQL:</p>
+
+  <figure class="tbl-fig" id="l20-tbl-cql">
+    <figcaption>Словарь слайдов и его соответствие в CQL.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>На слайдах (2010)</th><th>В CQL (урок 21)</th></tr></thead>
+        <tbody>
+          <tr><td>keyspace</td><td>keyspace, <code>CREATE KEYSPACE … WITH replication = {…}</code></td></tr>
+          <tr><td>column family</td><td>table — в экзаменах пишут "tables (column families)"</td></tr>
+          <tr class="is-key"><td>row key</td><td>partition key (ключ партиционирования): решает, на каких узлах живёт строка</td></tr>
+          <tr class="is-key"><td>имена столбцов, отсортированные компаратором</td><td>clustering columns (кластеризующие столбцы), отсортированные по <code>CLUSTERING ORDER BY</code></td></tr>
+          <tr><td>значение столбца, байты</td><td>обычный столбец с типом (<code>text</code>, <code>int</code>, …)</td></tr>
+          <tr><td>timestamp (clock)</td><td>время записи каждой ячейки: по-прежнему last write wins</td></tr>
+          <tr><td>super column</td><td>исчезли: ещё один clustering column или пользовательский тип (user-defined type)</td></tr>
+          <tr><td>slice predicate: start, finish, reverse, count</td><td>диапазон по clustering column, <code>ORDER BY … DESC</code>, <code>LIMIT</code></td></tr>
+          <tr><td>get, insert, remove … с CL</td><td><code>SELECT</code>, <code>INSERT</code>, <code>DELETE</code> в cqlsh, с уровнем согласованности</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+</section>
+
+
+<section id="l20-queries">
+  <h2>Никакого SELECT … WHERE: начинай с запросов</h2>
+
+  <p>Слайд (p. 429) спрашивает "what about… SQL?" и перечисляет пять привычек: SELECT, WHERE, ORDER BY, JOIN ON, GROUP. Ответ — это способ проектировать, а не ещё одна клауза.</p>
+
+  <p>Слайд (p. 430): "rdbms: domain-based model — what answers do I have?"; "cassandra: query-based model — what questions do I have?"; "Start from queries, then design the data model". Реляционный проектировщик моделирует предметную область — сущности, связи, нормальные формы (уроки <a href="l08.html">8</a>–<a href="l09.html">9</a>) — и отвечает на будущие вопросы джойнами. Cassandra находит строки только по ключу и не делает джойнов, так что на вопрос, под который не построена структура, эффективного ответа нет: сначала ты перечисляешь вопросы.</p>
+
+  <p>Слайд "cassandra is an index factory" (p. 431): у column family USER ключ UserID и столбцы username, email, birth date, city, state. Она отвечает на «дай пользователя 123» за одно чтение — и больше ни на что. "How to support this query?"</p>
+
+<pre><code>-- p. 431: the query that USER, keyed by UserID, cannot answer
+SELECT * FROM User WHERE city = 'Scottsdale'</code></pre>
+
+  <p>Ответ слайда: "Create a new CF called UserCity" с ключом по городу, столбцы которого — "IDs of the users in that city". Запрос превращается в чтение одной строки плюс <code>multiget_slice</code> по USER за самими пользователями. UserCity "uses the <mark class="key">Valueless Column</mark> pattern" (шаблон «столбец без значения»): информация лежит в именах столбцов, значения пусты. То, что СУБД делает индексом, ты делаешь вручную — по column family на каждый вопрос, записывая их вместе с USER, — <mark class="key">фабрика индексов (index factory)</mark>.</p>
+
+  <p>В CQL (<a href="l21.html">урок 21</a>) UserCity — это таблица, у которой partition key — город, а id пользователей — значения clustering column, те самые столбцы без значения:</p>
+
+<pre><code>-- UserCity of p. 431 in CQL: one partition per city
+CREATE TABLE user_city (
+  city text,
+  user_id text,
+  PRIMARY KEY ((city), user_id)
+);</code></pre>
+
+<pre><code>-- all the users of Scottsdale: one partition read
+SELECT user_id FROM user_city WHERE city = 'Scottsdale';</code></pre>
+
+  <p>Два условия сразу? Слайд (p. 432): "Use an aggregate key" (составной ключ) — <code>state:city: { user1, user2}</code> — затем "Get rows between AZ: &amp; AZ; for all Arizona users" и "Get rows between AZ:Scottsdale &amp; AZ:Scottsdale1 for all Scottsdale users". Почему эти границы работают?</p>
+
+  <ol class="steps" id="l20-steps-range">
+    <li><p>Четыре строки — AZ:Phoenix, AZ:Scottsdale, AZ:Tucson, CA:Fresno, — в каждой её пользователи как столбцы без значения. Ключи сравниваются как строки, символ за символом, и префикс идёт первым: AZ: стоит перед AZ:Phoenix.</p></li>
+    <li><p>В ASCII двоеточие — 58, точка с запятой — 59. У каждого аризонского ключа на третьем месте двоеточие, поэтому он сортируется перед AZ;. CA:Fresno идёт после AZ;, потому что C стоит после A. Так что от AZ: до AZ; лежат ровно аризонские строки.</p></li>
+    <li><p>Аналогично AZ:Scottsdale1 сортируется сразу после AZ:Scottsdale: в этом диапазоне одна строка — Scottsdale.</p></li>
+    <li><p>Для этого строки должны лежать в порядке ключей: нужен order-preserving partitioner (партиционер, сохраняющий порядок). Случайный (random) хранит строки в порядке MD5 их ключей — AZ:Phoenix (ab66…), AZ:Tucson (f163…), CA:Fresno (f3ca…), AZ:Scottsdale (f412…), — так что калифорнийская строка оказывается между аризонскими, и «строки между AZ: и AZ;» больше не означают пользователей из Аризоны.</p></li>
+  </ol>
+
+  <p>Слайд "ORDER BY" (p. 433): "Columns are sorted according to CompareWith or CompareSubcolumnsWith" (компараторы имён и имён подстолбцов); "Rows are placed according to their Partitioner: Random: MD5 of key; Order-Preserving: actual key". Клаузы ORDER BY нет: чтобы получать записи по времени, сделай время именем столбца. Последнюю строку слайда нужно поправить:</p>
+
+  <aside class="redpen" data-page="433">
+    <p class="claim">"are sorted by key, regardless of partitioner"</p>
+    <p class="fix">Строки хранятся в порядке токена (token) партиционера: это сам ключ при order-preserving partitioner и MD5 ключа при random — порядок, никак не связанный с ключом. Диапазоны ключей вроде AZ: … AZ; (p. 432) работают только с order-preserving partitioner.</p>
+    <p class="because">Захешируй ключи из пошагового разбора: CA:Fresno попадает между AZ:Tucson и AZ:Scottsdale. Order-preserving partitioner платит за диапазоны горячими точками (hot spots) — все ключи AZ: на одних и тех же узлах, — а CQL не принимает диапазон по partition key: диапазоны задаются по clustering columns (<a href="l21.html">урок 21</a>). Экзамен могут проверять по напечатанной строке: знай её — и правильную.</p>
+  </aside>
+
+  <p>Ни один слайд не отвечает словами на JOIN ON и GROUP; пример с отелем (pp. 434–435) (рис. 4) отвечает на них самим проектированием. Восемь реляционных таблиц, связанных внешними ключами, где страница отеля требует нескольких джойнов, превращаются в семь column families без внешних ключей, каждое из которых сделано под те чтения, которые оно обслуживает.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l20-fig-hotel">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="До: восемь реляционных таблиц — Hotel, Room, Reservation, HotelToPOI, RoomToAmenity, Guest, PointOfInterest, Amenity, — связанных семью стрелками внешних ключей.">
+        <rect x="2" y="20" width="84" height="28" class="fi-paper sw-2"/>
+        <rect x="104" y="20" width="96" height="28" class="fi-paper sw-2"/>
+        <rect x="218" y="20" width="80" height="28" class="fi-paper sw-2"/>
+        <rect x="2" y="100" width="84" height="28" class="fi-paper sw-2"/>
+        <rect x="104" y="100" width="96" height="28" class="fi-paper sw-2"/>
+        <rect x="218" y="100" width="80" height="28" class="fi-paper sw-2"/>
+        <rect x="2" y="180" width="84" height="34" class="fi-paper sw-2"/>
+        <rect x="104" y="180" width="96" height="28" class="fi-paper sw-2"/>
+        <line x1="104" y1="34" x2="90" y2="34" marker-end="url(#arr)"/>
+        <line x1="218" y1="34" x2="204" y2="34" marker-end="url(#arr)"/>
+        <line x1="258" y1="48" x2="258" y2="96" marker-end="url(#arr)"/>
+        <line x1="44" y1="100" x2="44" y2="52" marker-end="url(#arr)"/>
+        <line x1="44" y1="128" x2="44" y2="176" marker-end="url(#arr)"/>
+        <line x1="152" y1="100" x2="152" y2="52" marker-end="url(#arr)"/>
+        <line x1="152" y1="128" x2="152" y2="176" marker-end="url(#arr)"/>
+        <text x="44" y="38" class="tx-sm tx-mid">Hotel</text>
+        <text x="152" y="38" class="tx-sm tx-mid">Room</text>
+        <text x="258" y="38" class="tx-sm tx-mid">Reservation</text>
+        <text x="44" y="118" class="tx-sm tx-mid">HotelToPOI</text>
+        <text x="152" y="118" class="tx-sm tx-mid">RoomToAmenity</text>
+        <text x="258" y="118" class="tx-sm tx-mid">Guest</text>
+        <text x="44" y="194" class="tx-sm tx-mid">PointOf</text>
+        <text x="44" y="208" class="tx-sm tx-mid">Interest</text>
+        <text x="152" y="198" class="tx-sm tx-mid">Amenity</text>
+        <text x="258" y="176" class="tx-sm tx-mid">стрелки:</text>
+        <text x="258" y="192" class="tx-sm tx-mid">внешние ключи</text>
+      </svg>
+      <p class="fig-label">До (p. 434): восемь таблиц, семь внешних ключей</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="После: семь column families без стрелок — Hotel, HotelByCity, super column family PointOfInterest, Guest, super column families RoomAvailability и Room, и Reservation.">
+        <rect x="6" y="6" width="288" height="26" class="fi-paper"/>
+        <rect x="6" y="38" width="288" height="26" class="fi-paper"/>
+        <rect x="6" y="70" width="288" height="26" class="fi-paper"/><rect x="9" y="73" width="282" height="20" class="fi-none"/>
+        <rect x="6" y="102" width="288" height="26" class="fi-paper"/>
+        <rect x="6" y="134" width="288" height="26" class="fi-paper"/><rect x="9" y="137" width="282" height="20" class="fi-none"/>
+        <rect x="6" y="166" width="288" height="26" class="fi-paper"/><rect x="9" y="169" width="282" height="20" class="fi-none"/>
+        <rect x="6" y="198" width="288" height="26" class="fi-paper"/>
+        <text x="16" y="23" class="tx-sm">&lt;&lt;CF&gt;&gt; Hotel · ключ hotelID</text>
+        <text x="16" y="55" class="tx-sm">&lt;&lt;CF&gt;&gt; HotelByCity · city:state → ID отелей</text>
+        <text x="16" y="87" class="tx-sm">&lt;&lt;SCF&gt;&gt; PointOfInterest · HotelID, poiName</text>
+        <text x="16" y="119" class="tx-sm">&lt;&lt;CF&gt;&gt; Guest · ключ phone</text>
+        <text x="16" y="151" class="tx-sm">&lt;&lt;SCF&gt;&gt; RoomAvailability · hotelID, date</text>
+        <text x="16" y="183" class="tx-sm">&lt;&lt;SCF&gt;&gt; Room · hotelID, roomID, удобства</text>
+        <text x="16" y="215" class="tx-sm">&lt;&lt;CF&gt;&gt; Reservation · ключ resID, с копиями</text>
+      </svg>
+      <p class="fig-label">После (p. 435): семь column families, ни одного внешнего ключа</p>
+    </div>
+    <figcaption><b>Рис. 4.</b> Пример с отелем, до и после (pp. 434–435). До: нормализованная реляционная схема, где прочитать отель вместе с его номерами, удобствами и ближайшими достопримечательностями значит делать джойны вдоль стрелок. После: по column family на каждый способ читать данные, с копиями вместо ссылок; двойная рамка обозначает super column family (&lt;&lt;SCF&gt;&gt;), у которой два ключа — имя суперстолбца и ключ строки, в том порядке, в каком их печатает слайд.</figcaption>
+  </figure>
+
+  <figure class="tbl-fig" id="l20-tbl-hotel">
+    <figcaption>Что стало с каждой таблицей отеля (p. 434 → p. 435).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Реляционная (p. 434)</th><th>Cassandra (p. 435)</th><th>Что изменилось</th></tr></thead>
+        <tbody>
+          <tr><td>Hotel</td><td>&lt;&lt;CF&gt;&gt; Hotel, ключ строки hotelID</td><td>та же сущность, находится по своему ключу</td></tr>
+          <tr class="is-key"><td>«отели в городе»: WHERE по City</td><td>&lt;&lt;CF&gt;&gt; HotelByCity, ключ city:state (напечатано #city:state:hotelID), столбцы hotel1, hotel2, …</td><td>индексное column family с составным ключом и столбцами без значения (pp. 431–432)</td></tr>
+          <tr><td>PointOfInterest + HotelToPOI</td><td>&lt;&lt;SCF&gt;&gt; PointOfInterest, ключи HotelID и poiName, столбцы desc, phone</td><td>связующая таблица исчезает: достопримечательности скопированы к каждому отелю</td></tr>
+          <tr><td>Room + RoomToAmenity + Amenity</td><td>&lt;&lt;SCF&gt;&gt; Room, ключи hotelID и roomID, столбцы num, type, rate, coffee, tv, hottub, …</td><td>удобства становятся столбцами, которые у номера есть или нет: разреженная таблица</td></tr>
+          <tr><td>— (считается по бронированиям)</td><td>&lt;&lt;SCF&gt;&gt; RoomAvailability, ключи hotelID и date, kk = 22, qq = 14</td><td>счётчики, которые обновляются в момент записи (что такое kk и qq, слайд не раскрывает): это наше прочтение того, как отвечают на GROUP</td></tr>
+          <tr><td>Guest (GuestID, Name, Email)</td><td>&lt;&lt;CF&gt;&gt; Guest, ключ строки phone</td><td>ключ — то, по чему приложение ищет гостей</td></tr>
+          <tr class="is-key"><td>Reservation (GuestID, RoomID, StartDate, EndDate)</td><td>&lt;&lt;CF&gt;&gt; Reservation, ключ строки resID: hotelID, roomID, phone, name, arrive, depart, rate, ccNum</td><td>телефон и имя гостя и тариф номера скопированы внутрь: без джойна</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Цена: имена, телефоны и тарифы хранятся дважды, а приложение поддерживает копии в согласии — это по карману, потому что запись дешёвая ("very fast writes", p. 438). Слайды (pp. 436–437) сравнивают Cassandra с реляционной СУБД:</p>
+
+  <figure class="tbl-fig" id="l20-tbl-rdbms">
+    <figcaption>"Properties wrt RDBMS (e.g., Oracle)" (pp. 436–437), как напечатано.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Свойство</th><th>Cassandra</th><th>RDBMS</th></tr></thead>
+        <tbody>
+          <tr class="is-key"><td>Core Architecture</td><td>Masterless (no single point of failure)</td><td>Master-slave (single points of failure)</td></tr>
+          <tr><td>High Availability</td><td>Always-on continuous availability</td><td>General replication with master-slave</td></tr>
+          <tr><td>Data Model</td><td>Dynamic; structured and unstructured data</td><td>Legacy RDBMS; Structured data</td></tr>
+          <tr><td>Scalability Model</td><td>Big data/Linear scale performance</td><td>Oracle RAC or Exadata</td></tr>
+          <tr><td>Multi-Data Center Support</td><td>Multi-directional, multi-cloud availability</td><td>Nothing specific</td></tr>
+          <tr><td>Enterprise Search</td><td>Integrated search on Cassandra data.</td><td>Handled via Oracle search</td></tr>
+          <tr><td>In-Memory Database Option</td><td>Built-in in-memory option</td><td>Columnar in-memory option</td></tr>
+          <tr class="is-key"><td>Joining</td><td>Doesn't support joining</td><td>Supports joining</td></tr>
+          <tr class="is-key"><td>Referential Integrity</td><td>Cassandra has no concept of referential integrity across tables. No cascading deletes.</td><td>Supports foreign keys in a table to reference the primary key of a another table. Supports cascading delete.</td></tr>
+          <tr class="is-key"><td>Normalization</td><td>Tables contain duplicate denormalize data.</td><td>Tables are normalized to avoid redundancy.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Строки второго слайда (p. 437) — это модель данных на одном дыхании: ни джойнов, ни внешних ключей, данные дублируются — джойны и проверки целостности заставили бы узлы координироваться на каждом запросе. "Enterprise Search" и "In-Memory Database Option" описывают коммерческую редакцию DataStax, из материалов которой взята таблица (дополнительно).</p>
+
+  <p>Последний слайд (p. 438) подводит итог списком: "tuneably consistent", "very fast writes", "highly available", "fault tolerant", "linear, elastic scalability", "decentralized/symmetric", "~12 client languages", "Thrift RPC API", "~automatic provisioning of new nodes", "0(1) dht" (читай O(1), как на слайде (p. 411)), "big data" — механизмы из <a href="l22.html">урока 22</a>.</p>
+
+  <div class="tip"><p>Когда в экзаменационной таблице на один балл спрашивают, какая технология БД подходит для каких сущностей (<a href="l05.html">урок 5</a>), обосновывай колоночную строку этими слайдами: большой, непрерывно растущий объём записей, которые часто пишутся и читаются по ключу по заранее известным запросам — "Often write-heavy workloads" (p. 412), "very fast writes" и "linear, elastic scalability" (p. 438).</p></div>
+
+  <div class="pitfall"><p>Конспект курса говорит, что Cassandra "is almost exclusively used in OLAP systems with multiple Terabytes sized data", и называет "Increased tuple reconstruction costs" среди её отличий от реляционных таблиц: это свойства колоночных хранилищ, перенесённые по ошибке. Слайды говорят "Often write-heavy workloads" (p. 412), а строка Cassandra хранится целиком.</p></div>
+
+  <p class="memo"><mark class="key">Начинай с запросов: по column family на каждый вопрос, данные скопированы туда, где их читают, и никаких джойнов.</mark></p>
+
+  <p>Вернёмся к загадке. "The Column Oriented Database stores data in columns" (p. 401) и "think of cassandra as row-oriented" (p. 417) — оба верны, потому что «column» означает две разные вещи. В Vertica или C-Store столбец — это файл: один атрибут всех записей, хранящийся вместе, сжатый и сканируемый, — OLAP. В Cassandra столбец — это имя в отсортированной карте строки, хранящееся вместе с остальной строкой; строка может содержать их огромное количество, отсюда и "Big Column Stores". Лекция и экзамены ("you decide to store it in a columnar database", экзамен 12 сентября 2025 года) называют «columnar» оба варианта: сохраняй этот ярлык, но говори, какой из них имеешь в виду.</p>
+</section>
+
+
+<section id="l20-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Теоретические вопросы в форматах теоретической части — «верно/неверно», выбор вариантов и короткие открытые ответы, где за неправильный ответ могут снять баллы, — и одно практическое упражнение в формулировках прошлых экзаменов, построенное на отеле со слайдов (pp. 434–435).</p>
+
+  <div class="exam" data-kind="mcq" id="l20-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>True or false: Cassandra stores the values of each column of a column family together, separately from the other columns, as a column-oriented database such as Vertica does.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>True <span class="fb">Это колоночное хранение со слайдов (pp. 401–407). Cassandra держит столбцы строки вместе под её ключом строки: "think of cassandra as row-oriented" (p. 417).</span></li>
+      <li data-correct>False <span class="fb">Cassandra — wide-column store: строка, которую находят по ключу, хранит все свои столбцы вместе (p. 417). Хранить каждый столбец отдельно — это аналитическое колоночное хранилище со слайдов (pp. 401–407).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>False. Cassandra is a wide-column (column-family) store: each row is uniquely identified by its key and keeps all its columns, sorted by name, together, so it should be thought of as row-oriented. Storing each column separately is the design of column-oriented databases such as Vertica or C-Store, built for OLAP: a query reads only the columns it needs, while inserts and whole-record reads touch every column. Cassandra is called columnar because of its column families and its very wide rows, and it is built for write-heavy workloads.</p></div>
+      <div class="exam-note"><p>Ловушка — в слове «column», общем для двух разных конструкций (разделы 2 и 3). За неправильные ответы может быть штраф, о нём объявляют прямо перед экзаменом: отвечай только то, что можешь обосновать.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-colstore">
+    <div class="exam-q" lang="en">
+      <p>Explain how a column-oriented database stores a table and compare it with a row-oriented database: advantages, disadvantages, and the workloads each one suits.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>A row-oriented database stores each record contiguously; a column-oriented database stores each column contiguously, in its own storage. A query that needs k of the m columns therefore reads only those k columns in a column store, while a row store reads whole records and may read unnecessary data. The column layout also compresses better (the values of a column share a type and repeat, so techniques such as run-length encoding work well) and improves bandwidth utilisation, code pipelining and cache locality. Its disadvantages are increased disk seek time (a record is spread over many files), an increased cost of inserts (one write per column) and increased tuple reconstruction costs (records must be rebuilt by position). Column stores therefore suit read-mostly, read-intensive, large repositories — OLAP and data mining — while row stores suit OLTP, with frequent inserts and updates of whole records.</p></div>
+      <div class="exam-note"><p>У полного ответа четыре части: две раскладки, довод про чтение (k из m столбцов), плюсы и минусы словами слайдов (pp. 403–404) и типы нагрузки. Сильное дополнение — график со слайда (p. 405): колоночное хранилище проигрывает, только когда запрос выбирает почти весь кортеж.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l20-exam-rle">
+    <div class="exam-q" lang="en">
+      <p>The Quarter column of a sales table, sorted by quarter, is stored with run-length encoding as (Q1, 1, 300), (Q2, 301, 350), (Q3, 651, 500), (Q4, 1151, 600). Which statements are correct? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li>(Q2, 301, 350) means that Q2 is stored at the positions from 301 to 350. <span class="fb">Третье число — длина, а не конец: Q2 занимает 350 позиций с 301 по 650.</span></li>
+      <li data-correct>The table has 1,750 rows. <span class="fb">Последняя серия заканчивается на 1151 + 600 − 1 = 1750 — столько же, сколько 300 + 350 + 500 + 600.</span></li>
+      <li data-correct>Position 700 holds Q3. <span class="fb">Q3 начинается с 651 и покрывает 500 позиций, до 1150.</span></li>
+      <li>The Price column of the same table would shrink just as much with the same encoding. <span class="fb">Соседние цены редко повторяются: каждая цена превратилась бы в тройку, втрое больше сырого размера, — поэтому слайд (p. 407) оставляет Price несжатым.</span></li>
+      <li data-correct>Sorted by customer instead, the same Quarter column would usually compress far less. <span class="fb">Сериям нужны равные значения рядом; другой порядок сортировки их разбивает.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>The second, third and fifth statements. Each triple is (value, start_pos, run_length), so (Q2, 301, 350) covers the positions 301 to 650; the last run ends at 1151 + 600 − 1 = 1750; position 700 lies in the run of Q3, from 651 to 1150. Run-length encoding pays only when equal values are adjacent: the Quarter column is sorted and the prices are not, so the encoding is chosen column by column and Price stays raw.</p></div>
+      <div class="exam-note"><p>Числа взяты со слайда (p. 407), так что ответ можно сверить со слайдом. Классическая ошибка — принять run_length за конечную позицию. За неверные отметки может быть штраф: отмечай только то, что можешь обосновать.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-model">
+    <div class="exam-q" lang="en">
+      <p>Describe the data model of Cassandra as presented in the lecture — keyspace, column family, row, column and super column. Explain why a column family is called a sparse table and what the timestamp of a column is used for.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>A keyspace is the outermost container, roughly a database and typically one per application; some settings, such as the replication, are configured per keyspace. It contains column families, the analogue of tables, which group records of a similar but not identical kind; their settings include the comparator and the type, standard or super. A column family holds rows, each uniquely identified by its row key; Cassandra should be thought of as row-oriented, because a row's columns are stored and returned together. A column has three parts: a name (bytes; it determines the sort order, is used in queries and is indexed), a value (bytes; values are not queried) and a timestamp. A super column groups columns under a common name: it has a name and a map of columns instead of a value, and its sub-column names are not indexed. A column family is a sparse table because each row stores only the columns it has: a missing column costs nothing and is not a NULL. The timestamp (clock) is supplied with every write and resolves conflicts between replicas: the last write wins.</p></div>
+      <div class="exam-note"><p>Дай цепочку вложенности по порядку и три части столбца с их свойствами (p. 420). «Sparse» и «last write wins» — два «почему», о которых спрашивает вопрос. Если цитируешь пример настройки keyspace со слайда, partitioner, добавь, что на самом деле он задаётся для всего кластера (красная ручка к слайду (p. 413)).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-query">
+    <div class="exam-q" lang="en">
+      <p>Explain the difference between the domain-based model of an RDBMS and the query-based model of Cassandra. How would you support the query <code>SELECT * FROM User WHERE city = 'Scottsdale'</code> on a column family User keyed by UserID, and what does the solution cost?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>An RDBMS follows a domain-based model: you model the entities and relationships of the domain, normalise them, and answer any later question by combining tables with joins ("what answers do I have?"). Cassandra follows a query-based model: rows are found by key, column values are not queried and there are no joins, so you list the questions first and build a structure for each one ("what questions do I have?" — start from queries, then design the data model). For the query, create a second column family, UserCity, keyed by city, whose column names are the IDs of the users living there, with empty values (the Valueless Column pattern): the query becomes one row read, followed by a multiget of the users from User. This is why Cassandra is called an index factory. The cost is duplication: every user is written to both column families, and the application must keep the copies consistent, with no joins and no referential integrity to help.</p></div>
+      <div class="exam-note"><p>Ответ держится на двух вещах: почему (строки находятся только по ключу, джойнов нет) и цена (дублирование, копии синхронизирует приложение). В CQL та же идея — таблица с <code>PRIMARY KEY ((city), user_id)</code>. Другой инструмент с практического занятия — вторичный индекс, <code>CREATE INDEX</code>; задание на проектирование в экзамене 30 января 2026 года исключает его словами "Do not use indexes".</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l20-exam-hotel">
+    <div class="exam-q" lang="en">
+      <p><b>Our exercise, in the wording of the past papers: the hotel of pp. 434–435.</b> Consider the following ER diagram. Hotel (Hotel_ID, Name, Phone, Address, City, State, Zip); Room (Room_ID, Room Number, Rate); Guest (Guest_ID, Name, Phone, Email). Relationships: Has, Hotel (1, N) – Room (1, 1); Reserve, Guest (0, N) – Room (0, N), with the attributes Start Date and End Date.</p>
+      <p>Suppose you expect to record a large-scale, continuously increasing number of reservations, and therefore you decide to store them in a columnar database. Write the specification of the tables (column families) of a Cassandra deployment so that one can query the hotels of a state, the hotels of a city of a given state, and the reservations of a guest by phone number, the most recent first. Do not use indexes.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+        <p>Two tables, one per access path: the hotels by location, partitioned by state and clustered by city, and the reservations by guest phone, partitioned by phone and clustered by start date, the most recent first. Each reservation carries copies of the guest, hotel and room data it shows, because Cassandra has no joins.</p>
+<pre><code>-- the keyspace (one per application)
+CREATE KEYSPACE hotels
+  WITH replication = {'class': 'SimpleStrategy',
+                      'replication_factor': 3};</code></pre>
+<pre><code>-- queries 1 and 2: the hotels of a state, or of a city in it
+CREATE TABLE hotels_by_location (
+  state text,
+  city text,
+  hotel_id text,
+  name text,
+  phone text,
+  address text,
+  zip text,
+  PRIMARY KEY ((state), city, hotel_id)
+);</code></pre>
+<pre><code>-- query 3: a guest's reservations, with copies, newest first
+CREATE TABLE reservations_by_guest_phone (
+  guest_phone text,
+  start_date date,
+  reservation_id uuid,
+  end_date date,
+  guest_name text,
+  hotel_id text,
+  hotel_name text,
+  room_number int,
+  rate float,
+  PRIMARY KEY ((guest_phone), start_date, reservation_id)
+) WITH CLUSTERING ORDER BY (start_date DESC, reservation_id ASC);</code></pre>
+<pre><code>-- all the hotels of Arizona: one partition
+SELECT * FROM hotels_by_location WHERE state = 'AZ';</code></pre>
+<pre><code>-- the hotels of Scottsdale: the first clustering column fixed
+SELECT * FROM hotels_by_location
+  WHERE state = 'AZ' AND city = 'Scottsdale';</code></pre>
+<pre><code>-- a guest's reservations, the most recent first
+SELECT * FROM reservations_by_guest_phone
+  WHERE guest_phone = '+1 480 555 0101';</code></pre>
+        <p>Every reservation is one <code>INSERT</code> into <code>reservations_by_guest_phone</code>, with <code>reservation_id</code> from <code>uuid()</code> and the guest's name, the hotel's name and the room's number and rate copied in.</p>
+      </div>
+      <div class="exam-note"><p>Это слайды (pp. 431–435) на CQL. <code>hotels_by_location</code> — это составной ключ <code>state:city</code> со слайда (p. 432): штат — partition key, а город — первый clustering column, так что одна таблица отвечает на оба вопроса о местоположении без диапазона ключей и без order-preserving partitioner. <code>reservations_by_guest_phone</code> — это Reservation со слайда (p. 435): ключ — то, по чему ищет приложение, с копиями вместо джойнов; <code>reservation_id</code> разделяет два бронирования одного гостя на один день, потому что <code>INSERT</code> с уже существующим первичным ключом перезаписывает строку. Прошлые экзамены спрашивают то же самое — задание 1 из экзамена про фермеров от 12 сентября 2025 года решено в <a href="l21.html">уроке 21</a> вместе с правилами CQL, стоящими за каждой строкой.</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l20-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">В таблице продаж 20 столбцов одинаковой ширины и десять миллионов строк. Запрос считает среднее по одному столбцу. Какую примерно долю байтов строкового хранилища читает колоночное?</p>
+    <ul class="options">
+      <li>Ту же: оба должны прочитать десять миллионов строк <span class="fb">Оба проходят десять миллионов строк, но колоночное читает по одному значению на строку, а строковое — по двадцать.</span></li>
+      <li data-correct>Одну двадцатую <span class="fb">\(k/m = 1/20\): с диска едет только один столбец, который называет запрос.</span></li>
+      <li>Половину <span class="fb">Ничто здесь не делится пополам: доля — это доля нужных столбцов, 1 из 20.</span></li>
+      <li>В двадцать раз больше, потому что колоночное хранилище должно собирать кортежи <span class="fb">Среднему кортежи не нужны, так что собирать нечего. Восстановление стоит денег, только когда возвращаются целые записи.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Показания датчиков хранятся отсортированными по id датчика, по 50,000 показаний на датчик. Какой столбец больше всех выиграет от кодирования длин серий?</p>
+    <ul class="options">
+      <li>температура, потому что этот столбец запрашивают чаще всего <span class="fb">Частота запросов не создаёт серий; температура меняется от показания к показанию.</span></li>
+      <li>время показания, потому что оно всегда растёт <span class="fb">Всегда растущие значения никогда не повторяются: каждая серия будет длины 1.</span></li>
+      <li data-correct>id датчика <span class="fb">Таблица по нему отсортирована, поэтому 50,000 одинаковых соседей каждого датчика становятся одной тройкой.</span></li>
+      <li>все столбцы одинаково: кодирование длин серий не зависит от данных <span class="fb">Оно целиком зависит от данных: ему нужны одинаковые соседние значения.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Две реплики строки 456 расходятся: одна хранит email = eben@bar.com с меткой 1004, другая — email = eben@new.com с меткой 1010. Что будет на них после сравнения?</p>
+    <ul class="options">
+      <li data-correct>eben@new.com на обеих, потому что побеждает бо́льшая метка <span class="fb">"last write wins conflict resolution" (p. 420): решают часы, а проигравший отбрасывается.</span></li>
+      <li>eben@bar.com на обеих, потому что оно записано первым <span class="fb">Правило — последняя запись, а не первая.</span></li>
+      <li>оба значения, как две версии столбца <span class="fb">У столбца одно значение; проигравшая запись молча отбрасывается — цена last write wins.</span></li>
+      <li>то значение, которое хранит более быстрая реплика <span class="fb">Скорость ничего не решает; решают временные метки.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В time_ordered_blogs_by_user имена столбцов — временные метки в миллисекундах (компаратор long). Какой предикат среза вернёт десять последних записей пользователя?</p>
+    <ul class="options">
+      <li>start и finish пустые, reverse выключен, count 10 <span class="fb">Так имена проходятся вверх: десять самых старых записей.</span></li>
+      <li data-correct>start и finish пустые, reverse включён, count 10 <span class="fb">Reverse проходит отсортированные имена с новейшего конца; count останавливается после десяти, как LIMIT.</span></li>
+      <li>start = новейшая метка, reverse выключен, count 10 <span class="fb">От новейшего имени вверх есть только новейшая запись: один столбец, а не десять.</span></li>
+      <li>никакой: в Cassandra нет ORDER BY, поэтому записи нельзя вернуть в порядке времени <span class="fb">Клаузы ORDER BY нет, но имена отсортированы компаратором — сделать время именем столбца и есть способ получить порядок (p. 433).</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Нужно отвечать на «пользователи в Scottsdale» и «пользователи в Аризоне», не читая всю column family User. Какие схемы из лекции работают? Выбери все подходящие.</p>
+    <ul class="options">
+      <li data-correct>две column families, одна с ключом по городу, другая — по штату, имена столбцов в которых — ID живущих там пользователей <span class="fb">UserCity со слайда (p. 431), построенная дважды: каждый вопрос — чтение одной строки, и каждый пользователь записывается в оба семейства.</span></li>
+      <li><code>SELECT * FROM User WHERE city = 'Scottsdale'</code> на column family User с ключом UserID <span class="fb">Строки находятся по ключу; без индекса это означает прочитать всё — именно этого слайд (p. 431) и стремится избежать.</span></li>
+      <li data-correct>column family с ключом state:city, которую читают диапазоном ключей от AZ: до AZ; при order-preserving partitioner <span class="fb">Слайд (p. 432): одно семейство отвечает на оба вопроса, пока строки лежат в порядке ключей.</span></li>
+      <li>то же семейство state:city при random partitioner <span class="fb">Тогда строки идут в порядке MD5 ключа: калифорнийская строка оказывается между аризонскими, и диапазон ключей больше не означает Аризону (красная ручка к слайду (p. 433)).</span></li>
+      <li>джойн User с column family City <span class="fb">"Doesn't support joining" (p. 437).</span></li>
+    </ul>
+    <p class="q-fb">Обе работающие схемы — фабрики индексов: данные копируются в семейство с ключом по тому значению, по которому ищут.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему Cassandra отказывается от джойнов (p. 437)?</p>
+    <ul class="options">
+      <li>Потому что значения столбцов — непрозрачные байты, которые нельзя сравнивать <span class="fb">Джойн сравнивает ключи, а ключи сравнивать можно; препятствие в другом.</span></li>
+      <li>Потому что column family не может хранить ключ другой строки <span class="fb">Может: Reservation хранит hotelID и roomID (p. 435). Просто никто их не проверяет и не следует по ним.</span></li>
+      <li>Потому что теорема CAP запрещает джойны в AP-системах <span class="fb">CAP ничего не говорит о джойнах; она про реплики во время разделения сети.</span></li>
+      <li data-correct>Потому что объединяемые строки жили бы на разных узлах, и координировать их на каждом запросе стоило бы той линейной масштабируемости и доступности, ради которых Cassandra построена <span class="fb">Поэтому данные, которые читают вместе, и хранят вместе, при необходимости дублируя: "Tables contain duplicate denormalize data" (p. 437).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В super column family PointOfInterest тебе нужен только телефон Empire State Building (строка 10019). Что прочитает Cassandra?</p>
+    <ul class="options">
+      <li>только столбец phone, найденный через индекс <span class="fb">"sub-column names in a SCF are not indexed" (p. 425).</span></li>
+      <li>всю строку 10019, включая Central Park <span class="fb">Имена суперстолбцов проиндексированы, так что она может сразу перейти к Empire State Building.</span></li>
+      <li data-correct>весь суперстолбец Empire State Building, desc и phone, а потом выберет phone <span class="fb">Верхний уровень проиндексирован, подстолбцы — нет: суперстолбец читается целиком.</span></li>
+      <li>ничего: суперстолбец нельзя прочитать по имени <span class="fb">Путь к столбцу (column path) может назвать суперстолбец и даже подстолбец (get, p. 427); отличается стоимость.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l20-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>Строковое хранилище держит каждую запись одним куском, колоночное — каждый столбец: запрос, которому нужны \(k\) из \(m\) столбцов, читает в колоночном хранилище долю \(k/m\) байтов, но чтение или вставка целой записи затрагивает \(m\) мест — "suitable for read-mostly, read-intensive, large data repositories" (pp. 402–405).</li>
+    <li>Колоночные хранилища хорошо сжимаются, потому что соседние значения принадлежат одному атрибуту; кодирование длин серий хранит (value, start_pos, run_length) и окупается только на отсортированных или сгруппированных столбцах (pp. 406–407).</li>
+    <li>«Columnar» называет два семейства: column-oriented stores (Vertica, C-Store, MonetDB, SybaseIQ, LucidDB) и wide-column stores (Cassandra, BigTable, HBase) — "think of cassandra as row-oriented" (p. 417).</li>
+    <li>"cassandra ~= bigtable + dynamo": модель данных Bigtable (разреженная карта) на распределении Dynamo (O(1) DHT, согласованность, настраиваемая клиентом); по умолчанию AP и согласованность в конечном счёте (eventual consistency), "tuneably consistent" для каждой операции.</li>
+    <li>keyspace › column family › строка (по ключу) › столбец (имя, значение, временная метка): имена отсортированы компаратором и читаются срезами, по значениям по замыслу не запрашивают, побеждает последняя запись; суперстолбцы добавляют уровень именованных групп, подстолбцы которых не индексируются.</li>
+    <li>Модель Cassandra основана на запросах: начинай с запросов, строй по column family на каждый вопрос (фабрика индексов, столбцы без значения, составные ключи), получай порядок проектированием (компаратор, партиционер) и денормализуй вместо джойнов — ни джойнов, ни ссылочной целостности.</li>
+    <li>Сегодня ту же модель записывают на CQL (урок 21): таблица, partition key, clustering columns; ни суперстолбцов, ни Thrift.</li>
+  </ul>
+  <aside class="cheat" id="l20-cheat">
+    <dl>
+      <dt>Row store</dt><dd>каждая запись одним куском: лёгкие вставки и обновления, "might read in unnecessary data" (OLTP)</dd>
+      <dt>Column store</dt><dd>каждый столбец отдельным куском: "only need to read in relevant data"; читает \(k/m\) байтов (OLAP)</dd>
+      <dt>Pros (p. 403)</dt><dd>data compression · bandwidth utilization · code pipelining · cache locality</dd>
+      <dt>Cons (p. 404)</dt><dd>disk seek time · cost of inserts · tuple reconstruction</dd>
+      <dt>Tuple reconstruction</dt><dd>позиция \(i\) каждого столбца = запись \(i\); "Large prefetch hides disk seeks in columns"</dd>
+      <dt>Тройка RLE</dt><dd>(value, start_pos, run_length): покрывает start_pos … start_pos + run_length − 1; следующий start = start + length</dd>
+      <dt>cassandra ~= bigtable + dynamo</dt><dd>модель данных sparse map + O(1) DHT и согласованность, настраиваемая клиентом</dd>
+      <dt>CAP (p. 400)</dt><dd>Cassandra: eventual (weak) consistency, availability, partition tolerance; "tuneably consistent" (p. 438)</dd>
+      <dt>Keyspace</dt><dd>~= база данных, одна на приложение; задаёт репликацию (партиционер — один на кластер)</dd>
+      <dt>Column family</dt><dd>разреженная таблица похожих записей; компаратор; тип standard или super</dd>
+      <dt>Column</dt><dd>name (отсортировано, используется в запросах, проиндексировано) · value (по нему не запрашивают) · timestamp (last write wins)</dd>
+      <dt>Comparator</dt><dd>порядок имён столбцов: byte, utf8, long, timeuuid, lexicaluuid, pluggable</dd>
+      <dt>Super column</dt><dd>имя + карта столбцов; имена подстолбцов не индексируются, читается целиком</dd>
+      <dt>SliceRange</dt><dd>start, finish (пусто = остановиться по count), reverse, count (как LIMIT)</dd>
+      <dt>API чтения и записи</dt><dd><code>get</code>, <code>get_slice</code>, <code>multiget_slice</code>, <code>get_range_slices</code>; <code>insert</code>, <code>batch_mutate</code>, <code>remove</code> — ключ первым, CL последним</dd>
+      <dt>Query-based model</dt><dd>"Start from queries, then design the data model": фабрика индексов (index factory), столбцы без значения (valueless columns), составные ключи (aggregate keys)</dd>
+      <dt>ORDER BY (p. 433)</dt><dd>столбцы — по компаратору; строки — по токену партиционера, порядок ключей только с order-preserving</dd>
+      <dt>vs RDBMS (pp. 436–437)</dt><dd>без мастера; без джойнов; без ссылочной целостности; дублированные, денормализованные данные</dd>
+      <dt>В CQL</dt><dd><code>PRIMARY KEY ((city), user_id)</code>: row key → partition key, отсортированные имена → clustering columns</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l20-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://cassandra.apache.org/doc/stable/cassandra/developing/data-modeling/data-modeling_logical.html" target="_blank" rel="noopener">Logical data modeling</a>
+      <span class="res-by">Документация Apache Cassandra</span>
+      <p class="res-why">Предметная область отеля, как на слайдах (pp. 434–435), смоделированная от запросов в таблицы CQL вроде <code>hotels_by_poi</code> и <code>available_rooms_by_hotel_date</code>. Читай вместе с разделом 5: та же «фабрика индексов», в нотации практических занятий.</p>
+    </li>
+    <li class="res" data-kind="video" data-when="after">
+      <a class="res-title" href="https://www.youtube.com/watch?v=UuHw3SQMrog" target="_blank" rel="noopener">F2023 #05 – Storage Models &amp; Database Compression</a>
+      <span class="res-by">Andy Pavlo, CMU Intro to Database Systems</span>
+      <p class="res-why">Университетская лекция о строковой и колоночной раскладке и о сжатии — длины серий, словарное, упаковка битов (bit-packing), — которая превращает четыре плюса и три минуса со слайдов (pp. 403–404) в раскладку страниц.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/" target="_blank" rel="noopener">Bigtable: A Distributed Storage System for Structured Data</a>
+      <span class="res-by">Chang et al., Google, OSDI 2006</span>
+      <p class="res-why">"Sparse map" со слайда (p. 411) в оригинальных словах: строки, column families и временные метки. Достаточно раздела 2, о модели данных.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cs.cornell.edu/projects/ladis2009/papers/lakshman-ladis2009.pdf" target="_blank" rel="noopener">Cassandra – A Decentralized Structured Storage System</a>
+      <span class="res-by">Avinash Lakshman, Prashant Malik, LADIS 2009</span>
+      <p class="res-why">Шесть страниц от двух авторов: модель данных этого урока и кольцо следующих, с поиском по входящим сообщениям, ради которого Cassandra и создавалась.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Теперь ты умеешь рисовать строку Cassandra так, как это делают слайды. Практические занятия и прошлые экзамены записывают её на CQL: какая часть <code>PRIMARY KEY ((…), …)</code> решает, где живёт строка, какая — её порядок, и какие условия WHERE Cassandra отвергает?</p>
+</aside>
+
+</main>
+</body>
+</html>

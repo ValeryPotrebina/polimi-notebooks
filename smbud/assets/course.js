@@ -688,6 +688,12 @@
       setThemePref(nx);
       var b = doc.getElementById('tb-theme-' + nx); if (b) b.focus();
     });
+    var alt = S.course.alt;
+    if (alt && alt.dirs) {                                       // the same page in the other language, in a sibling folder
+      var segs = location.pathname.split('/'), file = segs.pop() || 'index.html', dir = decodeURIComponent(segs.pop() || '');
+      if (alt.dirs[dir]) bar.appendChild(el('a', { 'class': 'tb-lang', href: '../' + alt.dirs[dir] + '/' + file + location.hash,
+        hreflang: alt.lang || '', lang: alt.lang || '', title: alt.title || '', text: alt.label }));
+    }
     bar.appendChild(tg);
 
     /* shell */
@@ -1277,14 +1283,15 @@
     if (form === 'short') return slideNums(p);
     return form === 'of' ? slideNums(p) + ' of ' + deckName(p.deck) : deckName(p.deck) + ', ' + slideNums(p);
   }
-  function partNode(p, form, linked) {
-    var text = partLabel(p, form);
+  function partNode(p, form, linked, bare) {
+    var text = bare ? slideNums(p) : partLabel(p, form);      // bare: the same deck as the part before it ("slides 75 and 78")
     if (!linked) return doc.createTextNode(text);
     return el('a', { 'class': 'slide-ref', href: slideSrc(p.deck, p.from), 'data-deck': p.deck.id,
       'data-slide': p.from === p.to ? String(p.from) : p.from + '-' + p.to, text: text });
   }
-  /* "p. 15", "pp. 23–25", "page 104", "Pages 9–12", each optionally after "the slide(s) of / on / in / at" */
-  var PAGE_REF = /(^|[^\w.])((?:([Tt]he)[  ])?([Ss]lides?)[  ](?:of|on|in|at)[  ])?(pp?\.|[Pp]ages?)[  ]+(\d{1,4})(?:[  ]*[–—-][  ]*(\d{1,4}))?(?!\d)/g;
+  /* "p. 15", "pp. 23–25", "page 104", "Pages 9–12", each optionally after "the slide(s) of / on / in / at";
+     after "pp." / "Pages" also a list: "pp. 21, 25, 27", "pp. 134 and 137", "pp. 1334 и 1346" (group 8, the tail) */
+  var PAGE_REF = /(^|[^\w.])((?:([Tt]he)[  ])?([Ss]lides?)[  ](?:of|on|in|at)[  ])?(pp?\.|[Pp]ages?)[  ]+(\d{1,4})(?:[  ]*[–—-][  ]*(\d{1,4}))?((?:(?:[  ]*,[  ]*|[  ]+(?:and|и)[  ]+)\d{1,4}(?:[  ]*[–—-][  ]*\d{1,4})?(?!\d))*)(?!\d)/g;
   var PAGE_HINT = /p\.|age/;
   var TEX_SPLIT = /(\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\])/;
   /* one match -> { parts, form, capital } or null (a page outside the decks, or a page of another document) */
@@ -1292,11 +1299,24 @@
     if (/\btheir[  ]*$/i.test(before)) return null;                    // "their p. 20": the course notes
     var a = parseInt(m[6], 10), b = m[7] ? parseInt(m[7], 10) : a, parts = pageParts(a, b);
     if (!parts) return null;
+    var tail = m[8] || '';
+    if (tail && /^(?:pp|[Pp]ages)/.test(m[5])) {                        // a list after "pp.": every item must be a page of the decks
+      var extra = [], ok = true;
+      tail.replace(/(\d{1,4})(?:[  ]*[–—-][  ]*(\d{1,4}))?/g, function (_, x, y) {
+        var pp = pageParts(parseInt(x, 10), y ? parseInt(y, 10) : parseInt(x, 10));
+        if (pp) extra = extra.concat(pp); else ok = false;
+      });
+      if (ok) { parts = parts.concat(extra); tail = ''; }
+    }
     var capital = m[2] ? (m[3] === 'The' || (!m[3] && /^S/.test(m[4]))) : /^P/.test(m[5]);
-    return { parts: parts, form: short ? 'short' : m[2] ? 'of' : '', capital: capital };
+    return { parts: parts, form: short ? 'short' : m[2] ? 'of' : '', capital: capital, tail: tail };   // tail: text the match took but did not use
   }
+  function sameDeck(parts, k) { return k > 0 && parts[k - 1].deck === parts[k].deck; }
+  function partSep(parts, k) { return k === parts.length - 1 ? ' and ' : ', '; }     // "slides 21, 25 and 27"
   function refText(ref) {
-    var s = ref.parts.map(function (p) { return partLabel(p, ref.form); }).join(' and ');
+    var s = ref.parts.map(function (p, k) {
+      return (k ? partSep(ref.parts, k) : '') + (sameDeck(ref.parts, k) ? slideNums(p) : partLabel(p, ref.form));
+    }).join('');
     return ref.capital ? capFirst(s) : s;
   }
   /* a string (an attribute, a text without links) with its references named */
@@ -1307,7 +1327,7 @@
       parts[i] = parts[i].replace(PAGE_REF, function () {
         var m = arguments, offset = m[m.length - 2], whole = m[m.length - 1];
         var ref = pageRef(m, whole.slice(0, offset + m[1].length), short);
-        return ref ? m[1] + refText(ref) : m[0];
+        return ref ? m[1] + refText(ref) + ref.tail : m[0];
       });
     }
     return parts.join('');
@@ -1330,12 +1350,13 @@
         buf += s.slice(last, start);
         if (buf) { frag.appendChild(doc.createTextNode(buf)); buf = ''; }
         ref.parts.forEach(function (part, k) {
-          if (k) frag.appendChild(doc.createTextNode(' and '));
-          var node = partNode(part, ref.form, linked);
+          if (k) frag.appendChild(doc.createTextNode(partSep(ref.parts, k)));
+          var node = partNode(part, ref.form, linked, sameDeck(ref.parts, k));
           if (!k && ref.capital) { if (node.nodeType === 3) node.nodeValue = capFirst(node.nodeValue); else node.textContent = capFirst(node.textContent); }
           frag.appendChild(node);
         });
-        last = m.index + m[0].length;
+        last = m.index + m[0].length - ref.tail.length;
+        PAGE_REF.lastIndex = last;
         changed = true;
       }
       buf += s.slice(last);

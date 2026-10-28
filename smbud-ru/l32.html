@@ -1,0 +1,1381 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Экосистема Hadoop: HBase, Pig, Hive, Impala · Тетрадь SMBUD</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<style>
+/* page-local: the toy relations under the jobs widget (rows of tuples that wrap on a phone) and the clickable boxes of its plan; no component covers them; tokens only */
+.l32-rel { padding: 0.7rem 1rem 0.9rem; display: grid; gap: 0.45rem; font-family: var(--f-display); font-size: var(--t-sm); color: var(--ink); }
+.l32-rel-h, .l32-rel-m { margin: 0; font-size: var(--t-xs); line-height: 1.45; }
+.l32-rel-h { font-weight: 650; color: var(--ink-2); }
+.l32-rel-m { color: var(--ink); }
+.l32-tuples { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.l32-tuple { font-family: var(--f-mono); font-size: var(--t-xs); line-height: 1.35; padding: 0.06rem 0.35rem; color: var(--ink); background: color-mix(in srgb, var(--s1) 10%, var(--paper)); border: 1px solid color-mix(in srgb, var(--s1) 50%, var(--paper)); border-radius: var(--radius); overflow-wrap: anywhere; }
+.l32-hit { cursor: pointer; }
+</style>
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l32">
+
+<header class="lesson-head">
+  <h1>Экосистема Hadoop: HBase, Pig, Hive, Impala</h1>
+  <p class="lede">После этого урока ты сможешь найти ячейку HBase по её адресу и объяснить, почему пустые ячейки ничего не стоят, посчитать, во сколько заданий MapReduce превращается скрипт Pig или запрос Hive, рассказать, как Hive пропускает ненужные запросу партиции, и сказать, что Impala выигрывает — и чем платит, — отказавшись от MapReduce совсем.</p>
+</header>
+
+<div class="hook" data-label="Загадка для начала">
+  <p>Слайд задаёт вопрос, который задаёт себе любой сайт: "find the top 5 most visited pages by users aged 18-25" (p. 900). Следующий слайд отвечает на него вручную написанной Java для MapReduce — пять заданий, сцепленных руками (p. 901). А ещё один отвечает девятью строками на Pig (p. 902). Эти девять строк всё равно выполняются на MapReduce: задания за тебя пишет Pig.</p>
+  <p>Дальше лекция переходит к SQL. Hive задаёт тот же вопрос на SQL и под капотом тоже запускает MapReduce. Impala задаёт его на том же SQL, но без MapReduce, и её слайд обещает: "Always faster then Hive at least 10 times" (p. 921). При этом Hive на том же слайде никуда не делся: он умеет то, чего не умеет Impala. Зачем держать движок, который в десять раз медленнее?</p>
+  <p>Ответ не про скорость, и он будет в последнем разделе. По дороге ты встретишь таблицу, где пустая ячейка ничего не стоит, скрипт, который становится ровно тремя заданиями, и запрос, который пропускает почти всю таблицу, даже не открывая её.</p>
+</div>
+
+
+<section id="l32-hbase">
+  <h2>HBase: отсортированная карта, похожая на таблицу</h2>
+
+  <p>В <a href="l31.html">уроке 31</a> HDFS хранила огромные файлы, которые MapReduce читает целиком, батчем. Следующая лекция ставит поверх неё четыре проекта — по одному на каждую жалобу. Три названы на слайде (p. 891): "Pig – High-level language for data analysis", "HBase – Table storage for semi-structured data", "Hive – SQL-like Query language and Metastore", — а Impala появляется позже (табл. 1).</p>
+
+  <figure class="tbl-fig" id="l32-tbl-map">
+    <figcaption>Табл. 1. Четыре проекта этого урока и жалоба, на которую отвечает каждый.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Проект</th><th>Что это</th><th>Ты хочешь…</th><th>Что выполняется</th></tr></thead>
+        <tbody>
+          <tr><td>HBase</td><td>табличное хранилище поверх HDFS (pp. 893–897)</td><td>одну строку, сейчас, по её ключу</td><td>свои серверы; без MapReduce</td></tr>
+          <tr><td>Pig</td><td>язык потоков данных (pp. 899–904)</td><td>не писать Java руками</td><td>задания MapReduce, которые он генерирует</td></tr>
+          <tr><td>Hive</td><td>SQL-подобный HiveQL и Metastore (pp. 906–913)</td><td>SQL поверх своих файлов</td><td>задания MapReduce, которые он генерирует</td></tr>
+          <tr><td>Impala</td><td>MPP-движок SQL (pp. 915–922)</td><td>ответы на SQL, пока ты ждёшь</td><td>свои демоны, прямо на HDFS</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Начнём с HBase. Слайд описывает её пятью строками (p. 893): "Modeled on Google's Bigtable", "Key-valued row/column store", "Billions of rows/millions on columns", "Column-oriented - nulls are free", "Untyped - stores byte[]". Пример на следующем слайде объясняет каждую строку.</p>
+
+  <h3>Зоопарк в одной строке</h3>
+
+  <p>Зоопарк хранит по строке на каждый вольер (p. 894). Ключ строки — <code>enclosure1</code>. Её столбцы собраны в два <mark class="key">семейства столбцов (column families)</mark>: <code>animal:</code> со столбцами <code>animal:type</code> и <code>animal:size</code> и <code>repairs:</code> со столбцом <code>repairs:cost</code>. В момент t1 в вольере жил большой лев; в момент t2 туда въехала зебра. Слайд рисует одну строку с двумя линиями временных меток — t1: lion, big; t2: zebra — плюс стоимость ремонта 1000 EUR (смотри красную ручку ниже).</p>
+
+  <aside class="margin-note">Сам зоопарк нарисован на слайдах; правила за ним — строки отсортированы по ключу, семейства объявляются вместе с таблицей, на чтение отвечает самая новая версия — взяты из статьи о Bigtable и из справочника HBase (фон, не со слайдов).</aside>
+
+  <div class="def">
+    <p><dfn>Ключ строки (row key)</dfn> — ключ строки, <code>enclosure1</code>. Строки хранятся отсортированными по нему.</p>
+    <p><dfn>Семейство столбцов (column family)</dfn> — группа столбцов, объявленная в схеме таблицы, обычно при её создании (<code>animal:</code>, <code>repairs:</code>), и хранящаяся отдельно от других семейств.</p>
+    <p><dfn>Столбец (column)</dfn> — записывается как <code>family:qualifier</code>, например <code>animal:type</code>. Квалификатор (qualifier) никогда не объявляется: любая строка может в любой момент начать использовать новый.</p>
+    <p><dfn>Временная метка (timestamp)</dfn> — момент, когда ячейку записали. Ячейка хранит несколько версий, по одной на метку, а обычное чтение возвращает самую новую.</p>
+    <p><dfn>Ячейка (cell)</dfn> — одно значение, адресуемое ключом строки, столбцом и временной меткой. Значение — это <code>byte[]</code>: типов в HBase нет.</p>
+  </div>
+
+  <div class="formula" id="l32-f-cell">
+    \[ (\text{row}, \text{column}, \text{timestamp}) \mapsto \text{value} \]
+    <dl class="legend">
+      <dt>row</dt><dd>ключ строки, <code>enclosure1</code></dd>
+      <dt>column</dt><dd>family:qualifier, <code>animal:type</code></dd>
+      <dt>timestamp</dt><dd>t1, t2, … — по одной на каждую версию ячейки</dd>
+      <dt>value</dt><dd>неинтерпретируемые байты, <code>byte[]</code></dd>
+    </dl>
+  </div>
+
+  <p>Вот и вся модель данных: отображение из адресов ячеек в байты — словами статьи о Bigtable, «разреженная, распределённая, персистентная многомерная отсортированная карта» (фон). Таблица на слайде (p. 894) — лишь один из способов её нарисовать.</p>
+
+  <h3>Что пишется на диск</h3>
+
+  <p>Другой способ показан на следующем слайде (p. 895). Каждое семейство столбцов хранится отдельно, списком записей, и каждая запись — это ключ <code>(row, timestamp, column)</code> со своим значением. В семействе <code>animal:</code> три записи — <code>(enclosure1, t2, animal:type)</code> zebra, <code>(enclosure1, t1, animal:size)</code> big, <code>(enclosure1, t1, animal:type)</code> lion. В семействе <code>repairs:</code> одна, <code>(enclosure1, t1, repairs:cost)</code> 1000 EUR. Всего четыре записи.</p>
+
+  <p>У пустых ячеек таблицы записей нет. Их ничто не помечает и ничто не резервирует для них место: отсутствующая запись и есть null. Это и значит "nulls are free". Место растёт с числом записанных ячеек, а не как «строки × столбцы», — поэтому такое хранилище подходит для "semi-structured data" (p. 891), где каждая строка заполняет свою горстку столбцов из тысяч. Реляционная таблица держит слот, или хотя бы пометку NULL, под каждый объявленный столбец в каждой строке (рис. 1).</p>
+
+  <p class="memo"><mark class="key">HBase хранит по одной записи на каждую записанную ячейку, (row, timestamp, column) → value, семейство за семейством; пустая ячейка не хранится вовсе.</mark></p>
+
+  <figure class="fig fig--pair fig--plain" id="l32-fig-nulls">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Реляционная таблица zoo со столбцами key, type, size и cost и тремя строками: enclosure1 zebra, big, 1000 EUR; enclosure2 giraffe, NULL, NULL; enclosure3 NULL, NULL, 250 EUR. Девять слотов, в четырёх из них NULL.">
+        <rect x="8" y="20" width="92" height="24" class="fw-s3 st-s3"/>
+        <rect x="100" y="20" width="64" height="24" class="fw-s3 st-s3"/>
+        <rect x="164" y="20" width="56" height="24" class="fw-s3 st-s3"/>
+        <rect x="220" y="20" width="72" height="24" class="fw-s3 st-s3"/>
+        <text x="54" y="37" class="tx-mono tx-sm tx-mid">key</text>
+        <text x="132" y="37" class="tx-mono tx-sm tx-mid">type</text>
+        <text x="192" y="37" class="tx-mono tx-sm tx-mid">size</text>
+        <text x="256" y="37" class="tx-mono tx-sm tx-mid">cost</text>
+
+        <rect x="8" y="44" width="92" height="26" class="fi-paper"/>
+        <rect x="100" y="44" width="64" height="26" class="fi-paper"/>
+        <rect x="164" y="44" width="56" height="26" class="fi-paper"/>
+        <rect x="220" y="44" width="72" height="26" class="fi-paper"/>
+        <text x="14" y="62" class="tx-mono tx-sm">enclosure1</text>
+        <text x="132" y="62" class="tx-mono tx-sm tx-mid">zebra</text>
+        <text x="192" y="62" class="tx-mono tx-sm tx-mid">big</text>
+        <text x="256" y="62" class="tx-mono tx-sm tx-mid">1000 EUR</text>
+
+        <rect x="8" y="70" width="92" height="26" class="fi-paper"/>
+        <rect x="100" y="70" width="64" height="26" class="fi-paper"/>
+        <rect x="164" y="70" width="56" height="26" class="fw-ink"/>
+        <rect x="220" y="70" width="72" height="26" class="fw-ink"/>
+        <text x="14" y="88" class="tx-mono tx-sm">enclosure2</text>
+        <text x="132" y="88" class="tx-mono tx-sm tx-mid">giraffe</text>
+        <text x="192" y="88" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+        <text x="256" y="88" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+
+        <rect x="8" y="96" width="92" height="26" class="fi-paper"/>
+        <rect x="100" y="96" width="64" height="26" class="fw-ink"/>
+        <rect x="164" y="96" width="56" height="26" class="fw-ink"/>
+        <rect x="220" y="96" width="72" height="26" class="fi-paper"/>
+        <text x="14" y="114" class="tx-mono tx-sm">enclosure3</text>
+        <text x="132" y="114" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+        <text x="192" y="114" class="tx-mono tx-sm tx-mid tx-muted">NULL</text>
+        <text x="256" y="114" class="tx-mono tx-sm tx-mid">250 EUR</text>
+
+        <text x="8" y="150" class="tx-sm">3 строки × 3 столбца = 9 слотов,</text>
+        <text x="8" y="168" class="tx-sm">в 4 из них лежит NULL</text>
+        <text x="8" y="216" class="tx-hand">слот под каждый столбец</text>
+      </svg>
+      <p class="fig-label">До: реляционная таблица</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Тот же зоопарк в HBase: в семействе animal четыре записи, (enclosure1, t1, animal:size) big, (enclosure1, t2, animal:type) zebra, (enclosure1, t1, animal:type) lion, (enclosure2, t3, animal:type) giraffe; в семействе repairs две, (enclosure1, t1, repairs:cost) 1000 EUR и (enclosure3, t4, repairs:cost) 250 EUR. У пустых ячеек записей нет.">
+        <text x="8" y="14" class="tx-sm tx-bold">семейство animal:</text>
+        <rect x="8" y="22" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="22" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="37" class="tx-mono tx-sm">(enclosure1, t1, animal:size)</text>
+        <text x="255" y="37" class="tx-mono tx-sm tx-mid">big</text>
+        <rect x="8" y="48" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="48" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="63" class="tx-mono tx-sm">(enclosure1, t2, animal:type)</text>
+        <text x="255" y="63" class="tx-mono tx-sm tx-mid">zebra</text>
+        <rect x="8" y="74" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="74" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="89" class="tx-mono tx-sm">(enclosure1, t1, animal:type)</text>
+        <text x="255" y="89" class="tx-mono tx-sm tx-mid">lion</text>
+        <rect x="8" y="100" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="100" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="115" class="tx-mono tx-sm">(enclosure2, t3, animal:type)</text>
+        <text x="255" y="115" class="tx-mono tx-sm tx-mid">giraffe</text>
+
+        <text x="8" y="146" class="tx-sm tx-bold">семейство repairs:</text>
+        <rect x="8" y="154" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="154" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="169" class="tx-mono tx-sm">(enclosure1, t1, repairs:cost)</text>
+        <text x="255" y="169" class="tx-mono tx-sm tx-mid">1000 EUR</text>
+        <rect x="8" y="180" width="210" height="22" class="fw-s3 st-s3"/>
+        <rect x="218" y="180" width="74" height="22" class="fi-paper"/>
+        <text x="14" y="195" class="tx-mono tx-sm">(enclosure3, t4, repairs:cost)</text>
+        <text x="255" y="195" class="tx-mono tx-sm tx-mid">250 EUR</text>
+
+        <text x="8" y="236" class="tx-hand">пустые ячейки: ничего</text>
+      </svg>
+      <p class="fig-label">После: HBase, одна запись на записанную ячейку</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Один и тот же зоопарк дважды. До: реляционная таблица держит в каждой строке слот под каждый объявленный столбец, и в 4 из её 9 слотов лежит NULL. После: HBase хранит одну запись на каждую записанную ячейку, семейство за семейством, — четыре записи со слайда (p. 895), жирафа, записанного в enclosure2 в момент t3, и ремонт enclosure3 в момент t4, — а пустой ячейки просто нет. Лев тоже никуда не делся: он хранится как более старая версия <code>animal:type</code>.</figcaption>
+  </figure>
+
+  <aside class="redpen" data-page="894">
+    <p class="claim">enclosure1 · t2 · zebra · (пусто) · 1000 EUR (строка t2 таблицы "HBase - Data Model")</p>
+    <p class="fix">Стоимость записали один раз, значит, у неё одна временная метка — а два слайда дают ей две. На слайде (p. 895) она хранится как "(enclosure1, t1, repairs:cost) 1000 EUR". Если следовать ему (p. 895), как делают этот урок и его виджет, стоимость стоит на линии t1 таблицы, рядом с lion и big.</p>
+    <p class="because">Два слайда — это два вида одних и тех же четырёх записей, так что одна версия не может нести t2 на одном и t1 на другом: одна из меток — опечатка. Код на слайде (p. 896) <code>repairs:cost</code> вообще не пишет, так что рассудить он не может. На экзамене ответ могут сверять с любой из напечатанных картинок: читай 1000 EUR как одну версию <code>repairs:cost</code>, записанную один раз, на какой бы линии её ни нарисовали.</p>
+  </aside>
+
+  <h3>Запись и чтение по ключу</h3>
+
+  <p>Код на слайде (p. 896) пишет ровно эти данные, через HBase API того времени:</p>
+
+<pre><code>// p. 896: lion and big at t1, then zebra at t2
+HTable table = …
+Text row = new Text("enclosure1");
+Text col1 = new Text("animal:type");
+Text col2 = new Text("animal:size");
+BatchUpdate update = new BatchUpdate(row);
+update.put(col1, "lion".getBytes("UTF-8"));
+update.put(col2, "big".getBytes("UTF-8"));
+table.commit(update);
+
+update = new BatchUpdate(row);
+update.put(col1, "zebra".getBytes("UTF-8"));
+table.commit(update);</code></pre>
+
+  <aside class="margin-note">На слайде во втором put не хватает закрывающей кавычки: "big".getBytes("UTF-8)). Опечатка; в блоке здесь она закрыта.</aside>
+
+  <p>Прочитай вслух. <code>BatchUpdate</code> собирает записи для одной строки; <code>commit</code> отправляет их вместе, поэтому lion и big делят одну метку, t1. Второй <code>BatchUpdate</code> пишет только <code>animal:type</code>, в момент t2. В <code>animal:size</code> в момент t2 ничего не пишется: на одном слайде (p. 894) эта ячейка пустая, на другом (p. 895) записи для неё нет, а чтение <code>animal:size</code> по-прежнему возвращает big, её самую новую версию. Каждое значение уходит байтами — <code>"lion".getBytes("UTF-8")</code> и есть "Untyped - stores byte[]" в коде.</p>
+
+  <p>Чтения перечислены на следующем слайде (p. 897). Их три, и только три:</p>
+
+<pre><code>// p. 897: a cell (newest version: zebra), a row, a scan
+Cell = table.getRow("enclosure1")
+            .getColumn("animal:type").getValue();
+RowResult = table.getRow( "enclosure1" );
+Scanner s = table.getScanner( new String[] { "animal:type" } );</code></pre>
+
+  <p>"Retrieve a cell", "Retrieve a row", "Scan through a range of rows": по ключу, по ключу, по диапазону ключей. Строки хранятся отсортированными, так что диапазон — это одно непрерывное чтение. И больше ничего: ни SQL, ни джойнов, ни вторичных индексов — условие на значение можно проверить только во время сканирования (фон, справочник HBase). Чтобы найти «все вольеры саванны», положи зону в ключ строки, чтобы они сортировались рядом, — та же логика, что у partition key в Cassandra (<a href="l21.html">урок 21</a>).</p>
+
+  <p>Классы на слайде — из 2008 года; сегодня это <code>Put</code>, <code>Get</code> и <code>Scan</code> (фон). На экзамене отвечай именами со слайда. В современной оболочке HBase зоопарк занимает шесть строк:</p>
+
+<pre><code># HBase shell today (background): the zoo of pp. 894–897
+create 'zoo', {NAME =&gt; 'animal', VERSIONS =&gt; 3}, 'repairs'
+put 'zoo', 'enclosure1', 'animal:type', 'lion'
+put 'zoo', 'enclosure1', 'animal:size', 'big'
+put 'zoo', 'enclosure1', 'animal:type', 'zebra'
+get 'zoo', 'enclosure1', {COLUMN =&gt; 'animal:type', VERSIONS =&gt; 2}
+scan 'zoo', {COLUMNS =&gt; 'animal:type'}</code></pre>
+
+  <p><code>get</code> возвращает zebra, потом lion. Семейство хранит ровно столько версий, со сколькими его создали, — начиная с HBase 0.96 по умолчанию одну (фон); пример со слайда хранит две.</p>
+
+  <div class="pitfall">
+    <p>«Column-oriented — значит, HBase и есть хранилище, чтобы усреднить один столбец по миллиарду строк». Нет. На слайде (p. 893) "Column-oriented" значит, что семейства столбцов хранятся отдельно; внутри семейства столбцы одной строки лежат вместе под её ключом, строка за строкой. Колоночное хранилище в смысле <a href="l20.html#l20-colstore">урока 20</a> держит значения каждого столбца вместе, в отдельном куске, как это делают файлы Parquet из раздела 5. Запомни подпись со слайда и её настоящий смысл: разреженное хранилище с семействами столбцов, построенное для доступа по ключу.</p>
+  </div>
+
+  <p>Если зоопарк напомнил тебе Cassandra (<a href="l20.html">урок 20</a>), так и должно быть: обе копируют модель данных Bigtable. Под капотом HBase держит свои файлы в HDFS и отдаёт каждый диапазон строк ровно одному серверу под управлением мастера, а у Cassandra мастера нет (<a href="l22.html#l22-hbase">урок 22</a> рисует обе). В стеке Hadoop HBase — это "online data access" со слайда (p. 835): случайные чтения и записи по ключу рядом с движками, которые читают файлы целиком.</p>
+
+  <p>Теперь запиши несколько ячеек сам: каждый put добавляет ровно одну запись в список одного семейства, а get возвращает самую новую версию, пока старые остаются в хранилище.</p>
+
+  <div class="widget" id="l32-w-sparse">
+    <h3 class="widget-title">Разреженная таблица, бесплатные null</h3>
+    <p class="widget-intro">Сверху — логический вид таблицы <code>zoo</code>: три ключа строк, два семейства столбцов, пять квалификаторов. Заполненная ячейка показывает своё самое новое значение и под ним по точке на каждую хранимую версию; ячейка с пунктиром пустая, а серый ключ строки не имеет ни одной ячейки — для HBase такой строки ещё не существует. Снизу — физический вид: что HBase хранит на самом деле, по списку на семейство столбцов, в порядке HBase (ключ строки, столбец, сначала самая новая версия; слайд (p. 895) перечисляет те же записи в другом порядке). Выбери ключ строки, столбец и значение, потом сделай put, get или scan. Начальное состояние — четыре записи со слайда (p. 895).</p>
+    <ol class="tasks">
+      <li>Пока ничего не трогай: на рисунке 3 строки и 5 столбцов, и каждое семейство могло бы принять ещё миллион квалификаторов. Сколько записей хранится? Предскажи, потом посмотри на нижнюю половину и на показания.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Четыре — записи со слайда (p. 895). Двенадцать из пятнадцати нарисованных ячеек пустые, и записей у них нет; у enclosure2 и enclosure3 нет ни одной ячейки, так что как строк их ещё не существует. Миллион лишних пустых квалификаторов стоил бы ровно столько же: ничего.</p></details>
+      </li>
+      <li>Оставь <code>enclosure1</code> и <code>animal:type</code> и нажми <em>«get ячейки»</em>. Какое значение вернётся и хранится ли ещё lion?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>zebra, записанная в момент t2: самая новая версия. lion остаётся в списке как <code>(enclosure1, t1, animal:type)</code> с пометкой «старее». Put добавляет версию, а не перезаписывает. Именно поэтому на слайде (p. 894) lion и zebra могут стоять в одной строке.</p></details>
+      </li>
+      <li>Выбери <code>enclosure2</code>, <code>animal:diet</code> — квалификатор, которым ещё никто не пользовался, — и hay, а потом предскажи: сколько записей добавит put, в какой список и изменятся ли enclosure1 и enclosure3? Нажми <em>«put»</em>.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Одна запись, <code>(enclosure2, t3, animal:diet)</code> hay, в списке <code>animal:</code>. Больше ничего не меняется: ни изменения таблицы, ни NULL в других строках, а enclosure2 теперь существует. Заранее фиксируются только семейства; квалификаторы свободны.</p></details>
+      </li>
+      <li>Запиши giraffe в <code>enclosure3</code>, <code>animal:type</code>. Теперь предскажи, что вернёт <em>«scan столбца»</em> для <code>animal:type</code> и в каком порядке. Потом попробуй записать Rossi в <code>animal:size</code>: возразит ли HBase?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>enclosure1 zebra, потом enclosure3 giraffe, в порядке ключей строк; у enclosure2 нет <code>animal:type</code>, и она пропускается. Это <code>getScanner</code> по <code>animal:type</code> со слайда (p. 897). А Rossi в качестве размера HBase принимает молча: она хранит байты и никаких типов не проверяет.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-sparse', function (root, ui) {
+    var ROWS = ['enclosure1', 'enclosure2', 'enclosure3'];
+    var COLS = ['animal:type', 'animal:size', 'animal:diet', 'repairs:cost', 'repairs:by'];
+    var QUAL = ['type', 'size', 'diet', 'cost', 'by'];
+    var FAMS = [{ name: 'animal:', cols: [0, 1, 2] }, { name: 'repairs:', cols: [3, 4] }];
+    var VALUES = ['giraffe', 'lion', 'small', 'hay', '250 EUR', 'Rossi'];
+    var MAXE = 10, entries, clock, last;
+
+    function reset() {
+      entries = [
+        { r: 0, c: 0, t: 1, v: 'lion' }, { r: 0, c: 1, t: 1, v: 'big' },
+        { r: 0, c: 3, t: 1, v: '1000 EUR' }, { r: 0, c: 0, t: 2, v: 'zebra' }
+      ];
+      clock = 2;
+      last = { op: 'start' };
+    }
+    reset();
+
+    var rowSel = ui.select('ключ строки', ROWS.map(function (r, i) { return { value: String(i), label: r }; }), null, '0');
+    var colSel = ui.select('столбец (family:qualifier)', COLS.map(function (c, i) { return { value: String(i), label: c }; }), null, '0');
+    var valSel = ui.select('значение, которое пишет put', VALUES.map(function (v) { return { value: v, label: v }; }), null, 'giraffe');
+    ui.button('put', function () {
+      if (entries.length >= MAXE) { last = { op: 'full' }; return; }
+      clock += 1;
+      var e = { r: +rowSel.value, c: +colSel.value, t: clock, v: valSel.value };
+      entries.push(e);
+      last = { op: 'put', e: e };
+    }, { kind: 'primary' });
+    ui.button('get ячейки', function () { last = { op: 'get', r: +rowSel.value, c: +colSel.value }; });
+    ui.button('scan столбца', function () { last = { op: 'scan', c: +colSel.value }; });
+    ui.button('как на слайде', function () { reset(); }, { kind: 'ghost', icon: 'refresh' });
+
+    var roStored = ui.readout('хранится записей');
+    var roEmpty = ui.readout('пустых ячеек на рисунке');
+    var roLast = ui.readout('последняя операция');
+    ui.note('Кроме пяти нарисованных столбцов каждое семейство могло бы принять ещё миллион квалификаторов (иллюстрация к "millions on columns", p. 893): ни один не хранится, пока в ячейку ничего не записано. HBase не проверяет значения — "Untyped - stores byte[]", — так что любое значение можно положить в любой столбец.');
+    ui.legend([
+      { label: 'записанная ячейка', color: 's1', mark: 'square' },
+      { label: 'семейство столбцов; ключ хранимой записи', color: 's3', mark: 'area' },
+      { label: 'затронуто последней операцией', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 470, { label: 'Сверху — логический вид таблицы zoo: три ключа строк, семейства столбцов animal и repairs с пятью квалификаторами, записанные ячейки заполнены самым новым значением, пустые — пунктиром. Снизу — физический вид: для каждого семейства список хранимых записей, каждая — ключ (row, timestamp, column) и значение.' });
+    var TAGRU = { 'new': 'новая', newest: 'новейшая', older: 'старее', returned: 'возвращена' };
+
+    function famOf(c) { return c < 3 ? 0 : 1; }
+    function key(e) { return e.r + ',' + e.c + ',' + e.t; }
+    function versions(r, c) {
+      return entries.filter(function (e) { return e.r === r && e.c === c; }).sort(function (a, b) { return b.t - a.t; });
+    }
+    function sortedFam(f) {
+      return entries.filter(function (e) { return famOf(e.c) === f; }).sort(function (a, b) {
+        if (a.r !== b.r) return a.r - b.r;
+        if (a.c !== b.c) return COLS[a.c] < COLS[b.c] ? -1 : 1;
+        return b.t - a.t;
+      });
+    }
+    function cellName(r, c) { return ROWS[r] + ', ' + COLS[c]; }
+    function entryTxt(e) { return '(' + ROWS[e.r] + ', t' + e.t + ', ' + COLS[e.c] + ')'; }
+    function touched() {
+      var T = { cells: {}, tags: {} };
+      if (last.op === 'put') { T.cells[last.e.r + ',' + last.e.c] = true; T.tags[key(last.e)] = 'new'; }
+      if (last.op === 'get') {
+        T.cells[last.r + ',' + last.c] = true;
+        versions(last.r, last.c).forEach(function (e, i) { T.tags[key(e)] = i === 0 ? 'newest' : 'older'; });
+      }
+      if (last.op === 'scan') {
+        ROWS.forEach(function (rk, r) {
+          var vs = versions(r, last.c);
+          if (vs.length) { T.cells[r + ',' + last.c] = true; T.tags[key(vs[0])] = 'returned'; }
+        });
+      }
+      return T;
+    }
+    function describe() {
+      if (last.op === 'start') return 'четыре записи со слайда, p. 895: lion и big в t1, zebra в t2, 1000 EUR в t1';
+      if (last.op === 'full') return 'виджет хранит не больше ' + MAXE + ' записей: нажми «как на слайде»';
+      if (last.op === 'put') return 'put ' + cellName(last.e.r, last.e.c) + ' = "' + last.e.v + '" → одна новая запись ' + entryTxt(last.e) + ' в семействе ' + FAMS[famOf(last.e.c)].name;
+      if (last.op === 'get') {
+        var vs = versions(last.r, last.c);
+        if (!vs.length) return 'get ' + cellName(last.r, last.c) + ' → ничего: записи нет, ячейка пуста';
+        var s = 'get ' + cellName(last.r, last.c) + ' → "' + vs[0].v + '" (t' + vs[0].t + '), самая новая версия';
+        if (vs.length > 1) s += '; всё ещё хранится: ' + vs.slice(1).map(function (e) { return '"' + e.v + '" (t' + e.t + ')'; }).join(', ');
+        return s;
+      }
+      if (last.op === 'scan') {
+        var hits = [], miss = [];
+        ROWS.forEach(function (rk, r) {
+          var vs = versions(r, last.c);
+          if (vs.length) hits.push(rk + ' → "' + vs[0].v + '"'); else miss.push(rk);
+        });
+        return 'scan ' + COLS[last.c] + ' → ' + (hits.length ? hits.join('; ') : 'ни у одной строки нет этого столбца') + (miss.length ? ' (пропущены, нет ячейки: ' + miss.join(', ') + ')' : '');
+      }
+      return '';
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    var X0 = 124, CWS = [88, 76, 76, 104, 86], CX = [], RY = 86, RH = 42;
+    CWS.reduce(function (x, w) { CX.push(x); return x + w; }, X0);
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var tt = touched(), used = {};
+      entries.forEach(function (e) { used[e.c] = true; });
+      T(12, 20, 'логический вид: таблица zoo', 'tx-sm tx-bold');
+      FAMS.forEach(function (f) {
+        var x1 = CX[f.cols[0]], w = f.cols.reduce(function (s, c) { return s + CWS[c]; }, 0);
+        S('rect', { x: x1 + 3, y: 30, width: w - 6, height: 24, 'class': 'fw-s3 st-s3' });
+        T(x1 + w / 2, 47, f.name, 'tx-mono tx-sm tx-mid');
+      });
+      QUAL.forEach(function (q, c) { T(CX[c] + CWS[c] / 2, 74, q, 'tx-mono tx-sm tx-mid' + (used[c] ? '' : ' tx-muted')); });
+      ROWS.forEach(function (rk, r) {
+        var y = RY + r * RH, exists = entries.some(function (e) { return e.r === r; });
+        T(12, y + 20, rk, 'tx-mono tx-sm' + (exists ? '' : ' tx-muted'));
+        COLS.forEach(function (cn, c) {
+          var x = CX[c] + 3, w = CWS[c] - 6, vs = versions(r, c);
+          if (tt.cells[r + ',' + c]) S('rect', { x: x - 2, y: y - 2, width: w + 4, height: 34, 'class': 'hl' });
+          if (vs.length) {
+            S('rect', { x: x, y: y, width: w, height: 30, 'class': 'fw-s1 st-s1' });
+            T(x + w / 2, y + 20, vs[0].v, 'tx-sm tx-mid');
+            for (var k = 0; k < Math.min(vs.length, 6); k++) S('circle', { cx: x + 6 + k * 8, cy: y + 36, r: 2.5, 'class': 'fi-s1 st-none' });
+          } else {
+            S('rect', { x: x, y: y, width: w, height: 30, 'class': 'st-muted dots' });
+          }
+        });
+      });
+      T(12, RY + 3 * RH + 16, '+ ещё миллион квалификаторов на семейство, все пустые', 'tx-sm tx-muted');
+      var y = RY + 3 * RH + 54;
+      T(12, y, 'физический вид: что хранит HBase, по списку на семейство', 'tx-sm tx-bold');
+      y += 12;
+      [0, 1].forEach(function (f) {
+        var list = sortedFam(f);
+        T(12, y + 18, 'семейство ' + FAMS[f].name, 'tx-mono tx-sm');
+        y += 28;
+        list.forEach(function (e) {
+          var tag = tt.tags[key(e)];
+          if (tag && tag !== 'older') S('rect', { x: 9, y: y - 3, width: 466, height: 30, 'class': 'hl' });
+          S('rect', { x: 12, y: y, width: 330, height: 24, 'class': 'fw-s3 st-s3' });
+          S('rect', { x: 342, y: y, width: 130, height: 24, 'class': 'fi-paper' });
+          T(20, y + 17, entryTxt(e), 'tx-mono tx-sm');
+          T(407, y + 17, e.v, 'tx-mono tx-sm tx-mid');
+          if (tag) T(482, y + 17, TAGRU[tag] || tag, 'tx-sm' + (tag === 'older' ? ' tx-muted' : ''));
+          y += 30;
+        });
+        if (!list.length) { T(20, y + 16, '(нет записей)', 'tx-sm tx-muted'); y += 30; }
+        y += 8;
+      });
+      svg.setAttribute('viewBox', '0 0 560 ' + Math.ceil(y + 4));
+    }
+
+    ui.onChange(function () {
+      var na = entries.filter(function (e) { return famOf(e.c) === 0; }).length, written = {};
+      entries.forEach(function (e) { written[e.r + ',' + e.c] = true; });
+      roStored.set(entries.length + ' (animal: ' + na + ', repairs: ' + (entries.length - na) + ')');
+      roEmpty.set((15 - Object.keys(written).length) + ' из 15 — хранится для них: 0 байт');
+      roLast.set(describe());
+      draw();
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l32-pig">
+  <h2>Pig: девять строк, три задания MapReduce</h2>
+
+  <p>Pig представлен на слайде (p. 899): "Started at Yahoo! Research"; он "Expresses sequences of MapReduce jobs"; его "Data model: nested "bags" of items"; он "Provides relational (SQL) operators (JOIN, GROUP BY, etc.)"; и в него "Easy to plug in Java functions". Язык называется Pig Latin; Pig компилирует скрипт в задания MapReduce и запускает их по порядку.</p>
+
+  <p>Вопрос со слайда (p. 900): данные о пользователях (name, age) в одном файле, данные сайта (user, url) — в другом; найти 5 самых посещаемых страниц среди пользователей 18–25 лет. Слайд рисует план восемью блоками: load users, filter by age, load pages, join on name, group on url, count clicks, order by clicks, take top 5.</p>
+
+  <aside class="margin-note">Java на слайде (p. 901) оставляет топ-100, а не 5: последнее задание там называется "Top 100 sites". Опечатка, унаследованная из исходного примера; больше от неё ничего не зависит.</aside>
+
+  <p>На слайде (p. 901) этот план построен на Java, каждый блок руками. Для джойна каждый маппер помечает свои записи файлом, из которого они пришли ("1" для pages, "2" для users), а редьюсер разделяет их по метке и составляет все пары. Для подсчёта маппер выдаёт 1 на каждое посещение, а редьюсер их складывает. Для сортировки по кликам маппер переставляет каждую пару местами, чтобы счётчик стал ключом, по которому сортирует фреймворк. Чтобы оставить топ, единственный редьюсер останавливается после N записей. Пять заданий сцеплены руками; каждое, кроме последнего, пишет свой результат во временный каталог HDFS для следующего.</p>
+
+  <p>На следующем слайде (p. 902) то же самое — девятью строками Pig Latin:</p>
+
+<pre><code>-- p. 902: top 5 pages of users aged 18-25
+Users = load 'users' as (name, age);
+Filtered = filter Users by age &gt;= 18 and age &lt;= 25;
+Pages = load 'pages' as (user, url);
+Joined = join Filtered by name, Pages by user;
+Grouped = group Joined by url;
+Summed = foreach Grouped generate group, COUNT(Joined) as clicks;
+Sorted = order Summed by clicks desc;
+Top5 = limit Sorted 5;
+store Top5 into 'top5sites';</code></pre>
+
+  <aside class="margin-note">На слайде написано count(Joined). Имена функций в Pig чувствительны к регистру, и встроенная функция называется COUNT (фон: справочник Pig Latin), поэтому здесь в скрипте она написана заглавными.</aside>
+
+  <p>Прочитай построчно. Каждая строка, кроме последней, даёт имя новому <mark class="key">отношению (relation)</mark> — мешку (bag) кортежей, — построенному из предыдущих: <code>load</code> читает файл с объявленной схемой, <code>filter</code> оставляет пользователей от 18 до 25 лет, <code>join</code> сводит каждого оставшегося пользователя с каждым посещением, у которого <code>user</code> равен его <code>name</code>. Дальше строка, в которой видна модель данных Pig: <code>group Joined by url</code> ничего не считает. Она выдаёт по кортежу на каждый url, <code>(group, Joined)</code>, второе поле которого — мешок всех сведённых кортежей с этим url, тот самый "nested bag" со слайда (p. 899). <code>foreach … generate</code> выдаёт для каждой группы url и <code>COUNT(Joined)</code>, размер её мешка, — это и есть клики. До <code>store</code> ничего не выполняется (фон): Pig планирует весь поток целиком.</p>
+
+  <p>В SQL тот же вопрос — один оператор (раздел 4 пишет его на HiveQL); Pig раскладывает его по шагу на строку. "Easy to plug in Java functions" — это пользовательские функции (UDF), Java-классы, которые вызываются по имени внутри <code>foreach</code> или <code>filter</code> (фон).</p>
+
+  <h3>Ease of translation: откуда берутся задания</h3>
+
+  <p>Слайд (p. 903) кладёт скрипт рядом с планом: каждый блок — один оператор, по порядку. Следующий слайд (p. 904) группирует блоки в три задания MapReduce: в Job 1 — load users, filter by age, load pages и join on name; в Job 2 — group on url и count clicks; в Job 3 — order by clicks и take top 5. Почему именно эти три?</p>
+
+  <ol class="steps" id="l32-steps-jobs">
+    <li><p>У задания MapReduce не больше одного shuffle: map, потом shuffle и сортировка, потом reduce (<a href="l30.html">урок 30</a>). Данные перегруппировываются по новому ключу через сеть один раз за задание — или ни разу, если задание только map.</p></li>
+    <li><p>Джойну по name нужны все оставшиеся пользователи и все посещения с тем же name на одной машине: shuffle по ключу name. Обе загрузки и фильтр смотрят на один кортеж за раз, поэтому они выполняются в фазе map перед ним. Джойн на стороне reduce: это Job 1.</p></li>
+    <li><p>Группировке по url нужны вместе все сведённые кортежи с одним url: shuffle по ключу url. Ключ другой, значит, нужно второе задание. Его сторона map читает результат Job 1 из HDFS; подсчёт каждого мешка — его сторона reduce: Job 2.</p></li>
+    <li><p>Упорядочению по кликам нужны счётчики, отсортированные по всем url: shuffle по ключу clicks, третье задание. Его сторона reduce читает их по порядку и оставляет первые 5: Job 3.</p></li>
+    <li><p>Итак, число заданий — это число операторов, которым нужен shuffle, — JOIN, GROUP, ORDER: три. Все остальные операторы едут в фазе map или reduce одного из них.</p></li>
+  </ol>
+
+  <p class="memo"><mark class="key">Pig режет скрипт на задания MapReduce — по одному на каждый оператор, которому нужен shuffle (JOIN, GROUP, ORDER), — и вкладывает все остальные операторы в эти задания.</mark></p>
+
+  <aside class="margin-note">Настоящий Pig добавляет перед ORDER одно маленькое задание: он делает выборку счётчиков, чтобы подобрать диапазоны ключей для глобальной сортировки (фон: статья о Pig Latin). Экзамен следует трём заданиям со слайда.</aside>
+
+  <p>Java на слайде (p. 901) обходилась пятью заданиями: её автор написал обе загрузки как отдельные задания только с map. Pig нужно три, и временных файлов он пишет меньше, но каждое оставшееся задание всё равно стоит запуска и результата, записанного в HDFS для следующего. Pig экономит в основном твоё время, а не время кластера.</p>
+
+  <p>Виджет прогоняет скрипт на игрушечных данных, по блоку за раз, и показывает, что задания режутся ровно по shuffle. Его меню движков прогоняет тот же вопрос ещё и на HiveQL и в Impala — вернись к нему после разделов 4 и 5.</p>
+
+  <div class="widget" id="l32-w-jobs">
+    <h3 class="widget-title">Девять строк, три задания</h3>
+    <p class="widget-intro">План со слайда (p. 900), разбитый на задания со слайда (p. 904). Проходи его кнопкой <em>«Дальше»</em> или кликай по блоку: показания называют оператор, где он выполняется и что перемещает shuffle; под рисунком — кортежи после этого шага, посчитанные на игрушечных данных из 8 пользователей и 16 посещений. Синие стрелки везут данные через сеть; пунктирная стрелка значит «записано в HDFS, прочитано следующим заданием». Планы для Hive и Impala — наши упрощённые наброски; на слайде напечатаны только рамки Pig.</p>
+    <ol class="tasks">
+      <li>Дойди до <em>Join on name</em>. Пока не смотришь на панель: какие кортежи перемещает shuffle и едут ли пользователи вне 18–25?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>21 кортеж по ключу name: 5 пользователей 18–25 лет и все 16 посещений. bob (34), eli (17) и gus (41) отброшены фильтром на стороне map и никуда не едут; их 4 посещения едут и не находят себе пары в джойне. Результат, Joined, — 12 кортежей.</p></details>
+      </li>
+      <li>Дойди до <em>Group on url</em> и предскажи форму одного кортежа Grouped. Потом перейди к <em>Count clicks</em>: откуда у news берётся число 3?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Каждый кортеж — это url и мешок: <code>(news, {(ann, 19, ann, news), (cai, 22, cai, news), (dev, 25, dev, news)})</code> — вложенный мешок (nested bag). <code>COUNT(Joined)</code> считает этот мешок: 3. GROUP собирает, foreach считает.</p></details>
+      </li>
+      <li>Включи <em>«остановиться после подсчёта»</em>. Предскажи число заданий, прежде чем его прочитать.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>2. Без ORDER нет третьего shuffle, а значит, и третьего задания: счётчики сохраняются в конце Job 2. LIMIT сам по себе тоже не потребовал бы отдельного задания — в плане со слайда он выполняется на стороне reduce у ORDER.</p></details>
+      </li>
+      <li>Прочитав разделы про Hive и Impala, переключи движок. Предскажи для каждого: сколько заданий MapReduce и что пишется в HDFS между шагами?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>HiveQL: снова три задания — те же три shuffle, только сгенерированные из SQL, — и результаты заданий 1 и 2 проходят через HDFS. Impala: заданий нет вовсе; те же три перемещения данных становятся обменами (exchanges), которые стримят строки в памяти, и до самого результата ничего не пишется. Игрушечные результаты одинаковые: движки различаются тем, как они выполняют план, а не тем, что они вычисляют.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l32-w-jobs', function (root, ui) {
+    var USERS = [['ann', 19], ['bob', 34], ['cai', 22], ['dev', 25], ['eli', 17], ['fay', 18], ['gus', 41], ['hal', 23]];
+    var PAGES = [['ann', 'news'], ['ann', 'maps'], ['bob', 'news'], ['cai', 'news'], ['cai', 'mail'], ['cai', 'game'], ['dev', 'maps'], ['dev', 'news'],
+                 ['eli', 'game'], ['fay', 'mail'], ['fay', 'shop'], ['gus', 'shop'], ['hal', 'game'], ['hal', 'shop'], ['hal', 'wiki'], ['bob', 'wiki']];
+    var FILTERED = USERS.filter(function (u) { return u[1] >= 18 && u[1] <= 25; });
+    var JOINED = [];
+    FILTERED.forEach(function (u) { PAGES.forEach(function (p) { if (p[0] === u[0]) JOINED.push([u[0], u[1], p[0], p[1]]); }); });
+    var G = {};
+    JOINED.forEach(function (t) { (G[t[3]] = G[t[3]] || []).push(t); });
+    var GROUPED = Object.keys(G).sort().map(function (k) { return [k, G[k]]; });
+    var SUMMED = GROUPED.map(function (g) { return [g[0], g[1].length]; });
+    var SORTED = SUMMED.slice().sort(function (a, b) { return b[1] - a[1] || (a[0] < b[0] ? -1 : 1); });
+    var TOP5 = SORTED.slice(0, 5);
+    var DATA = [USERS, FILTERED, PAGES, JOINED, GROUPED, SUMMED, SORTED, TOP5];
+    var NAMES = ['Users', 'Filtered', 'Pages', 'Joined', 'Grouped', 'Summed', 'Sorted', 'Top5'];
+
+    var STEPS = [
+      { box: 'Load Users', pig: "Users = load 'users' as (name, age);", sql: 'FROM users u', job: 1 },
+      { box: 'Filter by age', pig: 'Filtered = filter Users by age >= 18 and age <= 25;', sql: 'WHERE u.age >= 18 AND u.age <= 25', job: 1 },
+      { box: 'Load Pages', pig: "Pages = load 'pages' as (user, url);", sql: 'JOIN pages p', job: 1 },
+      { box: 'Join on name', pig: 'Joined = join Filtered by name, Pages by user;', sql: 'ON (u.name = p.username)', job: 1 },
+      { box: 'Group on url', pig: 'Grouped = group Joined by url;', sql: 'GROUP BY p.url', job: 2 },
+      { box: 'Count clicks', pig: 'Summed = foreach Grouped generate group, COUNT(Joined) as clicks;', sql: 'SELECT p.url, COUNT(*) AS clicks', job: 2 },
+      { box: 'Order by clicks', pig: 'Sorted = order Summed by clicks desc;', sql: 'ORDER BY clicks DESC', job: 3 },
+      { box: 'Take top 5', pig: 'Top5 = limit Sorted 5;', sql: 'LIMIT 5', job: 3 },
+      { box: 'store', pig: "store Top5 into 'top5sites';", sql: '(строки возвращаются клиенту)', job: 3 }
+    ];
+    var BOX = [[40, 40], [40, 100], [370, 40], [205, 160], [205, 250], [205, 306], [205, 396], [205, 452]], BW = 150, BH = 32;
+
+    var eng = ui.select('движок', [
+      { value: 'pig', label: 'Pig Latin (pp. 902–904)' },
+      { value: 'hive', label: 'HiveQL, тот же вопрос' },
+      { value: 'impala', label: 'Impala, тот же SQL' }
+    ], null, 'pig');
+    var drop = ui.toggle('остановиться после подсчёта (без ORDER и LIMIT)', false);
+    var step = ui.stepper({ steps: 9 });
+    var roCode = ui.readout('оператор');
+    var roWhere = ui.readout('где выполняется');
+    var roJobs = ui.readout('заданий MapReduce');
+    var roDisk = ui.readout('пишется в HDFS по дороге');
+    ui.legend([
+      { label: 'данные идут через сеть (shuffle или exchange)', color: 's1', mark: 'line' },
+      { label: 'промежуточно хранится в HDFS', color: 's1', mark: 'dash' },
+      { label: 'показанный шаг', color: 'ink', mark: 'hl' }
+    ]);
+    var svg = ui.svg(560, 520, { label: 'План со слайда, p. 900, восемью блоками: load users, filter by age и load pages питают join on name, затем group on url, count clicks, order by clicks и take top 5, и результат сохраняется. Рамки отмечают три задания MapReduce со слайда, p. 904, а для Impala — один план без заданий; синие стрелки отмечают данные, идущие через сеть.' });
+    var panel = Course.el('div', { 'class': 'l32-rel' });
+    ui.stage.appendChild(panel);
+
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function tup(a) { return '(' + a.join(', ') + ')'; }
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function T(x, y, s, cls) { return S('text', { x: x, y: y, 'class': cls || '', text: s }); }
+    function line(pts, cls, mk) {
+      var a = { points: pts.map(function (p) { return p[0] + ',' + p[1]; }).join(' '), 'class': cls };
+      if (mk) a['marker-end'] = 'url(#' + mk + ')';
+      return S('polyline', a);
+    }
+
+    function whereTxt(i, e, dropped) {
+      var mr = e !== 'impala';
+      if (dropped && (i === 6 || i === 7)) return 'удалено: без ORDER нет третьего shuffle, а значит, и третьего задания';
+      if (mr) {
+        return [
+          'задание 1, сторона map: по кортежу за раз, shuffle не нужен',
+          'задание 1, сторона map: фильтр отбрасывает пользователей прямо при чтении',
+          'задание 1, сторона map: каждое посещение помечается и получает ключ по своему пользователю',
+          'задание 1: shuffle по name сводит каждого пользователя с его посещениями; джойн выполняется на стороне reduce',
+          'задание 2: его сторона map читает результат задания 1 из HDFS; shuffle по url ' + (e === 'pig' ? 'строит по мешку на каждый url' : 'собирает вместе строки каждого url'),
+          'задание 2, сторона reduce: ' + (e === 'pig' ? 'COUNT каждого мешка' : 'COUNT(*) на каждый url') + ' (combiner может предварительно посчитать на стороне map)',
+          'задание 3: shuffle по clicks доставляет счётчики отсортированными',
+          'задание 3, сторона reduce: оставить первые 5',
+          dropped ? 'конец задания 2: счётчики ' + (e === 'pig' ? 'сохраняются в HDFS' : 'отправляются клиенту')
+                  : 'конец задания 3: топ-5 ' + (e === 'pig' ? 'сохраняется в HDFS как top5sites' : 'отправляется клиенту')
+        ][i];
+      }
+      return [
+        'фрагмент сканирования на каждом узле читает свои локальные блоки',
+        'внутри сканеров: условие на возраст проталкивается в само чтение',
+        'фрагмент сканирования на каждом узле читает свои локальные блоки',
+        'exchange по name стримит строки на узлы, которые их джойнят, в памяти',
+        'exchange по url стримит частичные счётчики на узлы, которые их сливают',
+        'агрегация, в памяти',
+        'строки стримятся к координатору, и он их сортирует',
+        'координатор оставляет первые 5',
+        'координатор возвращает строки клиенту; по дороге ничего не записано'
+      ][i];
+    }
+    function jobsTxt(e, dropped) {
+      if (e === 'pig') return dropped ? '2 — по одному на shuffle: JOIN, GROUP (по правилу)' : '3 — по одному на shuffle: JOIN, GROUP, ORDER (p. 904)';
+      if (e === 'hive') return dropped ? '2 — те же shuffle, что у Pig (наш набросок)' : '3 — те же три shuffle, что у Pig (наш набросок)';
+      return dropped ? 'ни одного — один план, 2 exchange в памяти (наш набросок)' : 'ни одного — один план, 3 exchange в памяти (наш набросок)';
+    }
+    function diskTxt(e, dropped) {
+      if (e === 'impala') return 'ничего между шагами: строки стримятся в памяти';
+      return dropped ? 'результат задания 1 (12 кортежей), потом итог' : 'результаты задания 1 (12 кортежей) и задания 2 (6 кортежей), потом итог';
+    }
+    var SCHEMA = ['(name, age)', '(name, age)', '(user, url)', '(name, age, user, url)', '(group, мешок сведённых кортежей)', '(url, clicks)', '(url, clicks)', '(url, clicks)'];
+
+    function fillPanel(i, e, dropped) {
+      while (panel.firstChild) panel.removeChild(panel.firstChild);
+      var pig = e === 'pig', head, moved = '', rows = [];
+      if (dropped && (i === 6 || i === 7)) {
+        head = 'удалено из скрипта: здесь ничего не вычисляется';
+      } else {
+        var k = i === 8 ? (dropped ? 5 : 7) : i, d = DATA[k];
+        rows = k === 4 ? d.map(function (g) { return '(' + g[0] + ', {' + g[1].map(tup).join(', ') + '})'; }) : d.map(tup);
+        head = (i === 8 ? (pig ? 'сохранено в HDFS: ' : 'возвращено клиенту: ') : 'после этого шага: ') +
+               (pig ? NAMES[k] + ', ' : '') + (pig ? 'кортежей: ' : 'строк: ') + d.length + ' ' +
+               (k === 4 && !pig ? '(url, сведённые строки этого url)' : SCHEMA[k]) + ' — игрушечные данные, посчитаны виджетом';
+        var verb = e === 'impala' ? 'exchange стримит ' : 'shuffle перемещает ';
+        if (i === 3) moved = verb + '21 кортеж по ключу name: 5 пользователей 18–25 лет и все 16 посещений. bob, eli и gus отброшены на стороне map; их 4 посещения едут и не находят пары.';
+        if (i === 4) moved = verb + '12 кортежей по ключу url' + (e === 'impala' ? ' (в реальном плане — частичные счётчики)' : ' (combiner мог бы вместо них отправить частичные счётчики)') + '.';
+        if (i === 6) moved = (e === 'impala' ? 'координатор получает ' : 'shuffle перемещает ') + '6 кортежей по ключу clicks; они приходят отсортированными. Равные значения могут выйти в любом порядке.';
+      }
+      panel.appendChild(Course.el('p', { 'class': 'l32-rel-h', text: head }));
+      if (moved) panel.appendChild(Course.el('p', { 'class': 'l32-rel-m', text: moved }));
+      if (rows.length) {
+        var box = Course.el('div', { 'class': 'l32-tuples' });
+        rows.forEach(function (t) { box.appendChild(Course.el('span', { 'class': 'l32-tuple', text: t })); });
+        panel.appendChild(box);
+      }
+    }
+
+    function draw(i, e, dropped) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mr = e !== 'impala', cur = STEPS[i].job;
+      if (dropped && i === 8) cur = 2;
+      if (mr) {
+        S('rect', { x: 24, y: 24, width: 522, height: 184, rx: 10, 'class': cur === 1 ? 'sw-3' : 'st-muted' });
+        T(34, 198, 'Job 1', 'tx-bold');
+        S('rect', { x: 190, y: 236, width: 180, height: 116, rx: 10, 'class': cur === 2 ? 'sw-3' : 'st-muted' });
+        T(176, 300, 'Job 2', 'tx-bold tx-end');
+        if (!dropped) {
+          S('rect', { x: 190, y: 382, width: 180, height: 116, rx: 10, 'class': cur === 3 ? 'sw-3' : 'st-muted' });
+          T(176, 446, 'Job 3', 'tx-bold tx-end');
+        }
+      } else {
+        S('rect', { x: 24, y: 24, width: 522, height: dropped ? 336 : 474, rx: 10, 'class': 'st-muted dash' });
+        T(34, 252, 'один план,', 'tx-bold');
+        T(34, 276, 'без заданий', 'tx-bold');
+      }
+      line([[115, 72], [115, 96]], 'sw-2', 'arr');
+      line([[115, 132], [115, 176], [201, 176]], 'st-s1 sw-3', 'arr-s1');
+      line([[445, 72], [445, 176], [359, 176]], 'st-s1 sw-3', 'arr-s1');
+      T(280, 148, mr ? 'shuffle по name' : 'exchange по name', 'tx-sm tx-mid');
+      line([[280, 192], [280, 246]], 'st-s1 sw-3' + (mr ? ' dash' : ''), 'arr-s1');
+      if (mr) T(290, 224, 'HDFS', 'tx-sm');
+      T(382, 272, mr ? 'shuffle по url' : 'exchange по url', 'tx-sm');
+      line([[280, 282], [280, 302]], 'sw-2', 'arr');
+      var fy;
+      if (!dropped) {
+        line([[280, 338], [280, 392]], 'st-s1 sw-3' + (mr ? ' dash' : ''), 'arr-s1');
+        if (mr) T(290, 370, 'HDFS', 'tx-sm');
+        T(382, 418, mr ? 'shuffle по clicks' : 'к координатору', 'tx-sm');
+        line([[280, 428], [280, 448]], 'sw-2', 'arr');
+        line([[355, 468], [424, 468]], 'sw-2', 'arr');
+        fy = 444;
+      } else {
+        line([[280, 338], [280, 392]], 'st-muted dash');
+        line([[280, 428], [280, 448]], 'st-muted dash');
+        line([[355, 322], [424, 322]], 'sw-2', 'arr');
+        fy = 298;
+      }
+      BOX.forEach(function (b, k) {
+        var removed = dropped && (k === 6 || k === 7), shuf = k === 3 || k === 4 || k === 6;
+        if (k === i) S('rect', { x: b[0] - 4, y: b[1] - 4, width: BW + 8, height: BH + 8, rx: 6, 'class': 'hl' });
+        var r = S('rect', { x: b[0], y: b[1], width: BW, height: BH, rx: 4, 'class': removed ? 'fi-paper st-muted dash l32-hit' : 'fi-paper l32-hit' + (shuf ? ' sw-3' : ' sw-2') });
+        var t = T(b[0] + BW / 2, b[1] + 21, STEPS[k].box, 'tx-sm tx-mid l32-hit' + (removed ? ' tx-muted' : ''));
+        r.addEventListener('click', function () { step.go(k); });
+        t.addEventListener('click', function () { step.go(k); });
+      });
+      var fileNode;
+      if (e === 'pig') {
+        if (i === 8) S('rect', { x: 424, y: fy - 6, width: 56, height: 62, rx: 6, 'class': 'hl' });
+        fileNode = S('path', { d: 'M432 ' + fy + ' H462 L472 ' + (fy + 10) + ' V' + (fy + 50) + ' H432 Z', 'class': 'fi-paper l32-hit' });
+        S('path', { d: 'M462 ' + fy + ' V' + (fy + 10) + ' H472 Z', 'class': 'fi-soft' });
+        T(452, fy + 68, dropped ? 'clicks' : 'top5sites', 'tx-mono tx-sm tx-mid');
+      } else {
+        if (i === 8) S('rect', { x: 422, y: fy + 6, width: 76, height: 38, rx: 8, 'class': 'hl' });
+        fileNode = S('rect', { x: 428, y: fy + 12, width: 64, height: 26, rx: 6, 'class': 'fi-paper l32-hit' });
+        T(460, fy + 30, 'клиент', 'tx-sm tx-mid');
+      }
+      fileNode.addEventListener('click', function () { step.go(8); });
+    }
+
+    ui.onChange(function () {
+      var i = step.index, e = eng.value, dropped = drop.value;
+      var removed = dropped && (i === 6 || i === 7);
+      var code = e === 'pig' ? STEPS[i].pig : STEPS[i].sql;
+      if (i === 8 && dropped && e === 'pig') code = "store Summed into 'clicks';";
+      roCode.set('<code>' + esc(code) + '</code>' + (removed ? ' — удалено' : ''));
+      roWhere.set(whereTxt(i, e, dropped));
+      roJobs.set(jobsTxt(e, dropped));
+      roDisk.set(diskTxt(e, dropped));
+      fillPanel(i, e, dropped);
+      draw(i, e, dropped);
+    });
+  });
+  </script>
+</section>
+
+
+<section id="l32-hive">
+  <h2>Hive: SQL и Metastore поверх обычных файлов</h2>
+
+  <p>Слайд (p. 906): Hive был "Developed at Facebook" и "Used for majority of Facebook jobs". Это "Relational database", построенная на Hadoop, — причём на слайде слово стоит в кавычках. Он "Maintains list of table schemas", предлагает "SQL-like query language (HiveQL)", "Can call Hadoop Streaming scripts from HiveQL" и "Supports table partitioning, clustering, complex data types, some optimizations".</p>
+
+  <p>Всё дело в кавычках. Hive выглядит реляционным — таблицы, типизированные столбцы, SELECT, JOIN, GROUP BY, — но собственного движка хранения или выполнения у него нет: запрос превращается в задания MapReduce над файлами в HDFS и идёт столько, сколько идут они. Словами туториала Hive: «Hive не предназначен для онлайновой обработки транзакций. Лучше всего он подходит для традиционных задач хранилищ данных» (фон).</p>
+
+  <div class="pitfall">
+    <p>«Hadoop Streaming scripts — значит, Hive занимается потоковой обработкой». Нет. Hadoop Streaming — это способ MapReduce запускать маппер или редьюсер, написанный на любом языке: программу, которая читает записи со стандартного ввода и пишет пары ключ–значение в стандартный вывод (фон). Обработка данных, которые приходят без остановки, — совсем другое: это Storm, в <a href="l33.html">уроке 33</a>.</p>
+  </div>
+
+  <h3>Архитектура: метаданные здесь, данные там</h3>
+
+  <aside class="margin-note">JobTracker и TaskTracker на рисунке — имена из Hadoop 1; их заменил YARN, как показывает урок 31.</aside>
+
+  <p>Проследи путь запроса по схеме со слайда (p. 907), она перерисована на рис. 2. Он приходит через интерфейс командной строки, веб-интерфейс или Thrift-сервер, к которому программы подключаются по JDBC или ODBC, как к любой SQL-базе. <mark class="key">Driver</mark> компилирует, оптимизирует и выполняет его: компилятор превращает HiveQL в план из заданий MapReduce, заглядывая за таблицами в <mark class="key">Metastore</mark> — столбцы и типы, партиции и где в HDFS лежит каждая таблица, — а исполнитель отправляет задания в Hadoop, чей JobTracker запускает их задачи рядом с блоками.</p>
+
+  <figure class="fig fig--plain" id="l32-fig-hive">
+    <svg class="dia" viewBox="0 0 560 410" role="img" aria-label="Архитектура Hive: внутри Hive интерфейс командной строки, веб-интерфейс и Thrift-сервер с JDBC и ODBC над Driver из компилятора, оптимизатора и исполнителя, а рядом Metastore со схемами и партициями. Driver отправляет задания MapReduce вниз, в Hadoop, и получает результаты; в Hadoop — JobTracker, NameNode и машины, на которых работают DataNode и TaskTracker.">
+      <rect x="10" y="10" width="540" height="200" rx="10"/>
+      <text x="26" y="38" class="tx-bold tx-lg">Hive</text>
+      <rect x="246" y="20" width="72" height="30" class="fi-paper"/>
+      <rect x="324" y="20" width="72" height="30" class="fi-paper"/>
+      <text x="282" y="40" class="tx-sm tx-mid">JDBC</text>
+      <text x="360" y="40" class="tx-sm tx-mid">ODBC</text>
+      <line x1="282" y1="50" x2="282" y2="62" class="st-muted"/>
+      <line x1="360" y1="50" x2="360" y2="62" class="st-muted"/>
+      <rect x="26" y="62" width="100" height="36" class="fi-paper"/>
+      <rect x="134" y="62" width="100" height="36" class="fi-paper"/>
+      <rect x="242" y="62" width="158" height="36" class="fi-paper"/>
+      <text x="76" y="85" class="tx-sm tx-mid">CLI</text>
+      <text x="184" y="85" class="tx-sm tx-mid">Web UI</text>
+      <text x="321" y="85" class="tx-sm tx-mid">Thrift server</text>
+      <rect x="26" y="110" width="374" height="86" class="fi-paper sw-2"/>
+      <text x="213" y="142" class="tx-bold tx-mid">Driver</text>
+      <text x="213" y="174" class="tx-sm tx-mid">компилятор · оптимизатор · исполнитель</text>
+      <rect x="414" y="62" width="122" height="134" class="fw-s3 st-s3"/>
+      <text x="475" y="122" class="tx-bold tx-mid">Metastore</text>
+      <text x="475" y="152" class="tx-sm tx-mid">схемы,</text>
+      <text x="475" y="176" class="tx-sm tx-mid">партиции</text>
+
+      <line x1="180" y1="198" x2="180" y2="246" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="246" y1="248" x2="246" y2="200" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <text x="170" y="230" class="tx-sm tx-end">задания</text>
+      <text x="256" y="230" class="tx-sm">результаты</text>
+
+      <rect x="10" y="250" width="540" height="150" rx="10"/>
+      <text x="26" y="278" class="tx-bold">Hadoop: MapReduce + HDFS</text>
+      <rect x="26" y="294" width="140" height="34" class="fi-paper st-s6 dash sw-2"/>
+      <rect x="180" y="294" width="140" height="34" class="fi-paper st-s6 dash sw-2"/>
+      <text x="96" y="316" class="tx-sm tx-mid">JobTracker</text>
+      <text x="250" y="316" class="tx-sm tx-mid">NameNode</text>
+      <rect x="344" y="296" width="44" height="28" class="fi-paper"/>
+      <line x1="351" y1="303" x2="381" y2="303" class="st-muted"/>
+      <line x1="351" y1="310" x2="381" y2="310" class="st-muted"/>
+      <line x1="351" y1="317" x2="381" y2="317" class="st-muted"/>
+      <rect x="400" y="296" width="44" height="28" class="fi-paper"/>
+      <line x1="407" y1="303" x2="437" y2="303" class="st-muted"/>
+      <line x1="407" y1="310" x2="437" y2="310" class="st-muted"/>
+      <line x1="407" y1="317" x2="437" y2="317" class="st-muted"/>
+      <rect x="456" y="296" width="44" height="28" class="fi-paper"/>
+      <line x1="463" y1="303" x2="493" y2="303" class="st-muted"/>
+      <line x1="463" y1="310" x2="493" y2="310" class="st-muted"/>
+      <line x1="463" y1="317" x2="493" y2="317" class="st-muted"/>
+      <text x="422" y="348" class="tx-sm tx-mid">DataNode + TaskTracker</text>
+      <text x="300" y="386" class="tx-hand">здесь живут файлы</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Архитектура Hive (p. 907), перерисовано. Запрос входит через CLI, веб-интерфейс или Thrift-сервер (JDBC, ODBC); Driver компилирует, оптимизирует и выполняет его по определениям таблиц из Metastore. Из Hive наружу выходят задания MapReduce (оранжевые) для JobTracker; они выполняются там, где лежат блоки HDFS, и результаты возвращаются (синие). Пунктирные охристые контуры — два мастера Hadoop 1.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Hive хранит метаданные — схемы, партиции, расположение — в своём Metastore; данные остаются в HDFS обычными файлами, а его запросы выполняются как задания MapReduce.</mark></p>
+
+  <h3>Таблицы, партиции, бакеты</h3>
+
+  <p>Модель данных перечислена на слайде (p. 908). У <b>таблиц</b> (tables) есть "Typed columns (int, float, string, date, boolean)" и "Also, array/map/struct for JSON-like data": один столбец может хранить список, словарь или запись, чего плоская SQL-таблица не умеет. <b>Партиции</b> (partitions) делят таблицу по значениям одного или нескольких столбцов — "e.g., to range-partition tables by date". <b>Бакеты</b> (buckets) — это "Hash partitions within ranges (useful for sampling, join optimization)": внутри партиции строки раскладываются по фиксированному числу файлов по хешу одного столбца — это и есть "clustering" со слайда (p. 906).</p>
+
+  <div class="formula" id="l32-f-bucket">
+    \[ \text{bucket}(r) = \operatorname{hash}(r.\text{col}) \bmod N \]
+    <dl class="legend">
+      <dt>\(r\)</dt><dd>строка партиции</dd>
+      <dt>col</dt><dd>столбец бакетирования, например <code>userid</code></dd>
+      <dt>\(N\)</dt><dd>число файлов-бакетов, фиксируется при создании таблицы</dd>
+    </dl>
+  </div>
+
+  <p>Оба применения следуют из хеша. Один бакет из N — это выборка примерно каждой N-й строки, равномерно размазанная по значениям. А две таблицы, бакетированные по одному и тому же ключу джойна, можно джойнить бакет за бакетом, потому что равные ключи всегда попадают в соответствующие бакеты (фон: в HiveQL это <code>CLUSTERED BY (userid) INTO 32 BUCKETS</code>).</p>
+
+  <div class="pitfall">
+    <p>«Hive режет таблицу по диапазонам дат, одна партиция на диапазон». Не совсем: партиция Hive хранит одно значение столбцов партиционирования — по каталогу на каждую пару (dt, country) на слайде (p. 910). Диапазон дат в запросе читает каждую однодневную партицию внутри диапазона (p. 911). Слово "range-partition" на слайде говорит о том, что можно делать с партициями по датам, а не о том, как они нарезаны; экзамен может процитировать напечатанную строку.</p>
+  </div>
+
+  <h3>Хранение: каталоги и плоские файлы</h3>
+
+  <p>Где всё лежит, сказано на слайде (p. 909): "Warehouse directory in HDFS – e.g., /user/hive/warehouse"; "Table row data stored in subdirectories of warehouse"; "Partitions form subdirectories of table directories"; "Actual data stored in flat files – Control char-delimited text, or SequenceFiles – With custom SerDe, can use arbitrary format".</p>
+
+  <p>Итак, таблица — это каталог, партиция — каталог внутри него, а строки — обычные файлы: текст с управляющими символами в роли разделителей или SequenceFile, двоичный формат ключ–значение из Hadoop. <mark class="key">SerDe</mark> (serializer/deserializer) превращает байты файла в типизированные строки, когда запрос их читает, и обратно — когда пишет. При поступлении файлов Hive ничего не проверяет: схема из Metastore применяется во время чтения — это схема при чтении (schema on read) из <a href="l04.html#l04-shift">урока 4</a>. И любой другой инструмент, читающий HDFS, может пользоваться теми же файлами; Impala так и делает. Таблица, созданная через <code>CREATE EXTERNAL TABLE … LOCATION '…'</code>, идёт ещё дальше: Hive регистрирует файлы, которые остаются на своём месте, и удаление таблицы стирает только её определение (фон).</p>
+
+  <p>Слайд (p. 910) создаёт таблицу, к которой обращается вся остальная лекция:</p>
+
+<pre><code>-- p. 910: page views, one directory per (dt, country) pair
+CREATE TABLE page_views(viewTime INT, userid BIGINT,
+                        page_url STRING, referrer_url STRING,
+                        ip STRING COMMENT 'User IP address')
+COMMENT 'This is the page view table'
+PARTITIONED BY(dt STRING, country STRING)
+STORED AS SEQUENCEFILE;</code></pre>
+
+  <p>Пять типизированных столбцов, комментарий к <code>ip</code> и комментарий к таблице. <code>PARTITIONED BY</code> объявляет <code>dt</code> и <code>country</code>, которых нет в списке столбцов: их значения живут в именах каталогов, а не в файлах. <code>STORED AS SEQUENCEFILE</code> выбирает формат файлов. Словами слайда, "Partitioning breaks table into separate files for each (dt, country) pair".</p>
+
+  <p>Примеры путей со слайда, "/hive/page_view/dt=2008-06-08,country=USA" и "…,country=CA", — это сокращение, и <code>page_view</code> там вместо <code>page_views</code>. В HDFS каждый столбец партиционирования — это отдельный уровень каталогов внутри хранилища со слайда (p. 909): <code>/user/hive/warehouse/page_views/dt=2008-06-08/country=USA/</code>, а рядом — <code>…/country=CA/</code> (рис. 3 ниже рисует это дерево).</p>
+
+  <p>CLI Hive на слайде (p. 913) выводит список таблиц и описывает их:</p>
+
+<pre><code>hive&gt; show tables;
+hive&gt; describe page_views;
+hive&gt; describe extended page_views;</code></pre>
+
+  <p>"List tables", "Describe a table", "More information": все три команды отвечают из Metastore, без задания (фон). <code>describe</code> печатает столбцы и их типы, включая столбцы партиционирования; <code>describe extended</code> добавляет расположение в HDFS, формат файлов и SerDe.</p>
+</section>
+
+
+<section id="l32-query">
+  <h2>Спрашиваем Hive: отсечение партиций, джойны и группировки</h2>
+
+  <p>Вопрос со слайда (p. 911): "Find all page views coming from xyz.com on March 31st". Как напечатано:</p>
+
+<pre><code>-- p. 911 as printed (see the red pen)
+SELECT page_views.*
+FROM page_views
+WHERE page_views.date &gt;= '2008-03-01'
+AND page_views.date &lt;= '2008-03-31'
+AND page_views.referrer_url like '%xyz.com';</code></pre>
+
+  <p>И главное на этом слайде: "Hive only reads partition 2008-03-01,* instead of scanning entire table". У этого механизма есть имя.</p>
+
+  <div class="def">
+    <p><dfn>Отсечение партиций (partition pruning)</dfn> — ещё до запуска любого задания компилятор сопоставляет условия на столбцы партиционирования со списком партиций в Metastore, и входом заданий MapReduce становятся только подходящие каталоги. Остальные каталоги даже не открываются.</p>
+  </div>
+
+  <p>Два условия запроса играют противоположные роли. Условие на дату касается столбца партиционирования — <code>dt</code> на слайде (p. 910), смотри красную ручку, — а его значения — это имена каталогов, так что компилятор может решить по нему, не прочитав ни байта. Условие на <code>referrer_url</code> касается столбца внутри файлов: его можно проверить только построчно, мапперами, на том, что пережило отсечение. Оно уменьшает выход, но никогда — вход (рис. 3).</p>
+
+  <aside class="redpen" data-page="911">
+    <p class="claim">"Find all page views coming from xyz.com on March 31st" — "WHERE page_views.date &gt;= '2008-03-01' AND page_views.date &lt;= '2008-03-31'" — "Hive only reads partition 2008-03-01,*"</p>
+    <p class="fix">Эти три фразы друг другу противоречат. Столбец называется <code>dt</code> — в таблице со слайда (p. 910) столбца <code>date</code> нет, — и если читать условие по <code>dt</code>, запрос выбирает весь март: Hive читает 31 каталог дней с <code>dt=2008-03-01</code> по <code>dt=2008-03-31</code>, в каждом — все страны. Только для 31 марта пиши <code>dt = '2008-03-31'</code>: тогда Hive прочитает <code>2008-03-31,*</code>.</p>
+    <p class="because">Столбец партиционирования, объявленный на слайде (p. 910), — это <code>dt</code>, а отсечение оставляет ровно те партиции, чьи значения удовлетворяют условию: диапазон в 31 день оставляет 31 день, а не первый. Туториал Hive выполняет тот же запрос, чтобы получить «все page_views за месяц 03/2008» (фон). Мысль, которую слайд хочет донести, — Hive читает только подходящие партиции "instead of scanning entire table", — верна в любом случае. На экзамене ответ могут сверять с напечатанным слайдом: знай, что на нём напечатано, и правильное число.</p>
+  </aside>
+
+  <p>Исправлено для 31 марта:</p>
+
+<pre><code>-- from xyz.com on March 31st: reads only dt=2008-03-31
+SELECT page_views.*
+FROM page_views
+WHERE page_views.dt = '2008-03-31'
+AND page_views.referrer_url LIKE '%xyz.com';</code></pre>
+
+  <p>Для всего месяца оставь диапазон со слайда, но по <code>dt</code>: 31 день по всем странам. Диапазон работает на столбце типа STRING, потому что даты в виде <code>yyyy-mm-dd</code> при сортировке как строки идут в порядке дат.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l32-fig-prune">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Без условия на столбец партиционирования: запрос WHERE referrer_url LIKE '%xyz.com' читает каждый каталог page_views, обе страны каждого дня марта.">
+        <text x="8" y="18" class="tx-mono tx-sm">WHERE referrer_url LIKE '%xyz.com'</text>
+        <text x="8" y="36" class="tx-sm tx-muted">(ничего про dt или country)</text>
+        <text x="8" y="64" class="tx-mono tx-sm">page_views/</text>
+        <text x="160" y="64" class="tx-mono tx-sm">country=</text>
+        <line x1="14" y1="70" x2="14" y2="172" class="st-muted"/>
+        <line x1="14" y1="88" x2="22" y2="88" class="st-muted"/>
+        <line x1="14" y1="116" x2="22" y2="116" class="st-muted"/>
+        <line x1="14" y1="172" x2="22" y2="172" class="st-muted"/>
+        <text x="26" y="92" class="tx-mono tx-sm">dt=2008-03-01/</text>
+        <rect x="160" y="76" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="76" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="91" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="91" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="26" y="120" class="tx-mono tx-sm">dt=2008-03-02/</text>
+        <rect x="160" y="104" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="104" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="119" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="119" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="26" y="148" class="tx-sm">… ещё 28 дней, все читаются</text>
+        <text x="26" y="176" class="tx-mono tx-sm">dt=2008-03-31/</text>
+        <rect x="160" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="175" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="175" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="8" y="208" class="tx-sm">читается: каждый каталог, вся таблица</text>
+        <text x="8" y="240" class="tx-hand">полное сканирование</text>
+      </svg>
+      <p class="fig-label">До: нет условия на столбец партиционирования</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="С условием dt = '2008-03-31': читаются только два каталога 31 марта, USA и CA; все остальные дни пропускаются до старта задания.">
+        <text x="8" y="18" class="tx-mono tx-sm">WHERE dt = '2008-03-31'</text>
+        <text x="8" y="36" class="tx-mono tx-sm">AND referrer_url LIKE '%xyz.com'</text>
+        <text x="8" y="64" class="tx-mono tx-sm">page_views/</text>
+        <text x="160" y="64" class="tx-mono tx-sm">country=</text>
+        <line x1="14" y1="70" x2="14" y2="172" class="st-muted"/>
+        <line x1="14" y1="88" x2="22" y2="88" class="st-muted"/>
+        <line x1="14" y1="116" x2="22" y2="116" class="st-muted"/>
+        <line x1="14" y1="172" x2="22" y2="172" class="st-muted"/>
+        <text x="26" y="92" class="tx-mono tx-sm tx-muted">dt=2008-03-01/</text>
+        <rect x="160" y="76" width="56" height="22" class="st-muted dash"/>
+        <rect x="226" y="76" width="56" height="22" class="st-muted dash"/>
+        <text x="188" y="91" class="tx-mono tx-sm tx-mid tx-muted">USA</text>
+        <text x="254" y="91" class="tx-mono tx-sm tx-mid tx-muted">CA</text>
+        <text x="26" y="120" class="tx-mono tx-sm tx-muted">dt=2008-03-02/</text>
+        <rect x="160" y="104" width="56" height="22" class="st-muted dash"/>
+        <rect x="226" y="104" width="56" height="22" class="st-muted dash"/>
+        <text x="188" y="119" class="tx-mono tx-sm tx-mid tx-muted">USA</text>
+        <text x="254" y="119" class="tx-mono tx-sm tx-mid tx-muted">CA</text>
+        <text x="26" y="148" class="tx-sm tx-muted">… ещё 28 дней, пропущены</text>
+        <text x="26" y="176" class="tx-mono tx-sm">dt=2008-03-31/</text>
+        <rect x="160" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <rect x="226" y="160" width="56" height="22" class="fw-s2 st-s2"/>
+        <text x="188" y="175" class="tx-mono tx-sm tx-mid">USA</text>
+        <text x="254" y="175" class="tx-mono tx-sm tx-mid">CA</text>
+        <text x="8" y="208" class="tx-sm">читается: 2 каталога, выбраны до задания</text>
+        <text x="8" y="240" class="tx-hand">отсечено</text>
+      </svg>
+      <p class="fig-label">После: условие на dt</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Отсечение партиций на таблице со слайда (p. 910), март 2008-го, две страны (оранжевое читается запросом). До: одно лишь условие на <code>referrer_url</code> ничего пропустить не может — этот столбец живёт внутри файлов, — поэтому читается каждый каталог. После: условие на <code>dt</code> сопоставляется с партициями в Metastore до старта задания, и его входом становятся только два каталога 31 марта; LIKE затем проверяется внутри них, строка за строкой.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Отсечение партиций (partition pruning): условие на столбец партиционирования выбирает каталоги до запуска любого задания; условие на любой другой столбец фильтрует строки внутри прочитанных файлов.</mark></p>
+
+  <div class="pitfall">
+    <p>«Партиция работает как индекс». Нет: индекса на уровне строк нет вообще. Отсечение пропускает целые каталоги по значению в их имени; внутри уцелевших каталогов читается каждая строка. Запрос только по <code>referrer_url</code> — это полное сканирование, каким бы избирательным он ни был.</p>
+  </div>
+
+  <h3>Джойны и агрегация</h3>
+
+  <p>Слайд (p. 912): "Count users who visited each page by gender". Как напечатано:</p>
+
+<pre><code>-- p. 912 as printed (see the red pen)
+SELECT pv.page_url, u.gender, COUNT(DISTINCT u.id)
+FROM page_views pv JOIN user u ON (pv.userid = u.id)
+GROUP BY pv.page_url, u.gender
+WHERE pv.date = '2008-03-03';</code></pre>
+
+  <aside class="redpen" data-page="912">
+    <p class="claim">"GROUP BY pv.page_url, u.gender WHERE pv.date = '2008-03-03';"</p>
+    <p class="fix">WHERE идёт перед GROUP BY: <code>… ON (pv.userid = u.id) WHERE pv.dt = '2008-03-03' GROUP BY pv.page_url, u.gender;</code> — и, как на слайде (p. 911), столбец партиционирования — это <code>dt</code>.</p>
+    <p class="because">В SQL, как и в HiveQL, предложения идут в фиксированном порядке — SELECT, FROM, JOIN … ON, WHERE, GROUP BY, — потому что WHERE фильтрует строки до того, как их сгруппируют; в напечатанном виде парсер запрос отвергнет. На экзамене ответ могут сверять с напечатанной версией; сам пиши правильный порядок.</p>
+  </aside>
+
+  <aside class="margin-note">Современный Hive к тому же резервирует слова user и date: таблицу с именем user приходится писать в обратных кавычках (фон). Пример со слайда, из 2008 года, старше этого правила.</aside>
+
+<pre><code>-- p. 912 corrected: distinct users per page and gender
+SELECT pv.page_url, u.gender, COUNT(DISTINCT u.id)
+FROM page_views pv JOIN user u ON (pv.userid = u.id)
+WHERE pv.dt = '2008-03-03'
+GROUP BY pv.page_url, u.gender;</code></pre>
+
+  <figure class="tbl-fig" id="l32-tbl-output">
+    <figcaption>Табл. 2. Пример вывода со слайда (p. 912) (в заголовке написано <code>count(userid)</code>; запрос считает <code>u.id</code> — через джойн это то же значение).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>page_url</th><th>gender</th><th>count(userid)</th></tr></thead>
+        <tbody>
+          <tr><td>home.php</td><td>MALE</td><td class="num">12,141,412</td></tr>
+          <tr><td>home.php</td><td>FEMALE</td><td class="num">15,431,579</td></tr>
+          <tr><td>photo.php</td><td>MALE</td><td class="num">23,941,451</td></tr>
+          <tr><td>photo.php</td><td>FEMALE</td><td class="num">21,231,314</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p><code>COUNT(DISTINCT u.id)</code> считает пользователей, а не просмотры: пользователь, открывший home.php десять раз, считается один раз — а таких на страницу за день десятки миллионов. План устроен как у Pig: один shuffle для джойна по <code>pv.userid = u.id</code>, другой для группировки по <code>(page_url, gender)</code>, и задания режутся по этим shuffle. Отсечение идёт первым: в джойн попадают только файлы 3 марта.</p>
+
+  <p>Вопрос со слайда (p. 900), заданный на HiveQL над двумя таблицами <code>users(name, age)</code> и <code>pages(username, url)</code>, — это один оператор; переключи движок в виджете выше на HiveQL и пройди его по шагам:</p>
+
+<pre><code>-- p. 900 in HiveQL: top 5 pages of users aged 18-25
+SELECT p.url, COUNT(*) AS clicks
+FROM users u JOIN pages p ON (u.name = p.username)
+WHERE u.age &gt;= 18 AND u.age &lt;= 25
+GROUP BY p.url
+ORDER BY clicks DESC
+LIMIT 5;</code></pre>
+
+  <p>Те же три shuffle — join, group, order, — а значит, те же три задания, которые Hive пишет за тебя. Hive, как и Pig, экономит твоё время; кластер всё равно гоняет MapReduce.</p>
+</section>
+
+
+<section id="l32-impala">
+  <h2>Impala: SQL рядом с MapReduce, а не поверх него</h2>
+
+  <p>Слайд (p. 915): Impala — это "Massive parallel processing (MPP) database engine, developed by Cloudera", "Integrated into Hadoop stack on the same level as MapReduce, and not above it (as Hive and Pig)". Рисунок на этом слайде — тезис всего раздела (рис. 4).</p>
+
+  <figure class="fig fig--plain" id="l32-fig-stack">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="Слои со слайда (p. 915): внизу HDFS; на ней бок о бок Impala слева и MapReduce справа; Pig и Hive поверх MapReduce. Запрос Hive входит в Hive и становится заданиями MapReduce, каждое из которых пишет свой результат в HDFS, чтобы следующее его прочитало; запрос Impala входит в Impala и читает HDFS напрямую, держа свои строки в памяти.">
+      <text x="105" y="24" class="tx-sm tx-mid">запрос Impala</text>
+      <text x="475" y="24" class="tx-sm tx-mid">запрос Hive</text>
+      <rect x="290" y="62" width="110" height="36" class="fi-paper"/>
+      <rect x="420" y="62" width="110" height="36" class="fi-paper"/>
+      <text x="345" y="85" class="tx-mid">Pig</text>
+      <text x="475" y="85" class="tx-mid">Hive</text>
+      <rect x="30" y="126" width="150" height="40" class="fi-paper sw-2"/>
+      <text x="105" y="151" class="tx-mid tx-bold">Impala</text>
+      <rect x="194" y="126" width="336" height="40" class="fi-paper"/>
+      <text x="300" y="151" class="tx-mid">MapReduce</text>
+      <rect x="30" y="204" width="500" height="40" class="fi-paper"/>
+      <text x="280" y="229" class="tx-mid">HDFS</text>
+      <line x1="475" y1="32" x2="475" y2="58" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="475" y1="98" x2="475" y2="122" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="430" y1="166" x2="430" y2="200" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="465" y1="204" x2="465" y2="170" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="500" y1="166" x2="500" y2="200" class="st-s4 sw-3" marker-end="url(#arr-s4)"/>
+      <line x1="105" y1="32" x2="105" y2="122" class="st-s5 sw-3" marker-end="url(#arr-s5)"/>
+      <line x1="105" y1="166" x2="105" y2="200" class="st-s5 sw-3" marker-end="url(#arr-s5)"/>
+      <text x="30" y="272" class="tx-sm">одно чтение, строки в памяти</text>
+      <text x="530" y="272" class="tx-sm tx-end">задание пишет в HDFS</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Слои со слайда (p. 915). Pig и Hive стоят поверх MapReduce: запрос Hive становится заданиями MapReduce, и каждое задание пишет свой результат в HDFS, чтобы следующее его прочитало (бирюзовый: вниз, вверх, вниз). Impala стоит рядом с MapReduce, прямо на HDFS: её запрос читает файлы и держит свои строки в памяти до самого конца (пурпурный).</figcaption>
+  </figure>
+
+  <p>Зачем её строить? Слайд (p. 916) аргументирует шестью строками: "Data has a gravity"; "Today a lot of data live in HDFS"; "It is not practical to move big data"; "It is practical to bring engine to the data"; "In the same time – MapReduce is not must"; "Impala process data in Hadoop cluster without using MapReduce". Большие данные слишком тяжелы, чтобы копировать их в отдельное хранилище, поэтому движок переезжает на машины Hadoop — это собственный принцип MapReduce «перемещай код, а не данные» (<a href="l30.html#l30-cluster">урок 30</a>). Но ничто не заставляет этим движком быть MapReduce, который каждое задание начинает с нуля и каждый результат пишет на диск. И Impala тут не одна: "Several other modern Database engines also realized the opportunity to bypass MapReduce but work right with HDFS" (p. 917, вместе с Greenplum и JethroData).</p>
+
+  <div class="def">
+    <p><dfn>MPP, массово-параллельная обработка (massively parallel processing)</dfn> — на слайде напечатано "Massive". Каждый узел выполняет кусок каждого запроса одновременно с остальными, и куски стримят строки друг другу по сети, не записывая промежуточные результаты на диск. Это архитектура параллельных аналитических баз данных.</p>
+  </div>
+
+  <h3>Архитектура: каждый узел планирует, координирует и выполняет</h3>
+
+  <p>Проследи путь запроса по схеме со слайда (p. 918), она перерисована на рис. 5. Клиент — любое "SQL App" через ODBC, с "Common Hive SQL and interface" — отправляет его на один узел Impala. Планировщик запросов (query planner) этого узла читает "Unified metadata": Hive Metastore — за таблицами, HDFS NameNode — за тем, где лежит каждый блок, State Store — за тем, какие узлы живы. Его координатор запроса (query coordinator) режет план на фрагменты и рассылает их на все узлы, "Fully MPP Distributed". Движок выполнения (query exec engine) каждого узла читает блоки своего DataNode — "Local Direct Reads" — или свою HBase и стримит свои строки обратно. Ни одного задания не запускается, и между шагами ничего не пишется.</p>
+
+  <figure class="fig fig--plain" id="l32-fig-impala">
+    <svg class="dia" viewBox="0 0 560 360" role="img" aria-label="Архитектура Impala: SQL-приложение через ODBC отправляет запрос на один из трёх узлов Impala; планировщик этого узла читает общие метаданные (Hive Metastore, HDFS NameNode, State Store). На каждом узле есть query planner, query coordinator и query exec engine над его HDFS DataNode и HBase. Координатор запроса рассылает фрагменты другим узлам и получает их строки; каждый exec engine читает свой локальный DataNode.">
+      <text x="20" y="16" class="tx-sm">Common Hive SQL and interface</text>
+      <rect x="20" y="26" width="130" height="30" class="fi-paper"/>
+      <rect x="20" y="62" width="130" height="30" class="fi-paper"/>
+      <text x="85" y="46" class="tx-sm tx-mid">SQL app</text>
+      <text x="85" y="82" class="tx-sm tx-mid">ODBC</text>
+      <text x="540" y="16" class="tx-sm tx-end">Unified metadata</text>
+      <rect x="380" y="26" width="160" height="26" class="fw-s3 st-s3"/>
+      <rect x="380" y="56" width="160" height="26" class="fi-paper st-s6 dash"/>
+      <rect x="380" y="86" width="160" height="26" class="fw-s3 st-s3"/>
+      <text x="460" y="44" class="tx-sm tx-mid">Hive Metastore</text>
+      <text x="460" y="74" class="tx-sm tx-mid">HDFS NameNode</text>
+      <text x="460" y="104" class="tx-sm tx-mid">State Store</text>
+
+      <line x1="150" y1="88" x2="246" y2="142" class="st-s2 sw-2" marker-end="url(#arr-s2)"/>
+      <line x1="390" y1="114" x2="318" y2="142" class="sw-2" marker-end="url(#arr)"/>
+      <text x="168" y="126" class="tx-sm halo">запрос</text>
+
+      <rect x="194" y="142" width="172" height="146" rx="6" class="st-s6 dash sw-2"/>
+
+      <rect x="10" y="150" width="160" height="26" class="fi-paper"/>
+      <rect x="10" y="176" width="160" height="26" class="fi-paper"/>
+      <rect x="10" y="202" width="160" height="26" class="fi-paper"/>
+      <text x="90" y="168" class="tx-sm tx-mid">planner</text>
+      <text x="90" y="194" class="tx-sm tx-mid">coordinator</text>
+      <text x="90" y="220" class="tx-sm tx-mid">exec engine</text>
+      <rect x="10" y="252" width="84" height="28" class="fi-paper"/>
+      <rect x="100" y="252" width="70" height="28" class="fi-paper"/>
+      <text x="52" y="271" class="tx-sm tx-mid">HDFS DN</text>
+      <text x="135" y="271" class="tx-sm tx-mid">HBase</text>
+
+      <rect x="200" y="150" width="160" height="26" class="fi-paper"/>
+      <rect x="200" y="176" width="160" height="26" class="fi-paper"/>
+      <rect x="200" y="202" width="160" height="26" class="fi-paper"/>
+      <text x="280" y="168" class="tx-sm tx-mid">planner</text>
+      <text x="280" y="194" class="tx-sm tx-mid">coordinator</text>
+      <text x="280" y="220" class="tx-sm tx-mid">exec engine</text>
+      <rect x="200" y="252" width="84" height="28" class="fi-paper"/>
+      <rect x="290" y="252" width="70" height="28" class="fi-paper"/>
+      <text x="242" y="271" class="tx-sm tx-mid">HDFS DN</text>
+      <text x="325" y="271" class="tx-sm tx-mid">HBase</text>
+
+      <rect x="390" y="150" width="160" height="26" class="fi-paper"/>
+      <rect x="390" y="176" width="160" height="26" class="fi-paper"/>
+      <rect x="390" y="202" width="160" height="26" class="fi-paper"/>
+      <text x="470" y="168" class="tx-sm tx-mid">planner</text>
+      <text x="470" y="194" class="tx-sm tx-mid">coordinator</text>
+      <text x="470" y="220" class="tx-sm tx-mid">exec engine</text>
+      <rect x="390" y="252" width="84" height="28" class="fi-paper"/>
+      <rect x="480" y="252" width="70" height="28" class="fi-paper"/>
+      <text x="432" y="271" class="tx-sm tx-mid">HDFS DN</text>
+      <text x="515" y="271" class="tx-sm tx-mid">HBase</text>
+
+      <line x1="200" y1="184" x2="176" y2="184" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="170" y1="218" x2="194" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="360" y1="184" x2="384" y2="184" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="390" y1="218" x2="366" y2="218" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="52" y1="250" x2="52" y2="232" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="242" y1="250" x2="242" y2="232" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+      <line x1="432" y1="250" x2="432" y2="232" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+
+      <text x="20" y="318" class="tx-hand">fully MPP distributed</text>
+      <text x="300" y="348" class="tx-hand">local direct reads</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Архитектура Impala (p. 918), перерисовано; на каждом узле работают Query Planner, Query Coordinator и Query Exec Engine. Запрос приходит на один узел (пунктирный охристый — координатор этого запроса), чей планировщик читает Hive Metastore, HDFS NameNode и State Store. Его координатор рассылает фрагменты плана на все узлы (чёрные стрелки); каждый движок выполнения читает блоки своего DataNode (короткие синие стрелки) и стримит свои строки обратно (синие).</figcaption>
+  </figure>
+
+  <h3>Те же таблицы, быстрее чтение</h3>
+
+  <p>Слайд (p. 919): "Impala supports multiple formats. It is kind of schema on read"; "Impala shares metastore with Hive, which enables very simple adoption"; "Internally Impala have well defined way to add new formats". Таблица <code>page_views</code>, которую создал Hive, — это та самая таблица, к которой обращается Impala: то же определение в Metastore, те же каталоги, те же файлы. Чтобы перейти на Impala, достаточно направить её на уже имеющееся хранилище, — снова гравитация данных, ничего не переезжает.</p>
+
+  <p>Что делает её быстрой, перечислено на слайде (p. 920). «Адаптеры форматов» Impala, которые называются <mark class="key">сканерами (scanners)</mark>, "have predicate pushdown capability": условие WHERE передаётся коду, который читает файл, так что строка, не прошедшая его, отбрасывается прямо во время чтения, а не материализуется и фильтруется потом. Это "Open source MPP engine", который "Runs hundreds of CPU cores in one query efficiently without expensive license", — и "Hive give us the same but not efficiently". Сканеры есть для форматов со слайда (p. 922) (табл. 3).</p>
+
+  <figure class="tbl-fig" id="l32-tbl-formats">
+    <figcaption>Табл. 3. Сканеры со слайда (p. 922) и то, как каждый формат раскладывает таблицу (столбец о раскладке — фон, не со слайда).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Формат (p. 922)</th><th>Раскладка</th><th>Примечание</th></tr></thead>
+        <tbody>
+          <tr><td>RCFile</td><td>колоночная</td><td>record columnar file из Hive</td></tr>
+          <tr><td>Parquet (native dremel format)</td><td>колоночная</td><td>открытый формат, а не собственный формат Dremel: он кодирует вложенные данные так, как это делает статья Google о Dremel; <a href="l40.html">урок 40</a></td></tr>
+          <tr><td>CSV</td><td>построчная, текст</td><td>текст с разделителями со слайда (p. 909)</td></tr>
+          <tr><td>AVRO</td><td>построчная, двоичная</td><td>каждый файл несёт свою схему</td></tr>
+          <tr><td>Sequence File</td><td>построчная, двоичная</td><td>файл ключ–значение из Hadoop со слайда (p. 910)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>С колоночным файлом сканер читает только те столбцы, которые называет запрос, — это колоночное хранилище из <a href="l20.html#l20-colstore">урока 20</a> и тот самый точный смысл, в котором HBase <em>не</em> колоночная. Отсечение партиций пропускает каталоги, колоночная раскладка пропускает столбцы, проталкивание предикатов (predicate pushdown) отбрасывает строки во время чтения: вместе они заставляют аналитический запрос читать и обрабатывать лишь малую часть данных.</p>
+
+  <h3>Цена: один сбой — один потерянный запрос</h3>
+
+  <p>Слайд (p. 921) — честный: "Hive is doing things Impala can not do yet, like joins between several big tables"; "Hive has convenient java UDF, while impala has not"; "Impala does not have inter-query fault tolerance"; "In the same time – MapReduce is not good framework for the database engine"; "Always faster then Hive at least 10 times"; "Impala in the cloud is not elastic".</p>
+
+  <aside class="redpen" data-page="921">
+    <p class="claim">"Impala does not have inter-query fault tolerance."</p>
+    <p class="fix">Чего Impala не хватает, так это отказоустойчивости внутри запроса (intra-query): если узел падает во время выполнения запроса, падает весь запрос, и его надо запускать заново. Между запросами ничего не теряется.</p>
+    <p class="because">MapReduce пишет результат каждой задачи на диск, поэтому, когда машина умирает, заново в другом месте запускаются только её задачи, и задание доходит до конца. Фрагменты Impala передают строки друг другу в памяти: мёртвый узел уносит с собой свою часть выполняющегося запроса, и никакого сохранённого состояния, с которого остальные могли бы продолжить, нет. "Inter-query" значило бы «между запросами», а там защищать нечего. На экзамене ответ могут сверять с напечатанным словом: знай его, а отвечай механизмом.</p>
+  </aside>
+
+  <p>Остальные пункты следуют из того же устройства. MPP-джойны строят свои таблицы в памяти, поэтому в версии со слайда две большие таблицы соединить было нельзя, тогда как джойн Hive на стороне reduce сбрасывает данные на диск и справляется с любым размером, пусть и медленно. Java UDF были только в Hive, а демоны Impala живут на DataNode, поэтому она не может расти и сжиматься по нагрузке, как облачный сервис. Всё это описывает раннюю Impala со слайдов, а "at least 10 times" — собственное утверждение слайда против Hive на MapReduce: учи их как напечатано, как факты о той версии.</p>
+
+  <p><b>Назад к загадке.</b> Зачем держать движок, который в десять раз медленнее? Потому что длинное задание должно переживать сбои. Четырёхчасовое задание Hive на сотнях машин почти наверняка застанет смерть некоторых из них, и MapReduce просто перезапустит их задачи. Запрос Impala делает ставку на то, что он достаточно короткий, чтобы перезапустить его с нуля, — отличная ставка для запроса на секунды и разорительная для ночного ETL. Отсюда разделение труда, которое следует из слайда (p. 921): Hive — для длинных тяжёлых батч-заданий и джойнов больших таблиц, Impala — для интерактивных запросов к тем же таблицам, через тот же Metastore. Вопрос никогда не был в скорости; он был в том, чтобы пережить сбои и таблицы, которые не влезают в память.</p>
+
+  <p class="memo"><mark class="key">Impala быстрее, потому что обходит MapReduce — без запуска заданий, строки стримятся в памяти, — и по той же причине сбой узла убивает весь запрос: Hive — для длинных отказоустойчивых заданий, Impala — для интерактивных.</mark></p>
+
+  <div class="story" data-year="2008–2010">
+    <p>В январе 2008 года Дэвид Девитт и Майкл Стоунбрейкер назвали MapReduce «гигантским шагом назад в парадигме программирования для крупномасштабных приложений, интенсивно работающих с данными», в котором «отсутствует большинство возможностей, обычно входящих в современные СУБД». Через два года Стоунбрейкер и шесть соавторов опубликовали «MapReduce and Parallel DBMSs: Friends or Foes?» и пришли к выводу, что одно дополняет другое: MapReduce ближе к ETL-системе, чем к базе данных. Hive и Impala бок о бок на слайде (p. 921) и есть это перемирие.</p>
+  </div>
+</section>
+
+
+<section id="l32-exam" class="no-num">
+  <h2>Вопросы в стиле экзамена</h2>
+  <p>Экосистема Hadoop относится к теоретической части: открытые ответы, выбор из вариантов и «верно/неверно», где за неверные ответы может быть штраф, о котором объявляют прямо перед экзаменом. Последний вопрос — наше упражнение на ER-диаграмме из прошлого варианта.</p>
+
+  <div class="exam" data-kind="open" id="l32-exam-hbase">
+    <div class="exam-q" lang="en">
+      <p>Describe the data model of HBase, using the zoo example of the slides. How is a cell identified, how is a table stored, and what does "nulls are free" mean?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>HBase is modelled on Google's Bigtable: a key-valued row/column store on HDFS for billions of rows and millions of columns. A table is a sparse map in which each cell is addressed by its row key, its column — written family:qualifier — and a timestamp, and holds an untyped byte array. Column families are declared with the table (in the zoo example, animal: and repairs:), while qualifiers such as animal:type and animal:size can be added by any row. Every write creates a new version: enclosure1 has animal:type = lion at t1 and zebra at t2, and a read returns the newest version, zebra. Each column family is stored separately, as a list of (row, timestamp, column) → value entries: three in animal: and one in repairs: for the example. A cell that was never written has no entry at all, so it takes no space — that is "nulls are free"; space grows with the cells written, not with rows times columns. Access is only by key: get a cell or a row, or scan a range of row keys; there is no SQL and no join.</p></div>
+      <div class="exam-note"><p>Полный ответ покрывает четыре вещи: адрес ячейки (row key, family:qualifier, timestamp) с нетипизированным значением; версии, из которых возвращается самая новая; хранение по семействам как записи (row, timestamp, column) → value; отсутствующую запись как смысл "nulls are free". Используй зоопарк: это собственный пример слайдов. Если упоминаешь "column-oriented", добавь, что речь о семействах столбцов, а не о колоночном хранилище.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l32-exam-pig">
+    <div class="exam-q" lang="en">
+      <p>The Pig Latin script below finds the top 5 most visited pages by users aged 18–25. Into how many MapReduce jobs is it compiled, which statements belong to each job, and why that number?</p>
+<pre><code>Users = load 'users' as (name, age);
+Filtered = filter Users by age &gt;= 18 and age &lt;= 25;
+Pages = load 'pages' as (user, url);
+Joined = join Filtered by name, Pages by user;
+Grouped = group Joined by url;
+Summed = foreach Grouped generate group, COUNT(Joined) as clicks;
+Sorted = order Summed by clicks desc;
+Top5 = limit Sorted 5;
+store Top5 into 'top5sites';</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Three MapReduce jobs. A MapReduce job has at most one shuffle, so Pig starts a new job for every operator that needs tuples with equal keys brought together across the cluster: the join on name, the group on url and the order by clicks. Job 1 loads users and pages and filters the users by age in the map phase, shuffles both inputs on the name and joins them in the reduce phase. Job 2 reads the joined tuples, shuffles them on url, and counts each group in the reduce phase (COUNT can also run as a combiner). Job 3 shuffles the (url, clicks) pairs on clicks, so they arrive sorted; the reduce side keeps the first five and stores them. LOAD, FILTER, FOREACH … GENERATE and LIMIT need no shuffle of their own and ride along in the map or reduce phase of these jobs; the outputs of jobs 1 and 2 are written to HDFS and read by the next job.</p></div>
+      <div class="exam-note"><p>Одно число не отвечает на «почему»: назови правило — одно задание на shuffle — и распредели операторы по заданиям, как на слайде (p. 904). Соблазнительные неверные ответы — девять (по одному на строку) и одно («это же один скрипт»). Если знаешь, что настоящий Pig добавляет перед ORDER маленькое задание-выборку, скажи об этом после трёх заданий со слайда (p. 904), но никогда не вместо них.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l32-exam-prune">
+    <div class="exam-q" lang="en">
+      <p>A Hive table <code>page_views</code> is <code>PARTITIONED BY (dt STRING, country STRING)</code> and holds 365 days of data for 4 countries, one partition per (dt, country) pair. How many partition directories does Hive read to answer the query below?</p>
+<pre><code>SELECT * FROM page_views
+WHERE dt = '2008-03-31' AND referrer_url LIKE '%xyz.com';</code></pre>
+    </div>
+    <ul class="options" lang="en">
+      <li>1 <span class="fb">Для этого нужно было бы условие ещё и на country. С одним dt читаются все страны этого дня.</span></li>
+      <li data-correct>4 <span class="fb">dt = '2008-03-31' выбирает один день; country не ограничен, поэтому читаются 4 каталога этого дня, а LIKE фильтрует строки внутри них.</span></li>
+      <li>124 <span class="fb">31 день × 4 страны: весь март — это то, что выбирает напечатанный запрос со слайда (p. 911), а не этот.</span></li>
+      <li>1460 <span class="fb">Вся таблица: так бывает, только если условия на dt нет. LIKE на referrer_url ничего не отсекает.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>4 directories out of 365 × 4 = 1460. Partition pruning matches the condition on the partition column dt against the partitions listed in the Metastore before the job starts, so only the directories dt=2008-03-31/country=… become input. The condition on referrer_url concerns a column inside the files: it is evaluated row by row in the mappers and does not reduce the data read.</p></div>
+      <div class="exam-note"><p>Две идеи в одном вопросе: партиция — это каталог, выбранный по значению до запуска задания, а условие на обычный столбец ничего не отсекает.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l32-exam-impala">
+    <div class="exam-q" lang="en">
+      <p>Impala and Hive can query the same tables. Explain why Impala answers interactive queries much faster than Hive, what it gives up in exchange, and when Hive remains the better choice.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>Hive compiles a HiveQL query into MapReduce jobs: every job pays a start-up cost, and the output of every job is written to HDFS before the next one reads it. Impala is a massively parallel processing (MPP) engine integrated into the Hadoop stack on the same level as MapReduce, not above it: long-running daemons on the DataNodes plan the query, split it into fragments that run in parallel on every node, read the HDFS blocks locally and stream intermediate rows to each other in memory, and its scanners push predicates down into the read. It shares Hive's Metastore, so it uses the same tables and files without moving any data — the engine is brought to the data. The slides claim it is always at least 10 times faster than Hive. In exchange it has no fault tolerance within a query (the slide says "inter-query"): if a node fails, the whole query is aborted and must be restarted, whereas MapReduce re-runs only the failed tasks because their inputs and outputs are on disk. In the slides' version Impala also could not join several big tables, had no Java UDFs and was not elastic in the cloud. Hive therefore remains the choice for long batch jobs over very large tables, where a restart would be expensive, and Impala for short interactive queries.</p></div>
+      <div class="exam-note"><p>Суть ответа — компромисс, а не скорость: механизм (MPP-демоны, без MapReduce, стриминг в памяти, локальное чтение, predicate pushdown), цена (сбой узла убивает запрос — внутри запроса, что бы ни говорило напечатанное "inter-query") и следствие (длинные задания — на Hive, интерактивные — на Impala). Остальные пункты слайда (p. 921) устарели: используя их, говори «на слайдах».</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l32-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements are true? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Pig and Hive run their queries as MapReduce jobs, whereas Impala runs SQL without MapReduce. <span class="fb">Верно: Pig и Hive стоят поверх MapReduce; Impala стоит на том же уровне и обрабатывает данные "without using MapReduce" (pp. 915–916).</span></li>
+      <li>HBase stores a NULL marker for every unwritten cell of a row. <span class="fb">Неверно: у незаписанной ячейки нет записи вовсе — "nulls are free" (pp. 893, 895).</span></li>
+      <li data-correct>Hive keeps the schemas of its tables in the Metastore and their data as files in HDFS directories. <span class="fb">Верно: "Maintains list of table schemas" (p. 906); каталог хранилища, подкаталоги и плоские файлы (p. 909).</span></li>
+      <li>Tables created in Hive must be redefined in Impala before Impala can query them. <span class="fb">Неверно: "Impala shares metastore with Hive, which enables very simple adoption" (p. 919).</span></li>
+      <li data-correct>A Hive bucket spreads the rows of a partition over a fixed number of files by hashing a column. <span class="fb">Верно: "Hash partitions within ranges (useful for sampling, join optimization)" (p. 908).</span></li>
+      <li>"Can call Hadoop Streaming scripts from HiveQL" means that Hive processes real-time data streams. <span class="fb">Неверно: Hadoop Streaming запускает мапперы и редьюсеры, написанные на любом языке, через стандартный ввод и вывод; потоковая обработка — это Storm.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en"><p>True: the first, the third and the fifth. HBase does not store anything for an unwritten cell; Impala shares the Hive Metastore, so Hive's tables are visible to it at once; Hadoop Streaming is a way of writing MapReduce code in any language, not stream processing.</p></div>
+      <div class="exam-note"><p>При возможном штрафе отмечай только то, что подтверждает слайд. В каждом неверном утверждении подменено слово: NULL marker вместо отсутствия записи, redefine вместо share, streaming scripts вместо потоковой обработки.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l32-exam-farm">
+    <div class="exam-q" lang="en">
+      <p><b>An exercise of ours, on the ER diagram of the Exam of 12 Sep 2025</b> (tracking farmers and their sales at local markets): People (Personal ID, Name, Surname, Age, Address, State) buy Products (Product ID, Name, Quantity, Expiration Date) through the relationship Buy (Buy Date, Amount); Products are sold at Markets (Name, Location, Opening Time, Closing Time, Size) through the relationship Sell.</p>
+      <p>Suppose you record a large, continuously increasing number of purchases of products at the markets as files in HDFS, and analyse them with Hive, mostly one day at a time. (a) Write the Hive table for the purchases, with the attributes of the ER model you need, partitioned so that a query on one day reads only that day's data. (b) Write a HiveQL query that returns, for each market location, the number of distinct people who bought a product on 20/03/2025 and the total amount. (c) How many partition directories does your query read, and why?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Показать образец ответа</summary>
+      <div class="exam-answer" lang="en">
+<pre><code>CREATE TABLE purchases(product_id STRING, product_name STRING,
+                       market_name STRING, market_location STRING,
+                       personal_id STRING, amount DOUBLE)
+COMMENT 'One row per purchase of a product at a market'
+PARTITIONED BY(buy_date STRING)
+STORED AS SEQUENCEFILE;</code></pre>
+<pre><code>SELECT market_location, COUNT(DISTINCT personal_id), SUM(amount)
+FROM purchases
+WHERE buy_date = '2025-03-20'
+GROUP BY market_location;</code></pre>
+        <p>(a) The partition column buy_date is declared in PARTITIONED BY and not in the column list: each day becomes a directory such as /user/hive/warehouse/purchases/buy_date=2025-03-20/. Dates are stored as yyyy-mm-dd strings, which sort in date order. (b) WHERE comes before GROUP BY; COUNT(DISTINCT personal_id) counts people, not purchases. (c) One directory: buy_date is a partition column, so the compiler matches the WHERE against the partitions listed in the Metastore before the job starts and reads only buy_date=2025-03-20; the GROUP BY then needs one shuffle, on market_location.</p>
+      </div>
+      <div class="exam-note"><p>Упражнение наше: Hive не входит в темы практической части (Neo4j, MongoDB, Elasticsearch, Redis, SparkQL), но первое упражнение самого варианта просит колоночный дизайн для тех же продаж. Оно проверяет то, о чём теоретическая часть может спросить про Hive: столбцы партиционирования, объявленные отдельно и превращённые в каталоги, WHERE перед GROUP BY и COUNT(DISTINCT …), считающий людей. Используются только атрибуты ER-модели, как того требует упражнение на MongoDB из того же варианта ("Do not add variables besides the ones included in the ER model").</p></div>
+    </details>
+  </div>
+</section>
+
+
+<section class="quiz" id="l32-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">В таблице зоопарка у <code>enclosure3</code> записан только <code>animal:type</code>. Put записывает в <code>enclosure3</code> <code>animal:diet</code> = hay. Что меняется в хранилище?</p>
+    <ul class="options">
+      <li>Put отвергается, пока таблицу не изменят, объявив <code>animal:diet</code> <span class="fb">Объявляются только семейства столбцов; квалификаторы свободны, как показал столбец diet в виджете.</span></li>
+      <li>Столбец <code>animal:diet</code> добавляется во все три строки, с NULL там, где ничего не записано <span class="fb">Столбцы — не слоты: для других строк ничего не пишется, и у их <code>animal:diet</code> просто нет записи.</span></li>
+      <li data-correct>Одна запись, <code>(enclosure3, t, animal:diet)</code> → hay, добавляется в список семейства <code>animal:</code> <span class="fb">Одна записанная ячейка — одна запись, в списке своего семейства.</span></li>
+      <li>Записывается новая версия каждой ячейки <code>enclosure3</code>, с одной и той же меткой <span class="fb">Put пишет только те ячейки, которые называет; остальные ячейки сохраняют свои версии.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Любая строка может добавить любой квалификатор. Зачем тогда HBase вообще нужны семейства столбцов?</p>
+    <ul class="options">
+      <li data-correct>Они — единица хранения: каждое семейство хранится отдельно, так что чтение <code>repairs:</code> никогда не трогает записи <code>animal:</code> <span class="fb">Два семейства хранятся отдельными списками (p. 895); столбцы, которые читают вместе, кладут в одно семейство.</span></li>
+      <li>Они задают каждому столбцу тип <span class="fb">HBase не типизирована: каждое значение — это <code>byte[]</code> (p. 893).</span></li>
+      <li>Без семейств пустые ячейки не были бы бесплатными <span class="fb">Пустые ячейки бесплатны, потому что отсутствующие записи не хранятся — ни в каком семействе.</span></li>
+      <li>Они заменяют ключ строки при поиске <span class="fb">Поиск идёт по ключу строки (p. 897); семейство лишь говорит, какой список читать.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Скрипт Pig загружает журнал посещений, фильтрует посещения 2024 года, группирует их по стране, считает каждую группу через <code>foreach … generate</code> и сохраняет результат. Во сколько заданий MapReduce он компилируется по правилу «одно задание на shuffle» со слайда (p. 904)?</p>
+    <ul class="options">
+      <li>5, по одному на оператор <span class="fb">Операторы — не задания: load, filter, foreach и store выполняются внутри фазы map или reduce какого-то задания.</span></li>
+      <li data-correct>1: shuffle нужен только группировке <span class="fb">Load и filter — на стороне map, shuffle по country, подсчёт и store — на стороне reduce.</span></li>
+      <li>2: одно для фильтра, одно для группировки <span class="fb">Фильтр смотрит на один кортеж за раз: ни shuffle, ни собственного задания.</span></li>
+      <li>0: Pig не использует MapReduce <span class="fb">Pig "Expresses sequences of MapReduce jobs" (p. 899).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text"><code>page_views</code> партиционирована по (dt, country): 365 дней и две страны, USA и CA. В запросе есть <code>WHERE country = 'CA'</code> и ничего про <code>dt</code>. Какие каталоги читает Hive?</p>
+    <ul class="options">
+      <li>Только каталог <code>country=CA</code> <span class="fb">Такого каталога наверху нет: каталоги <code>country=…</code> лежат внутри каждого каталога <code>dt=…</code>.</span></li>
+      <li>Ничего пропустить нельзя: country — не первый столбец партиционирования <span class="fb">Отсекать может любой столбец партиционирования; Metastore перечисляет каждую пару (dt, country).</span></li>
+      <li>Все 730, потому что dt не ограничен <span class="fb">Отсечение применяется к каждому столбцу партиционирования: 365 каталогов USA пропускаются.</span></li>
+      <li data-correct>365: каталог <code>country=CA</code> внутри каждого каталога <code>dt</code> <span class="fb">У каждого дня есть подкаталог CA; половина таблицы пропускается.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Почему Impala отвечает на короткий запрос быстрее, чем Hive? Отметь всё подходящее.</p>
+    <ul class="options">
+      <li data-correct>Не нужно запускать задание MapReduce: её демоны уже работают на каждом узле <span class="fb">Impala "process data in Hadoop cluster without using MapReduce" (p. 916).</span></li>
+      <li>Она хранит таблицы в собственном, более быстром движке хранения <span class="fb">Нет: она читает те же файлы HDFS, что и Hive, через общий Metastore (p. 919).</span></li>
+      <li data-correct>Промежуточные строки стримятся между узлами в памяти, а не пишутся в HDFS между заданиями <span class="fb">"Fully MPP Distributed" (p. 918); MapReduce пишет результат каждого задания в HDFS.</span></li>
+      <li data-correct>Её сканеры проталкивают условия WHERE в само чтение файлов <span class="fb">"predicate pushdown capability" (p. 920): неподходящие строки отбрасываются во время чтения.</span></li>
+      <li>Когда узел умирает, она перезапускает только упавший фрагмент <span class="fb">Это сильная сторона MapReduce; у Impala нет отказоустойчивости внутри запроса (p. 921).</span></li>
+    </ul>
+    <p class="q-fb">Все три верные причины — одно и то же устройство: долгоживущие процессы, которые держат данные в движении в памяти. Это же устройство — причина, по которой сбой убивает запрос.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Ночное задание джойнит три таблицы по нескольку терабайт каждая и идёт четыре часа на большом кластере, где машина отказывает раз в несколько часов. Если следовать слайдам — Hive или Impala?</p>
+    <ul class="options">
+      <li>Impala, потому что она всегда хотя бы в 10 раз быстрее <span class="fb">Сбой узла прервал бы весь запрос, а слайд (p. 921) называет джойны между несколькими большими таблицами тем, чего Impala пока не умела.</span></li>
+      <li>Любой: у них общий Metastore, значит, ведут они себя одинаково <span class="fb">Общие у них таблицы и файлы, а не способ выполнения запроса.</span></li>
+      <li data-correct>Hive: MapReduce перезапускает упавшие задачи с данных на диске и справляется с джойнами больших таблиц <span class="fb">Длинная отказоустойчивая батч-работа — ниша Hive: "Hive is doing things Impala can not do yet, like joins between several big tables" (p. 921).</span></li>
+      <li>Ни то ни другое: соединить три таблицы может только Pig <span class="fb">Hive джойнит с синтаксисом SQL (p. 912), сколько угодно таблиц.</span></li>
+    </ul>
+  </div>
+</section>
+
+
+<section class="recap" id="l32-recap">
+  <h2>Главное</h2>
+  <ul>
+    <li>HBase, созданная по образцу Bigtable и построенная на HDFS, — это разреженная карта: ячейка адресуется тройкой (row key, family:qualifier, timestamp) и хранит нетипизированные байты; семейства объявляются, квалификаторы свободны, а чтение возвращает самую новую версию.</li>
+    <li>Каждое семейство столбцов хранится собственным списком записей (row, timestamp, column) → value, поэтому незаписанная ячейка ничего не стоит — "nulls are free"; чтение идёт только по ключу (ячейка, строка, скан отсортированных ключей), а "column-oriented" здесь значит семейства столбцов, а не колоночное хранилище.</li>
+    <li>Pig компилирует поток данных из отношений над вложенными мешками в последовательность заданий MapReduce, по одному на каждый оператор, которому нужен shuffle: JOIN, GROUP и ORDER дают три задания со слайда (p. 904).</li>
+    <li>Hive ставит SQL на Hadoop: Driver компилирует HiveQL в задания MapReduce, Metastore хранит схемы и партиции, а данные остаются плоскими файлами в HDFS — таблицы и партиции это каталоги, бакеты это хеш-файлы, SerDe применяет схему при чтении.</li>
+    <li>Отсечение партиций читает только те каталоги, чьи значения партиций удовлетворяют WHERE, и выбирает их до запуска любого задания; условия на другие столбцы фильтруют строки внутри файлов. Поправки к слайдам (pp. 911–912): столбец партиционирования — dt, а не date, и WHERE идёт перед GROUP BY.</li>
+    <li>Impala — это MPP-движок SQL рядом с MapReduce: она делит с Hive Metastore и файлы, планирует на любом узле, выполняет фрагменты на каждом узле с локальным чтением и стримингом в памяти и проталкивает предикаты в свои сканеры — быстрее, но сбой узла убивает весь запрос, поэтому за Hive остаются длинные батч-задания, а Impala берёт интерактивные.</li>
+  </ul>
+  <aside class="cheat" id="l32-cheat">
+    <dl>
+      <dt>Ячейка HBase</dt><dd>(row key, family:qualifier, timestamp) → value (<code>byte[]</code>); возвращается самая новая версия</dd>
+      <dt>Хранение в HBase (p. 895)</dt><dd>по списку на семейство столбцов из (row, timestamp, column) → value; незаписанная ячейка = нет записи: "nulls are free"</dd>
+      <dt>Запись в HBase (p. 896)</dt><dd><code>BatchUpdate update = new BatchUpdate(row); update.put(col, bytes); table.commit(update);</code></dd>
+      <dt>Чтение в HBase (p. 897)</dt><dd><code>table.getRow(row).getColumn(col).getValue()</code> · <code>table.getRow(row)</code> · <code>table.getScanner(cols)</code></dd>
+      <dt>Pig Latin</dt><dd><code>load … as (…)</code> · <code>filter … by</code> · <code>join A by x, B by y</code> · <code>group … by</code> · <code>foreach … generate group, COUNT(bag)</code> · <code>order … by … desc</code> · <code>limit … n</code> · <code>store … into</code></dd>
+      <dt>Задания скрипта</dt><dd>по одному на оператор с shuffle (JOIN, GROUP, ORDER): 3 для скрипта top-5 (p. 904)</dd>
+      <dt>Hive</dt><dd>HiveQL + Metastore; Driver = компилятор, оптимизатор, исполнитель → задания MapReduce; данные = файлы в <code>/user/hive/warehouse</code></dd>
+      <dt>Таблица Hive (p. 910)</dt><dd><code>CREATE TABLE t(…) PARTITIONED BY(dt STRING, country STRING) STORED AS SEQUENCEFILE;</code></dd>
+      <dt>Партиция / бакет</dt><dd>каталог на значение, <code>…/page_views/dt=2008-06-08/country=USA</code> · файл на хеш: bucket = hash(col) mod N</dd>
+      <dt>Отсечение партиций</dt><dd><code>WHERE dt = '2008-03-31'</code> → только каталоги этого дня, выбранные до задания</dd>
+      <dt>CLI Hive (p. 913)</dt><dd><code>show tables;</code> · <code>describe t;</code> · <code>describe extended t;</code></dd>
+      <dt>Impala</dt><dd>MPP-движок от Cloudera, рядом с MapReduce на HDFS; общий Hive Metastore; planner + coordinator + exec engine на каждом узле; local direct reads; сканеры с predicate pushdown</dd>
+      <dt>Форматы Impala (p. 922)</dt><dd>RCFile, Parquet (колоночные) · CSV, Avro, SequenceFile (построчные)</dd>
+      <dt>Hive или Impala</dt><dd>длинные отказоустойчивые батч-задания → Hive; интерактивные запросы → Impala (нет отказоустойчивости внутри запроса)</dd>
+    </dl>
+  </aside>
+</section>
+
+
+<section class="resources" id="l32-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://hbase.apache.org/book.html" target="_blank" rel="noopener">Apache HBase Reference Guide</a>
+      <span class="res-by">Apache HBase project</span>
+      <p class="res-why">Прочитай главу Data Model рядом с разделом 1: её conceptual view и physical view — та же пара картинок, что на слайдах (pp. 894–895), только на веб-таблице вместо зоопарка. Её раздел о версиях объясняет, сколько их хранит семейство.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="during">
+      <a class="res-title" href="https://cwiki.apache.org/confluence/display/Hive/Tutorial" target="_blank" rel="noopener">Apache Hive Tutorial</a>
+      <span class="res-by">Apache Hive wiki</span>
+      <p class="res-why">Единицы данных со слайда (p. 908) — таблицы, партиции, бакеты — и таблица со слайда (p. 910) (там она называется <code>page_view</code>) с запросами по партициям. Читай рядом с разделами 3 и 4.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="http://infolab.stanford.edu/~olston/publications/sigmod08.pdf" target="_blank" rel="noopener">Pig Latin: A Not-So-Foreign Language for Data Processing</a>
+      <span class="res-by">Olston, Reed, Srivastava, Kumar, Tomkins · Yahoo! Research · SIGMOD 2008</span>
+      <p class="res-why">Статья, стоящая за слайдом (p. 899). Раздел 3.1 определяет вложенные мешки; раздел 3.5 показывает, что JOIN — это COGROUP, за которым следует выравнивание (flatten); раздел 4.2 и его Figure 3 компилируют скрипт в задания MapReduce — каждый (CO)GROUP открывает задание, а ORDER стоит два.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://www.cidrdb.org/cidr2015/Papers/CIDR15_Paper28.pdf" target="_blank" rel="noopener">Impala: A Modern, Open-Source SQL Engine for Hadoop</a>
+      <span class="res-by">Kornacker et al. · CIDR 2015</span>
+      <p class="res-why">Три демона за рисунком со слайда (p. 918) (impalad на каждом DataNode, statestore, catalog service) и конвейерное выполнение с операторами обмена (exchange) вместо заданий MapReduce. Ещё она показывает, как поздние версии сняли ограничения со слайда (p. 921): hash-джойны, сбрасывающие данные на диск, UDF на Java и C++.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="after">
+      <a class="res-title" href="https://static.googleusercontent.com/media/research.google.com/en//archive/bigtable-osdi06.pdf" target="_blank" rel="noopener">Bigtable: A Distributed Storage System for Structured Data</a>
+      <span class="res-by">Chang, Dean, Ghemawat et al. · OSDI 2006</span>
+      <p class="res-why">Раздел 2, две страницы, — источник словаря HBase: разреженная отсортированная карта, индексированная строкой, столбцом и временной меткой, на примере веб-таблицы.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Всё в этом уроке читает файлы, которые уже лежат в HDFS и уже закончены. Откуда они берутся — и что, если данные не перестают приходить: поток кликов или логов, который надо считать, пока он течёт?</p>
+</aside>
+
+</main>
+</body>
+</html>
