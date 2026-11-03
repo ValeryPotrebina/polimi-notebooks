@@ -3195,7 +3195,7 @@
       /* lesson anatomy (advice: an extras page is free-form) */
       if (lessonLike) {
         var need = [['.lesson-head h1', 'header.lesson-head with <h1>'], ['.lesson-head .lede', '.lede in the lesson head'], ['.hook', '.hook'],
-          ['section.quiz', 'section.quiz'], ['section.recap', 'section.recap'], ['.recap .cheat', '.cheat inside the recap'],
+          ['section.quiz', 'section.quiz'], ['section.recap', 'section.recap'],
           ['section.resources', 'section.resources'], ['.bridge', 'aside.bridge'], ['.exam', '.exam question'], ['.widget', 'widget']];
         need.forEach(function (x) { if (!main.querySelector(x[0])) stWarn('anatomy', 'the lesson has no ' + x[1]); });
         if (main.querySelectorAll('figure.fig').length < 2) stWarn('anatomy', 'fewer than 2 figures (figure.fig) in the lesson');
