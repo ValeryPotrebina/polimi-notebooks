@@ -1369,7 +1369,7 @@
   function convertPageRefs(scope) {
     if (!PAGEMAP || !scope) return;
     var walker = doc.createTreeWalker(scope, NodeFilter.SHOW_TEXT, null), tn, list = [];
-    while ((tn = walker.nextNode())) if (PAGE_HINT.test(tn.nodeValue)) list.push(tn);
+    while ((tn = walker.nextNode())) if (PAGE_HINT.test(tn.nodeValue) && !(tn.parentNode && tn.parentNode.closest('li[data-meta="pages"]'))) list.push(tn);       // the chip of the source pages: slideChip reads its numbers
     list.forEach(function (n) { try { convertTextNode(n); } catch (e) { report('page reference', e); } });
     var els = scope.querySelectorAll ? Array.prototype.slice.call(scope.querySelectorAll('[aria-label], [data-label], [data-tab], [title], [alt]')) : [];
     if (scope.nodeType === 1) els.push(scope);
@@ -3303,7 +3303,7 @@
       var walker = doc.createTreeWalker(main, NodeFilter.SHOW_TEXT, null), tn, dollars = 0, emoji = 0;
       while ((tn = walker.nextNode())) {
         var p = tn.parentNode, t = tn.nodeValue;
-        if (!p || p.closest('script, style, textarea, pre, code, noscript, .no-math, mjx-container, svg')) continue;
+        if (!p || p.closest('script, style, textarea, pre, code, noscript, .no-math, mjx-container, svg, .sr-only')) continue;
         if (/\$[^$\n]{1,80}\$/.test(t) && ++dollars <= 3) stWarn('math', 'looks like $…$ math (use \\( … \\)): "' + short(t, 70) + '" @ ' + cssPath(p));
         if (/[☀-⛿✀-➿]|\uD83C[\uDF00-\uDFFF]|\uD83D[\uDC00-\uDEFF]|\uD83E[\uDD00-\uDEFF]/.test(t) && ++emoji <= 3) stWarn('text', 'emoji or pictograph in the text (no emoji as icons or bullets): "' + short(t, 50) + '" @ ' + cssPath(p));
       }
