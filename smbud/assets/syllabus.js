@@ -137,9 +137,7 @@ window.SYLLABUS = {
     ] }
   ],
   extras: [
-    { id: 'formulas', file: 'formulas.html', title: 'Cheat sheets', teaser: 'The cheat sheet of every lesson on one page: commands, query patterns, key terms.' },
     { id: 'exam', file: 'exam.html', title: 'Exam trainer', teaser: 'Every exam-style question of the course with model answers, filters and a random ten.' },
     { id: 'glossary', file: 'glossary.html', title: 'Glossary', teaser: 'The terms of the lectures and the exam, and what they mean.' },
-    { id: 'errata', file: 'errata.html', title: 'Red pen: slips in the slides', teaser: 'Every imprecise or wrong statement of the slides that the lessons correct, in one place.' }
   ]
 };
