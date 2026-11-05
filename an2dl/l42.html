@@ -1,0 +1,1209 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Как seq2seq учится и говорит · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l42">
+
+<header class="lesson-head">
+  <h1>Как seq2seq учится и говорит</h1>
+  <p class="lede">После этого урока ты выведешь функцию ошибки seq2seq из maximum likelihood, объяснишь teacher forcing и exposure bias, соберёшь батч со служебными символами и найдёшь ответ greedy decoding и beam search на дереве вероятностей.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>Обученная модель начинает фразу. Первое слово — "I" с вероятностью 0.6 или "You" с вероятностью 0.4. После "I" она колеблется между "am" и "like", по 0.5. После "You" почти уверена: "are", 0.9.</p>
+  <p>Говорит модель по одному слову, и проще всего на каждом шаге брать самое вероятное. Какую фразу из двух слов она скажет? И будет ли это самая вероятная фраза из тех, что модель знает?</p>
+  <p>Откуда при обучении берутся такие вероятности и как по ним потом выбирают слова — две половины этого урока.</p>
+</div>
+
+<section id="l42-loss">
+  <h2>Учиться: штраф за каждое слово</h2>
+
+  <p>Модель из <a href="l41.html">урока 41</a> готова. <span class="en" lang="en">Encoder</span> сжимает исходную фразу \(x_1, \dots, x_m\) в вектор контекста \(c\). <span class="en" lang="en">Decoder</span> стартует с \(c\) и пишет перевод по слову, от &lt;SOS&gt; до &lt;EOS&gt;, и на каждом шаге выдаёт вероятности всех слов словаря \(V\). Для любой пары фраз модель умеет посчитать \(P(y \mid x; \theta)\). Остался вопрос <span class="en" lang="en">learning</span>: "How to find \(\theta\)?" (<span class="nw"><a class="slide-ref" href="assets/slides/s04_058.webp" data-deck="s04" data-slide="58">лекция 4, слайд 58</a></span>).</p>
+
+  <p>Учат на парах «исходная фраза — правильный перевод». Пример лекции (<a class="slide-ref" href="assets/slides/s04_063.webp" data-deck="s04" data-slide="63">слайд 63</a>): источник «Я видел котю на мате &lt;EOS&gt;», цель "I saw a cat on a mat &lt;EOS&gt;". Возьмём один шаг. Декодер уже получил начало цели "I saw a" и должен предсказать "cat". Его ответ на шаге \(t\) — вектор вероятностей всех \(|V|\) слов:</p>
+
+  \[ p_t = p(\cdot \mid y_1, \dots, y_{t-1}, x_1, \dots, x_m) \]
+
+  <figure class="fig fig--plain" id="l42-fig-step">
+    <svg class="dia" viewBox="0 0 560 262" role="img" aria-label="Один шаг обучения: декодер получил вектор контекста c и предыдущие слова SOS, I, saw, a и на четвёртом шаге выдал распределение p4 по словам cat 0.60, dog 0.20, mat 0.10, on 0.05 и остальным 0.05; вектор one-hot y4 отмечает правильное слово cat, штраф шага равен минус логарифму 0.60, около 0.51">
+      <text x="12" y="80" class="tx-sm">Я видел котю на мате &lt;EOS&gt;</text>
+      <line x1="30" y1="86" x2="30" y2="96" class="st-muted" marker-end="url(#arr-muted)"/>
+      <rect x="12" y="100" width="36" height="36" rx="6" class="fi-paper sw-2"/>
+      <text x="30" y="124" class="tx-mid tx-lg">c</text>
+      <line x1="48" y1="118" x2="73" y2="118" marker-end="url(#arr)"/>
+      <line x1="124" y1="118" x2="141" y2="118" marker-end="url(#arr)"/>
+      <line x1="192" y1="118" x2="209" y2="118" marker-end="url(#arr)"/>
+      <line x1="260" y1="118" x2="277" y2="118" marker-end="url(#arr)"/>
+      <rect x="76" y="100" width="48" height="36" rx="6" class="fi-paper"/>
+      <rect x="144" y="100" width="48" height="36" rx="6" class="fi-paper"/>
+      <rect x="212" y="100" width="48" height="36" rx="6" class="fi-paper"/>
+      <rect x="280" y="100" width="48" height="36" rx="6" class="fi-paper sw-2"/>
+      <text x="100" y="123" class="tx-mid">s₁</text>
+      <text x="168" y="123" class="tx-mid">s₂</text>
+      <text x="236" y="123" class="tx-mid">s₃</text>
+      <text x="304" y="123" class="tx-mid">s₄</text>
+      <line x1="100" y1="169" x2="100" y2="140" marker-end="url(#arr)"/>
+      <line x1="168" y1="169" x2="168" y2="140" marker-end="url(#arr)"/>
+      <line x1="236" y1="169" x2="236" y2="140" marker-end="url(#arr)"/>
+      <line x1="304" y1="169" x2="304" y2="140" marker-end="url(#arr)"/>
+      <rect x="70" y="170" width="60" height="24" rx="4" class="fi-paper dash"/>
+      <rect x="142" y="170" width="52" height="24" rx="4" class="fw-s1 st-s1"/>
+      <rect x="210" y="170" width="52" height="24" rx="4" class="fw-s1 st-s1"/>
+      <rect x="278" y="170" width="52" height="24" rx="4" class="fw-s1 st-s1"/>
+      <text x="100" y="186" class="tx-mid tx-mono">&lt;SOS&gt;</text>
+      <text x="168" y="186" class="tx-mid tx-mono">I</text>
+      <text x="236" y="186" class="tx-mid tx-mono">saw</text>
+      <text x="304" y="186" class="tx-mid tx-mono">a</text>
+      <text x="236" y="226" class="tx-mid tx-hand">предыдущие слова</text>
+      <path d="M304 100 V70 H335" marker-end="url(#arr)"/>
+      <rect x="342" y="39" width="214" height="22" rx="3" class="fw-key st-none"/>
+      <text x="356" y="24" class="tx-mid">y₄</text>
+      <text x="412" y="24">p₄</text>
+      <text x="356" y="55" class="tx-mid tx-mono">1</text>
+      <text x="356" y="85" class="tx-mid tx-mono">0</text>
+      <text x="356" y="115" class="tx-mid tx-mono">0</text>
+      <text x="356" y="145" class="tx-mid tx-mono">0</text>
+      <text x="356" y="175" class="tx-mid tx-mono">0</text>
+      <text x="402" y="55" class="tx-end">cat</text>
+      <text x="402" y="85" class="tx-end">dog</text>
+      <text x="402" y="115" class="tx-end">mat</text>
+      <text x="402" y="145" class="tx-end">on</text>
+      <text x="402" y="175" class="tx-end">…</text>
+      <rect x="412" y="43" width="90" height="14" class="fw-s3 st-s3"/>
+      <rect x="412" y="73" width="30" height="14" class="fw-s3 st-s3"/>
+      <rect x="412" y="103" width="15" height="14" class="fw-s3 st-s3"/>
+      <rect x="412" y="133" width="7.5" height="14" class="fw-s3 st-s3"/>
+      <rect x="412" y="163" width="7.5" height="14" class="fw-s3 st-s3"/>
+      <text x="508" y="55" class="tx-mono">0.60</text>
+      <text x="448" y="85" class="tx-mono">0.20</text>
+      <text x="433" y="115" class="tx-mono">0.10</text>
+      <text x="426" y="145" class="tx-mono">0.05</text>
+      <text x="426" y="175" class="tx-mono">0.05</text>
+      <text x="452" y="222" class="tx-mid">loss₄ = −y₄ᵀ log p₄</text>
+      <text x="452" y="248" class="tx-mid">= −ln 0.60 ≈ 0.51</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Один шаг обучения: по \(c\) и предыдущим словам цели декодер выдал распределение \(p_4\) (фиолетовые полосы). <span class="en" lang="en">One-hot</span> \(y_4\) отмечает правильное "cat"; штраф шага — минус логарифм его вероятности, остальные полосы в него не входят. Числа \(p_4\) условные.</figcaption>
+  </figure>
+
+  <aside class="margin-note">Буквы сменили роли. В уроке 11 цель обозначалась \(t\), ответ сети — \(y\). Здесь, как на <a class="slide-ref" href="assets/slides/s04_055.webp" data-deck="s04" data-slide="55-70">слайдах 55–70</a>, \(t\) — номер шага, \(y_t\) — правильное слово, \(p_t\) — ответ модели.</aside>
+
+  <p>Правильное слово записано вектором <span class="en" lang="en">one-hot</span> \(y_t\) длины \(|V|\): единица на месте "cat", нули на остальных местах. Штраф шага — <span class="en" lang="en">cross-entropy</span> из <a href="l11.html#l11-multi">урока 11</a>: "Using a one-hot vector for \(y_t\) we can use the cross-entropy as loss" (<a class="slide-ref" href="assets/slides/s04_063.webp" data-deck="s04" data-slide="63">слайд 63</a>).</p>
+
+  <div class="formula">
+    \[ \begin{aligned} \mathrm{loss}_t(p_t, y_t) &amp;= -\sum_{i=1}^{|V|} y_t^{(i)} \log p_t^{(i)} \\ &amp;= -y_t\T \log(p_t) \end{aligned} \]
+    <dl class="legend">
+      <dt>\(y_t\)</dt><dd>правильное слово шага \(t\): вектор <span class="en" lang="en">one-hot</span> длины \(|V|\)</dd>
+      <dt>\(p_t\)</dt><dd>ответ модели: вероятности всех слов словаря, выход <span class="en" lang="en">softmax</span></dd>
+      <dt>\(y_t^{(i)},\ p_t^{(i)}\)</dt><dd>их \(i\)-е компоненты; логарифм берётся поэлементно, натуральный</dd>
+    </dl>
+  </div>
+
+  <p>В сумме выживает одно слагаемое — то, где \(y_t^{(i)} = 1\). Штраф шага — минус логарифм вероятности, которую модель дала правильному слову: 0.105 при вероятности 0.9, 0.693 при 0.5, 2.303 при 0.1, 4.605 при 0.01. Уверенная правота почти бесплатна, уверенная ошибка стоит дорого. Градиент по <span class="en" lang="en">logits</span>, как в уроке 11, равен \(p_t - y_t\): шаг спуска поднимает <span class="en" lang="en">logit</span> правильного слова и опускает остальные.</p>
+
+  <p>По всей фразе штрафы складываются (<a class="slide-ref" href="assets/slides/s04_064.webp" data-deck="s04" data-slide="64">слайд 64</a>):</p>
+
+  \[ \mathcal L = -\sum_{t=1}^{n} y_t\T \log(p_t) \]
+
+  <p>Последнее слагаемое — шаг, на котором правильный ответ &lt;EOS&gt;. Только так модель и учится вовремя замолкать: другого сигнала о длине фразы у неё нет.</p>
+
+  <h3>Откуда сумма: maximum likelihood по шагам</h3>
+
+  <p>Этот штраф даёт <span class="en" lang="en">maximum likelihood</span> (<a href="l15.html">урок 15</a>): подобрать \(\theta\) так, чтобы обучающие пары стали для модели как можно вероятнее. Обучающее множество \(\mathcal S\) — это \(N\) пар \((x, y)\).</p>
+
+  <aside class="margin-note">Пары можно пронумеровать, \((x^{(i)}, y^{(i)})\), \(i = 1, \dots, N\), но индекс \((i)\) здесь уже занят номером слова в словаре. Поэтому сумма идёт по парам из \(\mathcal S\).</aside>
+
+  <ol class="steps" id="l42-steps-mle">
+    <li><p>Пары считают независимыми, поэтому вероятность всех данных — произведение вероятностей пар. Ищем \(\theta\), при котором оно наибольшее:</p>
+      \[ \theta^* = \argmax_\theta \prod_{(x,y)\in\mathcal S} P(y \mid x; \theta) \]</li>
+    <li><p>Логарифм возрастает и не сдвигает точку максимума, а произведение превращает в сумму:</p>
+      \[ \theta^* = \argmax_\theta \sum_{(x,y)\in\mathcal S} \log P(y \mid x; \theta) \]</li>
+    <li><p>Цепное правило (урок 41) раскладывает вероятность фразы на множители по шагам, логарифм делает из них сумму:</p>
+      \[ \begin{aligned} &amp;\log P(y \mid x; \theta) \\ &amp;\quad = \sum_{t=1}^{n} \log P(y_t \mid y_{\lt t}, x; \theta) \end{aligned} \]</li>
+    <li><p>Максимум суммы — это минимум той же суммы со знаком минус. Получилась функция ошибки, которую уменьшают градиентным спуском:</p>
+      \[ \theta^* = \argmin_\theta \sum_{(x,y)\in\mathcal S} \mathcal L(x, y; \theta) \]
+      \[ \mathcal L(x, y; \theta) = -\sum_{t=1}^{n} \log P(y_t \mid y_{\lt t}, x; \theta) \]</li>
+    <li><p>\(P(y_t \mid y_{\lt t}, x; \theta)\) — компонента выхода \(p_t\) у правильного слова, и вектор <span class="en" lang="en">one-hot</span> \(y_t\) вырезает ровно её:</p>
+      \[ -\log P(y_t \mid y_{\lt t}, x; \theta) = -y_t\T \log(p_t) \]
+      <p>Это штраф шага со <a class="slide-ref" href="assets/slides/s04_063.webp" data-deck="s04" data-slide="63">слайда 63</a>. Обучение по <span class="en" lang="en">maximum likelihood</span> и минимизация суммы <span class="en" lang="en">cross-entropy</span> по шагам — одна и та же задача.</p></li>
+  </ol>
+
+  <p>Проверим на числах. Цель — "I saw &lt;EOS&gt;", и правильные слова получили вероятности 0.5, 0.25 и 0.8.</p>
+
+  <figure class="tbl-fig" id="l42-tbl-sum">
+    <figcaption>Штраф фразы — сумма штрафов шагов.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>шаг \(t\)</th><th>правильное слово</th><th>его вероятность</th><th>\(-\ln p\)</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>I</td><td class="num">0.5</td><td class="num">0.693</td></tr>
+          <tr><td class="num">2</td><td>saw</td><td class="num">0.25</td><td class="num">1.386</td></tr>
+          <tr><td class="num">3</td><td>&lt;EOS&gt;</td><td class="num">0.8</td><td class="num">0.223</td></tr>
+          <tr class="is-key"><td>вся фраза</td><td>I saw &lt;EOS&gt;</td><td class="num">0.5 · 0.25 · 0.8 = 0.1</td><td class="num">2.303</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Сумма штрафов 2.303 равна \(-\ln 0.1\) — минус логарифму вероятности всей фразы. Это шаг 3 вывода, прочитанный справа налево.</p>
+
+  <p>Полезная точка отсчёта — модель до обучения. Со случайными весами она размазывает вероятность почти поровну, \(p_t^{(i)} \approx 1/|V|\), и штраф каждого шага \(\approx \ln |V|\): для словаря из 10&nbsp;000 слов это 9.21. С такого числа и должна начинаться кривая обучения. Если первая ошибка в логе сильно отличается от \(\ln |V|\), сначала ищи ошибку в коде.</p>
+
+  <p>Всё обучение умещается на одном слайде — "Given &lt;S, T&gt; pairs, read S, and output T′ that best matches T" (<a class="slide-ref" href="assets/slides/s04_068.webp" data-deck="s04" data-slide="68">слайд 68</a>). Пример там — Smart Reply, подсказки коротких ответов в почте. LSTM-кодировщик читает письмо "Are you free tomorrow?", "thought vector" передаёт его декодеру, и тот пишет ответ "Yes, what's up?" от &lt;START&gt; до &lt;END&gt; — так здесь названы &lt;SOS&gt; и &lt;EOS&gt;. В буквах слайда цепное правило и цель обучения выглядят так:</p>
+
+  <div class="formula">
+  \[ \begin{aligned} &amp;p(y_1, \dots, y_{T'} \mid x_1, \dots, x_T) \\ &amp;\quad = \prod_{t=1}^{T'} p(y_t \mid v, y_1, \dots, y_{t-1}) \end{aligned} \]
+  \[ \frac{1}{|\mathcal S|} \sum_{(T,S)\in\mathcal S} \log p(T \mid S) \]
+    <dl class="legend">
+      <dt>\(T,\ T'\)</dt><dd>в первой формуле — длины источника и цели</dd>
+      <dt>\(v\)</dt><dd><span class="en" lang="en">thought vector</span>, то есть \(c\)</dd>
+      <dt>\(S,\ T\)</dt><dd>во второй формуле — источник и цель, пара из обучающего множества \(\mathcal S\)</dd>
+    </dl>
+  </div>
+
+  <p>Вторая формула — сумма логарифмов из шага 2, поделённая на число пар; её максимизируют.</p>
+
+  <p class="memo"><mark class="key">Функция ошибки seq2seq — сумма cross-entropy по всем шагам цели, включая &lt;EOS&gt;. Она равна \(-\log P(y \mid x; \theta)\), и уменьшать её — то же, что maximum likelihood.</mark></p>
+</section>
+
+<section id="l42-forcing">
+  <h2><span class="en" lang="en">Teacher forcing</span>: учиться по правильной истории</h2>
+
+  <p>В штрафе стоит \(P(y_t \mid y_{\lt t}, x)\): чтобы предсказать слово \(t\), декодер должен получить предыдущие. Какие — правильные слова из обучающей пары или те, что он только что выдал сам?</p>
+
+  <p>Представь ученика переводчика. На занятии после каждого его слова преподаватель называет правильное, и ученик продолжает уже от него. На настоящей конференции поправлять некому: одно неверное слово — и дальше ученик говорит от своей ошибки, а такой ситуации на занятиях не было.</p>
+
+  <p>Декодер учат как ученика на занятии (<a class="slide-ref" href="assets/slides/s04_065.webp" data-deck="s04" data-slide="65">слайд 65</a>): "At training time the decoder does not feed the output of each time step to the next; the input to the decoder time steps are the target from the training". При генерации — наоборот: "At inference time the decoder feeds the output of each time step as an input to the next one".</p>
+
+  <div class="def">
+    <p><dfn><span class="en" lang="en">Teacher forcing</span></dfn> (обучение с подсказкой) — режим обучения, в котором на шаге \(t\) декодер получает на вход правильное предыдущее слово \(y_{t-1}\) из обучающей пары, а не слово, которое выдал сам. Входы декодера — цель, сдвинутая на шаг вправо: &lt;SOS&gt;, \(y_1, \dots, y_{n-1}\).</p>
+  </div>
+
+  <figure class="fig fig--pair fig--plain" id="l42-fig-tf">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="Обучение с teacher forcing, шаги 3–7: на входах правильные слова saw, a, cat, on, a; на выходах a, dog, on, a, mat; dog на шаге 4 ошибочно, но на шаг 5 всё равно подано правильное cat, и следующие выходы верны">
+        <line x1="0" y1="104" x2="11" y2="104" marker-end="url(#arr)"/>
+        <line x1="54" y1="104" x2="69" y2="104" marker-end="url(#arr)"/>
+        <line x1="112" y1="104" x2="127" y2="104" marker-end="url(#arr)"/>
+        <line x1="170" y1="104" x2="185" y2="104" marker-end="url(#arr)"/>
+        <line x1="228" y1="104" x2="243" y2="104" marker-end="url(#arr)"/>
+        <rect x="14" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="72" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="130" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="188" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="246" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <line x1="34" y1="89" x2="34" y2="56" marker-end="url(#arr)"/>
+        <line x1="92" y1="89" x2="92" y2="56" marker-end="url(#arr)"/>
+        <line x1="150" y1="89" x2="150" y2="56" marker-end="url(#arr)"/>
+        <line x1="208" y1="89" x2="208" y2="56" marker-end="url(#arr)"/>
+        <line x1="266" y1="89" x2="266" y2="56" marker-end="url(#arr)"/>
+        <line x1="34" y1="155" x2="34" y2="121" marker-end="url(#arr)"/>
+        <line x1="92" y1="155" x2="92" y2="121" marker-end="url(#arr)"/>
+        <line x1="150" y1="155" x2="150" y2="121" marker-end="url(#arr)"/>
+        <line x1="208" y1="155" x2="208" y2="121" marker-end="url(#arr)"/>
+        <line x1="266" y1="155" x2="266" y2="121" marker-end="url(#arr)"/>
+        <rect x="12" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="70" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="128" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="186" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="244" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="67" y="27" width="50" height="28" rx="6" class="fi-none st-bad sw-2"/>
+        <text x="34" y="45" class="tx-mid tx-mono">a</text>
+        <text x="92" y="45" class="tx-mid tx-mono">dog</text>
+        <text x="150" y="45" class="tx-mid tx-mono">on</text>
+        <text x="208" y="45" class="tx-mid tx-mono">a</text>
+        <text x="266" y="45" class="tx-mid tx-mono">mat</text>
+        <rect x="12" y="156" width="44" height="22" rx="4" class="fw-s1 st-s1"/>
+        <rect x="70" y="156" width="44" height="22" rx="4" class="fw-s1 st-s1"/>
+        <rect x="128" y="156" width="44" height="22" rx="4" class="fw-s1 st-s1"/>
+        <rect x="186" y="156" width="44" height="22" rx="4" class="fw-s1 st-s1"/>
+        <rect x="244" y="156" width="44" height="22" rx="4" class="fw-s1 st-s1"/>
+        <text x="34" y="171" class="tx-mid tx-mono">saw</text>
+        <text x="92" y="171" class="tx-mid tx-mono">a</text>
+        <text x="150" y="171" class="tx-mid tx-mono">cat</text>
+        <text x="208" y="171" class="tx-mid tx-mono">on</text>
+        <text x="266" y="171" class="tx-mid tx-mono">a</text>
+        <text x="150" y="216" class="tx-mid tx-hand">ошибка осталась одна</text>
+      </svg>
+      <p class="fig-label">Обучение: на входе правильные слова</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 232" role="img" aria-label="Генерация, шаги 3–7: каждый выход подаётся на вход следующего шага; после ошибочного dog на шаге 4 декодер продолжает от своей ошибки и выдаёт bark, at, me — все неверные">
+        <path d="M114 41 H121 V167 H126" class="hl"/>
+        <path d="M56 41 H63 V167 H68" class="st-s3" marker-end="url(#arr-s3)"/>
+        <path d="M114 41 H121 V167 H126" class="st-s3" marker-end="url(#arr-s3)"/>
+        <path d="M172 41 H179 V167 H184" class="st-s3" marker-end="url(#arr-s3)"/>
+        <path d="M230 41 H237 V167 H242" class="st-s3" marker-end="url(#arr-s3)"/>
+        <line x1="0" y1="104" x2="11" y2="104" marker-end="url(#arr)"/>
+        <line x1="54" y1="104" x2="69" y2="104" marker-end="url(#arr)"/>
+        <line x1="112" y1="104" x2="127" y2="104" marker-end="url(#arr)"/>
+        <line x1="170" y1="104" x2="185" y2="104" marker-end="url(#arr)"/>
+        <line x1="228" y1="104" x2="243" y2="104" marker-end="url(#arr)"/>
+        <rect x="14" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="72" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="130" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="188" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <rect x="246" y="90" width="40" height="28" rx="5" class="fi-paper"/>
+        <line x1="34" y1="89" x2="34" y2="56" marker-end="url(#arr)"/>
+        <line x1="92" y1="89" x2="92" y2="56" marker-end="url(#arr)"/>
+        <line x1="150" y1="89" x2="150" y2="56" marker-end="url(#arr)"/>
+        <line x1="208" y1="89" x2="208" y2="56" marker-end="url(#arr)"/>
+        <line x1="266" y1="89" x2="266" y2="56" marker-end="url(#arr)"/>
+        <line x1="34" y1="155" x2="34" y2="121" marker-end="url(#arr)"/>
+        <line x1="92" y1="155" x2="92" y2="121" marker-end="url(#arr)"/>
+        <line x1="150" y1="155" x2="150" y2="121" marker-end="url(#arr)"/>
+        <line x1="208" y1="155" x2="208" y2="121" marker-end="url(#arr)"/>
+        <line x1="266" y1="155" x2="266" y2="121" marker-end="url(#arr)"/>
+        <rect x="12" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="70" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="128" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="186" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="244" y="30" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="67" y="27" width="50" height="28" rx="6" class="fi-none st-bad sw-2"/>
+        <rect x="125" y="27" width="50" height="28" rx="6" class="fi-none st-bad sw-2"/>
+        <rect x="183" y="27" width="50" height="28" rx="6" class="fi-none st-bad sw-2"/>
+        <rect x="241" y="27" width="50" height="28" rx="6" class="fi-none st-bad sw-2"/>
+        <text x="34" y="45" class="tx-mid tx-mono">a</text>
+        <text x="92" y="45" class="tx-mid tx-mono">dog</text>
+        <text x="150" y="45" class="tx-mid tx-mono">bark</text>
+        <text x="208" y="45" class="tx-mid tx-mono">at</text>
+        <text x="266" y="45" class="tx-mid tx-mono">me</text>
+        <rect x="12" y="156" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="70" y="156" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="128" y="156" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="186" y="156" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <rect x="244" y="156" width="44" height="22" rx="4" class="fw-s3 st-s3"/>
+        <text x="34" y="171" class="tx-mid tx-mono">saw</text>
+        <text x="92" y="171" class="tx-mid tx-mono">a</text>
+        <text x="150" y="171" class="tx-mid tx-mono">dog</text>
+        <text x="208" y="171" class="tx-mid tx-mono">bark</text>
+        <text x="266" y="171" class="tx-mid tx-mono">at</text>
+        <text x="150" y="216" class="tx-mid tx-hand">ошибка тянет за собой</text>
+      </svg>
+      <p class="fig-label">Генерация: на входе свои слова</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Шаги 3–7 перевода "I saw a cat on a mat": синие — правильные слова, фиолетовые — слова модели. На шаге 4 модель ошиблась, "dog" вместо "cat". При обучении на шаг 5 всё равно приходит "cat", и ошибка остаётся одной. При генерации "dog" идёт на вход (жёлтая линия), и за ним съезжают все следующие слова.</figcaption>
+  </figure>
+
+  <p>Названия <span class="en" lang="en">teacher forcing</span> на слайде нет, но термин стандартный, и на экзамене его могут употребить. Учат так по трём причинам.</p>
+
+  <ul>
+    <li><b>Правильный контекст.</b> В начале обучения собственные слова модели — почти шум. Если подавать их на вход, каждый следующий шаг учится продолжать шум, и ошибки кормят друг друга: обучение идёт медленно и неустойчиво.</li>
+    <li><b>Осмысленные цели.</b> Правильное слово \(y_t\) — продолжение правильного начала. Если модель сказала "I sat", эталонное продолжение "a cat on a mat" к нему уже не подходит, а штрафовать будут именно за него.</li>
+    <li><b>Скорость.</b> Все входы декодера известны заранее: это цель, сдвинутая на шаг. Поэтому всю строку подают декодеру одним вызовом, а не крутят цикл, где каждый следующий вход надо сначала выдать самому.</li>
+  </ul>
+
+  <div class="pitfall">
+    <p>«Teacher forcing — подать на вход \(y_t\), чтобы предсказать \(y_t\)». Нет, на вход идёт \(y_{t-1}\). Если подать само \(y_t\), ответ лежит во входе: ошибка быстро падает почти до нуля, модель учится копировать вход, а при генерации копировать ей нечего. Забытый сдвиг — классическая ошибка в коде.</p>
+  </div>
+
+  <h3><span class="en" lang="en">Exposure bias</span>: конференция не похожа на занятия</h3>
+
+  <p>За удобство платят при генерации. Пока декодер не ошибается, его собственные слова и есть правильная история, и разницы нет. Но после первой ошибки он попадает в ситуацию, которой не было ни в одном обучающем примере, и следующие слова строит на шатком основании.</p>
+
+  <div class="def">
+    <p><dfn><span class="en" lang="en">Exposure bias</span></dfn> — расхождение условий обучения и генерации: модель учили на правильной истории, а работает она на своей, где бывают ошибки. Своих ошибок на обучении она не видела, поэтому ранняя ошибка тянет за собой следующие (<span class="en" lang="en">error accumulation</span>).</p>
+  </div>
+
+  <p>Масштаб виден на числах. Пусть при правильном начале декодер выбирает верное слово в 95 % шагов. Без подсказки фраза из 20 слов выйдет целиком правильной, только если он ни разу не ошибётся: \(0.95^{20} \approx 0.36\), для 50 слов — \(0.95^{50} \approx 0.077\). А после первой ошибки начало уже неправильное, и дальше декодер ошибается чаще, чем в 5 % шагов.</p>
+
+  <div class="pitfall">
+    <p>«Exposure bias — это переобучение». Нет. Переобучение — плохая работа на новых данных. Exposure bias — разные <em>входы</em> декодера на обучении и при генерации; он есть даже у модели, которая обобщает идеально.</p>
+  </div>
+
+  <p>Самое известное лекарство — <mark class="key"><span class="en" lang="en">scheduled sampling</span></mark> (Bengio и соавторы, 2015; этого нет на слайдах этого года). На каждом шаге декодера при обучении бросают монетку: с вероятностью \(\varepsilon\) подают правильное слово, иначе — слово, выданное самой моделью. В начале обучения \(\varepsilon = 1\), это чистый teacher forcing; потом \(\varepsilon\) постепенно уменьшают, и модель привыкает продолжать и от своих ошибок. В лабе 5 (урок 47) монетка проще: \(\varepsilon = 0.5\) на всё обучение. При генерации эффект смягчает <span class="en" lang="en">beam search</span>: он не обязан верить первому выбранному слову (раздел 5).</p>
+
+  <div class="story" data-year="1989–2015">
+    <p>Название <span class="en" lang="en">teacher forcing</span> дали Уильямс и Ципсер в 1989 году, когда приём уже был "frequently used in dynamical supervised learning tasks". Расхождение обучения и генерации, которое он создаёт, получило классическое лекарство — scheduled sampling — только через 26 лет, в 2015-м.</p>
+  </div>
+
+  <div class="widget" id="l42-w-forcing">
+    <h3 class="widget-title">Подсказка или свои слова</h3>
+    <p class="widget-intro">Игрушечный декодер переводит «Я видел котю на мате»: таблица правдоподобных слов, а не обученная сеть. Верхний ряд — эталон, под ним — что модель выдала на каждом шаге, внизу — что ей подали на вход. Синяя линия приносит на вход правильное слово, фиолетовая — собственное слово модели. Ползунок \(\varepsilon\) — вероятность подать правильное слово на каждом шаге: 1 — teacher forcing, 0 — свои слова, как при генерации. Главное здесь: при подсказке ошибка остаётся одной, на своих словах она тянет за собой следующие.</p>
+    <ol class="tasks">
+      <li>Сейчас \(\varepsilon = 1\), и модель ошиблась на шаге 4. Сколько выходов не совпадёт с эталоном при \(\varepsilon = 0\), когда декодер ест свои слова? Сначала предскажи, потом сдвинь ползунок.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Четыре из восьми: dog → bark → at → me. При \(\varepsilon = 1\) на шаг 5 всё равно пришло правильное "cat", и ошибка осталась одной. При \(\varepsilon = 0\) пришло "dog" — такой истории декодер на обучении не видел, и дальше он продолжает свою ошибку. Фраза гладкая, только она про собаку, которая лает на меня. Это и есть <span class="en" lang="en">exposure bias</span>.</p></details>
+      </li>
+      <li>Выбери ошибку на шаге 2 и оставь \(\varepsilon = 0\). Сколько слов совпадёт с эталоном теперь?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Одно — первое "I". Из "I sat" декодер уверенно строит "I sat on a mat" и замолкает на шаге 6; кот исчез из перевода. Чем раньше ошибка, тем дороже она обходится.</p></details>
+      </li>
+      <li>Выбери «нигде» и подвигай \(\varepsilon\) от 1 до 0. Изменится ли что-нибудь?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Нет. Пока модель не ошибается, её слова совпадают с правильными, и оба режима дают одно и то же. Обучение и генерация расходятся только после первой ошибки — поэтому при обучении с подсказкой этой беды не видно.</p></details>
+      </li>
+      <li>Верни ошибку на шаге 4, поставь \(\varepsilon = 0.5\) и несколько раз брось монетки заново. Когда "dog" утягивает за собой следующее слово, а когда нет?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Всё решает монетка шага 5. Выпало правильное слово — на вход идёт "cat", и шаг 5 снова верен. Выпало своё — идёт "dog", и шаг 5 выдаёт "bark". Так работает <span class="en" lang="en">scheduled sampling</span>: при обучении декодер иногда встречает свои ошибки и учится продолжать от них, а \(\varepsilon\) по ходу обучения уменьшают от 1 к 0.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l42-w-forcing', function (root, ui) {
+    var S = Course.svg;
+    var EOS = '<EOS>', SOS = '<SOS>', N = 8;
+    var REF = ['I', 'saw', 'a', 'cat', 'on', 'a', 'mat', EOS];               // y_1 … y_8
+    var ERR = { 2: 'sat', 4: 'dog' };                                        // the mistake the model makes on the true prefix
+    /* off the true prefix the toy decoder continues from the last word it was fed */
+    var DRIFT = { sat: 'on', on: 'a', a: 'mat', mat: EOS, dog: 'bark', bark: 'at', at: 'me', me: EOS, cat: 'on', saw: 'a', I: 'saw' };
+    var X0 = 82, DX = 63, HW = 26, CH = 22, YR = 26, YO = 84, YC = 132, YI = 198, seed = 1, coins = [];
+    function throwCoins() { var r = Course.rng(seed); coins = []; for (var t = 0; t <= N; t++) coins.push(r.random()); }
+    throwCoins();
+
+    var svg = ui.svg(560, 262, { label: 'Декодер на восьми шагах: сверху эталонный перевод, под ним выходы модели, внизу входы шагов; линии показывают, откуда пришёл каждый вход — из эталона или из выхода модели' });
+    var layer = S('g', null, svg);
+    var errS = ui.select('где модель ошибается', [
+      { value: '0', label: 'нигде' },
+      { value: '2', label: 'шаг 2: sat вместо saw' },
+      { value: '4', label: 'шаг 4: dog вместо cat' }
+    ], null, '4');
+    var epsS = ui.slider({ label: 'ε — вероятность подать правильное слово', min: 0, max: 1, step: 0.1, value: 1 });
+    ui.button('Бросить монетки заново', function () { seed += 1; throwCoins(); }, { kind: 'ghost', icon: 'refresh' });
+    var roOut = ui.readout('выходы шагов'), roMiss = ui.readout('не совпало с эталоном'), roRef = ui.readout('входов из эталона');
+    var note = ui.note('');
+    ui.legend([
+      { label: 'эталон: правильное слово', color: 's1', mark: 'square' },
+      { label: 'слово модели', color: 's3', mark: 'square' },
+      { label: 'не совпало с эталоном', color: 'bad', mark: 'ring' },
+      { label: 'ошибка ушла на вход', color: 's3', mark: 'hl' }
+    ]);
+
+    function esc(s) { return s.replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function run() {
+      var eps = epsS.value, err = +errS.value, inp = [], src = [], out = [], onRef = true, t;
+      for (t = 1; t <= N; t++) {
+        var x, from;
+        if (t === 1) { x = SOS; from = 'sos'; }
+        else if (coins[t] < eps) { x = REF[t - 2]; from = 'ref'; }
+        else { x = out[t - 2]; from = 'own'; if (x === EOS) break; }        // the model said <EOS>: generation is over
+        if (from === 'own' && x !== REF[t - 2]) onRef = false;
+        inp.push(x); src.push(from);
+        out.push(onRef ? (err === t && ERR[t] ? ERR[t] : REF[t - 1]) : (DRIFT[x] || EOS));
+      }
+      var miss = 0, i;
+      for (i = 0; i < N; i++) if (out[i] !== REF[i]) miss++;
+      return { inp: inp, src: src, out: out, miss: miss, fed: src.filter(function (s) { return s === 'ref'; }).length };
+    }
+
+    function draw(R) {
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      function el(tag, a) { return S(tag, a, layer); }
+      function txt(x, y, s, cls) { return el('text', { x: x, y: y, 'class': cls, text: s }); }
+      function cx(t) { return X0 + (t - 1) * DX; }
+      var t, firstBad = true;
+      txt(8, YR - 9, 'эталон', 'tx-sm tx-muted');
+      txt(8, YO - 9, 'выход', 'tx-sm tx-muted');
+      txt(8, YI - 9, 'вход', 'tx-sm tx-muted');
+      el('rect', { x: 6, y: YC, width: 30, height: 30, rx: 5, 'class': 'fi-paper sw-2' });
+      txt(21, YC + 21, 'c', 'tx-mid');
+      el('line', { x1: 36, y1: YC + 15, x2: X0 - 20 - 2, y2: YC + 15, 'marker-end': 'url(#arr)' });
+      /* feed lines first, so that chips sit on top of them: down the gap, then up into the next input from below (as on slide 65) */
+      for (t = 2; t <= R.inp.length; t++) {
+        var own = R.src[t - 1] === 'own', yFrom = (own ? YO : YR) + CH / 2, xa = cx(t - 1) + HW, xm = xa + (DX - 2 * HW) / 2;
+        var d = 'M' + xa + ' ' + yFrom + ' H' + xm + ' V' + (YI + CH + 9) + ' H' + cx(t) + ' V' + (YI + CH + 2);
+        if (own && R.inp[t - 1] !== REF[t - 2] && firstBad) { el('path', { d: d, 'class': 'hl' }); firstBad = false; }
+        el('path', { d: d, 'class': own ? 'st-s3' : 'st-s1', 'marker-end': own ? 'url(#arr-s3)' : 'url(#arr-s1)' });
+      }
+      for (t = 1; t <= N; t++) {
+        var x = cx(t), done = t <= R.inp.length;
+        el('rect', { x: x - HW, y: YR, width: 2 * HW, height: CH, rx: 4, 'class': 'fw-s1 st-s1' });
+        txt(x, YR + 15, REF[t - 1], 'tx-mid tx-mono');
+        el('rect', { x: x - 20, y: YC, width: 40, height: 30, rx: 5, 'class': done ? 'fi-paper' : 'fi-paper st-muted dots' });
+        if (t < N) el('line', { x1: x + 20, y1: YC + 15, x2: x + DX - 22, y2: YC + 15, 'class': t < R.inp.length ? '' : 'st-muted dots', 'marker-end': t < R.inp.length ? 'url(#arr)' : 'url(#arr-muted)' });
+        txt(x, YI + CH + 32, String(t), 'tx-mid tx-sm tx-muted');
+        if (!done) continue;
+        el('line', { x1: x, y1: YC - 1, x2: x, y2: YO + CH + 3, 'marker-end': 'url(#arr)' });
+        el('line', { x1: x, y1: YI - 1, x2: x, y2: YC + 33, 'marker-end': 'url(#arr)' });
+        var s = R.src[t - 1];
+        el('rect', { x: x - HW, y: YI, width: 2 * HW, height: CH, rx: 4, 'class': s === 'sos' ? 'fi-paper dash' : s === 'own' ? 'fw-s3 st-s3' : 'fw-s1 st-s1' });
+        txt(x, YI + 15, R.inp[t - 1], 'tx-mid tx-mono');
+        el('rect', { x: x - HW, y: YO, width: 2 * HW, height: CH, rx: 4, 'class': R.out[t - 1] !== REF[t - 1] ? 'fw-s3 st-bad sw-3' : 'fw-s3 st-s3' });
+        txt(x, YO + 15, R.out[t - 1], 'tx-mid tx-mono');
+      }
+      txt(8, YI + CH + 32, 't', 'tx-sm tx-muted');
+    }
+
+    ui.onChange(function () {
+      var R = run(), eps = epsS.value, stopped = R.inp.length < N;
+      draw(R);
+      roOut.set(esc(R.out.join(' ')) + (stopped ? ' · дальше стоп' : ''));
+      roMiss.set(R.miss + ' из ' + N, R.miss ? 'bad' : 'good');
+      roRef.set(R.fed + ' из ' + (N - 1));
+      note.set(eps >= 0.999 ? 'ε = 1: на каждый шаг приходит правильное предыдущее слово — teacher forcing.'
+        : eps <= 0.001 ? 'ε = 0: на каждый шаг приходит слово, выданное моделью на прошлом шаге, — как при генерации.'
+        : 'Перед каждым шагом бросают монетку: с вероятностью ε на вход идёт правильное слово, иначе слово модели — scheduled sampling.');
+    });
+  });
+  </script>
+
+  <p class="memo"><mark class="key">На обучении декодер получает правильную историю — teacher forcing; при генерации — свою. Разница этих режимов и есть exposure bias.</mark></p>
+</section>
+
+<section id="l42-batch">
+  <h2><span class="en" lang="en">Special characters</span> и батч</h2>
+
+  <p>Учат не по одной паре, а мини-батчами (<a href="l13.html#l13-batch">урок 13</a>). Батч — это прямоугольные тензоры чисел, а фразы состоят из слов и бывают разной длины. Четыре задачи решают четыре служебных символа — <span class="en" lang="en">Special Characters</span> (<a class="slide-ref" href="assets/slides/s04_066.webp" data-deck="s04" data-slide="66">слайд 66</a>).</p>
+
+  <figure class="tbl-fig" id="l42-tbl-special">
+    <figcaption>Служебные символы: где стоят, зачем нужны и попадают ли в функцию ошибки.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Символ</th><th>Где стоит</th><th>Зачем</th><th>В функции ошибки</th></tr></thead>
+        <tbody>
+          <tr><td>&lt;SOS&gt;, &lt;GO&gt;</td><td>первый вход декодера, \(y_0\)</td><td>первому шагу нужен хоть какой-то вход: «фраза пока пуста»</td><td>нет: его всегда дают, а не предсказывают</td></tr>
+          <tr><td>&lt;EOS&gt;</td><td>в конце источника и последним словом цели</td><td>где кончается фраза — на входе и на выходе</td><td>да: так модель учится останавливаться</td></tr>
+          <tr><td>&lt;PAD&gt;</td><td>в хвостах коротких строк батча</td><td>выровнять строки до одной ширины</td><td>нет: его закрывает маска</td></tr>
+          <tr><td>&lt;UNK&gt;</td><td>вместо редких слов</td><td>держать словарь, а с ним и <span class="en" lang="en">softmax</span>, небольшим</td><td>да, как обычное слово</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>По-английски, как на слайде: &lt;SOS&gt;/&lt;GO&gt; — "the input to the first time step of the decoder"; &lt;EOS&gt; "tells the decoder where a sentence ends"; &lt;PAD&gt; "is used to pad shorter inputs to the same width of the batch"; замена редких слов на &lt;UNK&gt; "can vastly improve the resource efficiency". Имена бывают разные — "Special characters may vary in name …": на слайдах лекции &lt;SOS&gt; встречается ещё как &lt;GO&gt;, &lt;go&gt;, &lt;bos&gt; и &lt;START&gt;, а &lt;EOS&gt; — как &lt;eos&gt; и &lt;END&gt;.</p>
+
+  <div class="pitfall">
+    <p>«&lt;SOS&gt; инициализирует декодер». Состояние декодера начинается с вектора контекста, \(s_0 = c\) (урок 41). &lt;SOS&gt; — его первый <em>вход</em>, \(y_0\): пустое начало фразы, записанное словом.</p>
+  </div>
+
+  <p>&lt;UNK&gt; экономит ресурсы. Таблица <span class="en" lang="en">embeddings</span> и выходной слой <span class="en" lang="en">softmax</span> растут вместе со словарём. У Sutskever и соавторов (2014) словарь цели — 80&nbsp;000 слов, верхний слой LSTM-декодера — 1000 клеток, и один только выходной слой — \(80\,000 \cdot 1000 = 8 \cdot 10^7\) весов. Плата — потеря информации: все редкие слова сливаются в один символ, и модель учится выдавать &lt;UNK&gt; там, где стояло редкое слово.</p>
+
+  <h3>Рецепт батча</h3>
+
+  <p>Рецепт из шести шагов — на <a class="slide-ref" href="assets/slides/s04_067.webp" data-deck="s04" data-slide="67">слайде 67</a> ("Dataset Batch Preparation"):</p>
+
+  <ol>
+    <li>Взять batch_size пар (source_sequence, target_sequence).</li>
+    <li>Приписать &lt;EOS&gt; к концу источника.</li>
+    <li>Из цели сделать две строки: с &lt;SOS&gt; в начале — вход декодера (target_input_sequence), с &lt;EOS&gt; в конце — цель функции ошибки (target_output_sequence).</li>
+    <li>Дополнить строки символом &lt;PAD&gt; до самой длинной в батче — отдельно источники (max_input_length) и цели (max_target_length).</li>
+    <li>Заменить слова их номерами в словаре; дальше номер превращается в <span class="en" lang="en">embedding</span>.</li>
+    <li>Слова не из словаря (<span class="en" lang="en">out of vocabulary</span>, OOV) заменить на &lt;UNK&gt;; записать длину каждой строки источника и цели.</li>
+  </ol>
+
+  <figure class="fig fig--plain" id="l42-fig-shift">
+    <svg class="dia" viewBox="0 0 560 290" role="img" aria-label="Пример со слайда 67: источник le chat est noir EOS с номерами 02 85 03 12 99; вход декодера SOS the cat is black с номерами 00 42 82 16 04; цель the cat is black EOS с номерами 42 82 16 04 99; стрелки показывают, что каждое слово цели на следующем шаге стоит во входе декодера">
+      <text x="10" y="46">источник</text>
+      <text x="10" y="126">вход декодера</text>
+      <text x="10" y="226">цель</text>
+      <line x1="196" y1="199" x2="258" y2="150" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <line x1="272" y1="199" x2="334" y2="150" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <line x1="348" y1="199" x2="410" y2="150" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <line x1="424" y1="199" x2="486" y2="150" class="st-muted dash" marker-end="url(#arr-muted)"/>
+      <rect x="158" y="22" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="234" y="22" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="310" y="22" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="386" y="22" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="462" y="22" width="64" height="42" rx="5" class="fi-paper dash"/>
+      <text x="190" y="40" class="tx-mid tx-mono">le</text>
+      <text x="266" y="40" class="tx-mid tx-mono">chat</text>
+      <text x="342" y="40" class="tx-mid tx-mono">est</text>
+      <text x="418" y="40" class="tx-mid tx-mono">noir</text>
+      <text x="494" y="40" class="tx-mid tx-mono">&lt;EOS&gt;</text>
+      <text x="190" y="58" class="tx-mid tx-mono tx-muted">02</text>
+      <text x="266" y="58" class="tx-mid tx-mono tx-muted">85</text>
+      <text x="342" y="58" class="tx-mid tx-mono tx-muted">03</text>
+      <text x="418" y="58" class="tx-mid tx-mono tx-muted">12</text>
+      <text x="494" y="58" class="tx-mid tx-mono tx-muted">99</text>
+      <rect x="158" y="102" width="64" height="42" rx="5" class="fi-paper dash"/>
+      <rect x="234" y="102" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="310" y="102" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="386" y="102" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="462" y="102" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <text x="190" y="120" class="tx-mid tx-mono">&lt;SOS&gt;</text>
+      <text x="266" y="120" class="tx-mid tx-mono">the</text>
+      <text x="342" y="120" class="tx-mid tx-mono">cat</text>
+      <text x="418" y="120" class="tx-mid tx-mono">is</text>
+      <text x="494" y="120" class="tx-mid tx-mono">black</text>
+      <text x="190" y="138" class="tx-mid tx-mono tx-muted">00</text>
+      <text x="266" y="138" class="tx-mid tx-mono tx-muted">42</text>
+      <text x="342" y="138" class="tx-mid tx-mono tx-muted">82</text>
+      <text x="418" y="138" class="tx-mid tx-mono tx-muted">16</text>
+      <text x="494" y="138" class="tx-mid tx-mono tx-muted">04</text>
+      <rect x="158" y="202" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="234" y="202" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="310" y="202" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="386" y="202" width="64" height="42" rx="5" class="fw-s1 st-s1"/>
+      <rect x="462" y="202" width="64" height="42" rx="5" class="fi-paper dash"/>
+      <text x="190" y="220" class="tx-mid tx-mono">the</text>
+      <text x="266" y="220" class="tx-mid tx-mono">cat</text>
+      <text x="342" y="220" class="tx-mid tx-mono">is</text>
+      <text x="418" y="220" class="tx-mid tx-mono">black</text>
+      <text x="494" y="220" class="tx-mid tx-mono">&lt;EOS&gt;</text>
+      <text x="190" y="238" class="tx-mid tx-mono tx-muted">42</text>
+      <text x="266" y="238" class="tx-mid tx-mono tx-muted">82</text>
+      <text x="342" y="238" class="tx-mid tx-mono tx-muted">16</text>
+      <text x="418" y="238" class="tx-mid tx-mono tx-muted">04</text>
+      <text x="494" y="238" class="tx-mid tx-mono tx-muted">99</text>
+      <text x="342" y="280" class="tx-mid tx-hand">цель — тот же вход, сдвинутый на шаг</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Пример со <a class="slide-ref" href="assets/slides/s04_067.webp" data-deck="s04" data-slide="67">слайда 67</a>. Источник с &lt;EOS&gt; идёт в кодировщик, две строки цели — в декодер. Под словами — их номера в словаре. Стрелки: каждое слово цели на следующем шаге стоит во входе декодера.</figcaption>
+  </figure>
+
+  <aside class="margin-note">На слайде у «est» тот же номер 03, что у &lt;PAD&gt;. Противоречия нет, если у французского свой словарь: номера не повторяются внутри одного словаря.</aside>
+
+  <p>Главное — шаг 3. Вход декодера и цель — одна и та же фраза, сдвинутая на одну позицию: на шаге \(t\) декодер видит \(y_{t-1}\) и должен выдать \(y_t\). Это и есть <span class="en" lang="en">teacher forcing</span>, записанный прямо в данных. &lt;EOS&gt; в конце источника говорит кодировщику «фраза кончилась» и даёт ему одинаковый последний шаг у всех фраз.</p>
+
+  <div class="pitfall">
+    <p>«К цели приписать &lt;SOS&gt; в начало и &lt;EOS&gt; в конец и подать эту строку и на вход декодера, и как цель». Тогда цель шага \(t\) совпадает с его входом, и модель учится копировать — та же утечка ответа, что и без сдвига. Строк должно быть две. В конспекте (стр. 306) рецепт строит одну строку &lt;SOS&gt; y &lt;EOS&gt; и не приписывает &lt;EOS&gt; к источнику; на экзамене пиши рецепт слайда.</p>
+  </div>
+
+  <h3>Маска: что делать с &lt;PAD&gt;</h3>
+
+  <p>&lt;PAD&gt; — не данные, а заполнитель. Представь коробку для яиц: в каждом ряду батча одинаковое число ячеек, и короткие фразы оставляют ячейки пустыми. <mark class="key">Маска</mark> (<span class="en" lang="en">mask</span>) — список ячеек, где яйца есть; по ней пустые ячейки не оценивают и не варят.</p>
+
+  <ul>
+    <li><b>Функция ошибки.</b> На позициях &lt;PAD&gt; в цели маска \(M_{bt} = 0\), и слагаемых там нет. Ошибку батча усредняют только по настоящим словам, формула ниже. В PyTorch это аргумент <code>ignore_index</code> у <code>nn.CrossEntropyLoss</code>.</li>
+    <li><b>Кодировщик.</b> &lt;PAD&gt; в хвосте источника кодировщик прочитал бы как обычные слова, и его последнее состояние — вектор \(c\) — зависело бы от того, сколько заполнителя досталось фразе. Длины из шага 6 позволяют остановить чтение на настоящем конце каждой строки; в PyTorch для этого есть <code>pack_padded_sequence</code>.</li>
+  </ul>
+
+  <div class="formula">
+    \[ \mathcal L_{\text{batch}} = \frac{\sum_{b,t} M_{bt}\, \mathrm{loss}_{bt}}{\sum_{b,t} M_{bt}} \]
+    <dl class="legend">
+      <dt>\(b,\ t\)</dt><dd>строка батча и позиция в ней</dd>
+      <dt>\(M_{bt}\)</dt><dd>маска: 1 на настоящем слове цели, включая &lt;EOS&gt;, 0 на &lt;PAD&gt;</dd>
+      <dt>\(\mathrm{loss}_{bt}\)</dt><dd>штраф шага, \(-y_{bt}\T \log(p_{bt})\)</dd>
+    </dl>
+  </div>
+
+  <div class="pitfall">
+    <p>«При фиксированной длине 12 каждая строка получает два &lt;PAD&gt;». Нет: каждую строку дополняют до 12, и &lt;PAD&gt; у неё столько, сколько ей не хватает: строка из 10 слов получит два, из 7 — пять, из 4 — восемь. Два &lt;PAD&gt; в примере на стр. 306 конспекта относятся только к самой длинной строке. Переключи виджет ниже на фиксированную длину 12 и посчитай &lt;PAD&gt; в каждой строке.</p>
+  </div>
+
+  <style>
+    #l42-w-batch .l42-tensors { padding: 0.5rem 1rem 0.6rem; }
+    #l42-w-batch .l42-tcap { font-family: var(--f-display); font-size: var(--t-sm); font-weight: 600; color: var(--ink-2); margin: 0.7rem 0 0.35rem; }
+    #l42-w-batch .l42-bt { width: auto; border-collapse: collapse; }
+    #l42-w-batch .l42-bt th, #l42-w-batch .l42-bt td { padding: 0.22rem 0.32rem; border: 1px solid var(--line); vertical-align: middle; text-align: center; }
+    #l42-w-batch .l42-bt thead th { font-size: var(--t-xs); font-weight: 600; color: var(--ink-3); border-bottom: 1.5px solid var(--ink); }
+    #l42-w-batch .l42-bt tbody th { font-size: var(--t-xs); font-weight: 600; color: var(--ink-3); }
+    #l42-w-batch .l42-bt td > * + * { margin-top: 0.05rem; }
+    #l42-w-batch .l42-tok { display: block; font-family: var(--f-mono); font-size: 0.78rem; line-height: 1.25; white-space: nowrap; }
+    #l42-w-batch .l42-id { display: block; font-family: var(--f-mono); font-size: 0.7rem; line-height: 1.2; color: var(--ink-3); }
+    #l42-w-batch td.is-word { background: color-mix(in srgb, var(--s1) 16%, transparent); }
+    #l42-w-batch td.is-spec { background: var(--paper-2); }
+    #l42-w-batch td.is-spec .l42-tok { font-weight: 700; }
+    #l42-w-batch td.is-pad { background: var(--paper-3); }
+    #l42-w-batch td.is-pad .l42-tok, #l42-w-batch td.is-zero { color: var(--ink-3); }
+    #l42-w-batch td.is-zero { background: var(--paper-3); }
+    #l42-w-batch td.is-unk { background: var(--key-bg); }
+    #l42-w-batch td.is-unk .l42-tok, #l42-w-batch td.is-unk .l42-id { color: var(--key-fg); }
+    #l42-w-batch td.l42-len { font-family: var(--f-mono); font-size: 0.78rem; background: transparent; }
+    #l42-w-batch td.l42-bit { font-family: var(--f-mono); font-size: 0.8rem; min-width: 2.2rem; }
+  </style>
+
+  <div class="widget" id="l42-w-batch">
+    <h3 class="widget-title">Собери батч из трёх пар</h3>
+    <p class="widget-intro">Три пары «французский → английский» разной длины, собранные по рецепту слайда: источник \(X\) для кодировщика, вход декодера \(Y_{in}\), цель \(Y_{out}\) и маска \(M\). В каждой клетке слово и его номер в словаре; синие — слова, серые с жирной надписью — служебные символы, бледные — &lt;PAD&gt;, жёлтые — &lt;UNK&gt;. У цели словарь со слайда (&lt;SOS&gt; 00, &lt;UNK&gt; 01, &lt;PAD&gt; 03, &lt;EOS&gt; 99), у источника свой (&lt;PAD&gt; 00, &lt;UNK&gt; 01, &lt;EOS&gt; 99). Главное здесь: \(Y_{in}\) и \(Y_{out}\) — одна фраза со сдвигом на шаг, а &lt;PAD&gt; только выравнивает строки, и маска не пускает его в функцию ошибки. На телефоне таблицы прокручиваются вбок.</p>
+    <ol class="tasks">
+      <li>Найди "cat" в первой строке \(Y_{in}\) и в первой строке \(Y_{out}\). Предскажи позиции, потом проверь.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>В \(Y_{in}\) — позиция 3, в \(Y_{out}\) — позиция 2. Так со всеми словами: цель — тот же вход, сдвинутый на шаг. На шаге 2 декодер получает "the" и должен выдать "cat".</p></details>
+      </li>
+      <li>Сколько слагаемых будет у функции ошибки этого батча? Посчитай по целям, потом сверь с маской.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>13: по одному на каждое настоящее слово цели, включая &lt;EOS&gt; (5 + 4 + 4). Две клетки &lt;PAD&gt; в \(Y_{out}\) маска закрывает нулями.</p></details>
+      </li>
+      <li>Переключи длину на фиксированную, 12. Сколько &lt;PAD&gt; получит вторая строка \(Y_{out}\)? Все ли строки получат по два &lt;PAD&gt;?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Вторая строка (I am tired &lt;EOS&gt;, 4 слова) получит восемь &lt;PAD&gt;; в \(Y_{out}\) строки получают 7, 8 и 8. У каждой строки своё число: 12 минус её длина. Слагаемых в ошибке по-прежнему 13 — заполнитель добавляет работу, но не информацию: его доля выросла с 16 % до 65 % клеток.</p></details>
+      </li>
+      <li>Верни длину по батчу и сдвинь словарь до 6 слов. Какие слова станут &lt;UNK&gt;? Останутся ли они в функции ошибки?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Самые редкие: в цели black, tired и raining, в источнике noir, fatigué и pleut. Слагаемых в ошибке по-прежнему 13: &lt;UNK&gt; — обычное слово словаря, и модель учат выдавать его на этих местах. Слова сэкономлены, а то, что кот был чёрным, потеряно.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l42-w-batch', function (root, ui) {
+    var PAIRS = [
+      { src: ['le', 'chat', 'est', 'noir'], tgt: ['the', 'cat', 'is', 'black'] },
+      { src: ['je', 'suis', 'fatigué'], tgt: ['I', 'am', 'tired'] },
+      { src: ['il', 'pleut'], tgt: ['it', 'is', 'raining'] }
+    ];
+    /* words of each vocabulary from the most to the least frequent; ids of the slide where the slide gives them */
+    var SV = { rank: ['le', 'est', 'je', 'il', 'suis', 'chat', 'noir', 'fatigué', 'pleut'],
+      id: { le: 2, est: 3, je: 21, il: 15, suis: 34, chat: 85, noir: 12, 'fatigué': 66, pleut: 77 }, PAD: 0, UNK: 1, EOS: 99 };
+    var TV = { rank: ['the', 'is', 'I', 'it', 'am', 'cat', 'black', 'tired', 'raining'],
+      id: { the: 42, is: 16, I: 5, it: 9, am: 7, cat: 82, black: 4, tired: 61, raining: 73 }, SOS: 0, UNK: 1, PAD: 3, EOS: 99 };
+
+    var box = Course.el('div', { 'class': 'l42-tensors' });
+    ui.stage.appendChild(box);
+    var lenS = ui.select('длина строк', [{ value: 'batch', label: 'до самой длинной в батче' }, { value: '12', label: 'фиксированная: 12' }], null, 'batch');
+    var vocS = ui.slider({ label: 'словарь: самых частых слов', min: 3, max: 9, step: 1, value: 9 });
+    var roShape = ui.readout('формы X, Y<sub>in</sub>, Y<sub>out</sub>'), roPad = ui.readout('&lt;PAD&gt; в батче');
+    var roTerms = ui.readout('слагаемых в ошибке (сумма M)', { digits: 0 }), roUnk = ui.readout('&lt;UNK&gt; в батче', { digits: 0 });
+
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+    function esc(s) { return s.replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function word(V, w, n) { var r = V.rank.indexOf(w); return r >= 0 && r < n ? { t: w, id: V.id[w], k: 'word' } : { t: '<UNK>', id: V.UNK, k: 'unk' }; }
+    function spec(t, id) { return { t: t, id: id, k: 'spec' }; }
+    function padTo(rows, L, id) {
+      return rows.map(function (r) { var o = r.slice(); while (o.length < L) o.push({ t: '<PAD>', id: id, k: 'pad' }); return o; });
+    }
+    function build() {
+      var n = Math.round(vocS.value), fixed = lenS.value === '12';
+      var X = PAIRS.map(function (p) { return p.src.map(function (w) { return word(SV, w, n); }).concat([spec('<EOS>', SV.EOS)]); });
+      var Yin = PAIRS.map(function (p) { return [spec('<SOS>', TV.SOS)].concat(p.tgt.map(function (w) { return word(TV, w, n); })); });
+      var Yout = PAIRS.map(function (p) { return p.tgt.map(function (w) { return word(TV, w, n); }).concat([spec('<EOS>', TV.EOS)]); });
+      var lx = X.map(function (r) { return r.length; }), ly = Yout.map(function (r) { return r.length; });
+      var Lx = fixed ? 12 : Math.max.apply(null, lx), Ly = fixed ? 12 : Math.max.apply(null, ly);
+      return { X: padTo(X, Lx, SV.PAD), Yin: padTo(Yin, Ly, TV.PAD), Yout: padTo(Yout, Ly, TV.PAD), lx: lx, ly: ly, Lx: Lx, Ly: Ly };
+    }
+    function table(cap, rows, lens, mask) {
+      var head = [Course.el('th', { text: '' })], i;
+      for (i = 0; i < rows[0].length; i++) head.push(Course.el('th', { text: String(i + 1) }));
+      head.push(Course.el('th', { text: mask ? 'сумма' : 'длина' }));
+      var body = rows.map(function (r, b) {
+        var cells = [Course.el('th', { text: 'пара ' + (b + 1) })];
+        r.forEach(function (c) {
+          if (mask) { cells.push(Course.el('td', { 'class': 'l42-bit' + (c ? '' : ' is-zero'), text: String(c) })); return; }
+          cells.push(Course.el('td', { 'class': 'is-' + c.k }, [Course.el('span', { 'class': 'l42-tok', text: c.t }), Course.el('span', { 'class': 'l42-id', text: two(c.id) })]));
+        });
+        cells.push(Course.el('td', { 'class': 'l42-len', text: String(lens[b]) }));
+        return Course.el('tr', null, cells);
+      });
+      var tb = Course.el('table', { 'class': 'tbl l42-bt' }, [Course.el('thead', null, [Course.el('tr', null, head)]), Course.el('tbody', null, body)]);
+      return [Course.el('p', { 'class': 'l42-tcap', html: cap }), Course.el('div', { 'class': 'scroll-x', role: 'region', tabindex: '0', 'aria-label': 'Таблица: прокручивается по горизонтали' }, [tb])];
+    }
+
+    ui.onChange(function () {
+      var B = build(), M = B.Yout.map(function (r) { return r.map(function (c) { return c.k === 'pad' ? 0 : 1; }); });
+      var sums = M.map(function (r) { return r.reduce(function (a, v) { return a + v; }, 0); });
+      var cells = 0, pads = 0, unks = 0;
+      [B.X, B.Yin, B.Yout].forEach(function (T) { T.forEach(function (r) { r.forEach(function (c) { cells++; if (c.k === 'pad') pads++; if (c.k === 'unk') unks++; }); }); });
+      while (box.firstChild) box.removeChild(box.firstChild);
+      [].concat(
+        table('X — вход кодировщика: источник + &lt;EOS&gt;', B.X, B.lx),
+        table('Y<sub>in</sub> — вход декодера: &lt;SOS&gt; + цель', B.Yin, B.ly),
+        table('Y<sub>out</sub> — цель функции ошибки: цель + &lt;EOS&gt;', B.Yout, B.ly),
+        table('M — маска цели: 1 — слагаемое есть, 0 — &lt;PAD&gt;', M, sums, true)
+      ).forEach(function (n) { box.appendChild(n); });
+      roShape.set('3 × ' + B.Lx + ' · 3 × ' + B.Ly + ' · 3 × ' + B.Ly);
+      roPad.set(pads + ' из ' + cells + ' клеток (' + Math.round(100 * pads / cells) + ' %)');
+      roTerms.set(sums.reduce(function (a, v) { return a + v; }, 0));
+      roUnk.set(unks, unks ? 'key' : null);
+    });
+  });
+  </script>
+
+  <p class="memo"><mark class="key">Вход декодера и цель — одна фраза со сдвигом на шаг: &lt;SOS&gt; + y и y + &lt;EOS&gt;. &lt;PAD&gt; только выравнивает строки, и маска не пускает его ни в функцию ошибки, ни в состояние кодировщика.</mark></p>
+</section>
+
+<section id="l42-greedy">
+  <h2>Говорить: почему нельзя просто взять argmax</h2>
+
+  <p>Модель обучена, \(\theta\) известны. Теперь по новой фразе \(x = x_1, \dots, x_m\) нужно выдать перевод — самую вероятную последовательность (<a class="slide-ref" href="assets/slides/s04_069.webp" data-deck="s04" data-slide="69">слайд 69</a>):</p>
+
+  \[ y' = \argmax_y \prod_{t=1}^{n} P(y_t \mid y_{\lt t}, x, \theta) \]
+
+  <p>Оценить одну фразу модель может дёшево: \(n\) шагов декодера, \(n\) раз <span class="en" lang="en">softmax</span>. Но argmax берётся по всем фразам сразу, а их \(|V|^n\): при словаре из 10&nbsp;000 слов и длине 20 это \(10^{80}\) кандидатов (урок 41). Перебрать их невозможно, и argmax ищут приближённо. Способов на слайдах два — greedy decoding и beam search (<a class="slide-ref" href="assets/slides/s04_069.webp" data-deck="s04" data-slide="69-70">слайды 69–70</a>).</p>
+
+  <figure class="fig fig--plain" id="l42-fig-cost">
+    <svg class="dia" viewBox="0 0 560 214" role="img" aria-label="Сколько кандидатов оценивают на фразу из 20 слов при словаре в 10 000 слов, по логарифмической шкале: greedy 2 на 10 в пятой, beam search с k = 5 — 10 в шестой, полный перебор — 10 в восьмидесятой">
+      <text x="20" y="26">greedy: n · |V|</text>
+      <text x="540" y="26" class="tx-end tx-sm tx-muted">|V| = 10 000, n = 20</text>
+      <rect x="20" y="36" width="33" height="18" class="fw-ink"/>
+      <text x="62" y="50">2 · 10⁵</text>
+      <text x="20" y="82">beam search, k = 5: n · k · |V|</text>
+      <rect x="20" y="92" width="38" height="18" class="fw-ink"/>
+      <text x="66" y="106">10⁶</text>
+      <text x="20" y="138">полный перебор: |V|ⁿ</text>
+      <rect x="20" y="148" width="500" height="18" class="fw-ink dash"/>
+      <text x="512" y="162" class="tx-end">10⁸⁰</text>
+      <line x1="20" y1="180" x2="520" y2="180" class="st-muted"/>
+      <line x1="20" y1="180" x2="20" y2="186" class="st-muted"/>
+      <line x1="145" y1="180" x2="145" y2="186" class="st-muted"/>
+      <line x1="270" y1="180" x2="270" y2="186" class="st-muted"/>
+      <line x1="395" y1="180" x2="395" y2="186" class="st-muted"/>
+      <line x1="520" y1="180" x2="520" y2="186" class="st-muted"/>
+      <text x="20" y="204" class="tx-mid tx-sm tx-muted">1</text>
+      <text x="145" y="204" class="tx-mid tx-sm tx-muted">10²⁰</text>
+      <text x="270" y="204" class="tx-mid tx-sm tx-muted">10⁴⁰</text>
+      <text x="395" y="204" class="tx-mid tx-sm tx-muted">10⁶⁰</text>
+      <text x="520" y="204" class="tx-mid tx-sm tx-muted">10⁸⁰</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Сколько кандидатов оценивают на одну фразу; шкала логарифмическая. Greedy и beam search у левого края шкалы, полный перебор недостижим.</figcaption>
+  </figure>
+
+  <div class="def">
+    <p><dfn><span class="en" lang="en">Greedy decoding</span></dfn> (жадное декодирование) — "at each step, pick the most probable token": на каждом шаге взять самое вероятное слово при уже выбранных и подать его на вход следующему шагу, пока не выйдет &lt;EOS&gt;.</p>
+  </div>
+
+  \[ y'_t = \argmax_{w \in V} P(w \mid y'_{\lt t}, x, \theta) \]
+
+  <aside class="margin-note">На <a class="slide-ref" href="assets/slides/s04_069.webp" data-deck="s04" data-slide="69">слайде 69</a> справа стоит произведение argmax по шагам. Читай его как цепочку выборов: каждый argmax берут при словах, уже выбранных на прошлых шагах.</aside>
+
+  <p>Это дёшево: \(|V|\) вероятностей на шаг, \(n \cdot |V|\) на фразу. Слабых мест два, и оба названы на слайде: жадный выбор "does not guarantee to reach the best sequence and it does not allow to backtrack from errors in early stages". Сказанное слово уже не вернуть, а самое вероятное первое слово не обязано начинать самую вероятную фразу.</p>
+
+  <figure class="fig fig--plain" id="l42-fig-greedy">
+    <svg class="dia" viewBox="0 0 560 236" role="img" aria-label="Дерево из задачки: после SOS слово I с вероятностью 0.6 или You с 0.4; после I — am или like по 0.5, итог 0.30; после You — are 0.9, итог 0.36. Greedy идёт по I и am, ветку You не рассматривает">
+      <line x1="90" y1="118" x2="180" y2="68" class="hl"/>
+      <line x1="240" y1="68" x2="330" y2="38" class="hl"/>
+      <line x1="90" y1="118" x2="180" y2="68" class="sw-2"/>
+      <line x1="240" y1="68" x2="330" y2="38" class="sw-2"/>
+      <line x1="240" y1="68" x2="330" y2="98"/>
+      <line x1="90" y1="118" x2="180" y2="178" class="st-muted dash"/>
+      <line x1="240" y1="178" x2="330" y2="178" class="st-muted dash"/>
+      <rect x="30" y="105" width="60" height="26" rx="5" class="fi-paper dash"/>
+      <rect x="180" y="55" width="60" height="26" rx="5" class="fw-s3 st-s3 sw-2"/>
+      <rect x="180" y="165" width="60" height="26" rx="5" class="fi-paper st-muted dash"/>
+      <rect x="330" y="25" width="60" height="26" rx="5" class="fw-s3 st-s3 sw-2"/>
+      <rect x="330" y="85" width="60" height="26" rx="5" class="fi-paper"/>
+      <rect x="330" y="165" width="60" height="26" rx="5" class="fi-paper st-muted dash"/>
+      <text x="60" y="122" class="tx-mid tx-mono">&lt;SOS&gt;</text>
+      <text x="210" y="72" class="tx-mid tx-mono">I</text>
+      <text x="210" y="182" class="tx-mid tx-mono tx-muted">You</text>
+      <text x="360" y="42" class="tx-mid tx-mono">am</text>
+      <text x="360" y="102" class="tx-mid tx-mono">like</text>
+      <text x="360" y="182" class="tx-mid tx-mono tx-muted">are</text>
+      <text x="135" y="86" class="tx-mid tx-mono halo">0.6</text>
+      <text x="135" y="141" class="tx-mid tx-mono halo">0.4</text>
+      <text x="285" y="46" class="tx-mid tx-mono halo">0.5</text>
+      <text x="285" y="77" class="tx-mid tx-mono halo">0.5</text>
+      <text x="285" y="172" class="tx-mid tx-mono halo">0.9</text>
+      <rect x="414" y="168" width="48" height="22" rx="3" class="fw-key st-none"/>
+      <text x="420" y="43" class="tx-mono">0.30</text>
+      <text x="420" y="103" class="tx-mono">0.30</text>
+      <text x="420" y="184" class="tx-mono">0.36</text>
+      <text x="508" y="187" class="tx-mid tx-hand">больше</text>
+      <text x="210" y="226" class="tx-mid tx-hand">сюда не вернётся</text>
+    </svg>
+    <figcaption><b>Рис. 5.</b> Дерево из задачки. Greedy decoding выбирает "I" (0.6 больше 0.4), потом "am" — или "like", вероятность та же; итог 0.30. Ветку "You" он больше не рассматривает, а фраза "You are" вероятнее: \(0.4 \cdot 0.9 = 0.36\).</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">Greedy decoding берёт на каждом шаге самое вероятное слово: это дёшево, \(n \cdot |V|\), но назад не вернуться, и самая вероятная фраза может начинаться не с самого вероятного слова.</mark></p>
+</section>
+
+<section id="l42-beam">
+  <h2><span class="en" lang="en">Beam search</span>: держать несколько гипотез</h2>
+
+  <p>Представь разведчиков на развилках. Greedy — один разведчик: на каждой развилке он берёт тропу, которая выглядит лучше, и вернуться не может. <span class="en" lang="en">Beam search</span> (лучевой поиск) — \(k\) разведчиков: на каждой развилке они пробуют все тропы, а дальше идут только \(k\) самых многообещающих маршрутов из всех. Один разведчик — это greedy; разведчиков столько, сколько маршрутов, — полный перебор.</p>
+
+  <p>Суть метода — "Keep track of several most probable hypotheses", начиная "with the begin of sentence token" (<a class="slide-ref" href="assets/slides/s04_070.webp" data-deck="s04" data-slide="70">слайд 70</a>). Гипотеза (<span class="en" lang="en">hypothesis</span>) — начало фразы вместе с его счётом. Процедура целиком стандартная, на слайдах её нет:</p>
+
+  <ol>
+    <li>Начать с одной гипотезы: &lt;SOS&gt; со счётом 0.</li>
+    <li>Продлить каждую гипотезу луча каждым словом словаря. Счёт кандидата — счёт гипотезы плюс \(\log P(w \mid \text{гипотеза}, x)\).</li>
+    <li>Из всех кандидатов (их не больше \(k \cdot |V|\)) оставить \(k\) лучших — \(k\) на всех, а не по \(k\) от каждой гипотезы.</li>
+    <li>Из оставленных те, что кончаются &lt;EOS&gt;, уходят в список готовых, остальные образуют новый луч (<span class="en" lang="en">beam</span>).</li>
+    <li>Повторять, пока не наберётся \(k\) готовых гипотез или не кончится предельная длина. Ответ — лучшая из готовых.</li>
+  </ol>
+
+  <div class="formula">
+    \[ \mathrm{score}(y_{\le t}) = \sum_{\tau=1}^{t} \log P(y_\tau \mid y_{\lt \tau}, x) \]
+    <dl class="legend">
+      <dt>\(y_{\le t}\)</dt><dd>гипотеза: первые \(t\) слов \(y_1, \dots, y_t\)</dd>
+    </dl>
+  </div>
+
+  <p>Счёт — сумма логарифмов, а не произведение вероятностей: сотня множителей порядка 0.1 даёт \(10^{-100}\), а в 32-битной арифметике это просто ноль. Порядок гипотез от логарифма не меняется.</p>
+
+  <p>При \(k = 1\) луч из одной гипотезы — это greedy decoding. Цена — \(n \cdot k \cdot |V|\) кандидатов: в \(k\) раз дороже жадного и несравнимо дешевле перебора (рис. 4). И это по-прежнему приближение: гипотеза, отброшенная на раннем шаге, не вернётся.</p>
+
+  <div class="widget" id="l42-w-beam">
+    <h3 class="widget-title">Лучевой поиск на дереве</h3>
+    <p class="widget-intro">Дерево следующих слов: на рёбрах — вероятность слова при начале фразы, под словом — вероятность всего начала. Сплошные гипотезы вошли в луч, пунктирные отброшены, до точечных поиск не дошёл. Ответ поиска — путь на жёлтой подложке, его слова фиолетовые; эталон (правильный ответ) обведён охристым пунктиром. Нормировка влияет только на выбор среди готовых гипотез. Главное здесь: луч оставляет \(k\) лучших продолжений из всех, и ветка, отброшенная на первом шаге, уже не вернётся.</p>
+    <ol class="tasks">
+      <li>Дерево «A, B, C». Предскажи ответ greedy decoding и его вероятность, потом поставь \(k = 1\).
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>"A x", 0.20. На первом шаге A (0.40) лучше всех, на втором x (0.5). Остальное дерево greedy просто не видит.</p></details>
+      </li>
+      <li>Поставь \(k = 2\). Найдёт ли луч лучшую фразу модели? А при \(k = 3\)?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>При \(k = 2\) — "B x", 0.21: B прошло отбор вторым. Лучшая фраза модели — "C x", 0.25, но её начало C (0.25) отброшено на первом шаге. Диагноз — ошибка поиска. При \(k = 3\) C проходит отбор, и луч находит "C x".</p></details>
+      </li>
+      <li>Выбери дерево «I / You» из задачки. Что скажет поиск при \(k = 1\) и при \(k = 2\)? Сначала предскажи, потом проверь.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>При \(k = 1\) — "I am", 0.30. При \(k = 2\) в луче остаются оба первых слова, и находится "You are", 0.36: счёт −1.02 против −1.20.</p></details>
+      </li>
+      <li>Дерево «Smart Reply», \(k = 2\). Предскажи, какой ответ выберет поиск без нормировки и какой — с ней, потом включи переключатель.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Без нормировки — "Yes, &lt;EOS&gt;", 0.44: в короткой фразе меньше отрицательных логарифмов. Диагноз — ошибка модели: она сама ставит короткий ответ выше эталона, и больший \(k\) не поможет. С нормировкой средний логарифм на слово у "Yes, what's up? &lt;EOS&gt;" −0.28, у "Yes, &lt;EOS&gt;" −0.41, и выигрывает длинный ответ.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l42-w-beam', function (root, ui) {
+    var S = Course.svg, EOS = '<EOS>';
+    function T(tok, p, kids) { return { tok: tok, p: p, kids: kids || [] }; }
+    function E(p) { return T(EOS, p == null ? 1 : p); }
+    var PRE = {
+      abc: { ref: 'C x', root: T('<SOS>', 1, [
+        T('A', 0.40, [T('x', 0.5, [E()]), T('y', 0.3, [E()]), T('z', 0.2, [E()])]),
+        T('B', 0.35, [T('x', 0.6, [E()]), T('y', 0.3, [E()]), T('z', 0.1, [E()])]),
+        T('C', 0.25, [T('x', 1.0, [E()])])]) },
+      ex10: { ref: 'You are', root: T('<SOS>', 1, [
+        T('I', 0.6, [T('am', 0.5, [E()]), T('like', 0.5, [E()])]),
+        T('You', 0.4, [T('are', 0.9, [E()])])]) },
+      reply: { ref: "Yes, what's up?", root: T('<SOS>', 1, [
+        T('Yes,', 0.8, [E(0.55), T("what's", 0.45, [T('up?', 0.9, [E()]), T('new?', 0.1, [E()])])]),
+        T('No,', 0.2, [E(0.8), T('thanks', 0.2, [E()])])]) }
+    };
+    /* positions, ids, prefix log-probabilities */
+    Object.keys(PRE).forEach(function (key) {
+      var P = PRE[key], rows = 0, id = 0, maxD = 0;
+      P.nodes = [];
+      (function rec(n, d, path, lp) {
+        n.d = d; n.path = path; n.lp = lp; n.id = id++; P.nodes.push(n); if (d > maxD) maxD = d;
+        if (!n.kids.length) { n.row = rows++; return; }
+        n.kids.forEach(function (c) { rec(c, d + 1, path.concat(c.tok), lp + Math.log(c.p)); });
+        n.row = (n.kids[0].row + n.kids[n.kids.length - 1].row) / 2;
+      })(P.root, 0, [], 0);
+      P.rows = rows; P.maxD = maxD;
+      P.leaves = P.nodes.filter(function (n) { return n.tok === EOS; });
+    });
+
+    var preS = ui.select('дерево', [
+      { value: 'abc', label: 'A, B, C: лучшее начало не первое' },
+      { value: 'ex10', label: 'I / You: задачка из начала урока' },
+      { value: 'reply', label: 'Smart Reply: короткий и длинный ответ' }
+    ], null, 'abc');
+    var kS = ui.slider({ label: 'ширина луча k', min: 1, max: 4, step: 1, value: 2 });
+    var normT = ui.toggle('нормировать на длину: счёт / |y|', false);
+    var svg = ui.svg(560, 386, { label: 'Дерево следующих слов с отмеченными гипотезами луча, отброшенными гипотезами и ответом поиска' });
+    var layer = S('g', null, svg);
+    var roOut = ui.readout('ответ поиска'), roGreedy = ui.readout('greedy (k = 1)'), roBest = ui.readout('лучшая фраза модели');
+    var roFin = ui.readout('готовые гипотезы'), roDiag = ui.readout('диагноз');
+    ui.legend([
+      { label: 'вошла в луч', color: 'ink', mark: 'line' },
+      { label: 'отброшена', color: 'muted', mark: 'dash' },
+      { label: 'ответ поиска', color: 'ink', mark: 'hl' },
+      { label: 'эталон', color: 's6', mark: 'dash' }
+    ]);
+
+    function phrase(n) { return n.path.filter(function (t) { return t !== EOS; }).join(' '); }
+    function score(n, norm) { return norm ? n.lp / n.d : n.lp; }
+    function search(P, k, norm) {
+      var state = {}, beam = [P.root], fin = [], step;
+      for (step = 1; step <= P.maxD && beam.length && fin.length < k; step++) {
+        var cand = [];
+        beam.forEach(function (h) { h.kids.forEach(function (c) { cand.push(c); state[c.id] = 'pruned'; }); });
+        cand.sort(function (a, b) { return b.lp - a.lp; });
+        beam = [];
+        cand.slice(0, k).forEach(function (c) { state[c.id] = 'kept'; if (c.tok === EOS) fin.push(c); else beam.push(c); });
+      }
+      if (!fin.length) fin = beam.slice();
+      fin.sort(function (a, b) { return score(b, norm) - score(a, norm); });
+      return { state: state, fin: fin, out: fin[0] };
+    }
+    function pfmt(p) { var s = p.toFixed(3).replace(/0$/, ''); return s.length < 4 ? p.toFixed(2) : s; }
+    function sfmt(v) { return Course.fmt(v, 2); }
+    function esc(s) { return s.replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+    function draw(P, R) {
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      function el(tag, a) { return S(tag, a, layer); }
+      function txt(x, y, s, cls) { return el('text', { x: x, y: y, 'class': cls, text: s }); }
+      var H = 40 + (P.rows - 1) * 52 + 46, HW = 34;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      function X(n) { return 44 + n.d * (472 / P.maxD); }
+      function Y(n) { return 40 + n.row * 52; }
+      var refLeaf = null;
+      function chosen(n) { return n === P.root || (R.out.path.length >= n.d && R.out.path.slice(0, n.d).join('|') === n.path.join('|')); }
+      P.leaves.forEach(function (n) { if (phrase(n) === P.ref) refLeaf = n; });
+      for (var d = 1; d <= P.maxD; d++) txt(44 + d * (472 / P.maxD), 14, 'шаг ' + d, 'tx-mid tx-sm tx-muted');
+      P.nodes.forEach(function (n) {                               // edges
+        n.kids.forEach(function (c) {
+          var st = R.state[c.id] || 'unseen', x1 = X(n) + HW, y1 = Y(n), x2 = X(c) - HW, y2 = Y(c);
+          if (chosen(c)) el('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': 'hl' });
+          el('line', { x1: x1, y1: y1, x2: x2, y2: y2, 'class': chosen(c) ? 'sw-2' : st === 'kept' ? '' : st === 'pruned' ? 'st-muted dash' : 'st-muted dots' });
+        });
+      });
+      P.nodes.forEach(function (n) {                               // edge labels
+        n.kids.forEach(function (c) {
+          if (c.p >= 0.999) return;
+          txt((X(n) + HW + X(c) - HW) / 2, (Y(n) + Y(c)) / 2 - 6, String(c.p), 'tx-mid tx-mono tx-sm halo' + (R.state[c.id] === 'kept' ? '' : ' tx-muted'));
+        });
+      });
+      P.nodes.forEach(function (n) {                               // chips
+        var st = n === P.root ? 'kept' : R.state[n.id] || 'unseen', ch = n !== P.root && chosen(n);
+        var cls = ch ? 'fw-s3 st-s3 sw-2' : st === 'kept' ? 'fi-paper' : st === 'pruned' ? 'fi-paper st-muted dash' : 'fi-paper st-muted dots';
+        el('rect', { x: X(n) - HW, y: Y(n) - 13, width: 2 * HW, height: 26, rx: 5, 'class': cls });
+        if (n === refLeaf) el('rect', { x: X(n) - HW - 4, y: Y(n) - 16, width: 2 * HW + 8, height: 32, rx: 7, 'class': 'fi-none st-s6 sw-3 dash' });
+        txt(X(n), Y(n) + 5, n.tok, 'tx-mid tx-mono' + (st === 'kept' || ch ? '' : ' tx-muted'));
+        if (n !== P.root) txt(X(n), Y(n) + 31, pfmt(Math.exp(n.lp)), 'tx-mid tx-mono tx-sm tx-muted');
+      });
+    }
+
+    ui.onChange(function () {
+      var P = PRE[preS.value], k = Math.round(kS.value), norm = normT.value;
+      var R = search(P, k, norm), G = search(P, 1, norm);
+      var best = P.leaves.slice().sort(function (a, b) { return score(b, norm) - score(a, norm); })[0];
+      draw(P, R);
+      function line(n) { return esc(n.path.join(' ')) + ' · P = ' + pfmt(Math.exp(n.lp)); }
+      var unit = norm ? ' на слово' : '';
+      roOut.set(line(R.out) + ' · счёт ' + sfmt(score(R.out, norm)) + unit);
+      roGreedy.set(line(G.out));
+      roBest.set(line(best) + ' · счёт ' + sfmt(score(best, norm)) + unit);
+      roFin.set(R.fin.map(function (n) { return esc(phrase(n) || EOS) + ': ' + sfmt(score(n, norm)); }).join('; '));
+      var searchErr = R.out !== best, modelErr = phrase(best) !== P.ref;
+      roDiag.set(!searchErr && !modelErr ? 'ответ совпал с эталоном'
+        : searchErr && !modelErr ? 'ошибка поиска: лучшая фраза модели — эталон, луч её потерял'
+        : !searchErr ? 'ошибка модели: поиск нашёл лучшую фразу модели, но это не эталон'
+        : 'ошибка поиска и ошибка модели сразу', !searchErr && !modelErr ? 'good' : 'bad');
+    });
+  });
+  </script>
+
+  <p>Запомни пример «A, B, C»: greedy 0.20 &lt; луч из двух гипотез 0.21 &lt; лучшая фраза модели 0.25. Луч обычно находит фразу вероятнее жадной, но и он может пропустить лучшую.</p>
+
+  <h3>Длинные фразы проигрывают: нормировка на длину</h3>
+
+  <p>Каждое слово добавляет к счёту отрицательный логарифм, поэтому длинная гипотеза при прочих равных проигрывает короткой. В игрушечном дереве «Smart Reply» из виджета короткий ответ "Yes, &lt;EOS&gt;" имеет вероятность 0.44, а "Yes, what's up? &lt;EOS&gt;" — 0.324, хотя на <a class="slide-ref" href="assets/slides/s04_068.webp" data-deck="s04" data-slide="68">слайде 68</a> ответ именно второй. Помогает нормировка на длину (<span class="en" lang="en">length normalisation</span>; на слайдах её нет): готовые гипотезы сравнивают по счёту, поделённому на длину в степени \(\alpha\).</p>
+
+  \[ \hat y = \argmax_{y\ \text{готова}} \frac{\mathrm{score}(y)}{|y|^{\alpha}} \]
+
+  <p>При \(\alpha = 0\) нормировки нет, при \(\alpha = 1\) это средний логарифм на слово; длина \(|y|\) считается вместе с &lt;EOS&gt;. С \(\alpha = 1\) короткий ответ получает \(\ln 0.44 / 2 = -0.41\), длинный — \(\ln 0.324 / 4 = -0.28\), и выигрывает длинный.</p>
+
+  <p>Как далеко заходит перекос, показала проверка 2019 года (Stahlberg и Byrne): точный поиск по модели перевода примерно для половины предложений находил самым вероятным… пустой перевод. Выходит, хорошие переводы такие системы выдают в том числе потому, что небольшой луч до этого «максимума» не добирается.</p>
+
+  <p>Поэтому с ростом \(k\) поиск находит фразы, всё более вероятные по модели, но качество перевода растёт только до умеренного \(k\), а дальше обычно падает (в конспекте на стр. 308 сказано, что качество с ростом \(k\) улучшается, — это верно лишь до какого-то \(k\)); на практике \(k\) обычно берут от 4 до 10.</p>
+
+  <h3>Ошибка поиска или ошибка модели</h3>
+
+  <p>Плохой перевод бывает по двум причинам, и лечат их по-разному.</p>
+
+  <div class="compare">
+    <div class="compare-col" data-label="Ошибка поиска · search error">
+      <p>Модель ставит правильную фразу выше выданной, но поиск её не нашёл: отбросил на раннем шаге. Помогает больший \(k\).</p>
+    </div>
+    <div class="compare-col" data-label="Ошибка модели · model error">
+      <p>Модель сама ставит свою неправильную фразу выше правильной. Лучший поиск только точнее найдёт её же; лечить надо модель: данные, обучение, архитектуру.</p>
+    </div>
+  </div>
+
+  <p>Различить их просто: посчитай счёт правильного перевода той же моделью — это один проход декодера с teacher forcing — и сравни со счётом выданного. Правильный выше — подвёл поиск, ниже — модель.</p>
+
+  <p>Теперь задачка из начала урока решена до конца. Greedy decoding говорит "I am" (или "I like") с вероятностью 0.30. Самая вероятная фраза модели — "You are", 0.36: её первое слово было лишь вторым по вероятности. Beam search с \(k = 2\) держит оба первых слова и находит её; в логарифмах это −1.02 против −1.20.</p>
+
+  <p class="memo"><mark class="key">Beam search держит k лучших гипотез по сумме log-вероятностей: k = 1 — это greedy, больший k дороже, и даже он не гарантирует самую вероятную фразу.</mark></p>
+</section>
+
+<section id="l42-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="open" data-points="4" id="l42-exam-mle">
+    <div class="exam-q" lang="en">
+      <p>Show that maximum-likelihood training of a sequence-to-sequence model is equivalent to minimising the sum, over the target positions, of the per-step cross-entropies \(-y_t\T \log(p_t)\). What loss per token do you expect from a freshly initialised model with a vocabulary of 10,000 words?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Maximum likelihood over the training set \(\mathcal S\) of pairs: \(\theta^* = \arg\max_\theta \prod_{(x,y)} P(y \mid x; \theta)\). The logarithm is increasing, so the maximiser does not change: \(\theta^* = \arg\max_\theta \sum_{(x,y)} \log P(y \mid x; \theta)\).</p>
+        <p>By the chain rule,</p>
+        \[ \begin{aligned} &amp;\log P(y \mid x; \theta) \\ &amp;\quad = \sum_{t=1}^{n} \log P(y_t \mid y_{\lt t}, x; \theta) . \end{aligned} \]
+        <p>Changing the sign turns the maximisation into the minimisation of \(\sum_{(x,y)} \sum_t -\log P(y_t \mid y_{\lt t}, x; \theta)\).</p>
+        <p>At step \(t\) the decoder outputs the softmax distribution \(p_t\) over the vocabulary, and \(P(y_t \mid y_{\lt t}, x; \theta)\) is its component at the correct token. With the one-hot target \(y_t\), only one term of the sum survives:</p>
+        \[ \begin{aligned} -\log P(y_t \mid y_{\lt t}, x; \theta) &amp;= -\sum_{i=1}^{|V|} y_t^{(i)} \log p_t^{(i)} \\ &amp;= -y_t\T \log(p_t) , \end{aligned} \]
+        <p>the categorical cross-entropy. So the loss of a pair is \(-\sum_{t=1}^{n} y_t\T \log(p_t)\) over all target positions, &lt;eos&gt; included, and it equals \(-\log P(y \mid x; \theta)\).</p>
+        <p>An untrained model gives roughly uniform probabilities \(1/|V|\), so the expected loss is \(\ln|V| = \ln 10\,000 \approx 9.21\) nats per token.</p>
+      </div>
+      <div class="exam-note"><p>Проверяют три перехода: логарифм (точка максимума не сдвигается), цепное правило (сумма по шагам), <span class="en" lang="en">one-hot</span> (из суммы по словарю остаётся одно слагаемое). Ответ без &lt;eos&gt; среди слагаемых неполон. Число \(\ln|V|\) — проверка здравого смысла для первой строки лога обучения.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="2.303" data-tol="0.005" id="l42-exam-ce">
+    <div class="exam-q" lang="en">
+      <p>A seq2seq decoder is trained with teacher forcing on the target sequence "I saw &lt;eos&gt;". The probabilities it assigns to the correct tokens at the three steps are 0.5, 0.25 and 0.8. Compute the cross-entropy loss of this sequence (natural logarithm).</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ \begin{aligned} \mathcal L &amp;= -(\ln 0.5 + \ln 0.25 + \ln 0.8) \\ &amp;= 0.693 + 1.386 + 0.223 = 2.303 \end{aligned} \]
+        <p>It equals \(-\ln(0.5 \cdot 0.25 \cdot 0.8) = -\ln 0.1\), the negative log-probability of the whole sequence.</p>
+      </div>
+      <div class="exam-note"><p>Частые промахи: забыть слагаемое &lt;eos&gt; (2.079) или взять десятичный логарифм (1.0).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="3" id="l42-exam-tf">
+    <div class="exam-q" lang="en">
+      <p>What is teacher forcing? Why is it used to train a seq2seq decoder, what problem does it create at inference time, and how can this problem be mitigated?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>With teacher forcing, the input of the decoder at step \(t\) during training is the ground-truth previous token \(y_{t-1}\) from the training pair, not the token predicted by the model: the decoder input is the target sequence shifted right by one position, starting with &lt;sos&gt;.</p>
+        <p>Why: early in training the model's own predictions are mostly wrong, and feeding them back would make every following step learn from a wrong context (errors compound, training is slow and unstable); the reference token \(y_t\) is the right continuation only of the correct prefix; and since all decoder inputs are known in advance, the whole target sequence is processed in one pass.</p>
+        <p>Problem: exposure bias. At inference there is no reference, so the decoder consumes its own predictions, a condition never seen during training. After an early mistake the decoder is in an unfamiliar state, and errors accumulate along the sequence.</p>
+        <p>Mitigation: scheduled sampling — during training, at each decoder step, feed the true token with probability \(\varepsilon\) and the model's own prediction otherwise, decreasing \(\varepsilon\) over training. At inference, beam search reduces the damage of a single early mistake.</p>
+      </div>
+      <div class="exam-note"><p>Главное слово — «сдвинутая»: на шаге \(t\) на вход идёт \(y_{t-1}\), а не \(y_t\). Полный ответ называет проблему (<span class="en" lang="en">exposure bias</span>), объясняет её через разные входы на обучении и при генерации и даёт хотя бы одно лекарство.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="3" id="l42-exam-batch">
+    <div class="exam-q" lang="en">
+      <p>A seq2seq model uses the target vocabulary {"&lt;SOS&gt;": 00, "&lt;EOS&gt;": 99, "&lt;UNK&gt;": 01, "&lt;PAD&gt;": 03, "the": 42, "is": 16, "cat": 82, "black": 04}. A batch contains two target sentences: "the cat is black" and "the cat". (a) Write the decoder input and the decoder output (target) rows as ids, padded within the batch. (b) Write the mask of the target rows and explain why padded positions must be masked, both in the loss and on the encoder side.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) Decoder input = &lt;SOS&gt; + sentence; decoder output = sentence + &lt;EOS&gt;; both padded to the longest row (5):</p>
+        <p>input: [00 42 82 16 04], [00 42 82 03 03]; output: [42 82 16 04 99], [42 82 99 03 03].</p>
+        <p>(b) Mask: [1 1 1 1 1], [1 1 1 0 0]. &lt;PAD&gt; is not data. In the loss, masked positions contribute nothing and the loss is averaged over the real tokens; otherwise the model would be trained to predict padding and the loss would depend on how much padding the batch contains. The source is padded too: the encoder would read the padding as input and its final state, the context vector, would change; the sequence lengths are used so that the encoder stops at the real end of each sentence.</p>
+      </div>
+      <div class="exam-note"><p>Проверяют сдвиг (две строки, а не одна &lt;SOS&gt; y &lt;EOS&gt;), &lt;EOS&gt; в конце цели короткой фразы перед заполнителем и обе причины маски. Номера взяты из словаря <a class="slide-ref" href="assets/slides/s04_067.webp" data-deck="s04" data-slide="67">слайда 67</a>.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="0.21" data-tol="0.002" id="l42-exam-beam">
+    <div class="exam-q" lang="en">
+      <p>A decoder gives the following next-token probabilities. Step 1: P(A) = 0.40, P(B) = 0.35, P(C) = 0.25. Step 2: after A: x 0.5, y 0.3, z 0.2; after B: x 0.6, y 0.3, z 0.1; after C: x 1.0. After the second token &lt;eos&gt; follows with probability 1. What is the probability of the sequence returned by beam search with beam width k = 2?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Step 1 keeps A (0.40) and B (0.35). Step 2 candidates: Ax 0.20, Ay 0.12, Az 0.08, Bx 0.21, By 0.105, Bz 0.035; the two best are Bx and Ax. The output is "B x" with probability \(0.35 \cdot 0.6 = 0.21\).</p>
+        <p>Greedy decoding gives "A x" = 0.20. Neither is optimal: "C x" has 0.25, but C was pruned at step 1; k = 3 finds it.</p>
+      </div>
+      <div class="exam-note"><p>Ловушка — оставлять по \(k\) продолжений от каждой гипотезы: оставляют \(k\) лучших из всех кандидатов шага. Сравнение greedy 0.20 &lt; beam 0.21 &lt; лучшая 0.25 показывает, что луч — приближение.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l42-exam-mcq">
+    <div class="exam-q" lang="en">
+      <p>Which of the following statements about training and decoding seq2seq models are correct? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>Beam search with beam width k = 1 is greedy decoding. <span class="fb">Луч из одной гипотезы на каждом шаге берёт самое вероятное слово.</span></li>
+      <li>At inference time, teacher forcing feeds the reference tokens to the decoder. <span class="fb">При генерации эталона нет: декодер получает свои слова.</span></li>
+      <li>Beam search always returns the most probable output sequence under the model. <span class="fb">Гипотеза, отброшенная рано, не вернётся: в примере A, B, C луч с k = 2 пропускает "C x".</span></li>
+      <li data-correct>The &lt;eos&gt; token is a target of the training loss. <span class="fb">Иначе модель не научится останавливаться.</span></li>
+      <li>Padded positions contribute to the loss with a small weight. <span class="fb">Их вклад нулевой: маска убирает их совсем.</span></li>
+      <li data-correct>Without length normalisation, beam search tends to prefer shorter outputs. <span class="fb">Каждое слово добавляет отрицательный логарифм, и короткие фразы выигрывают.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Correct: the first, the fourth and the sixth statement. Teacher forcing is a training technique only; beam search is approximate and can prune the best sequence; padded positions are masked out completely.</p>
+      </div>
+      <div class="exam-note"><p>Ловушки — «beam search всегда находит лучшую фразу» и «заполнитель учитывается с малым весом».</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l42-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Модель только что инициализирована, словарь — 10&nbsp;000 слов. Первая ошибка в логе обучения — 9.2 на слово. Что это значит?</p>
+    <ul class="options">
+      <li>Модель уже кое-чему научилась <span class="fb">Ничему: 9.21 = ln 10 000 — штраф модели, которая делит вероятность поровну.</span></li>
+      <li data-correct>Так и должно быть: случайная модель даёт почти равные вероятности <span class="fb">Штраф шага при \(p = 1/|V|\) равен \(\ln|V| \approx 9.21\). С этого числа кривая и должна начинаться.</span></li>
+      <li>В коде ошибка: в начале штраф должен быть около нуля <span class="fb">Около нуля штраф у идеальной модели, а не у необученной.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Программист подаёт на вход декодера на шаге \(t\) слово \(y_t\), а не \(y_{t-1}\). Что он увидит?</p>
+    <ul class="options">
+      <li data-correct>Ошибка на обучении быстро падает почти до нуля, а переводы никуда не годятся <span class="fb">Ответ лежит во входе, и модель учится его копировать. При генерации копировать нечего.</span></li>
+      <li>Обучение не сойдётся <span class="fb">Сойдётся, и очень быстро — к копированию входа.</span></li>
+      <li>Ничего особенного: это и есть teacher forcing <span class="fb">В teacher forcing на вход идёт предыдущее слово \(y_{t-1}\).</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Какие служебные символы бывают правильными ответами в функции ошибки?</p>
+    <ul class="options">
+      <li data-correct>&lt;EOS&gt; <span class="fb">Это последнее слово каждой цели: так модель учится останавливаться.</span></li>
+      <li data-correct>&lt;UNK&gt;, если на этом месте цели стояло редкое слово <span class="fb">Для функции ошибки это обычное слово словаря, и модель учат выдавать его.</span></li>
+      <li>&lt;SOS&gt; <span class="fb">Его всегда подают на вход первым, предсказывать его не нужно.</span></li>
+      <li>&lt;PAD&gt; <span class="fb">Позиции заполнителя закрывает маска, слагаемых там нет.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Декодер с teacher forcing почти безошибочно предсказывает следующее слово на проверочных фразах, если ему дают правильное начало. Но его собственные переводы длинных фраз часто съезжают после первого неверного слова. Что это?</p>
+    <ul class="options">
+      <li>Переобучение <span class="fb">На новых фразах с правильным началом модель работает хорошо — с обобщением всё в порядке.</span></li>
+      <li data-correct>Exposure bias <span class="fb">На обучении история всегда была правильной, при генерации она своя, и после первой ошибки модель в незнакомой ситуации.</span></li>
+      <li>Слишком маленький словарь <span class="fb">Словарь объяснил бы &lt;UNK&gt; в переводе, но не то, что ошибки идут цепочкой после первой.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Батч дополнили &lt;PAD&gt; до фиксированной длины 12. Сколько &lt;PAD&gt; получит строка из 7 слов?</p>
+    <ul class="options">
+      <li>2 — как у всех строк <span class="fb">Два получила бы только строка длины 10. У каждой строки своё число.</span></li>
+      <li data-correct>5 <span class="fb">12 − 7 = 5: строку дополняют до общей длины.</span></li>
+      <li>12 <span class="fb">Заполнитель дописывают после слов, а не вместо них.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Луч \(k = 2\), словарь из трёх слов. После первого шага в луче две гипотезы. Сколько кандидатов оценят на втором шаге и сколько оставят?</p>
+    <ul class="options">
+      <li data-correct>Оценят 6, оставят 2 <span class="fb">\(k \cdot |V| = 2 \cdot 3\) кандидата, из них \(k\) лучших на всех.</span></li>
+      <li>Оценят 6, оставят 4 <span class="fb">По два продолжения от каждой гипотезы не оставляют: \(k\) — на весь луч.</span></li>
+      <li>Оценят 3, оставят 2 <span class="fb">Продлевают каждую гипотезу, а не одну лучшую.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Beam search с \(k = 5\) выдал бедный перевод, а модель оценивает правильный перевод ниже выданного. Поможет ли \(k = 50\)?</p>
+    <ul class="options">
+      <li data-correct>Нет: это ошибка модели, больший луч найдёт ту же фразу или ещё «вероятнее» <span class="fb">Поиск ищет максимум модели, а модель ставит неправильный ответ выше. Лечить надо модель.</span></li>
+      <li>Да: больший луч всегда даёт лучший перевод <span class="fb">Качество обычно растёт только до умеренного \(k\); здесь же проблема не в поиске.</span></li>
+      <li>Да: правильный перевод просто отбросили на раннем шаге <span class="fb">Тогда модель оценивала бы его выше выданного — это была бы ошибка поиска.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l42-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>Функция ошибки seq2seq — сумма cross-entropy по шагам цели, \(-\sum_t y_t\T \log(p_t)\), включая &lt;EOS&gt;. Она равна \(-\log P(y \mid x; \theta)\), и уменьшать её — то же, что maximum likelihood; необученная модель начинает примерно с \(\ln|V|\) на слово.</li>
+    <li>Teacher forcing: на обучении вход шага \(t\) — правильное слово \(y_{t-1}\), то есть цель, сдвинутая вправо. Так обучение устойчиво и идёт за один проход.</li>
+    <li>При генерации декодер ест свои слова, и после первой ошибки оказывается в незнакомой ситуации — exposure bias; лекарство — scheduled sampling.</li>
+    <li>Служебные символы: &lt;SOS&gt; — первый вход декодера, &lt;EOS&gt; — конец источника и последнее слово цели, &lt;PAD&gt; — выравнивание строк, &lt;UNK&gt; — вместо редких слов. Батч по <a class="slide-ref" href="assets/slides/s04_067.webp" data-deck="s04" data-slide="67">слайду 67</a>: источник + &lt;EOS&gt;, вход декодера &lt;SOS&gt; + y, цель y + &lt;EOS&gt;, &lt;PAD&gt; до максимума батча, номера по словарю, длины строк.</li>
+    <li>Маска убирает &lt;PAD&gt; из функции ошибки, а длины строк не дают ему попасть в состояние кодировщика.</li>
+    <li>Точный argmax по \(|V|^n\) фразам невозможен. Greedy decoding берёт лучшее слово на каждом шаге и не может вернуться; beam search держит \(k\) гипотез по сумме логарифмов, при \(k = 1\) совпадает с greedy и всё равно не гарантирует лучшей фразы.</li>
+    <li>Без нормировки на длину поиск предпочитает короткие фразы, и больший \(k\) не всегда лучше. Если модель ставит правильный перевод выше выданного — подвёл поиск, если ниже — модель.</li>
+  </ul>
+</section>
+
+<section class="resources" id="l42-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://d2l.ai/chapter_recurrent-modern/seq2seq.html" target="_blank" rel="noopener">Sequence-to-Sequence Learning for Machine Translation</a>
+      <span class="res-by">Dive into Deep Learning, §10.7</span>
+      <p class="res-why">Этот урок в коде: teacher forcing — "the original target sequence (token labels) is fed into the decoder as input", &lt;bos&gt;, &lt;eos&gt;, &lt;pad&gt; и функция ошибки с маской, в которой заполнитель ничего не стоит. Следующий параграф, <a href="https://d2l.ai/chapter_recurrent-modern/beam-search.html" target="_blank" rel="noopener">§10.8 Beam Search</a>, разбирает greedy и луч на числах.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://lena-voita.github.io/nlp_course/seq2seq_and_attention.html" target="_blank" rel="noopener">Seq2seq and Attention</a>
+      <span class="res-by">Lena Voita, NLP Course | For You</span>
+      <p class="res-why">Источник картинок и примеров лекции. Части про обучение и про greedy и beam search; там же — почему луч обычно 4–10 и почему больший луч бывает хуже. Раздел про attention — дальше программы слайдов.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="после">
+      <a class="res-title" href="https://arxiv.org/abs/1506.03099" target="_blank" rel="noopener">Scheduled Sampling for Sequence Prediction with Recurrent Neural Networks</a>
+      <span class="res-by">Bengio, Vinyals, Jaitly, Shazeer, 2015</span>
+      <p class="res-why">Лекарство от exposure bias из первоисточника: переход от обучения с полной подсказкой к обучению на своих словах.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="после">
+      <a class="res-title" href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">Sequence to Sequence Learning with Neural Networks</a>
+      <span class="res-by">Sutskever, Vinyals, Le, 2014</span>
+      <p class="res-why">Статья, на которую ссылаются <a class="slide-ref" href="assets/slides/s04_065.webp" data-deck="s04" data-slide="65-66">слайды 65–66</a>. Четырёхслойные LSTM по 1000 клеток, перевёрнутый источник и вывод про декодирование: "a beam of size 2 provides most of the benefits of beam search".</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Функция ошибки, батчи, маски и шаг градиентного спуска описаны формулами. Как этот цикл выглядит в коде — от тензоров до кривых обучения — покажет модуль лабораторных на PyTorch, начиная с самой простой сети.</p>
+</aside>
+
+</main>
+</body>
+</html>

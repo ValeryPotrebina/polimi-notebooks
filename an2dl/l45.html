@@ -1,0 +1,1343 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Лаба 3. Подбор гиперпараметров без самообмана · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l45">
+
+<header class="lesson-head">
+  <h1>Лаба 3. Подбор гиперпараметров без самообмана</h1>
+  <p class="lede">После этого урока ты напишешь <code>make_split</code>, <code>cross_validate</code>, сетку, random search и objective для Optuna — и сможешь сказать, чего стоит каждое число, которое они печатают.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>В каждом validation-наборе этой лабы 238 белков, и ровно один из них относится к классу ERL. Сеть первой попытки его угадывает, и её macro F1 равен 0.559. Ошибись она на этом единственном белке, macro F1 упал бы до 0.459, а accuracy сдвинулась бы с 0.592 всего до 0.588.</p>
+  <p>Потом три стратегии поиска перебирают 80 конфигураций и делают 236 обучений. Лучшие результаты на validation: 0.601, 0.600 и 0.603. Весь поиск поднимает стартовую конфигурацию (0.570) примерно на 0.03 — на треть одного белка ERL.</p>
+  <p>Какой поиск победил и какое число честно написать в отчёте? Ответ в конце урока, и он не тот, что напрашивается.</p>
+</div>
+
+<section id="l45-data">
+  <h2>Один белок — десятая часть оценки</h2>
+
+  <p>Данные лабы — <span class="en" lang="en">Yeast</span>: 1484 белка пекарских дрожжей. Каждый описан восемью числами, посчитанными по его аминокислотной последовательности (есть ли сигнал, который ведёт белок в мембрану, ядро, митохондрию или пероксисому), и помечен одним из 10 мест в клетке, где он работает. Классы очень неравны: от CYT (цитоплазма, 463 белка) до ERL (просвет эндоплазматического ретикулума, 5 белков), 93 : 1.</p>
+
+<pre><code>X = dataset[features].values.astype(np.float32)
+y = dataset['Localisation Site'].map(
+    {name: i for i, name in enumerate(class_names)}
+).values.astype(np.int64)</code></pre>
+
+  <p>Получаются <code>X</code> формы (1484, 8) и <code>y</code> формы (1484,) с номерами классов от 0 (CYT) до 9 (ERL); типы <code>float32</code> и <code>int64</code> — как в первой лабе (<a href="l43.html">урок 43</a>). Сеть тоже знакомая: <code>FeedForwardNet</code> из <code>nn.Linear</code> и <code>nn.ReLU</code> с 10 logits на выходе; в стартовой конфигурации у неё два скрытых слоя по 128 нейронов, 18 954 параметра (веса и смещения).</p>
+
+  <p>Вопрос лабы — не «какая сеть лучше», а как выбрать конфигурацию и назвать её качество, не обманув себя, когда данных так мало.</p>
+
+  <p>Мерка качества, как и в <a href="l44.html#l44-data">уроке 44</a>, — <mark class="key">macro F1</mark>: F1 из <a href="l01.html#l01-metric">урока 1</a> для каждого класса отдельно («этот класс против остальных»), усреднённая без весов. По матрице ошибок:</p>
+
+  <div class="formula">
+    \[ F_{1,c} = \frac{2\,\mathrm{TP}_c}{2\,\mathrm{TP}_c + \mathrm{FP}_c + \mathrm{FN}_c} \]
+    \[ \text{macro } F_1 = \frac{1}{10} \sum_{c=1}^{10} F_{1,c} \]
+    <dl class="legend">
+      <dt>\(\mathrm{TP}_c\)</dt><dd>белки класса \(c\), которые сеть отнесла к&nbsp;\(c\)</dd>
+      <dt>\(\mathrm{FP}_c\)</dt><dd>чужие белки, отнесённые к&nbsp;\(c\)</dd>
+      <dt>\(\mathrm{FN}_c\)</dt><dd>белки класса \(c\), отнесённые к другим классам</dd>
+    </dl>
+  </div>
+
+  <p>В коде это <code>f1_score(y_true, y_pred, average='macro', zero_division=0)</code>. Каждый класс весит одну десятую, сколько бы в нём ни было белков: ответ «всем CYT» получает accuracy 0.311 (74 из 238), но macro F1 всего 0.047 — девять классов дают нули. Ровно 0.0474 и у сети после первой эпохи: похоже, она пока так и отвечает.</p>
+
+  <aside class="margin-note">Признак erl — флаг: он равен 1 только у 14 белков, и среди них все пять ERL. Самый редкий класс выдаёт себя одним числом.</aside>
+  <p>В validation у редких классов от 1 до 8 белков, и один такой белок сдвигает macro F1 на целые проценты. Ниже ответы сети первой попытки (о ней — в следующем разделе): попробуй сдвинуть по одному белку.</p>
+
+  <div class="widget" id="l45-w-protein">
+    <h3 class="widget-title">Цена одного белка</h3>
+    <p class="widget-intro">Матрица ошибок на 238 белках validation: строка — настоящий класс, столбец — ответ сети, на диагонали верные ответы. Выбери класс в списке или щелчком по строке и передвинь один его белок с диагонали в ошибку или обратно. Под матрицей F1 каждого класса; пунктирная линия — их среднее, macro F1.</p>
+    <ol class="tasks">
+      <li>Предскажи, на сколько упадут macro F1 и accuracy, если сеть ошибётся на единственном белке ERL. Потом выбери ERL и нажми «ошибиться на одном белке».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Macro F1: 0.5590 → 0.4587, минус 0.100. Accuracy: 0.5924 → 0.5882, минус 1/238 = 0.0042. F1 класса ERL падает с 1 до 0, а в среднем по десяти классам это одна десятая.</p></details>
+      </li>
+      <li>Сбрось матрицу и сделай то же с CYT. Во сколько раз белок ERL дороже белка CYT в macro F1 и в accuracy?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>У CYT macro F1 падает всего на 0.0013, accuracy — на те же 0.0042. В macro F1 один белок ERL весит почти как 80 белков CYT (0.100 / 0.0013), в accuracy все белки равны.</p></details>
+      </li>
+      <li>Сбрось и угадай по одному лишнему белку VAC, POX и EXC. Сколько прибавит macro F1? Сравни с тем, что весь поиск лабы прибавит к стартовой конфигурации, 0.03.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Плюс 0.080: с 0.559 до 0.639, accuracy при этом растёт только на 0.013. Три белка из 238 сдвигают оценку сильнее, чем перебор 80 конфигураций. Поэтому одному числу на одном разбиении верить нельзя: нужны несколько разбиений и среднее.</p></details>
+      </li>
+    </ol>
+  </div>
+<script>
+Course.widget('l45-w-protein', function (root, ui) {
+  var NAMES = ['CYT', 'NUC', 'MIT', 'ME3', 'ME2', 'ME1', 'EXC', 'VAC', 'POX', 'ERL'];
+  var M0 = [[48, 20, 5, 0, 0, 0, 1, 0, 0, 0], [28, 32, 7, 2, 0, 0, 0, 0, 0, 0], [12, 0, 26, 0, 0, 0, 0, 0, 1, 0],
+            [1, 2, 1, 22, 0, 0, 0, 0, 0, 0], [1, 1, 2, 0, 3, 1, 0, 0, 0, 0], [0, 0, 0, 1, 0, 6, 0, 0, 0, 0],
+            [1, 0, 1, 0, 0, 2, 2, 0, 0, 0], [3, 0, 0, 0, 1, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, 1, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]];
+  var N = 238, W = 560, H = 350, X0 = 60, Y0 = 56, CW = 44, CH = 28;
+  function copyM(m) { return m.map(function (r) { return r.slice(); }); }
+  /* F1 of class c = 2 TP / (row sum + column sum); a class never predicted and never present would get 0 (zero_division=0) */
+  function stats(m) {
+    var f = [], tp = 0, macro = 0;
+    for (var c = 0; c < 10; c++) {
+      var row = 0, col = 0;
+      for (var j = 0; j < 10; j++) { row += m[c][j]; col += m[j][c]; }
+      f.push(row + col > 0 ? 2 * m[c][c] / (row + col) : 0);
+      tp += m[c][c];
+    }
+    f.forEach(function (v) { macro += v; });
+    return { f: f, macro: macro / 10, acc: tp / N };
+  }
+  var S0 = stats(M0), M = copyM(M0), moved = null, last = '', msg = '';
+  var counts = M0.map(function (r) { return r.reduce(function (s, v) { return s + v; }, 0); });
+  function plural(n) { var a = n % 10, b = n % 100; return a === 1 && b !== 11 ? 'белок' : a >= 2 && a <= 4 && (b < 12 || b > 14) ? 'белка' : 'белков'; }
+  /* the largest off-diagonal cell of row c, the first one on ties; -1 when the row has no errors */
+  function worstCell(c) {
+    var jBest = -1, vBest = 0;
+    for (var j = 0; j < 10; j++) if (j !== c && M[c][j] > vBest) { vBest = M[c][j]; jBest = j; }
+    return jBest;
+  }
+
+  var board = ui.svg(W, H, { label: 'Матрица ошибок сети первой попытки на 238 белках validation: строка — настоящий класс, столбец — ответ сети' });
+  var plot = ui.plot({ x: [0.4, 10.6], y: [0, 1.12], xTicks: [], yTicks: [0, 0.5, 1], aspect: 2.6, minHeight: 230,
+    label: 'F1 каждого класса на validation сейчас и в начале, пунктир — macro F1' });
+  ui.legend([{ label: 'F1 класса сейчас', color: 's5', mark: 'square' }, { label: 'F1 класса в начале', color: 'muted', mark: 'dash' },
+             { label: 'macro F1', color: 'ink', mark: 'dash' }]);
+
+  var sel = ui.select('класс', NAMES.map(function (n, i) { return { value: n, label: n + ' · ' + counts[i] + ' ' + plural(counts[i]) }; }), null, 'ERL');
+  function cls() { return Math.max(0, NAMES.indexOf(sel.value)); }
+  function move(c, from, to) {
+    var before = stats(M);
+    M[c][from]--; M[c][to]++;
+    var after = stats(M), d = after.macro - before.macro;
+    moved = { r: c, a: from, b: to };
+    last = NAMES[c] + ': F1 класса ' + before.f[c].toFixed(2) + ' → ' + after.f[c].toFixed(2) + ', macro F1 ' + (d < 0 ? '−' : '+') + Math.abs(d).toFixed(4);
+    msg = '';
+  }
+  ui.button('ошибиться на одном белке', function () {
+    var c = cls();
+    if (M[c][c] === 0) { msg = 'У ' + NAMES[c] + ' не осталось верных ответов: портить нечего.'; return; }
+    var j = worstCell(c);
+    if (j < 0) j = c === 0 ? 1 : 0;
+    move(c, c, j);
+  }, { icon: 'cross' });
+  ui.button('угадать ещё один', function () {
+    var c = cls(), j = worstCell(c);
+    if (j < 0) { msg = 'Все белки ' + NAMES[c] + ' уже угаданы.'; return; }
+    move(c, j, c);
+  }, { icon: 'check' });
+  ui.button('сбросить', function () { M = copyM(M0); moved = null; last = ''; msg = ''; }, { kind: 'ghost', icon: 'refresh' });
+
+  var roAcc = ui.readout('accuracy', { digits: 4 }), roF1 = ui.readout('macro F1', { digits: 4 }), roLast = ui.readout('последний шаг');
+  var note = ui.note('');
+
+  function render() {
+    var sv = Course.svg, c0 = cls();
+    while (board.firstChild) board.removeChild(board.firstChild);
+    sv('text', { x: X0 + 5 * CW, y: 20, 'class': 'tx-mid tx-sm tx-muted', text: 'ответ сети' }, board);
+    sv('text', { x: X0 - 8, y: 44, 'class': 'tx-end tx-sm tx-muted', text: 'класс' }, board);
+    sv('text', { x: X0 + 10 * CW + 32, y: 44, 'class': 'tx-mid tx-sm tx-muted', text: 'всего' }, board);
+    NAMES.forEach(function (n, j) { sv('text', { x: X0 + j * CW + CW / 2, y: 44, 'class': 'tx-mid tx-sm', text: n }, board); });
+    NAMES.forEach(function (n, r) {
+      var y = Y0 + r * CH, g = sv('g', {}, board);
+      if (r === c0) sv('rect', { x: 4, y: y, width: W - 8, height: CH, 'class': 'fw-key st-none' }, g);
+      for (var j = 0; j < 10; j++) {
+        var v = M[r][j], x = X0 + j * CW;
+        sv('rect', { x: x, y: y, width: CW, height: CH, 'class': 'st-grid sw-1' + (v > 0 ? (j === r ? ' fw-good' : ' fw-bad') : '') }, g);
+        if (v > 0 || j === r) sv('text', { x: x + CW / 2, y: y + 19, 'class': 'tx-mid' + (v > 0 ? '' : ' tx-muted'), text: String(v) }, g);
+        if (moved && moved.r === r && (moved.a === j || moved.b === j)) sv('rect', { x: x + 2, y: y + 2, width: CW - 4, height: CH - 4, 'class': 'st-key sw-3' }, g);
+      }
+      sv('text', { x: X0 - 8, y: y + 19, 'class': 'tx-end' + (r === c0 ? ' tx-bold' : ''), text: n }, g);
+      sv('text', { x: X0 + 10 * CW + 32, y: y + 19, 'class': 'tx-mid tx-muted', text: String(counts[r]) }, g);
+      sv('rect', { x: 4, y: y, width: W - 8, height: CH, 'class': 'st-none', 'pointer-events': 'all', cursor: 'pointer',
+        onclick: function () { sel.value = n; ui.changed(); } }, g);
+    });
+  }
+
+  plot.draw(function (g) {
+    var s = stats(M), c0 = cls();
+    var c;
+    /* class c sits at x = c + 1, so that no axis line of x = 0 runs through the first bar */
+    for (c = 0; c < 10; c++) {
+      g.rect(c + 0.7, 0, c + 1.3, s.f[c], { color: 's5', alpha: c === c0 ? 0.7 : 0.4, width: 1.5 });
+      g.rect(c + 0.64, 0, c + 1.36, S0.f[c], { fill: false, stroke: 'muted', dash: [4, 3], width: 1.2 });
+    }
+    g.hline(s.macro, { color: 'ink', dash: true, width: 1.5 });
+    var ctx = g.ctx, ly = g.py(s.macro), labels = [];
+    for (c = 0; c < 10; c++) {
+      /* the value sits 3 px above its bar; when the macro F1 line would run through it, it moves up above the line.
+         A paper patch keeps the dashed outlines of the start out of the digits */
+      var lbl = s.f[c].toFixed(2), tx = g.px(c + 1), ty = g.py(s.f[c]) - 3;
+      if (ly > ty - 14 && ly < ty + 2) ty = ly - 4;
+      ctx.save(); ctx.font = '500 10.5px sans-serif';
+      var tw = ctx.measureText(lbl).width + 6;
+      ctx.fillStyle = g.colors.stage; ctx.fillRect(tx - tw / 2, ty - 12, tw, 12); ctx.restore();
+      labels.push([c + 1, s.f[c], lbl, ty - g.py(s.f[c])]);
+    }
+    labels.forEach(function (L) { g.text(L[0], L[1], L[2], { align: 'center', baseline: 'bottom', dy: L[3], size: 10.5, color: 'soft' }); });
+    for (c = 0; c < 10; c++) {
+      g.text(c + 1, 0, NAMES[c], { align: 'center', baseline: 'top', dy: 6, size: 11, color: c === c0 ? 'ink' : 'soft', weight: c === c0 ? 700 : 500 });
+    }
+  });
+
+  ui.onChange(function () {
+    var s = stats(M);
+    roAcc.set(s.acc);
+    roF1.set(s.macro);
+    roLast.set(last || '—');
+    note.set(msg || 'Щёлкни по строке матрицы или выбери класс в списке.');
+    render();
+  });
+});
+</script>
+
+  <p class="memo"><mark class="key">Одна macro F1 на 238 белках — лотерея: её двигают единичные белки редких классов.</mark></p>
+</section>
+
+<section id="l45-splits">
+  <h2>Одно разбиение — один жребий</h2>
+
+  <p>Сеть первой попытки обучена по схеме <span class="en" lang="en">hold-out</span> (<a href="l18.html#l18-holdout">урок 18</a>): одно случайное разбиение на training, validation и test и <span class="en" lang="en">early stopping</span> по validation macro F1 с <span class="en" lang="en">patience</span> 20 (<a href="l20.html#l20-patience">урок 20</a>). Её validation macro F1 — 0.559. Хороша ли конфигурация? Одно число этого не скажет. Лаба проверяет прямо: та же конфигурация с теми же начальными весами на трёх случайных стратифицированных разбиениях даёт 0.559, 0.566 и 0.585.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l45-fig-draw">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Hold-out: validation macro F1 по эпохам на одном разбиении; рекорд 0.559 на 24-й эпохе, через 20 эпох без рекорда остановка на 44-й">
+        <line x1="42" y1="112.2" x2="286" y2="112.2" class="st-grid sw-1"/>
+        <line x1="42" y1="38.3" x2="286" y2="38.3" class="st-grid sw-1"/>
+        <rect x="100.6" y="26" width="48.8" height="160" class="fw-key st-none"/>
+        <line x1="100.6" y1="26" x2="100.6" y2="186" class="st-muted sw-1 dash"/>
+        <line x1="42" y1="186" x2="286" y2="186" class="sw-1"/>
+        <line x1="42" y1="26" x2="42" y2="186" class="sw-1"/>
+        <polyline points="44.4,174.4 46.9,174.9 49.3,163.1 51.8,156.2 54.2,134.6 56.6,120.0 59.1,108.2 61.5,99.4 64.0,104.0 66.4,91.7 68.8,91.7 71.3,77.7 73.7,74.5 76.2,74.0 78.6,80.9 81.0,82.4 83.5,74.7 85.9,80.4 88.4,80.2 90.8,75.2 93.2,50.1 95.7,51.1 98.1,52.1 100.6,47.9 103.0,54.3 105.4,53.6 107.9,51.6 110.3,49.4 112.8,54.3 115.2,53.1 117.6,53.1 120.1,55.5 122.5,52.3 125.0,51.4 127.4,53.1 129.8,48.9 132.3,52.6 134.7,53.1 137.2,49.4 139.6,52.1 142.0,49.4 144.5,54.3 146.9,50.6 149.4,60.5" class="st-s5 sw-2"/>
+        <line x1="156" y1="54" x2="107" y2="48.5" class="st-muted sw-1"/>
+        <circle cx="100.6" cy="47.9" r="4.5" class="fi-s5 st-paper sw-2"/>
+        <text x="36" y="190" class="tx-end tx-sm">0</text>
+        <text x="36" y="116" class="tx-end tx-sm">0.3</text>
+        <text x="36" y="42" class="tx-end tx-sm">0.6</text>
+        <text x="42" y="202" class="tx-mid tx-sm">0</text>
+        <text x="164" y="202" class="tx-mid tx-sm">50</text>
+        <text x="286" y="202" class="tx-mid tx-sm">100</text>
+        <text x="164" y="217" class="tx-mid tx-sm tx-muted">эпоха</text>
+        <text x="46" y="16" class="tx-sm tx-muted">val macro F1</text>
+        <text x="160" y="58" class="tx-sm">checkpoint: эпоха 24</text>
+        <text x="160" y="80" class="tx-bold">val F1 = 0.559</text>
+        <text x="160" y="134" class="tx-sm">стоп: эпоха 44</text>
+        <text x="160" y="154" class="tx-sm tx-muted">20 эпох без рекорда</text>
+      </svg>
+      <p class="fig-label">До: одно разбиение — одно число</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 220" role="img" aria-label="Та же конфигурация на трёх случайных разбиениях: лучшие эпохи 24, 67 и 20, оценки 0.559, 0.566 и 0.585, среднее 0.570">
+        <line x1="42" y1="112.2" x2="286" y2="112.2" class="st-grid sw-1"/>
+        <line x1="42" y1="38.3" x2="286" y2="38.3" class="st-grid sw-1"/>
+        <line x1="42" y1="186" x2="286" y2="186" class="sw-1"/>
+        <line x1="42" y1="26" x2="42" y2="186" class="sw-1"/>
+        <polyline points="44.4,174.4 46.9,174.9 49.3,163.1 51.8,156.2 54.2,134.6 56.6,120.0 59.1,108.2 61.5,99.4 64.0,104.0 66.4,91.7 68.8,91.7 71.3,77.7 73.7,74.5 76.2,74.0 78.6,80.9 81.0,82.4 83.5,74.7 85.9,80.4 88.4,80.2 90.8,75.2 93.2,50.1 95.7,51.1 98.1,52.1 100.6,47.9 103.0,54.3 105.4,53.6 107.9,51.6 110.3,49.4 112.8,54.3 115.2,53.1 117.6,53.1 120.1,55.5 122.5,52.3 125.0,51.4 127.4,53.1 129.8,48.9 132.3,52.6 134.7,53.1 137.2,49.4 139.6,52.1 142.0,49.4 144.5,54.3 146.9,50.6 149.4,60.5" class="st-s5 sw-2"/>
+        <polyline points="44.4,174.4 46.9,174.7 49.3,171.2 51.8,155.5 54.2,156.0 56.6,123.5 59.1,115.1 61.5,99.8 64.0,107.7 66.4,96.2 68.8,89.8 71.3,90.7 73.7,92.0 76.2,92.0 78.6,90.2 81.0,67.8 83.5,56.8 85.9,68.3 88.4,65.6 90.8,65.4 93.2,62.9 95.7,63.9 98.1,61.7 100.6,66.1 103.0,64.2 105.4,56.8 107.9,56.5 110.3,55.8 112.8,61.7 115.2,66.4 117.6,61.2 120.1,66.4 122.5,63.2 125.0,59.7 127.4,54.6 129.8,63.9 132.3,64.9 134.7,60.2 137.2,60.2 139.6,54.8 142.0,54.1 144.5,60.0 146.9,60.2 149.4,52.3 151.8,63.7 154.2,56.3 156.7,52.8 159.1,57.0 161.6,57.0 164.0,61.9 166.4,54.6 168.9,62.2 171.3,61.4 173.8,50.4 176.2,56.3 178.6,52.6 181.1,55.3 183.5,50.1 186.0,58.5 188.4,54.8 190.8,55.0 193.3,61.4 195.7,53.6 198.2,58.2 200.6,59.5 203.0,62.4 205.5,46.7 207.9,52.3 210.4,54.8 212.8,52.1 215.2,54.1 217.7,55.5 220.1,50.6 222.6,59.5 225.0,55.3 227.4,58.0 229.9,56.3 232.3,47.7 234.8,61.2 237.2,51.1 239.6,60.0 242.1,50.6 244.5,56.8 247.0,52.6 249.4,51.6 251.8,57.3 254.3,55.8" class="st-s5 sw-2 dash"/>
+        <polyline points="44.4,174.4 46.9,173.7 49.3,169.3 51.8,169.5 54.2,129.6 56.6,126.9 59.1,105.0 61.5,95.7 64.0,95.2 66.4,77.4 68.8,83.4 71.3,74.5 73.7,71.0 76.2,71.8 78.6,68.1 81.0,58.2 83.5,45.2 85.9,46.7 88.4,48.6 90.8,42.0 93.2,47.9 95.7,48.4 98.1,47.7 100.6,45.7 103.0,45.2 105.4,48.4 107.9,50.1 110.3,46.9 112.8,50.9 115.2,51.1 117.6,50.1 120.1,43.7 122.5,51.6 125.0,46.4 127.4,50.4 129.8,48.9 132.3,48.6 134.7,45.7 137.2,48.2 139.6,50.9" class="st-s5 sw-3 dots"/>
+        <circle cx="100.6" cy="47.9" r="4" class="fi-s5 st-paper sw-2"/>
+        <circle cx="205.5" cy="46.7" r="4" class="fi-s5 st-paper sw-2"/>
+        <circle cx="90.8" cy="42.0" r="4" class="fi-s5 st-paper sw-2"/>
+        <line x1="160" y1="96" x2="184" y2="96" class="st-s5 sw-2"/>
+        <line x1="160" y1="118" x2="184" y2="118" class="st-s5 sw-2 dash"/>
+        <line x1="160" y1="140" x2="184" y2="140" class="st-s5 sw-3 dots"/>
+        <text x="36" y="190" class="tx-end tx-sm">0</text>
+        <text x="36" y="116" class="tx-end tx-sm">0.3</text>
+        <text x="36" y="42" class="tx-end tx-sm">0.6</text>
+        <text x="42" y="202" class="tx-mid tx-sm">0</text>
+        <text x="164" y="202" class="tx-mid tx-sm">50</text>
+        <text x="286" y="202" class="tx-mid tx-sm">100</text>
+        <text x="164" y="217" class="tx-mid tx-sm tx-muted">эпоха</text>
+        <text x="46" y="16" class="tx-sm tx-muted">val macro F1</text>
+        <text x="192" y="100" class="tx-sm">1: 0.559</text>
+        <text x="192" y="122" class="tx-sm">2: 0.566</text>
+        <text x="192" y="144" class="tx-sm">3: 0.585</text>
+        <text x="160" y="172" class="tx-bold">0.570&nbsp;±&nbsp;0.011</text>
+      </svg>
+      <p class="fig-label">После: три разбиения — три числа</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Validation macro F1 по эпохам, одна конфигурация и одни начальные веса. Слева hold-out: рекорд на 24-й эпохе, 20 эпох без рекорда (жёлтая полоса), остановка и возврат к рекорду. Справа три разбиения: лучшие эпохи 24, 67 и 20. Кривые — из повторного прогона кода лабы, числа — из лога.</figcaption>
+  </figure>
+
+  <p>Разница 0.026 между худшим и лучшим разбиением — почти столько же, сколько потом даст весь поиск, а меняется только жребий: какие белки учат сеть, а какие её проверяют. Отсюда правило лабы: конфигурацию оценивают средним по нескольким разбиениям, а разницу между конфигурациями сравнивают с разбросом.</p>
+
+  <figure class="fig fig--plain" id="l45-fig-schemes">
+    <svg class="dia" viewBox="0 0 560 400" role="img" aria-label="Пять схем проверки: только training; test hold-out 80 на 20; train, validation, test 60 на 20 на 20; K-fold, где блоки validation и test сдвигаются; K-shuffle-split, где каждый ряд — отдельный случайный жребий">
+      <rect x="20" y="10" width="14" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="150" y="10" width="14" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="300" y="10" width="14" height="12" class="fw-ink sw-1"/>
+      <text x="40" y="21">training</text>
+      <text x="170" y="21">validation</text>
+      <text x="320" y="21">test</text>
+
+      <text x="20" y="62">Только training — для отладки</text>
+      <rect x="20" y="72" width="520" height="18" class="fw-s4 st-s4 sw-2"/>
+
+      <text x="20" y="120">Test hold-out, например 80 / 20</text>
+      <rect x="20" y="130" width="416" height="18" class="fw-s4 st-s4 sw-2"/>
+      <rect x="436" y="130" width="104" height="18" class="fw-ink sw-2"/>
+
+      <text x="20" y="178">Train / validation / test, например 60 / 20 / 20</text>
+      <rect x="20" y="188" width="312" height="18" class="fw-s4 st-s4 sw-2"/>
+      <rect x="332" y="188" width="104" height="18" class="fw-s5 st-s5 sw-2"/>
+      <rect x="436" y="188" width="104" height="18" class="fw-ink sw-2"/>
+
+      <text x="20" y="236">K-fold: validation и test сдвигаются по блокам</text>
+      <rect x="20" y="246" width="312" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="332" y="246" width="104" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="436" y="246" width="104" height="12" class="fw-ink sw-1"/>
+      <rect x="20" y="264" width="208" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="228" y="264" width="104" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="332" y="264" width="104" height="12" class="fw-ink sw-1"/>
+      <rect x="436" y="264" width="104" height="12" class="fw-s4 st-s4 sw-1"/>
+      <circle cx="270" cy="284" r="1.6" class="fi-ink st-none"/>
+      <circle cx="280" cy="284" r="1.6" class="fi-ink st-none"/>
+      <circle cx="290" cy="284" r="1.6" class="fi-ink st-none"/>
+      <rect x="20" y="292" width="104" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="124" y="292" width="104" height="12" class="fw-ink sw-1"/>
+      <rect x="228" y="292" width="312" height="12" class="fw-s4 st-s4 sw-1"/>
+
+      <text x="20" y="332">K-shuffle-split: K случайных разбиений</text>
+      <text x="540" y="332" class="tx-end tx-hand">так в лабе</text>
+      <rect x="20" y="342" width="52" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="72" y="342" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="85" y="342" width="39" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="124" y="342" width="26" height="12" class="fw-ink sw-1"/>
+      <rect x="150" y="342" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="163" y="342" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="176" y="342" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="189" y="342" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="202" y="342" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="215" y="342" width="39" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="254" y="342" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="267" y="342" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="280" y="342" width="26" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="306" y="342" width="52" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="358" y="342" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="371" y="342" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="384" y="342" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="397" y="342" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="410" y="342" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="423" y="342" width="78" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="501" y="342" width="26" height="12" class="fw-ink sw-1"/>
+      <rect x="527" y="342" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="20" y="360" width="26" height="12" class="fw-ink sw-1"/>
+      <rect x="46" y="360" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="72" y="360" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="85" y="360" width="52" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="137" y="360" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="150" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="163" y="360" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="176" y="360" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="189" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="202" y="360" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="215" y="360" width="52" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="267" y="360" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="280" y="360" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="293" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="306" y="360" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="319" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="332" y="360" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="345" y="360" width="52" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="397" y="360" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="410" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="423" y="360" width="26" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="449" y="360" width="39" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="488" y="360" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="501" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="514" y="360" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="527" y="360" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="20" y="378" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="46" y="378" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="59" y="378" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="72" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="85" y="378" width="52" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="137" y="378" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="150" y="378" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="176" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="189" y="378" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="202" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="215" y="378" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="228" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="241" y="378" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="254" y="378" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="280" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="293" y="378" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="319" y="378" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="332" y="378" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="358" y="378" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="371" y="378" width="26" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="397" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="410" y="378" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="423" y="378" width="13" height="12" class="fw-ink sw-1"/>
+      <rect x="436" y="378" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="449" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="462" y="378" width="39" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="501" y="378" width="13" height="12" class="fw-s5 st-s5 sw-1"/>
+      <rect x="514" y="378" width="13" height="12" class="fw-s4 st-s4 sw-1"/>
+      <rect x="527" y="378" width="13" height="12" class="fw-ink sw-1"/>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Пять схем проверки модели: в трёх верхних одно обучение, в двух нижних — K. В K-fold validation-блоки разных рядов не пересекаются. В K-shuffle-split каждый ряд — независимый жребий; здесь первые 40 белков лабы в трёх её разбиениях: 22 из них ни разу не попадают в validation, 5 — ни разу в training.</figcaption>
+  </figure>
+
+  <p>Лаба выбирает нижнюю схему, <mark class="key">K-shuffle-split</mark>: K независимых случайных разбиений, у каждого своё зерно. В sklearn это <code>StratifiedShuffleSplit</code>, в литературе — <span class="en" lang="en">Monte Carlo cross-validation</span>. В отличие от K-fold (<a href="l19.html#l19-kfold">урок 19</a>), validation-наборы разных разбиений перекрываются: одни белки проверяются дважды, другие ни разу. При K = 3 и доле validation 16&nbsp;% белок минует validation одного разбиения с вероятностью 0.84, а всех трёх — с вероятностью \(0.84^3 \approx 0.59\). Так и вышло: ни разу не проверяются 880 белков из 1484, 59&nbsp;%, а 85 белков ни разу не попадают в training. Взамен K не связан с долей validation: в 3-fold на проверку ушла бы треть данных.</p>
+
+  <p>Каждое разбиение строит <code>make_split</code>:</p>
+
+<pre><code>X_train_val, X_test, y_train_val, y_test = train_test_split(
+    X, y, test_size=test_size,
+    random_state=seed + split, stratify=y)                   # (1)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train_val, y_train_val, test_size=test_size,
+    random_state=seed + split, stratify=y_train_val)
+low, high = X_train.min(axis=0), X_train.max(axis=0)         # (2)
+span = np.where(high &gt; low, high - low, 1.0)                 # (3)
+X_train, X_val, X_test = [((part - low) / span).astype(np.float32)
+                          for part in (X_train, X_val, X_test)]
+train_loader = DataLoader(
+    TensorDataset(torch.from_numpy(X_train),
+                  torch.from_numpy(y_train)),
+    batch_size=batch_size, shuffle=True)                     # (4)</code></pre>
+
+  <ol>
+    <li><code>random_state=seed + split</code> (<code>seed</code> по умолчанию равен <code>SEED</code> = 42): разбиение номер <code>split</code> — свой жребий, но воспроизводимый. <code>stratify</code> сохраняет доли классов в каждой части, вплоть до ERL: 3&nbsp;/&nbsp;1&nbsp;/&nbsp;1. Без стратификации validation из 238 белков в 42&nbsp;% жребиев (\(\approx 0.84^5\)) остался бы без единого ERL, и macro F1 разных разбиений усреднял бы разные наборы классов.</li>
+    <li>Минимум и максимум берутся только по <code>X_train</code>: статистики validation и test не должны попадать в обучение (<span class="en" lang="en">leakage</span>, утечка; <a href="l18.html#l18-leak">урок 18</a>). Те же <code>low</code> и <code>span</code> применяются ко всем трём частям.</li>
+    <li>Признак, постоянный на training, сохраняет масштаб 1: защита от деления на ноль.</li>
+    <li>Перемешивается только training; загрузчики validation и test (в блок не вошли) — без <code>shuffle</code>, батчами по 256. <code>make_split</code> возвращает все три.</li>
+  </ol>
+
+  <p>В каждом разбиении 949 / 238 / 297 белков (64 / 16 / 20&nbsp;%), и у каждого свой test. Test-наборы тоже перекрываются: любые два делят 57–61 белок. Это и не nested cross-validation (<a href="l19.html#l19-nested">урок 19</a>): там выбор делают заново в каждом внешнем раунде, не глядя на его test, а здесь одну конфигурацию выбирают по validation всех разбиений сразу.</p>
+</section>
+
+<section id="l45-cv">
+  <h2>Конфигурация — словарь, оценка — три обучения</h2>
+
+  <p>Оценку конфигурации упаковывают в функцию, а все её <span class="en" lang="en">hyperparameters</span> — в словарь. Стартовый словарь — <code>BASE_CONFIG</code>: batch 32, learning rate 1e-3, два слоя по 128 нейронов, без dropout и без weight decay. Настройки, общие для всех обучений (loss, 100 эпох, patience 20, macro F1 как монитор), собраны в <code>TRAIN_SETTINGS</code>. Одна оценка конфигурации — три обучения по схеме рис. 3.</p>
+
+  <figure class="fig fig--plain" id="l45-fig-pipe">
+    <svg class="dia" viewBox="0 0 560 640" role="img" aria-label="Конвейер одной оценки конфигурации: make_split делит X и y на training 949, validation 238 и test 297; батчи x [32, 8] проходят сеть 8-128-128-10, дают logits [32, 10], loss, backward и шаг оптимизатора, 30 раз за эпоху; после эпохи считается val macro F1, после 20 эпох без рекорда обучение останавливается; три разбиения дают оценку конфигурации">
+      <rect x="110" y="10" width="340" height="44" class="fi-paper"/>
+      <text x="280" y="38" class="tx-mid tx-mono tx-bold">X (1484, 8) · y (1484,)</text>
+      <line x1="200" y1="54" x2="124" y2="86" marker-end="url(#arr)"/>
+      <line x1="280" y1="54" x2="303" y2="86" marker-end="url(#arr)"/>
+      <line x1="360" y1="54" x2="458" y2="86" marker-end="url(#arr)"/>
+      <text x="20" y="78" class="tx-mono">make_split</text>
+
+      <rect x="20" y="90" width="200" height="52" class="fw-s4 st-s4 sw-2"/>
+      <text x="120" y="112" class="tx-mid tx-bold">training</text>
+      <text x="120" y="134" class="tx-mid tx-mono">949</text>
+      <rect x="240" y="90" width="130" height="52" class="fw-s5 st-s5 sw-2"/>
+      <text x="305" y="112" class="tx-mid tx-bold">validation</text>
+      <text x="305" y="134" class="tx-mid tx-mono">238</text>
+      <rect x="390" y="90" width="150" height="52" class="fw-ink sw-2"/>
+      <text x="465" y="112" class="tx-mid tx-bold">test</text>
+      <text x="465" y="134" class="tx-mid tx-mono">297</text>
+      <text x="465" y="178" class="tx-mid tx-hand">ждёт конца</text>
+
+      <line x1="120" y1="142" x2="120" y2="188" marker-end="url(#arr)"/>
+      <text x="132" y="162" class="tx-mono">DataLoader</text>
+      <text x="132" y="184" class="tx-mono">shuffle=True</text>
+      <rect x="20" y="192" width="200" height="52" class="fi-paper"/>
+      <text x="120" y="214" class="tx-mid tx-bold">батч</text>
+      <text x="120" y="236" class="tx-mid tx-mono">x [32, 8] · y [32]</text>
+      <line x1="120" y1="244" x2="120" y2="270" marker-end="url(#arr)"/>
+      <rect x="20" y="274" width="200" height="52" class="fw-s3 st-s3"/>
+      <text x="120" y="296" class="tx-mid">8 → 128 → 128 → 10</text>
+      <text x="120" y="318" class="tx-mid tx-mono">logits [32, 10]</text>
+      <line x1="120" y1="326" x2="120" y2="352" marker-end="url(#arr)"/>
+      <rect x="20" y="356" width="200" height="52" class="fi-paper"/>
+      <text x="120" y="378" class="tx-mid tx-mono">CrossEntropyLoss</text>
+      <text x="120" y="400" class="tx-mid tx-mono">backward(), step()</text>
+      <polyline points="220,382 238,382 238,218 224,218" marker-end="url(#arr)"/>
+      <text x="246" y="304">×30</text>
+      <polyline points="120,408 120,430 286,430" marker-end="url(#arr)"/>
+      <text x="130" y="452" class="tx-sm">конец эпохи</text>
+
+      <line x1="305" y1="142" x2="305" y2="400" marker-end="url(#arr)"/>
+      <rect x="290" y="404" width="250" height="52" class="fw-s5 st-s5"/>
+      <text x="415" y="426" class="tx-mid tx-bold">val macro F1</text>
+      <text x="415" y="448" class="tx-mid tx-sm">рекорд → checkpoint</text>
+      <line x1="415" y1="456" x2="415" y2="486" marker-end="url(#arr)"/>
+      <text x="403" y="476" class="tx-end tx-sm">20 эпох без рекорда</text>
+      <rect x="290" y="490" width="250" height="52" class="fi-paper"/>
+      <text x="415" y="512" class="tx-mid tx-bold">оценка разбиения</text>
+      <text x="415" y="534" class="tx-mid tx-sm">val F1 лучшей эпохи</text>
+      <line x1="415" y1="542" x2="415" y2="572" marker-end="url(#arr)"/>
+      <text x="403" y="562" class="tx-end tx-sm">× 3 разбиения</text>
+      <rect x="290" y="576" width="250" height="52" class="fi-paper sw-2"/>
+      <text x="415" y="598" class="tx-mid tx-mono">0.559 · 0.566 · 0.585</text>
+      <text x="415" y="620" class="tx-mid tx-mono tx-bold">0.570&nbsp;±&nbsp;0.011</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Одна оценка конфигурации с формами тензоров. Эпоха — 30 шагов AdamW по батчам из 32 белков (последний — 21). После эпохи считается macro F1 на validation; после 20 эпох без рекорда обучение останавливается и возвращается к лучшей. Test не участвует.</figcaption>
+  </figure>
+
+<pre><code>def train_on_split(X, y, config, split, criterion, device,
+                   test_size, epochs, patience, metric):
+    train_loader, val_loader, _ = make_split(
+        X, y, split, config['batch_size'], test_size)
+    model = make_model(config['hidden_layers'],              # (1)
+                       config['hidden_size'],
+                       config['dropout_rate'])
+    optimizer = torch.optim.AdamW(                           # (2)
+        model.parameters(), lr=config['learning_rate'],
+        weight_decay=config['weight_decay'])
+    history = fit(model, train_loader, val_loader, criterion,
+                  optimizer, device, epochs, metric=metric,
+                  patience=patience, verbose=0)
+    return max(history[f'val_{metric}']), history, model     # (3)</code></pre>
+
+  <ol>
+    <li><code>make_model</code> начинается с <code>torch.manual_seed(SEED)</code>: сеть одной архитектуры стартует с одних и тех же весов в любом разбиении и любой конфигурации. Разница между разбиениями идёт только от данных; цена — разброс от инициализации в оценку не попадает.</li>
+    <li><code>AdamW</code> из <a href="l44.html#l44-reg">урока 44</a>: перед каждым шагом Adam вес умножается на \(1 - \eta\lambda\), где <code>lr</code> = \(\eta\), <code>weight_decay</code> = \(\lambda\). По умолчанию у <code>AdamW</code> <code>weight_decay=0.01</code>, так что аргумент обязателен: без него <code>BASE_CONFIG</code> тихо получил бы затухание весов.</li>
+    <li><code>fit</code> в конце возвращает сеть к весам лучшей эпохи, поэтому <code>max(history['val_f1'])</code> — оценка ровно той сети, которую функция отдаёт.</li>
+  </ol>
+
+  <p><code>cross_validate</code> повторяет её на K разбиениях; <code>zip(*[...])</code> переставляет K троек (оценка, история, сеть) в три кортежа по K:</p>
+
+<pre><code>def cross_validate(X, y, config, k, **train_settings):
+    scores, histories, models = zip(*[
+        train_on_split(X, y, config, split, **train_settings)
+        for split in range(k)])
+    return np.array(scores), list(histories), list(models)</code></pre>
+
+  <p>Для <code>BASE_CONFIG</code> функция <code>cross_validate</code> возвращает 0.5590, 0.5657 и 0.5852, и лаба печатает 0.5700&nbsp;±&nbsp;0.0111. Первое число повторяет hold-out до последней цифры: то же разбиение, те же начальные веса и тот же оптимизатор — <code>AdamW</code> с <code>weight_decay=0</code> и есть Adam.</p>
+
+  <div class="pitfall"><p>«±&nbsp;0.0111 — это погрешность оценки». Не совсем. Это <code>np.std</code> трёх чисел с <code>ddof=0</code>; выборочное стандартное отклонение (<code>ddof=1</code>) в \(\sqrt{3/2} \approx 1.22\) раза больше, 0.0136. Разброс от инициализации в ± не входит, а разбиения делят много общих белков, и три числа зависимы. Читай ± как скорее заниженную оценку разброса, а не как доверительный интервал.</p></div>
+
+  <aside class="margin-note">Зерно хрупкое: каждый проход DataLoader, даже по validation, берёт число из общего генератора torch, и один лишний evaluate в цикле меняет все следующие перемешивания.</aside>
+  <p>Все числа урока — из нашего прогона: CPU, torch 2.15, seed 42. На GPU в Colab или с другим seed третий знак будет другим, и победитель любой сетки может смениться. Устойчиво другое: одна конфигурация получает от 0.56 до 0.59 на разных разбиениях, lr 1e-4 за 100 эпох не доучивается, у каждого победителя validation выше test, а три поиска выходят на одно плато.</p>
+</section>
+
+<section id="l45-grid">
+  <h2>Сетка и правило остановки</h2>
+
+  <p>Самый прямой способ сравнить конфигурации — поиск по сетке (<span class="en" lang="en">grid search</span>, <a href="l21.html#l21-grid-random">урок 21</a>): перебрать все сочетания перечисленных значений. Внутри <code>grid_search</code> это один цикл по <code>itertools.product</code>:</p>
+
+<pre><code>for values in product(*grid.values()):
+    changes = dict(zip(grid, values))          # (1)
+    config = {**base_config, **changes}        # (2)
+    start = time.time()
+    scores, _, _ = cross_validate(X, y, config, k, **train_settings)</code></pre>
+
+  <ol>
+    <li><code>product</code> выдаёт все сочетания значений: для <code>{'hidden_layers': [1, 2, 3], 'hidden_size': [32, 128, 512]}</code> это 9 пар, а <code>zip</code> возвращает им имена.</li>
+    <li>Новый словарь: изменённые значения поверх базовых; сам <code>base_config</code> не меняется.</li>
+  </ol>
+
+  <p>Сетка идёт в пять этапов. Первые три отталкиваются от <code>BASE_CONFIG</code>: batch size (5 значений), learning rate (5), глубина × ширина (9). Ширина помогает сильнее глубины: 2&nbsp;×&nbsp;512 даёт 0.597, 2&nbsp;×&nbsp;32 — 0.485, а 3&nbsp;×&nbsp;512 — те же 0.597. Дальше сетка строится на лучшем: dropout × weight decay на архитектуре 2&nbsp;×&nbsp;512 (9 конфигураций) и learning rate × batch size на лучшей регуляризации (12). Всего 40 конфигураций и 120 обучений.</p>
+
+  <figure class="tbl-fig" id="l45-tbl-lrbatch">
+    <figcaption>Последний этап сетки: средний validation macro F1 по трём разбиениям; 2&nbsp;×&nbsp;512, dropout 0, weight decay 0.1. Разброс по разбиениям от&nbsp;±&nbsp;0.0004 до&nbsp;±&nbsp;0.053, у победителя&nbsp;±&nbsp;0.016.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th>learning rate</th><th>batch 8</th><th>batch 32</th><th>batch 128</th></tr></thead>
+        <tbody>
+          <tr><td class="num">3e-4</td><td class="num">0.593</td><td class="num">0.585</td><td class="num">0.538</td></tr>
+          <tr class="is-key"><td class="num">1e-3</td><td class="num">0.597</td><td class="num">0.599</td><td class="num"><b>0.601</b></td></tr>
+          <tr><td class="num">3e-3</td><td class="num">0.574</td><td class="num">0.586</td><td class="num">0.593</td></tr>
+          <tr><td class="num">1e-2</td><td class="num">0.531</td><td class="num">0.588</td><td class="num">0.585</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>Победитель сетки — batch 128, lr 1e-3: 0.6008&nbsp;±&nbsp;0.0160. Соседи по строке отстают на 0.002 и 0.004, в 4–8 раз меньше разброса. Верить стоит форме таблицы, а не лучшей клетке: хорошие клетки идут от «маленький шаг — маленький batch» к «большой шаг — большой batch». Маленький batch даёт шумный градиент и больше шагов за эпоху (<a href="l27.html#l27-noise">урок 27</a>), поэтому ему подходит шаг поменьше.</p>
+
+  <h3>Правило остановки тоже выбирает</h3>
+
+  <p>Каждое из 120 обучений останавливает early stopping внутри <code>fit</code>:</p>
+
+<pre><code>if val_score &gt; best_score:                              # (1)
+    best_score, wait = val_score, 0
+    history['best_epoch'] = epoch
+    best_state = copy.deepcopy(model.state_dict())      # (2)
+else:
+    wait += 1
+stop = patience &gt; 0 and wait &gt;= patience                # (3)</code></pre>
+
+  <ol>
+    <li>Рекорд — только строго лучшее значение: равное не сбрасывает счётчик.</li>
+    <li><code>copy.deepcopy</code> — как в <a href="l44.html#l44-stop">уроке 44</a>: <code>state_dict()</code> отдаёт ссылки на живые тензоры.</li>
+    <li>Остановка после <code>patience</code> эпох без рекорда. В конце <code>fit</code> загружает лучшие веса: <code>model.load_state_dict(best_state)</code>.</li>
+  </ol>
+
+  <p>Монитор здесь — validation macro F1, а не loss: по F1 выбирают, по нему и останавливают. Но F1 на 238 белках скачет на 0.01–0.02 от эпохи к эпохе и надолго застревает на плато, пока loss ещё падает. Patience 20 на такой кривой — тоже hyperparameter, и он влияет на итоговое сравнение.</p>
+
+  <div class="widget" id="l45-w-stop">
+    <h3 class="widget-title">Правило остановки решает</h3>
+    <p class="widget-intro">Настоящие кривые восьми конфигураций: по 100 эпох без остановки на каждом из трёх разбиений (повторный прогон кода лабы; средние сходятся с логом до 0.002). Виджет останавливает их заново по выбранному правилу: где остановка, какая эпоха восстановлена и что она даёт на validation и на test. В таблице — все восемь конфигураций при этом же правиле.</p>
+    <ol class="tasks">
+      <li>Выбери lr 3e-4 и разбиение 2; монитор val macro F1, patience 20. Учится ли ещё сеть в момент остановки? Предскажи, потом посмотри на нижний график.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Рекорд 0.402 на 28-й эпохе, остановка на 48-й. Validation loss за эти 20 эпох падает с 1.160 до 1.100 и падает дальше: сеть учится, а F1 стоит на 0.38–0.40. К 100-й эпохе тот же прогон доходит до 0.513. Одно это разбиение и даёт lr 3e-4 весь разброс&nbsp;±&nbsp;0.081 в сетке.</p></details>
+      </li>
+      <li>Подними patience до 40. Предскажи, что станет с CV-оценкой lr 3e-4 и попытки 3 random search.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>lr 3e-4: 0.515 → 0.562, плюс 0.047 — больше, чем весь поиск прибавит к BASE; теперь он вровень с batch 128. Попытка 3 random search: 0.080 → 0.242. Кого считать «медленным», решает правило остановки.</p></details>
+      </li>
+      <li>Верни patience 20 и переключи монитор на val loss. Как переставятся batch 4, BASE и batch 128 на validation и на test? Посмотри и на readout «val − test».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>С F1 порядок 4 &gt; 32 &gt; 128 (0.591, 0.571, 0.559), с loss — 32 &gt; 128 &gt; 4 (0.560, 0.548, 0.546): из трёх batch 4 переходит с первого места на последнее. На test batch 4 лучший при обоих правилах (0.564 и 0.567). При мониторе F1 validation в восстановленной эпохе в среднем на 0.020 выше test, при мониторе loss — на 0.007 ниже: выбор максимума шумной кривой сам завышает оценку.</p></details>
+      </li>
+    </ol>
+  </div>
+<script>
+Course.widget('l45-w-stop', function (root, ui) {
+  /* per split: [val macro F1 x1000 (3 digits per epoch), val loss x1000 (4 digits), test macro F1 x1000 (3 digits)], epochs 1..100 */
+  var RAW = {
+    'base': [['047045093121209268316352333383383440453455427421452429430450552548544561535538546555535540540530543547540557542540555544555535550510514549516542522517535507534540542521550511547525541524526509517526518516524556519540537541529540546528530537524508527534507535516524490520527539540549527530522531518556',
+       '1756167615851485139913181276121111821166113811371124112311211138110011031119110710961094109010911107109610951091111111001095109810901101109610941108109811051101110011091092110111011106109711071099109410991107111411001096110211171096109710941099110510981101109710981102111210961100109711031102110411011110109711021100110210961104110711131100110611011109112811441106110410961099111011021108111011031100',
+       '048045092144220247299376372424416437446444439516529546526547550560560562567548547556555573537568583548579553563562564580564559577560570542577570558562553565568560573569578571581584552573586574582573584565580571586587592563584596586594586589593588584575593584583586578577591581598594591587581581616601'],
+      ['047046060124122254288350318365391387382382389480525478489490500496505487495525526529505486507486499513534496492511511533536512511543497527541524524504534503506551527542531552518533532506538519514502566543533544536530550514531520527562507548512550525542546523529548566530551558550537547554522562554550',
+       '1758166715801485139913361277123612431173115211391127112411251109110411001089108511061090108410791087109710771090107610661072106510621071106710611068106110601063106410631061107610601058105810821064106010541052105610641056105910621060105810531054106010711053105710471055105010661062106210531054105310531054104910481056106110661052104310581058103610451050105610381044106010361048105510351036104010461048',
+       '048046049142200310332331309347415414405370387393506410507487504495483493509521515558515506508496494501491512538502521518500488523516517525522496508524518516517508533527527527507496527548514525510520536528531488532521506508517534509514522517502516532516523536542540530530528569551545533534546544541542'],
+      ['047050068067229240329367369441417453467464479519572566558585561559562570572559552565549548552578546567551557558570560549567571552564539553561570554558563564588554571573553560571567576567567558553553569555563558564551553577549574564566588565582577572593575590569580581570569577581583584573581589584574',
+       '1760167015821494140813531274122912011171114111211113112511041098108510831080107710831081107910641081106610811075109410641059106410581060106110491058105910531056105510521068106410531070104410491057106210471042105510481043104010371038105210401043103310301042102810401036103710231028103510311019103210381037105210231019105410141015101110141009101010221020101210091006101010071009100210040996100409971002',
+       '048050064094236271316396393421400436447433442420450467538553543548457549559544542539543547545569545560543548548545541561539535561543559551551557563569554585564554568557556558542558558555564565563585555570586583560569575571588548551567580579564566587573564583589589593590587579564585566576570585580596']],
+    'bs4': [['055319383377373398441544460511529546550532553525528559506546538533558538544519556546560567512582540575547560555537547536558561553570504529575501500540564540560533543482578532510536489517534531556548568496578506525534525538548547561510537563498519521559492579519517512504570502490501590573556539498546',
+       '1543130311761139114111451108107910841108109310731083111211041135110011011110110110961094107611031085112810831099109711151107111711041117111811201095111211251155110411291107110911571130115511311148115511731186116411801166120011961196117912061198121812031211120512341230122612191247124112221238125312471240123912351268125412551264129512921283127012801274131712801285130113271367128913011340131713491328',
+       '069300376409416515542575556535549580558555535582579559569590587581590574588544588577610604557588582578585586602598602604626602615604547583613591582580594624594610613569613586574585579566604630609612595569624567590622610589631614616593594633585597625596601630599595575601613607619601604620616624621620'],
+      ['146248321382367378462487499510497487532564514531491536499506528501541514524553544527498535516514542507539551507533538549549516541571508535528540541516520556519565549551550510554560540538550518535564531552559566525544552553573505556557542556550554545548553553536568501548547554551553553549546547528544',
+       '1540130112111159112611321096111810741077106310711057107010811057107310731072105710801047107710381072103610331045102710411056104010911038106510381052108010531048105110661056103810341036105110271047104610521047105810581070105710671088105410481054106310601040105910701082107510931067110410841084108210701098109911061073109610921100110510921102109510951105112811401162114111151143113711121147113111481146',
+       '155225340399398378396505504509505505499532505548496484509522508532528534521534561537525549513528581524546519525568553556568542568557535559569525549556551544558559580569586541540551581568540562579555578556566573568541545570582556581551559535562567550574572555571536552538548584569557577545569543551559'],
+      ['126282346387452416510551529557572549538562560562556569563565562575570542554554587573570548583554582592593562580572590575557557595565596595594599556554606588611576586593606582612579564596598607611577571617612621608612609628604604568616621574622573582586594570609613496567591581581587523600552597585596',
+       '1526130412041131113311541114109211041086105710821068110910811044106810481044104410421038104010641028106610451060102210351044104510001016099010461033100810331024101709960997099809840983099810011034101809870992099810480987102209911025100709991043101510001000100010001034102810301013104410081012104310561010104510381025103810261018106110521050108610351026108510711056104910631068105110501077108810901060',
+       '122316411413391403422537437548550553557520561568465564561576564570583528564558560576595554579564601565579546580606597590586581598580607595590593581599589580591593608590592598617592592586588608593598570580607629623618599571595590595578610610583579547587608591608598581556583603589591601586591578613598']],
+    'bs128': [['036047047047047096071058086096103124153192246329321366331384393381399399404389401390436428424435443431446454448447450443449460447455438440439545543559539541544545541538540544545543548545546552540547544548543545556539546541558545547548524551545546542545513508511513510529509551543512512548506513511512',
+       '2144196918001730171216811650161715821544150514661428139213591327130012741247122312051190117311601152114511361128112211181116111411091108110511021104109811001096109810961093109510921092109110891090108710861089108610891089108810891090108910871088108810881087108810881090108810941093109310971090109210941090108810961092109410951092109410961095109310981096109310921096109410961096110010981095109410951093',
+       '034048048048052090075062082115108126159210251296317372365381408376398416414431409436419445426432452425464458426465518563554529563553553558551558544564556547555552550558556551555544550556559559540581546550551569552546559542549558562553562552543546560567551559560561557558547560562563557572550566560554'],
+      ['053047047047050060065075108112129136173200209252282284364368363374376382383395400412404383387382386383390388390382390388510490490492489498514486489489487489489498526505508499502538518534505531495502512512495528531516521535513535512533511512510512533517522535510514531517511535511541518510548509521508',
+       '2143196517931724170316701638160215641524148314441407137513441315129112721247122912121196118211721160115411441136113411281124112011151110110611041098109610941093109310861085108210821080108110781077107610741072107010701069107010681067106610681065106410661068106310631062106010681061106110621062106110591058105910581060106210581062105810611060105810601059106010581060105910581059106010571056106010621062',
+       '042048048048047062069082112122139172213224226311344333363370364381385381407385394406409414388384406405410404424399401410414400394509496498508496498502499502509497496504509499501511495495518495513500504500507500485519501516512524512504509503499513498520518529501522514514500517517520538514517516521512'],
+      ['028082058058047061098070100067125184216211268290310339342353406382431463410457430451466465437464472470565574560563560561570571571560574550562570570577559559559569569576561576558555560555551577560569575559572578559569579569562559562572566566557550557560568570561558572560558562551575546559564557553571',
+       '2143196517961729170816741645161015741538149914611428139313641331130212741249122812091191117811641157114511381130112211201113111311061104109910941093108810851085108210901080108310781080107910721075107510691069106910661069106610691065106610651066106410631062106010591061105910641056106010571054105910541061105510621054105810541052105610491051105010531051104610531048104810511046104810471045104410451047',
+       '030080066064050069096061099092130176244248269287386408417413419420407424429425416428430422428435450442444442435440445442446444553443449548436550549553554544543557553562548553549547544546547538551550548552545568540554564547549548553538547547549552536568546547554548548545543552561562547543548552549551']],
+    'lr1e-4': [['021027048047047047047047047047047047050050058061058061064062066076071092090100124111116137131147140152167190198207212209221223251265275276279287294291356353348355358358360363362361382385381383400403403401398384403395399395400399396382399396395384416384391401399410400396414406396408390390388388391389',
+       '2246218521172041196018841818177217441726171217001689167816671655164416321619160715951582156915571544153215191506149414831471146014501440142914191410140013901381137213631354134613381330132213141307129912921285127912721265125912531247124212371232122612221217121312091204120011971193119011861183117911761174117011681165116311601158115611541152114911481146114411421141113911371136113511331132113011291128',
+       '025029048048048048048048048048048048050050062070062063070063078086088104106120140135137139139143134152188207204214213216227236248255251258266270275274282319309321331332335332357363366367363367362368367384384382403382388392395396395398397391395395424424420428421420419423425424439423422414423416440437'],
+      ['030027067047047047047047047047047047050057057058067062073088102094114115134117134137136128138138137136174172193207204221225226241252276280286294287288292297302320320316317320311325320319315312319376368364369369367364365362368366371367368369369369371369402398401399401400404401404402398398400400402399',
+       '2246218621182041195818781813176817381718170316901678166616521639162616121598158415711557154315301517150514921480146914571446143514251415140513961386137613671359135013421334132613191311130412981291128412781272126612601254124912441239123412291224122012161212120812041200119711941190118711841181117811761172117011671165116211601158115511541152114911471146114411421140113911371135113411321131112911291127',
+       '034029052048048048048048048048048048047058058058069062074106118105124133139137143150157174189189188198199206225240245236253250247247266263265267262270270280281328357350357361354363363363366358367368361363369378375367363369362394392392393395387394391393390393390398390395395390393390393398393394394392'],
+      ['041028048047047047047047047047047047047058058064064064064069085092101115106123121118134118145168196207214222220216241238245230246246250254256257279274326328326328336339337350350344351348348348344351350350347350348349353370364396423419406403416424393424420424440444439447444443438438442433440440440450',
+       '2246218621192046196318841821177517451726171016971684167216601647163416211608159415811567155415411529151615031491147814671455144414331423141214021393138313741366135713491340133213241317131013021295128912821275126812621256125112451239123412291224121812141210120612011197119411911186118311801176117411711169116511631161115811561153115211491147114511431143113911381136113411331131113011281127112611251124',
+       '030029048048048048048048048048048048050070059069069081081089112115115123127133140137148148157185185221225235247258266276272272280294294302309316318322319324320324348350350356354352355397422420418420421415412419416414421417414410426426429434430433428429429435431421431424426427425430426422425426428427']],
+    'lr3e-4': [['067047047052053074059088083108131173210290258295304349356356378412381391390377409384410395393403389387434390390425420443425436443445453438448438442441435549541538541535551542548545538537547540555544546548547541543541553541548544545543546541542551542551542548546553554545546548551553557544542551550552',
+       '2130192217601713168416541622158515491510147514401409138113501323130112781258124012231210119711861178116911591152114911401137113111271127112011181120111611111111111111091104110411061104110211001102109810981099109710971098110010981097109610951097109410961098109510951096109810961094109410951095109810951096109610951095109611001095109810971096109710961098109710961095109610941098109811001100109610941097',
+       '078048048060057078063096098131137200216254244274284278331331362365368382406380405391425426429431442439442436429431534531526534539527533541548551551572561560556554555550557555541564554554564546558553555567556559562557564542556561550558553551546559565556561545556555557553550550564557569546542573564554'],
+      ['078047047047047060094108125138137139185162243240291292357346359369368377364381357402397400399400399398396398400396400388397384394394399387396389384393398402504503501514494503511483502501503488507497543495515502513501514513517502502508510536517534508517525513501504540512515516512514533516514513535513',
+       '2131191917561705167316411605156815321494145814281397137113441322129912801262124712301219120311951186118611671160115511461141113611311127112211201115111211091107110511011101109710971093109311001088108610851084108110821079107910771082107610741074107210741071107010711072106810731070106710671066106610631064106410621064106410621063106010611061105910611062106410601060106010601057106210561056105610591056',
+       '067048048048048058093107137157183181226203247237340349348352358377381379360396367392398388389391392389396397415404405393412403394399403404401390404406397408412405402418406395516398494509511490500509498491516490500506495504496514503497508501497495497491512495505494512494503503491498510502513509522514'],
+      ['086047047047053077063096127106127207199218247250272334340344364372351346397425392387415420438467476436475482488471471474473477476476468453486469475474562577577587575558560565569578572559561561577559578562559560561566575572556575573560558569562561559560559561562562560570573557560559578562574561582567',
+       '2131192017571710167716451609157015331498146214321401137113451320130112771261123812261208119611851183116511601152115011411134112811281120112011141113110811061102110611001098109910921093108810901087108910841083108210781077108210761076107510751075107010701075106910721066107410711065106910651066106410661063106710611061107010591062106210581056105810611060105510571055105610591054105410571051105710511063',
+       '087048048050060089080106132122146217260255290285320329349326351409416416415415429425425424420431426422419424426419419452432419437418460453450436443434442458446451464436442442440458437446462439457435463435537444542549452455537455542545541541550545540546542540538538545538556540538543545538562536570539']],
+    'lr3e-3': [['048156245304344367424426541538554549525560512545496551502552514558529554545547506568513491548544548532505518576522541532511523546568464544543527531554531590543548568500553536522526506520549554532535530520530549524466518544500537528464536523529516530518528540497542501452521589536518526543539560589582',
+       '1654149313141233115611341103109710981094109910981110110911381161109611041116109710941083110510981101109411131103109411141099111510831116112111181112111411141104110711101102111111221109111111421146112211711148113411351140112811521149118011581150115811661150116311761148116511741147117811661194115411581159119511951174118811671211119212181216119511921200121912141212119012091243120511791195122812061242',
+       '056142241310373375444559550544545557570550525567557540551554553569562578603576573562596570572580578552573576612574581599595580579607567606615581568611612610613608614597592626609581602623623620638632608601625620620597623617610623613595617592621605594578617610602600598565610604620615629616603618640617'],
+      ['078148225363378376370389401377526491495521545512503527487487523529526520493524540528549506509517509509553535540571550561566541524548547556542529537536555549532569543573536555530551524522516554564564558570566540557553558564549558523542561548551561563550543569536549547532538565550560560561565562521561',
+       '1694147513611243117312071138110811191128108510721069107310681091110410811072106410841056105310501062109510501070106210591060105010561077106010391041105610421065103810431058107210471041103710361064107310451037107510561068105410661059110010491039106511161051105210581056105410581062106710471086105010491065107710851072106510831058108210951071104710721099106611011132111810971090109511121093109711511109',
+       '068159301357406377385431407374382511520535503504516516534508499502512517517501561528486511546523500490523545528566502547517522532539518554538552553546574540552561591550550542529578576541565563578596578584586578590576559558565561592556569576567575559580577569561576556600564611565575582561567582566592'],
+      ['047109239317267446472421460592563547551562549550551531574542565558565557564558546565557590568567560582527568573569589588561557568593582547563597538612607565602560584603589587605607602590621614586629551629605617585606610631590614604577595600608626611589589623610631585620618620608619605584595602625594',
+       '1672147813291213118011551126111811041085108710861084108610701085106110811048107010531060106310381058105710731032107110451028101510201022103710301006100509991011100210191015099509901032099910041030099409981005099410050993099909881004101810011024101609870994101510171027099309961033100810120991101910621024102310271035106810271038103610261020102610561050104410441030103410361053105110421062106710661058',
+       '048121242318365450437408442438440545535528559534549556553538562558534556572579542556557525580562588547568591594595577592594599468501594550602601586599500472507556612615582602577502496600602504479461591484507602508492497474606601583579582583487588480597472456592614586568586604590599611577586593589478']],
+    'lr1e-2': [['145349304378422385545485457483490501548516520521516515532533481553505453566503464503483477490518476560459516581524489520504479579538469537491487460536530469536464453503499492456493450520460500508432500477530467455454489550512479464458547466520476583483449476451449457464469461469482519527474491514480',
+       '1460120711481112112111341088113811151126116411051118114611841171109911291140114611321094113712091131116712291177115612371158128012081175120712131227120312411187119512041263119312561257128412751284124812741314128812981289124212881291139013041341132213751371137413941330137913681433138213871348138513711382148814481450142314241454141815181497147815701531146915811561153915881586152015371566155015761611',
+       '160398378431425528558552558530553494590561546550564594585578548626531524576564589519551514546608535576552586601569577616572579572583581627604526554603571620569608574613566611570549594558603610624515613541577542574589543582608572595552573551595596602570513576552541585580587608564577538625579612594601'],
+      ['102324324359476502485491517487468489534557510524518551505474515476511480492513550529495514495510528461499516502505551547534541510533558494491523529498542555523523536522528499566551541524517523535542531542550510516503531487548498522524559544544539506536512522519564529534551559548558544521512574491559',
+       '1514123712141128114111401084108210661100108110731050106510741076106910581087110110941070108010761101113010571103106911101102107411331136112910621118114611171121110611491158109510871110112011431113115311531129114611301149111211301181115411741207115711871169118211691175124412421233121011801263124612011197124512691248123412871289130712971271122712951329125914661373128913311345134113271411137814351388',
+       '101330341408347527504546514489503504574563574563534565542511541554618563534541576584544545549571522519550538547561583554540516566556573568567556562554584543438564556440441588539553567556549575551511556575541584466443394567443460571555437546570556523445580437438465464436398457470452418444470459515452'],
+      ['111292391468519494522525559559497548529532501525548549526522582544582494583580569557550553592576569567514550557557548591554570587562597530570511531518584562599579562559579575609586552539593585589591574551484546574585547582571562539527550550563563542582583599590545538545571548559553538554599544596579',
+       '1496131511331150112511541089106210611054107710751112113710841049102910521066105810171099102110841018105410431039112110161024101610901080107411041028107311001045106410811088105710471128109110991104108810511055105610691084105311161062107010731162117011031065110010751099112411001160111410971078114911581157113911481155114011611141118211541121118911251158121612231170123312261239122012301158127812321223',
+       '126326420489507541422580568561541584494520494544571569561544578509575534488473575609528556597453589559527554600579565540579528591477611542462574495533598508548581578581608571612490582579598602580575445591474536518587565565611560533561586555568558547611603556588560558538565594554521568572595569601576']],
+    'random3': [['020023064045045045045045045045045045045045045051081056047047047053086092082079058065073071076085069069069062055058070062085089091090070092092091090087067064073091092089091088075075086100103105102092098108113118122118096094096124149159154173173172172171183183175182212215210215220231236238242245244251',
+       '2338231922982275225022212188214921022050199219301872182317861762174817381732172617211715171117061701169716921687168216781673166916641660165516511646164116351630162416191614160916041599159415901584157915731567156115561551154615411535153015241519151415091504150014961491148714821477147314691464146014561452144814451441143614321428142414201417141314081404140113971393138913851382137713741370136713631360',
+       '020020062045045045045045045045045045045045045048088047048048048050084092078076062062068066075085071070068062059058064060080091093079072087087088086086067063068081094086097081081085092120118121115097103129134141141141116118118145163164162159178190194189196203186188210223226224224225233235241244258257'],
+      ['020023061045045045045045045045045045045045045058051050051051051051051054054051051051055060064063065062062055058065067065065079082080062058055061061061075092083074088092096104103108100100103113105106111122127131126132137134138182183181181179180180180183199180191183202208196195192199193230235251247248',
+       '2338231922982276225022222189215121082056199919361875182417851760174617361729172217161710170617001696169216871683167916741669166416591653164816431637163216271622161616111606160115961590158515781572156615611556155015441539153415281523151815121507150214981492148814821477147114661461145714521447144314381433142914241420141514111407140313981394139013861382137813751372136913651362135813551351134813451342',
+       '020019051045045045045045045045045045045045045058067050050050050050050050050050050050051059072072073072072054060074077074076089098089074060054058058067086100094093092102104118113127123122124135124140142164173175167170176177191208200200211214206218217207213210206208214220219208210216221225228234239252'],
+      ['020020054045045045045045045045045045045045045045088051050050050050053053051053051050058058058058064058058058064061058058058061068072090087066066066085075071093094094095070097096080084083084096097095089107104108116117122121118119121121138164162167169168170176179168162179190198204204204211222220213224',
+       '2340232022992275225022212188215121092061200819481887183217901760174217311722171617111707170216981694168916841680167516701666166116561651164616411636163016251620161516111606160115971592158815831578157415701567156215561550154515401535153015261521151815131508150415011498149514901486148314791476147214671463146014571454145214471443144014351432142814241420141714141411140714031399139613931389138513821379',
+       '020020054045045045045045045045045045045045045045088050048048047047048048048047048047052052052052071058054064074070062058068069075085097092078078076090084083095098096103092101102093100106104114123118112127124122136143151151152152151170175197204207238241236233251246253260263263267261261278280280281280']]
+  };
+  var KEYS = ['base', 'bs4', 'bs128', 'lr1e-4', 'lr3e-4', 'lr3e-3', 'lr1e-2', 'random3'];
+  var NAME = { base: 'BASE: batch 32, lr 1e-3', bs4: 'batch 4', bs128: 'batch 128', 'lr1e-4': 'lr 1e-4', 'lr3e-4': 'lr 3e-4',
+               'lr3e-3': 'lr 3e-3', 'lr1e-2': 'lr 1e-2', random3: 'random, попытка 3' };
+  var BATCH = { base: 32, bs4: 4, bs128: 128, 'lr1e-4': 32, 'lr3e-4': 32, 'lr3e-3': 32, 'lr1e-2': 32, random3: 128 };
+  var EP = 100;
+  function dec(s, w) { var out = []; for (var i = 0; i + w <= s.length; i += w) out.push(Number(s.substr(i, w)) / 1000); return out; }
+  var D = {};
+  KEYS.forEach(function (k) { D[k] = RAW[k].map(function (t) { return { vf: dec(t[0], 3), vl: dec(t[1], 4), tf: dec(t[2], 3) }; }); });
+  /* the rule of fit(): a record only when strictly better; stop once `P` epochs pass without one; restore the record */
+  function replay(vals, P, higher) {
+    var best = higher ? -Infinity : Infinity, wait = 0, bestEp = 1;
+    for (var e = 1; e <= vals.length; e++) {
+      var v = vals[e - 1];
+      if (higher ? v > best : v < best) { best = v; wait = 0; bestEp = e; } else wait++;
+      if (wait >= P) return { best: bestEp, stop: e, stopped: true };
+    }
+    return { best: bestEp, stop: vals.length, stopped: false };
+  }
+  function mean(a) { var s = 0; a.forEach(function (v) { s += v; }); return a.length ? s / a.length : 0; }
+  function series(arr, from, to) { var out = []; for (var e = from; e <= to; e++) out.push([e, arr[e - 1]]); return out; }
+
+  var pF = ui.plot({ x: [0, 101], y: [0, 0.7], xLabel: 'эпоха', yLabel: 'macro F1', aspect: 2.2, minHeight: 260,
+    label: 'Validation и test macro F1 по эпохам на выбранном разбиении, остановка и восстановленная эпоха' });
+  var pL = ui.plot({ x: [0, 101], y: [1, 1.5], xLabel: 'эпоха', yLabel: 'val loss', aspect: 3.2, minHeight: 190,
+    label: 'Validation loss по эпохам на выбранном разбиении' });
+  var tbody = Course.el('tbody');
+  var head = Course.el('tr', {}, ['конфигурация', 'CV val', 'test', 'место'].map(function (h) { return Course.el('th', { text: h }); }));
+  ui.stage.appendChild(Course.el('div', { 'class': 'scroll-x' }, Course.el('table', { 'class': 'tbl tbl--center' }, [Course.el('thead', {}, head), tbody])));
+  ui.legend([{ label: 'val macro F1', color: 's5', mark: 'line' }, { label: 'test macro F1', color: 'ink', mark: 'line' },
+             { label: 'checkpoint', color: 'muted', mark: 'dash' }, { label: 'от checkpoint до остановки', color: 'key', mark: 'area' }]);
+
+  var cfg = ui.select('конфигурация', KEYS.map(function (k) { return { value: k, label: NAME[k] }; }), null, 'base');
+  var spl = ui.select('разбиение', [{ value: '0', label: '1' }, { value: '1', label: '2' }, { value: '2', label: '3' }], null, '0');
+  var mon = ui.select('что отслеживать', [{ value: 'f1', label: 'val macro F1' }, { value: 'loss', label: 'val loss' }], null, 'f1');
+  var pat = ui.slider({ label: 'patience, эпох', min: 1, max: 60, step: 1, value: 20, format: function (v) { return String(Math.round(v)); } });
+  var roStop = ui.readout('остановка'), roBest = ui.readout('checkpoint'), roVal = ui.readout('val F1 в checkpoint', { digits: 3 }),
+      roTest = ui.readout('test F1 в checkpoint', { digits: 3 }), roInfl = ui.readout('val − test, 24 обучения');
+  var note = ui.note('');
+
+  function state() {
+    var P = Math.max(1, Math.round(pat.value)), byF1 = mon.value !== 'loss', infl = 0;
+    var rows = KEYS.map(function (k) {
+      var runs = D[k].map(function (sp) {
+        var r = byF1 ? replay(sp.vf, P, true) : replay(sp.vl, P, false);
+        infl += sp.vf[r.best - 1] - sp.tf[r.best - 1];
+        return { best: r.best, stop: r.stop, stopped: r.stopped, vf: sp.vf[r.best - 1], tf: sp.tf[r.best - 1] };
+      });
+      return { key: k, runs: runs, cv: mean(runs.map(function (x) { return x.vf; })), test: mean(runs.map(function (x) { return x.tf; })) };
+    });
+    rows.slice().sort(function (a, b) { return b.cv - a.cv; }).forEach(function (r, i) { r.rank = i + 1; });
+    var key = D[cfg.value] ? cfg.value : 'base', s = Math.min(2, Math.max(0, parseInt(spl.value, 10) || 0));
+    var cur = rows[KEYS.indexOf(key)];
+    return { P: P, rows: rows, key: key, run: cur.runs[s], data: D[key][s], infl: infl / 24 };
+  }
+
+  pF.draw(function (g) {
+    var st = state(), r = st.run, d = st.data, v = g.view, late = r.best > 80;
+    g.rect(r.best, v.y0, Math.max(r.stop, r.best + 0.4), v.y1, { color: 'key', alpha: 0.3, stroke: false });
+    g.line(series(d.tf, 1, EP), { color: 'ink', width: 1.4, alpha: 0.3 });
+    g.line(series(d.tf, 1, r.stop), { color: 'ink', width: 1.4 });
+    g.line(series(d.vf, 1, EP), { color: 's5', width: 2, alpha: 0.3 });
+    g.line(series(d.vf, 1, r.stop), { color: 's5', width: 2 });
+    g.vline(r.best, { color: 'muted', dash: true });
+    g.text(r.best, v.y1, 'checkpoint', { align: late ? 'right' : 'left', baseline: 'top', dx: late ? -6 : 6, dy: 6, size: 11.5, color: 'soft' });
+    if (r.stopped) g.vline(r.stop, { color: 'ink', width: 1 });
+    g.points([[r.best, r.tf]], { color: 'ink', r: 4, shape: 'diamond' });
+    g.points([[r.best, r.vf]], { color: 's5', r: 5 });
+    g.text(r.stop, 0, r.stopped ? 'стоп' : 'без остановки', { align: r.stop > 80 ? 'right' : 'left', baseline: 'bottom', dx: r.stop > 80 ? -5 : 5, dy: -5, size: 11.5, color: 'soft' });
+  });
+  pL.draw(function (g) {
+    var st = state(), r = st.run, d = st.data, v = g.view;
+    g.rect(r.best, v.y0, Math.max(r.stop, r.best + 0.4), v.y1, { color: 'key', alpha: 0.3, stroke: false });
+    g.line(series(d.vl, 1, EP), { color: 's5', width: 2, alpha: 0.3 });
+    g.line(series(d.vl, 1, r.stop), { color: 's5', width: 2 });
+    g.vline(r.best, { color: 'muted', dash: true });
+    if (r.stopped) g.vline(r.stop, { color: 'ink', width: 1 });
+    g.points([[r.best, d.vl[r.best - 1]]], { color: 's5', r: 4.5 });
+  });
+
+  ui.onChange(function () {
+    var st = state(), r = st.run, lo = Math.min.apply(null, st.data.vl), B = BATCH[st.key], steps = Math.ceil(949 / B);
+    pL.setView({ x: [0, 101], y: [lo - 0.03, lo + 0.47] });
+    roStop.set(r.stopped ? 'эпоха ' + r.stop : 'не сработала');
+    roBest.set('эпоха ' + r.best);
+    roVal.set(r.vf);
+    roTest.set(r.tf);
+    roInfl.set((st.infl < 0 ? '−' : '+') + Math.abs(st.infl).toFixed(3));
+    note.set('Окно patience: ' + st.P + ' × ' + steps + ' = ' + st.P * steps + ' шагов оптимизатора (batch ' + B + ', ' + steps + ' батчей за эпоху).');
+    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+    st.rows.forEach(function (row) {
+      tbody.appendChild(Course.el('tr', { 'class': row.key === st.key ? 'is-key' : null }, [
+        Course.el('td', { text: NAME[row.key] }),
+        Course.el('td', { 'class': 'num', text: row.cv.toFixed(4) }),
+        Course.el('td', { 'class': 'num', text: row.test.toFixed(4) }),
+        Course.el('td', { 'class': 'num', text: String(row.rank) })]));
+    });
+  });
+});
+</script>
+
+  <div class="pitfall"><p>«Patience 20 — безопасная настройка, она только экономит время». Здесь нет: медленные конфигурации обрезаются на плато F1, и lr 3e-4 получает 0.515 вместо 0.562 при patience 40. Даже у BASE веса 100-й эпохи на test лучше восстановленных во всех трёх разбиениях (в среднем 0.580 против 0.550). А patience в эпохах подыгрывает маленьким batch: 4760 шагов на окно при batch 4 против 160 при batch 128. Поиск ранжирует «быстро обучающиеся при этом правиле». Что делают: берут patience больше, следят за loss, задают минимум эпох или считают patience в шагах оптимизатора.</p></div>
+</section>
+
+<section id="l45-search">
+  <h2>Random search и Optuna</h2>
+
+  <p>У сетки всего пять значений learning rate. <span class="en" lang="en">Random search</span> (случайный поиск, <a href="l21.html#l21-grid-random">урок 21</a>) тянет каждую конфигурацию из диапазонов и меняет все шесть hyperparameters сразу:</p>
+
+<pre><code>def sample_config(rng):
+    return {
+        'batch_size': int(rng.choice([8, 16, 32, 64, 128])),
+        'learning_rate': float(10 ** rng.uniform(-4, -2)),   # (1)
+        'hidden_layers': int(rng.integers(1, 4)),            # (2)
+        'hidden_size': int(rng.choice([32, 64, 128, 256, 512])),
+        'dropout_rate': float(rng.uniform(0.0, 0.5)),
+        'weight_decay': float(10 ** rng.uniform(-4, 0))}     # (1)</code></pre>
+
+  <ol>
+    <li>Log-uniform: равномерен показатель степени, и каждый порядок величины получает равную долю попыток. При равномерном выборе из [1e-4, 1e-2] 91&nbsp;% попыток легли бы выше 1e-3. Learning rate и weight decay действуют множителем, поэтому и шкала у них логарифмическая.</li>
+    <li><code>integers(1, 4)</code> даёт 1, 2 или 3: правая граница не входит. Генератор <code>np.random.default_rng(seed)</code> делает 20 жребиев воспроизводимыми.</li>
+  </ol>
+
+  <p>Лучшая из 20 попыток, 11-я (3&nbsp;×&nbsp;512, lr 6.0e-4, dropout 0.34), даёт 0.5999&nbsp;±&nbsp;0.0218 — вровень с сеткой за половину её обучений. Но 5 попыток ниже 0.40, как попытка 3 из виджета выше: широкие диапазоны включают и безнадёжные сочетания.</p>
+
+  <p>Optuna заменяет слепой жребий моделью поиска. Её sampler по умолчанию, TPE (<span class="en" lang="en">Tree-structured Parzen Estimator</span>, <a href="l21.html#l21-bayes">урок 21</a>), первые 10 попыток делает наугад, а дальше делит сделанные на хорошие и плохие и берёт следующую конфигурацию там, где хороших плотнее. Пространство поиска пишется прямо в <code>objective</code>, с теми же диапазонами:</p>
+
+<pre><code>def objective(trial):
+    config = {
+        'batch_size': trial.suggest_categorical(
+            'batch_size', [8, 16, 32, 64, 128]),
+        'learning_rate': trial.suggest_float(                # (1)
+            'learning_rate', 1e-4, 1e-2, log=True),
+        'hidden_layers': trial.suggest_int('hidden_layers', 1, 3),
+        'hidden_size': trial.suggest_categorical(
+            'hidden_size', [32, 64, 128, 256, 512]),
+        'dropout_rate': trial.suggest_float(
+            'dropout_rate', 0.0, 0.5),
+        'weight_decay': trial.suggest_float(
+            'weight_decay', 1e-4, 1.0, log=True)}</code></pre>
+
+  <p>Дальше <code>objective</code> учит конфигурацию разбиение за разбиением и после каждого спрашивает, не пора ли бросить (печать строки попытки опущена):</p>
+
+<pre><code>    start, scores = time.time(), []
+    for split in range(K):
+        scores.append(train_on_split(X, y, config, split,
+                                     **TRAIN_SETTINGS)[0])
+        trial.report(np.mean(scores), split)                 # (2)
+        if trial.should_prune():
+            break
+
+    scores = np.array(scores)
+    pruned = len(scores) &lt; K
+    optuna_results.append({'config': config, 'scores': scores,
+                           'seconds': time.time() - start})
+    if pruned:
+        raise optuna.TrialPruned()                           # (3)
+    return scores.mean()</code></pre>
+
+  <ol>
+    <li><code>suggest_float(..., log=True)</code> — тот же log-uniform, что <code>10 ** rng.uniform(...)</code>.</li>
+    <li>После каждого разбиения <code>trial.report</code> передаёт текущее среднее, а <code>should_prune</code> сравнивает лучшее из этих средних с медианой завершённых попыток на том же шаге: это <span class="en" lang="en">pruning</span> (отсечение) отстающих.</li>
+    <li><code>raise optuna.TrialPruned()</code> помечает попытку как отсечённую, и победить она не может; <code>return</code> выдал бы среднее двух разбиений за полную оценку. Запись в <code>optuna_results</code> стоит раньше, поэтому туда попадают и отсечённые попытки.</li>
+  </ol>
+
+  <p>Сам поиск — два вызова: создать study и запустить <code>objective</code> <code>N_TRIALS</code>&nbsp;=&nbsp;20 раз.</p>
+
+<pre><code>study = optuna.create_study(
+    direction='maximize',
+    sampler=optuna.samplers.TPESampler(seed=SEED),
+    pruner=optuna.pruners.MedianPruner(n_startup_trials=5,
+                                       n_warmup_steps=1))
+study.optimize(objective, n_trials=N_TRIALS)</code></pre>
+
+  <p>Pruner молчит, пока не завершены пять попыток, и не трогает шаг 0, так что раньше всего отсекают после второго разбиения шестой попытки. Сигнал после третьего разбиения ничего не меняет: <code>len(scores) == K</code>. Отсечены попытки 7, 8, 10 и 16, каждая после двух разбиений: 56 обучений вместо 60. Победитель — попытка 12 (2&nbsp;×&nbsp;256, lr 6.4e-3): 0.6028&nbsp;±&nbsp;0.0171. Как TPE к нему пришёл — в виджете.</p>
+
+  <div class="widget" id="l45-w-search">
+    <h3 class="widget-title">Три поиска, один бюджет</h3>
+    <p class="widget-intro">Все 80 конфигураций трёх поисков в том порядке, в каком они обучались; бюджет — сколько обучений уже сделано. Сверху лучший validation macro F1 на этот момент (отсечённые попытки не считаются). В середине каждая конфигурация по learning rate и ширине слоя; чем насыщеннее значок, тем выше её macro F1: бледный — 0.45 и ниже, сплошной — около 0.60. Квадраты сетки собраны по клеткам, «×n» — сколько её конфигураций обучено в клетке. Снизу победители, когда их поиск закончен: validation по трём разбиениям и, если включить, test.</p>
+    <ol class="tasks">
+      <li>Бюджет стоит на 27 обучениях: Optuna как раз закончила 10 случайных попыток. Предскажи, где на средней диаграмме лягут её следующие треугольники, потом доведи бюджет до 56.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Все десять — на ширине 256, семь из них с learning rate от 3e-3 до 7e-3: TPE перестал тянуть наугад и сгустил попытки там, где были хорошие. Медиана первых десяти попыток 0.552, следующих — 0.596. Уже попытка 11, тридцатое обучение, даёт 0.603 — лучший результат всех трёх поисков. Кресты — отсечённые попытки, по два обучения вместо трёх.</p></details>
+      </li>
+      <li>Доведи бюджет до 120 и найди квадраты с подписями «×n». Предскажи: сколько разных значений learning rate попробовала сетка и сколько её конфигураций стоят на 1e-3?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Пять значений и 27 конфигураций из 40, из них 15 в одной клетке 1e-3&nbsp;×&nbsp;512. Сетка подробно прочёсывает окрестность стартовой точки и на каждом этапе заново обучает уже посчитанное: 12 из 120 обучений — повторы. Random search за 60 обучений попробовал 20 разных learning rate.</p></details>
+      </li>
+      <li>При бюджете 120 включи «показать test». Предскажи порядок трёх победителей на test.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Обратный. На validation: Optuna 0.603, сетка 0.601, random search 0.600. На test: random search 0.580, сетка 0.575, Optuna 0.571. На validation три победителя умещаются в 0.003, на test — в 0.009, а test одного победителя по разбиениям гуляет от 0.522 до 0.602. Порядок стратегий здесь — шум.</p></details>
+      </li>
+    </ol>
+  </div>
+<script>
+Course.widget('l45-w-search', function (root, ui) {
+  /* the configurations of the three searches in training order (log of our run): [learning rate, hidden_size, mean validation macro F1 over the splits];
+     Optuna also [splits trained]: 2 = pruned after the second split */
+  var GRID = [[0.001, 128, 0.5913], [0.001, 128, 0.5801], [0.001, 128, 0.57], [0.001, 128, 0.558], [0.001, 128, 0.5587], [0.0001, 128, 0.4235], [0.0003, 128, 0.5148], [0.001, 128, 0.57], [0.003, 128, 0.5843], [0.01, 128, 0.5845],
+    [0.001, 32, 0.5095], [0.001, 128, 0.5618], [0.001, 512, 0.5815], [0.001, 32, 0.4848], [0.001, 128, 0.57], [0.001, 512, 0.5972], [0.001, 32, 0.5251], [0.001, 128, 0.5724], [0.001, 512, 0.5968], [0.001, 512, 0.5972],
+    [0.001, 512, 0.5987], [0.001, 512, 0.5741], [0.001, 512, 0.5952], [0.001, 512, 0.5913], [0.001, 512, 0.5803], [0.001, 512, 0.5849], [0.001, 512, 0.5849], [0.001, 512, 0.5651], [0.0003, 512, 0.5931], [0.0003, 512, 0.5848],
+    [0.0003, 512, 0.5381], [0.001, 512, 0.5974], [0.001, 512, 0.5987], [0.001, 512, 0.6008], [0.003, 512, 0.5743], [0.003, 512, 0.5863], [0.003, 512, 0.5927], [0.01, 512, 0.5308], [0.01, 512, 0.5877], [0.01, 512, 0.5846]];
+  var RANDOM = [[0.00075, 128, 0.5648], [0.0089, 256, 0.5756], [0.00055, 32, 0.0803], [0.00077, 64, 0.4605], [0.0018, 32, 0.3561], [0.0061, 256, 0.5937], [0.0002, 256, 0.3596], [0.00045, 64, 0.3936], [0.00089, 64, 0.5064], [0.0046, 256, 0.5699],
+    [0.0006, 512, 0.5999], [0.00025, 32, 0.1513], [0.0036, 128, 0.5635], [0.00017, 256, 0.5259], [0.0019, 128, 0.5817], [0.00012, 128, 0.4449], [0.00029, 512, 0.5833], [0.0021, 128, 0.5704], [0.0042, 64, 0.5735], [0.0028, 128, 0.5944]];
+  var OPTUNA = [[0.00021, 512, 0.569, 3], [0.00038, 512, 0.5786, 3], [0.0079, 32, 0.5519, 3], [0.0011, 64, 0.3792, 3], [0.00035, 512, 0.5791, 3], [0.0029, 256, 0.5887, 3], [0.00088, 256, 0.4789, 2], [0.001, 128, 0.5516, 2], [0.00024, 128, 0.5232, 3], [0.00028, 64, 0.1746, 2],
+    [0.0044, 256, 0.6028, 3], [0.0064, 256, 0.6028, 3], [0.0045, 256, 0.5759, 3], [0.0046, 256, 0.5965, 3], [0.004, 256, 0.5973, 3], [0.0012, 256, 0.5545, 2], [0.0068, 256, 0.5959, 3], [0.00088, 256, 0.5806, 3], [0.0033, 256, 0.5973, 3], [0.0098, 256, 0.5921, 3]];
+  /* the winners trained again and tested on every split: validation and test macro F1 per split, and the means printed by the lab */
+  var WIN = { grid: { val: [0.5959, 0.5841, 0.6224], test: [0.6012, 0.5216, 0.6021], mv: 0.6008, mt: 0.5750 },
+              random: { val: [0.5907, 0.5789, 0.63], test: [0.6172, 0.5495, 0.5723], mv: 0.5999, mt: 0.5797 },
+              optuna: { val: [0.5811, 0.6044, 0.6228], test: [0.5827, 0.5691, 0.5595], mv: 0.6028, mt: 0.5705 } };
+  var SIZES = [32, 64, 128, 256, 512];
+  function rows(list, n) { return list.map(function (r) { return { lr: r[0], size: r[1], f1: r[2], n: n || r[3] }; }); }
+  var S = [{ key: 'grid', name: 'сетка', shape: 'square', dash: [], off: -0.3, rows: rows(GRID, 3) },
+           { key: 'random', name: 'random search', shape: 'circle', dash: [7, 4], off: 0, rows: rows(RANDOM, 3) },
+           { key: 'optuna', name: 'Optuna', shape: 'triangle', dash: [2, 3], off: 0.3, rows: rows(OPTUNA) }];
+  S.forEach(function (s) { var t = 0; s.rows.forEach(function (r) { t += r.n; r.end = t; }); s.total = t; });
+  function done(s, b) { return s.rows.filter(function (r) { return r.end <= b; }); }
+  /* best mean so far among the configurations trained on all three splits: [trainings, best] at every improvement */
+  function steps(s) { var out = [], m = -1; s.rows.forEach(function (r) { if (r.n === 3 && r.f1 > m) { m = r.f1; out.push([r.end, m]); } }); return out; }
+  function alphaOf(f1) { return 0.12 + 0.85 * Math.max(0, Math.min(1, (f1 - 0.45) / 0.15)); }
+
+  var pA = ui.plot({ x: [0, 122], y: [0.555, 0.607], xLabel: 'обучений', yLabel: 'лучший val macro F1', aspect: 2.6, minHeight: 220,
+    label: 'Лучший validation macro F1 трёх поисков в зависимости от числа сделанных обучений' });
+  var pB = ui.plot({ x: [-4.62, -1.9], y: [0.05, 5.6], xTicks: [], yTicks: [], xLabel: 'learning rate', yLabel: 'ширина слоя', aspect: 2, minHeight: 330,
+    label: 'Конфигурации трёх поисков: learning rate по логарифмической шкале и ширина скрытого слоя; насыщенность значка — validation macro F1' });
+  var pC = ui.plot({ x: [0.4, 3.6], y: [0.5, 0.665], xTicks: [], yLabel: 'macro F1', aspect: 2.6, minHeight: 220,
+    label: 'Победители трёх поисков: validation и test macro F1 по трём разбиениям' });
+  ui.legend([{ label: 'сетка', color: 's5', mark: 'square' }, { label: 'random search', color: 's5', mark: 'dot' },
+             { label: 'Optuna', color: 's5', mark: 'triangle' }, { label: 'Optuna, попытка отсечена', color: 's5', mark: 'cross' },
+             { label: 'test победителя', color: 'ink', mark: 'diamond' }]);
+  var bud = ui.slider({ label: 'бюджет, обучений', min: 0, max: 120, step: 1, value: 27, format: function (v) { return String(Math.round(v)); } });
+  var tog = ui.toggle('показать test', false);
+  var ro = S.map(function (s) { return ui.readout(s.name); });
+  function budget() { return Math.max(0, Math.min(120, Math.round(bud.value))); }
+
+  pA.draw(function (g) {
+    var b = budget();
+    S.forEach(function (s) {
+      var st = steps(s), pts = [];
+      st.forEach(function (p, i) {
+        if (p[0] > b) return;
+        var next = i + 1 < st.length ? st[i + 1][0] : s.total;
+        pts.push([p[0], p[1]], [Math.min(next, b, s.total), p[1]]);
+      });
+      if (pts.length) g.line(pts, { color: 's5', width: 2, dash: s.dash });
+      g.points(st.filter(function (p) { return p[0] <= b; }), { color: 's5', r: 4.5, shape: s.shape });
+    });
+    g.vline(b, { color: 'muted', dash: true });
+  });
+
+  /* a marker drawn by hand: its fill opacity carries the F1 of the configuration */
+  function mark(g, x, y, shape, f1, cut) {
+    var c = g.ctx, px = g.px(x), py = g.py(y), r = 5, col = g.colors.s5;
+    c.save(); c.lineJoin = 'round'; c.lineCap = 'round'; c.setLineDash([]); c.beginPath();
+    if (cut) {
+      c.moveTo(px - r, py - r); c.lineTo(px + r, py + r); c.moveTo(px + r, py - r); c.lineTo(px - r, py + r);
+      c.strokeStyle = col; c.lineWidth = 2.2; c.stroke(); c.restore(); return;
+    }
+    if (shape === 'square') c.rect(px - r * 0.9, py - r * 0.9, r * 1.8, r * 1.8);
+    else if (shape === 'triangle') { c.moveTo(px, py - r * 1.15); c.lineTo(px + r * 1.1, py + r * 0.85); c.lineTo(px - r * 1.1, py + r * 0.85); c.closePath(); }
+    else c.arc(px, py, r, 0, 2 * Math.PI);
+    c.globalAlpha = alphaOf(f1); c.fillStyle = col; c.fill();
+    c.globalAlpha = 1; c.strokeStyle = col; c.lineWidth = 1.3; c.stroke();
+    c.restore();
+  }
+  pB.draw(function (g) {
+    var b = budget(), v = g.view, cells = {};
+    /* decade lines stop above their labels */
+    [-4, -3, -2].forEach(function (x, i) {
+      g.line([[x, 0.5], [x, v.y1]], { color: 'grid2', width: 1 });
+      g.text(x, v.y0, ['1e-4', '1e-3', '1e-2'][i], { align: 'center', baseline: 'bottom', dy: -4, size: 11, font: 'mono', color: 'muted' });
+    });
+    /* hidden_size lanes at y = 1 … 5 (32 … 512) */
+    SIZES.forEach(function (sz, i) { g.text(v.x0, i + 1, String(sz), { align: 'left', baseline: 'middle', dx: 6, size: 11, font: 'mono', color: 'muted' }); });
+    done(S[0], b).forEach(function (r) {
+      var k = r.lr + '|' + r.size;
+      if (!cells[k]) cells[k] = { lr: r.lr, size: r.size, n: 0, f1: 0 };
+      cells[k].n++; cells[k].f1 = Math.max(cells[k].f1, r.f1);
+    });
+    Object.keys(cells).forEach(function (k) {
+      var c = cells[k], x = Math.log10(c.lr), y = SIZES.indexOf(c.size) + 1 + S[0].off;
+      mark(g, x, y, 'square', c.f1, false);
+      var edge = x > -2.2;   /* at 1e-2 the count goes to the left of the square, away from the frame */
+      if (c.n > 1) g.text(x, y, '×' + c.n, { align: edge ? 'right' : 'left', baseline: 'middle', dx: edge ? -8 : 8, size: 11, color: 'soft' });
+    });
+    [S[1], S[2]].forEach(function (s) {
+      done(s, b).forEach(function (r) { mark(g, Math.log10(r.lr), SIZES.indexOf(r.size) + 1 + s.off, s.shape, r.f1, r.n < 3); });
+    });
+  });
+
+  pC.draw(function (g) {
+    var b = budget(), v = g.view, any = false;
+    S.forEach(function (s, i) {
+      var x = i + 1, w = WIN[s.key];
+      g.text(x, v.y1, s.name, { align: 'center', baseline: 'top', dy: 6, size: 12, weight: 600, color: 'ink' });
+      if (b < s.total) return;
+      any = true;
+      g.line([[x - 0.27, w.mv], [x - 0.03, w.mv]], { color: 's5', width: 2.5 });
+      g.points(w.val.map(function (f) { return [x - 0.15, f]; }), { color: 's5', r: 4.5, shape: s.shape });
+      if (!tog.value) return;
+      g.line([[x + 0.03, w.mt], [x + 0.27, w.mt]], { color: 'ink', width: 2.5 });
+      g.points(w.test.map(function (f) { return [x + 0.15, f]; }), { color: 'ink', r: 4.5, shape: 'diamond' });
+    });
+    if (!any) g.text(2, 0.57, 'здесь появятся победители', { align: 'center', baseline: 'middle', size: 12, color: 'muted' });
+  });
+
+  ui.onChange(function () {
+    var b = budget();
+    S.forEach(function (s, i) {
+      var d = done(s, b), best = null, w = WIN[s.key];
+      d.forEach(function (r) { if (r.n === 3 && (best === null || r.f1 > best)) best = r.f1; });
+      if (b >= s.total) ro[i].set('val ' + w.mv.toFixed(4) + (tog.value ? ' → test ' + w.mt.toFixed(4) : ''));
+      else ro[i].set(best === null ? '—' : best.toFixed(4) + ' · ' + d.length + ' из ' + s.rows.length);
+    });
+  });
+});
+</script>
+
+  <h3>Test — один раз, для трёх победителей</h3>
+
+  <p>Победителей обучают заново на каждом разбиении и сохраняют веса (<code>torch.save(model.state_dict(), ...)</code>), потом каждую сеть собирают, загружают и один раз проверяют на test своего разбиения:</p>
+
+<pre><code>model = make_model(config['hidden_layers'],                  # (1)
+                   config['hidden_size'], config['dropout_rate'])
+model.load_state_dict(torch.load(
+    weights_path(f'{name} split {split + 1}'), map_location=device))
+test_loader = make_split(                                    # (2)
+    X, y, split, config['batch_size'], TEST_SIZE)[2]</code></pre>
+
+  <ol>
+    <li>Файл хранит только тензоры (<a href="l44.html">урок 44</a>), поэтому сеть сначала строят по <code>config</code>; <code>map_location=device</code> откроет на CPU веса с GPU.</li>
+    <li>Тот же <code>split</code> — то же разбиение и тот же масштаб; <code>[2]</code> — третий загрузчик, test.</li>
+  </ol>
+
+  <figure class="tbl-fig" id="l45-tbl-test">
+    <figcaption>Три поиска: 40, 20 и 20 конфигураций. Validation и test победителя — среднее ± разброс по трём разбиениям.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl tbl--center">
+        <thead><tr><th><span class="sr-only">показатель</span></th><th>сетка</th><th>random<br>search</th><th>Optuna</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">обучений</th><td class="num">120</td><td class="num">60</td><td class="num">56</td></tr>
+          <tr><th scope="row">минут</th><td class="num">24.1</td><td class="num">41.3</td><td class="num">10.9</td></tr>
+          <tr><th scope="row">validation</th><td class="num">0.601 ±&nbsp;0.016</td><td class="num">0.600 ±&nbsp;0.022</td><td class="num">0.603 ±&nbsp;0.017</td></tr>
+          <tr class="is-key"><th scope="row">test</th><td class="num">0.575 ±&nbsp;0.038</td><td class="num">0.580 ±&nbsp;0.028</td><td class="num">0.571 ±&nbsp;0.010</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <div class="pitfall"><p>«Random search и Optuna получили по 30 попыток, и random search вчетверо медленнее». Попыток по 20 (<code>N_TRIALS</code> в коде; 30 — только в тексте лабы), а 41.3 минуты против 10.9 — время по часам: random search шёл, пока машина была занята другим; с тем же процессорным временем при обычной загрузке он уложился бы минут в 14. Бюджет честно меряют в обучениях: 60 и 56.</p></div>
+
+  <div class="pitfall"><p>«Test победителей не участвовал ни в каком выборе». Почти: в каждом test 87–94 белка из 297 были в validation других разбиений, а по validation выбирали конфигурацию. Смещение, скорее всего, небольшое; чисто — сначала отложить один test на всех, потом делать K разбиений остального.</p></div>
+</section>
+
+<section id="l45-final">
+  <h2>Итоговая модель: три сети в одной</h2>
+
+  <p>В итог идёт лучший на validation победитель, Optuna: по test не выбирают, иначе test стал бы вторым validation (<a href="l18.html#l18-three-sets">урок 18</a>). У него три обученные сети, по одной на разбиение, и каждая видела свои 64&nbsp;% данных. Что считать итоговой моделью? Законных ответа два (<a href="l19.html#l19-after">урок 19</a>): обучить конфигурацию заново на всех данных или усреднить K сетей. Лаба берёт второй — <span class="en" lang="en">ensemble</span> (ансамбль):</p>
+
+<pre><code>class Ensemble(nn.Module):
+    def __init__(self, members, shifts, scales):
+        super().__init__()
+        self.members = nn.ModuleList(members)                # (1)
+        self.register_buffer('shifts', torch.as_tensor(      # (2)
+            np.stack(shifts), dtype=torch.float32))
+        self.register_buffer('scales', torch.as_tensor(
+            np.stack(scales), dtype=torch.float32))
+
+    def forward(self, x):
+        probabilities = [                                    # (3)
+            torch.softmax(member((x - shift) / scale), dim=1)
+            for member, shift, scale
+            in zip(self.members, self.shifts, self.scales)]
+        return torch.stack(probabilities).mean(dim=0)</code></pre>
+
+  <ol>
+    <li><code>nn.ModuleList</code> регистрирует сети как части модели: их веса попадают в <code>state_dict</code>, а <code>.to(device)</code> и <code>.eval()</code> доходят до каждой. Обычный список Python модель не увидела бы.</li>
+    <li><code>register_buffer</code> хранит тензор, который не обучается: он сохраняется и переезжает на device вместе с моделью, но не входит в <code>parameters()</code>, и optimizer его не тронет.</li>
+    <li>Каждая сеть масштабирует вход по своему training. Softmax — потому что усредняют вероятности, а не logits.</li>
+  </ol>
+
+  <figure class="fig fig--plain" id="l45-fig-ens">
+    <svg class="dia" viewBox="0 0 560 312" role="img" aria-label="Устройство final_model: сырой x формы B на 8 идёт в три ветки; в каждой вычитается минимум и делится на размах своего training, затем своя сеть даёт B на 10 и softmax; вероятности складываются в стопку 3 на B на 10 и усредняются до B на 10">
+      <rect x="6" y="120" width="86" height="56" class="fi-paper"/>
+      <text x="49" y="144" class="tx-mid tx-bold">сырой x</text>
+      <text x="49" y="166" class="tx-mid tx-mono">[B, 8]</text>
+      <line x1="92" y1="138" x2="108" y2="66" marker-end="url(#arr)"/>
+      <line x1="92" y1="148" x2="108" y2="148" marker-end="url(#arr)"/>
+      <line x1="92" y1="158" x2="108" y2="230" marker-end="url(#arr)"/>
+
+      <rect x="112" y="30" width="124" height="56" class="fi-paper"/>
+      <text x="174" y="54" class="tx-mid tx-mono">(x − low₁)</text>
+      <text x="174" y="78" class="tx-mid tx-mono">/ span₁</text>
+      <line x1="236" y1="58" x2="252" y2="58" marker-end="url(#arr)"/>
+      <rect x="256" y="30" width="88" height="56" class="fw-s3 st-s3"/>
+      <text x="300" y="54" class="tx-mid">сеть 1</text>
+      <text x="300" y="78" class="tx-mid tx-mono">[B, 10]</text>
+      <line x1="344" y1="58" x2="420" y2="58" marker-end="url(#arr)"/>
+      <text x="382" y="48" class="tx-mid tx-mono">softmax</text>
+
+      <rect x="112" y="120" width="124" height="56" class="fi-paper"/>
+      <text x="174" y="144" class="tx-mid tx-mono">(x − low₂)</text>
+      <text x="174" y="168" class="tx-mid tx-mono">/ span₂</text>
+      <line x1="236" y1="148" x2="252" y2="148" marker-end="url(#arr)"/>
+      <rect x="256" y="120" width="88" height="56" class="fw-s3 st-s3"/>
+      <text x="300" y="144" class="tx-mid">сеть 2</text>
+      <text x="300" y="168" class="tx-mid tx-mono">[B, 10]</text>
+      <line x1="344" y1="148" x2="420" y2="148" marker-end="url(#arr)"/>
+      <text x="382" y="138" class="tx-mid tx-mono">softmax</text>
+
+      <rect x="112" y="210" width="124" height="56" class="fi-paper"/>
+      <text x="174" y="234" class="tx-mid tx-mono">(x − low₃)</text>
+      <text x="174" y="258" class="tx-mid tx-mono">/ span₃</text>
+      <line x1="236" y1="238" x2="252" y2="238" marker-end="url(#arr)"/>
+      <rect x="256" y="210" width="88" height="56" class="fw-s3 st-s3"/>
+      <text x="300" y="234" class="tx-mid">сеть 3</text>
+      <text x="300" y="258" class="tx-mid tx-mono">[B, 10]</text>
+      <line x1="344" y1="238" x2="420" y2="238" marker-end="url(#arr)"/>
+      <text x="382" y="228" class="tx-mid tx-mono">softmax</text>
+
+      <rect x="424" y="30" width="130" height="236" class="fi-paper sw-2"/>
+      <text x="489" y="96" class="tx-mid tx-mono tx-bold">stack</text>
+      <text x="489" y="122" class="tx-mid tx-mono">[3, B, 10]</text>
+      <line x1="489" y1="134" x2="489" y2="154" marker-end="url(#arr)"/>
+      <text x="489" y="180" class="tx-mid tx-mono tx-bold">mean(dim=0)</text>
+      <text x="489" y="206" class="tx-mid tx-mono">[B, 10]</text>
+      <text x="112" y="300" class="tx-hand">свой min-max у каждой сети</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Что внутри <code>final_model</code>. Каждая ветка масштабирует сырые признаки минимумом и размахом своего training (буферы <code>shifts</code> и <code>scales</code> формы [3, 8]) и прогоняет через свою сеть и softmax; вероятности усредняются.</figcaption>
+  </figure>
+
+  <p>Отсюда контракт: <code>final_model</code> ждёт сырые признаки, как в <code>X</code> (тензор float32 формы [B, 8] на device модели), и возвращает вероятности формы [B, 10], а не logits. Батч из <code>make_split</code> он масштабировал бы второй раз, а его выход в <code>nn.CrossEntropyLoss</code> получил бы второй softmax.</p>
+
+  <p>Собирают ансамбль из сохранённых сетей победителя, <code>best_name = 'Optuna'</code>:</p>
+
+<pre><code>members, shifts, scales = [], [], []
+for split in range(K):
+    member = make_model(config['hidden_layers'],
+                        config['hidden_size'],
+                        config['dropout_rate'])
+    member.load_state_dict(torch.load(
+        weights_path(f'{best_name} split {split + 1}'),
+        map_location=device))
+    low, span = split_scaling(X, y, split, TEST_SIZE)
+    members.append(member.eval())
+    shifts.append(low)
+    scales.append(span)
+final_model = Ensemble(members, shifts, scales).to(device).eval()</code></pre>
+
+  <div class="tip"><p><code>split_scaling</code> повторяет оба вызова <code>train_test_split</code> из <code>make_split</code> с теми же зёрнами, чтобы получить те же минимумы и размахи. Правка одной функции без другой молча разведёт масштабы; надёжнее, чтобы <code>make_split</code> сам возвращал <code>low</code> и <code>span</code>.</p></div>
+
+  <div class="pitfall"><p>«0.5705&nbsp;±&nbsp;0.0095 — качество ансамбля». Лаба печатает это число под итоговой моделью, но сама уточняет: <span lang="en">"mean over the test sets of the splits"</span>. Это среднее трёх отдельных сетей, то есть качество одной сети на 64&nbsp;% данных. Ансамбль, скорее всего, не хуже, но его никто не измерял, и честно измерить не на чем: test первого разбиения делит 195 белков с training второй сети и 185 — третьей. Причина не в том, что каждый белок учил хотя бы одну сеть, как пишет текст лабы: 85 белков не попали ни в один training, но 73 из них были в validation, а 12 оставшихся для macro F1 слишком мало.</p></div>
+
+  <div class="pitfall"><p>«После поиска сеть различает все классы». На test победителя, по всем трём разбиениям, все три белка ERL найдены, а из белков VAC — ни один. Это выбор, а не ошибка кода: <code>CrossEntropyLoss</code> без весов, где VAC — 2&nbsp;% слагаемых, и отбор по macro F1, где VAC — десятая часть. Следующий шаг тут — не новый поиск, а веса классов, <code>CrossEntropyLoss(weight=...)</code>; в лабе их не пробуют.</p></div>
+
+  <h3>Разгадка</h3>
+
+  <p>Какой поиск победил? На validation — Optuna: 0.603 против 0.601 у сетки и 0.600 у random search. На test она последняя: 0.571 против 0.575 и 0.580. Эти разницы ничего не значат: они меньше разброса одного победителя по разбиениям (test сетки — от 0.522 до 0.602) и в десять раз меньше цены одного белка ERL. Три поиска вышли на одно плато и различаются только ценой: 120, 60 и 56 обучений.</p>
+
+  <p>Validation 0.603 выбирал и эпоху, и конфигурацию, и потому завышен (<a href="l19.html#l19-curse">урок 19</a>), а ± скорее занижает разброс.</p>
+
+  <p class="memo"><mark class="key">Честное число для отчёта — 0.571&nbsp;±&nbsp;0.010 на test: качество одной сети на 64&nbsp;% данных.</mark></p>
+</section>
+
+<section id="l45-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="open" id="l45-exam-leak">
+    <div class="exam-q" lang="en">
+      <p>To simplify the code, a student scales the whole data set once, before any split, and then calls <code>make_split</code> on <code>X_scaled</code> without its own scaling. Everything runs, and the cross-validated scores barely change. What is wrong, and why can the scores barely change and the protocol still be wrong?</p>
+<pre><code>low, high = X.min(axis=0), X.max(axis=0)
+span = np.where(high &gt; low, high - low, 1.0)
+X_scaled = ((X - low) / span).astype(np.float32)</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The minimum and the maximum now come from all 1484 proteins, including the validation and test proteins of every split, so information about the data used for evaluation enters the preprocessing of the training data: data leakage. The validation and test values are guaranteed to lie in [0, 1], which genuinely new data does not, so the estimate is optimistic. Here the bias is small because the extremes of 1484 proteins are close to those of 949, but the protocol is wrong in principle, and with a step that learns more from the data, such as feature selection, or with fewer samples, the same mistake can inflate the score a lot. Fix: compute low and span on X_train of each split only and apply them to the three parts, as make_split does.</p></div>
+      <div class="exam-note"><p>Проверяют, что утечка — свойство протокола, а не размера эффекта. Следом спрашивают: <span lang="en">"Where does the scaling go in cross-validation?"</span> — внутрь каждого разбиения: у каждого training свои low и span, и у ансамбля по ним свой масштаб на каждую сеть.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l45-exam-prune">
+    <div class="exam-q" lang="en">
+      <p>In this Optuna objective, what do <code>trial.report</code> and <code>trial.should_prune</code> do? With <code>MedianPruner(n_startup_trials=5, n_warmup_steps=1)</code> and K = 3, when can a trial be pruned at the earliest? What would change if <code>raise optuna.TrialPruned()</code> were replaced by <code>return scores.mean()</code>?</p>
+<pre><code>for split in range(K):
+    scores.append(train_on_split(X, y, config, split,
+                                 **TRAIN_SETTINGS)[0])
+    trial.report(np.mean(scores), split)
+    if trial.should_prune():
+        break
+scores = np.array(scores)
+if len(scores) &lt; K:
+    raise optuna.TrialPruned()
+return scores.mean()</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>trial.report stores the running mean after each split as the intermediate value of step split. trial.should_prune asks the pruner whether to stop: the median pruner compares the trial's best intermediate value with the median of the completed trials at the same step. Pruning is off until 5 trials have completed and for steps below 1, so the earliest prune is after the second split (step 1) of trial 6. After the third split a prune signal saves nothing: len(scores) == K and the trial completes normally. With return instead of raise, a pruned trial would be recorded as complete with the mean of only two splits: a noisier, partial score that could become the best trial, and that would enter the medians used to prune later trials.</p></div>
+      <div class="exam-note"><p>Главное — отсечённая попытка не должна соревноваться с полными. Следом спрашивают: <span lang="en">"Why does TPE start with random trials?"</span> — ему нужны готовые результаты, чтобы разделить попытки на хорошие и плохие; в нашем прогоне все десять следующих попыток выбрали ширину 256.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l45-exam-ens">
+    <div class="exam-q" lang="en">
+      <p>A colleague evaluates the final ensemble of the lab as follows. What goes wrong?</p>
+<pre><code>test_loader = make_split(X, y, 0, 64, TEST_SIZE)[2]
+criterion = nn.CrossEntropyLoss()
+for x, y_true in test_loader:
+    loss = criterion(final_model(x), y_true)</code></pre>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Three things. First, make_split returns features already min-max scaled with the statistics of split 1, and final_model scales its input again with each member's own low and span, so the members see doubly scaled data; the ensemble expects raw features. Second, final_model returns averaged probabilities, while CrossEntropyLoss expects logits and applies log-softmax itself; on probabilities it computes the wrong loss. Use torch.log of the probabilities with nn.NLLLoss, or just accuracy and macro F1 of the argmax. Third, even when fixed, this test set is not clean for the ensemble: members 2 and 3 were trained on 195 and 185 of its 297 proteins, so the score would be optimistic.</p></div>
+      <div class="exam-note"><p>Проверяют контракт входа и выхода модели. Следом спрашивают: <span lang="en">"Why nn.ModuleList and register_buffer, not a Python list and plain tensors?"</span> — иначе сети и масштабы не попадут в <code>state_dict</code>, а <code>.to(device)</code> и <code>.eval()</code> до них не дойдут.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.1" data-tol="0.005" id="l45-exam-protein">
+    <div class="exam-q" lang="en">
+      <p>A validation set of 238 samples has 10 classes, and one class has exactly one sample, which the network classifies correctly; nothing else is predicted as that class. By about how much does the macro-averaged F1 score drop if the network misclassifies that one sample and every other prediction stays the same?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>About 0.10. The F1 of that class goes from 1 to 0, and in the unweighted mean of 10 classes that is 1/10. The class that receives the wrong prediction loses a little as well (in the lab 0.559 → 0.459, a drop of 0.1003). Accuracy drops by only 1/238 ≈ 0.0042.</p></div>
+      <div class="exam-note"><p>Проверяют, что в macro F1 каждый класс весит 1/K, сколько бы в нём ни было примеров. Следом: <span lang="en">"And for one sample of the largest class?"</span> — для CYT около 0.0013, почти в 80 раз меньше.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.593" data-tol="0.005" id="l45-exam-shuffle">
+    <div class="exam-q" lang="en">
+      <p>K-shuffle-split cross-validation draws K independent random splits, each sending 16% of the samples to validation. With K = 3, what fraction of the samples is never in any validation set? Treat every sample as drawn into validation independently with probability 0.16.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>(1 − 0.16)³ = 0.84³ ≈ 0.593. In the lab 880 of 1484 proteins (59%) are never validated; by the same estimate (1 − 0.64)³ ≈ 0.05 are never in a training set (85 proteins in the lab). With 3-fold cross-validation every sample is validated exactly once, but each validation set is a third of the data.</p></div>
+      <div class="exam-note"><p>Проверяют разницу между K-fold и K-shuffle-split (Monte Carlo cross-validation). Следом: <span lang="en">"Why use shuffle-split at all?"</span> — K и доля validation выбираются независимо, и у каждого разбиения может быть свой test.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l45-exam-report">
+    <div class="exam-q" lang="en">
+      <p>Grid search, random search and Optuna end with a mean validation macro F1 of 0.601, 0.600 and 0.603 over three splits, each with a spread of about ±0.02. Their winners score 0.575, 0.580 and 0.571 on the test sets. Which strategy found the best configuration? Why are all the test scores below the validation scores? What number do you report?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>None can be declared better. The differences, 0.003 on validation and 0.009 on test, are far below the spread over splits (one winner's test scores range from 0.522 to 0.602) and below the weight of one sample of a rare class in macro F1 (0.10), so the ranking is noise; here it even reverses on test. The validation scores are optimistic because they were used twice, to choose the epoch by early stopping and to choose the configuration, and the maximum of noisy estimates is biased upwards. Report the test score of the chosen configuration, 0.571&nbsp;±&nbsp;0.010, saying that it describes one network trained on 64% of the data and that the ± understates the uncertainty. The strategies differ mainly in cost: 120, 60 and 56 trainings.</p></div>
+      <div class="exam-note"><p>Главный вопрос урока: отличить разницу от шума и назвать честное число. Следом: <span lang="en">"How would you make the comparison cleaner?"</span> — отложить один test до всякого поиска, взять больше разбиений или nested cross-validation.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l45-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Что даёт <code>random_state=seed + split</code> в <code>make_split</code>?</p>
+    <ul class="options">
+      <li>Три одинаковых разбиения, зато воспроизводимых <span class="fb">Зерно у каждого разбиения своё: <code>seed + 0</code>, <code>seed + 1</code>, <code>seed + 2</code>.</span></li>
+      <li data-correct>Каждое разбиение своё, и при новом запуске получится то же самое <span class="fb">Разные зёрна дают разные жребии, фиксированные — те же жребии при каждом запуске.</span></li>
+      <li>Новые разбиения при каждом запуске <span class="fb">Так было бы без <code>random_state</code>; здесь все зёрна заданы.</span></li>
+      <li>Разбиения без общих белков в validation, как в K-fold <span class="fb">Жребии независимы, и validation-наборы перекрываются; ни разу не проверяются 880 белков.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Из <code>make_split</code> убрали оба <code>stratify=...</code>. Что изменится? Отметь все верные варианты.</p>
+    <ul class="options">
+      <li data-correct>В части разбиений в validation не окажется ни одного белка ERL <span class="fb">Вероятность, что ни один из пяти ERL не попадёт в 16&nbsp;% validation, около \(0.84^5 \approx 0.42\).</span></li>
+      <li data-correct>Разброс оценок по разбиениям вырастет <span class="fb">Доли редких классов начнут плавать от разбиения к разбиению, а с ними и macro F1.</span></li>
+      <li>Код упадёт с ошибкой <span class="fb"><code>train_test_split</code> без <code>stratify</code> работает молча.</span></li>
+      <li>Сломается min-max scaling <span class="fb">Масштаб считается по <code>X_train</code> при любом разбиении.</span></li>
+    </ul>
+    <p class="q-fb">Стратификация убирает лишний жребий — сколько белков редких классов попадёт в каждую часть. Без неё часть разбиений считала бы macro F1 без класса ERL.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Лаба печатает 0.5700&nbsp;±&nbsp;0.0111. Что описывает&nbsp;±&nbsp;0.0111?</p>
+    <ul class="options">
+      <li>Сколько сеть ошибается на одном белке <span class="fb">Это разброс оценки по разбиениям, а не ошибка на примере.</span></li>
+      <li data-correct>Разброс macro F1 той же конфигурации по трём разбиениям при одних и тех же начальных весах <span class="fb"><code>np.std</code> трёх чисел с ddof=0; разброс от инициализации сюда не входит.</span></li>
+      <li>95-процентный доверительный интервал качества на новых белках <span class="fb">Три зависимых числа, ddof=0 и одни и те же начальные веса: это скорее заниженная оценка разброса, а не интервал.</span></li>
+      <li>Разницу между validation и test <span class="fb">Test в оценке конфигурации не участвует вовсе.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Попытка Optuna получила от <code>should_prune()</code> сигнал после третьего, последнего разбиения. Что произойдёт?</p>
+    <ul class="options">
+      <li>Попытка будет помечена как отсечённая и не сможет победить <span class="fb"><code>break</code> сработает, но <code>len(scores)</code> уже равно K, и <code>pruned</code> ложно.</span></li>
+      <li data-correct>Ничего: попытка завершится и вернёт среднее трёх разбиений <span class="fb">Экономить уже нечего — все три обучения сделаны.</span></li>
+      <li>Её результат не попадёт в <code>optuna_results</code> <span class="fb">Запись стоит до проверки, туда попадают даже отсечённые попытки.</span></li>
+      <li>Optuna перезапустит её с другим зерном <span class="fb">Pruner ничего не перезапускает, он только советует остановиться.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Patience 20 эпох, в training 949 белков. Сколько шагов оптимизатора длится окно ожидания при batch 4 и при batch 128?</p>
+    <ul class="options">
+      <li>20 и 20 <span class="fb">20 — это эпохи, а не шаги.</span></li>
+      <li data-correct>4760 и 160 <span class="fb">За эпоху ceil(949 / 4) = 238 и ceil(949 / 128) = 8 шагов, умноженные на 20: маленький batch ждёт в 30 раз дольше.</span></li>
+      <li>80 и 2560 <span class="fb">Это 20 × batch size, а нужно 20 × число батчей за эпоху.</span></li>
+      <li>600 и 600 <span class="fb">600 — окно для batch 32, где эпоха — 30 шагов.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text"><code>learning_rate</code> тянут как <code>10 ** rng.uniform(-4, -2)</code>. Какая доля попыток окажется ниже 1e-3?</p>
+    <ul class="options">
+      <li>Около 9&nbsp;% <span class="fb">Столько было бы при равномерном выборе самого learning rate из [1e-4, 1e-2].</span></li>
+      <li data-correct>Половина <span class="fb">Равномерен показатель степени на [−4, −2], и [−4, −3] — ровно его половина.</span></li>
+      <li>Около 91&nbsp;% <span class="fb">91&nbsp;% — доля выше 1e-3 при равномерном выборе самого числа.</span></li>
+      <li>Зависит от seed <span class="fb">От seed зависит конкретный жребий, а не распределение.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Что верно про <code>final_model</code>? Отметь все верные варианты.</p>
+    <ul class="options">
+      <li data-correct>Ему нужны сырые признаки, а не батчи из <code>make_split</code> <span class="fb">Каждая сеть масштабирует вход сама; батч из <code>make_split</code> прошёл бы min-max дважды.</span></li>
+      <li data-correct>Он возвращает вероятности, и каждая строка в сумме даёт 1 <span class="fb">Это среднее softmax трёх сетей.</span></li>
+      <li data-correct><code>shifts</code> и <code>scales</code> сохраняются в <code>state_dict</code>, но optimizer их не обучает <span class="fb">Так работает <code>register_buffer</code>: буфер — часть состояния, но не параметр.</span></li>
+      <li>Его ожидаемый macro F1 на новых белках — 0.5705, как печатает лаба <span class="fb">Это среднее отдельных сетей на test своих разбиений; сам ансамбль никто не мерил.</span></li>
+      <li>Его можно честно проверить на test любого разбиения <span class="fb">Две другие сети обучались на 182–195 белках каждого такого test.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l45-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>Одна macro F1 на 238 белках — жребий: белок ERL весит в ней 0.10, белок CYT — 0.0013, а одна и та же конфигурация на трёх разбиениях получает от 0.559 до 0.585.</li>
+    <li>Конфигурацию оценивают средним по K стратифицированным разбиениям с масштабом, посчитанным по training каждого; K-shuffle-split — независимые жребии, а не K-fold: 880 белков ни разу не проверяются, 85 ни разу не учат сеть.</li>
+    <li>± из <code>np.std</code> трёх чисел скорее занижает разброс; разница меньше него — шум, и верить стоит форме таблицы, а не лучшей клетке.</li>
+    <li>Правило остановки — тоже hyperparameter: patience 20 по шумной macro F1 обрезает медленные конфигурации и меняет порядок в поиске.</li>
+    <li>Сетка, random search с log-uniform learning rate и weight decay и Optuna с TPE и pruning вышли на одно плато (0.601, 0.600, 0.603) и различаются ценой — 120, 60 и 56 обучений, а на test их порядок обратный.</li>
+    <li>Итоговая модель — ансамбль трёх сетей со своими масштабами; её вход — сырые признаки, а 0.571&nbsp;±&nbsp;0.010 — качество одной сети на 64&nbsp;% данных.</li>
+  </ul>
+</section>
+
+<section class="resources" id="l45-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/docs/stable/notes/randomness.html" target="_blank" rel="noopener">Reproducibility</a>
+      <span class="res-by">документация PyTorch</span><span class="res-dur">10 мин</span>
+      <p class="res-why">Какие генераторы надо зафиксировать, чтобы прогон повторился, и как DataLoader получает свои случайные числа: почему один лишний проход по данным меняет все следующие перемешивания.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_buffer" target="_blank" rel="noopener">torch.nn.Module.register_buffer</a>
+      <span class="res-by">документация PyTorch</span><span class="res-dur">5 мин</span>
+      <p class="res-why">Чем буфер отличается от параметра и что попадает в <code>state_dict</code>; рядом на той же странице — <code>parameters()</code> и <code>to()</code>, которые ансамбль лабы проходит насквозь.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="после">
+      <a class="res-title" href="https://jmlr.org/papers/v13/bergstra12a.html" target="_blank" rel="noopener">Random Search for Hyper-Parameter Optimization</a>
+      <span class="res-by">James Bergstra, Yoshua Bengio · JMLR 2012</span><span class="res-dur">15 мин на рис. 1 и введение</span>
+      <p class="res-why">Работа, на которую ссылается лаба: девять точек сетки пробуют три значения важного hyperparameter, девять случайных — девять.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://scikit-learn.org/stable/auto_examples/model_selection/plot_nested_cross_validation_iris.html" target="_blank" rel="noopener">Nested versus non-nested cross-validation</a>
+      <span class="res-by">галерея примеров scikit-learn</span><span class="res-dur">15 мин</span>
+      <p class="res-why">Тридцать строк кода, которые меряют оптимизм оценки, когда одни и те же данные выбирают hyperparameters и оценивают модель, — то, о чём предупреждает test этой лабы.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://github.com/google-research/tuning_playbook" target="_blank" rel="noopener">Deep Learning Tuning Playbook</a>
+      <span class="res-by">Google Research</span><span class="res-dur">40 мин</span>
+      <p class="res-why">Как подбирают hyperparameters на практике: quasi-random search, какие ручки крутить первыми и как отличить настоящее улучшение от шума.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Белки считаются независимыми друг от друга, и случайное стратифицированное разбиение здесь честно. В следующей лабе (урок 46, он пока не готов) — показания акселерометра телефона, нарезанные на перекрывающиеся окна. Схема та же: K-shuffle-split, early stopping, ансамбль из K сетей, но резать данные придётся по записям, а не по окнам: окна одной записи по обе стороны разбиения подсказали бы сети ответ.</p>
+</aside>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,1100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Глубже и в обе стороны · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l33">
+
+<header class="lesson-head">
+  <h1>Глубже и в обе стороны</h1>
+  <p class="lede">После этого урока ты запишешь уравнения GRU и сравнишь его с LSTM, соберёшь из ячеек многослойную и двунаправленную сеть, скажешь, когда двунаправленность запрещена, и посчитаешь параметры и формы тензоров в PyTorch.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>Два предложения: "I arrived at the bank to deposit money" и "I arrived at the bank of the river". Сеть читает каждое слева направо, по слову за шаг, и про каждое слово говорит, что оно значит. Для bank в первом предложении верный ответ — «банк», во втором — «берег».</p>
+  <p>Первые пять слов у предложений одинаковые. Значит, когда сеть дочитала bank, её состояние в обоих случаях одно и то же, число в число, и ответ тоже один. Хотя бы в одном предложении он неверен, как бы долго сеть ни учили.</p>
+  <p>Как дать сети увидеть правую часть фразы? И почему тот же приём запрещён сети, которая дописывает текст слово за словом?</p>
+</div>
+
+<section id="l33-gru">
+  <h2>GRU: один кроссфейдер вместо двух фейдеров</h2>
+
+  <aside class="margin-note">Обозначения как на слайдах про LSTM и GRU: время — нижний индекс, \(*\) — поэлементное произведение, \([h_{t-1}, x_t]\) — склейка двух векторов.</aside>
+
+  <p>Сеть собирают из ячеек, и кроме LSTM есть вторая ячейка с воротами, на четверть легче. Только считать она не умеет — почему, видно прямо из её формулы. С неё и начнём, а к bank вернёмся, когда дойдём до сети.</p>
+
+  <p>Представь диджейский пульт. Смешать старую дорожку с новой можно двумя способами. Первый — два независимых фейдера: один держит громкость старой, другой — новой, и оба можно поднять до упора. Второй — один кроссфейдер: сдвигаешь его к новой дорожке, и старая на столько же стихает. Доли всегда дают в сумме единицу.</p>
+
+  <p>LSTM из <a href="l32.html">урока 32</a> — пульт с фейдерами. Keep gate \(f_t\) (он же forget gate) решает, сколько старой памяти \(C_{t-1}\) оставить, write gate \(i_t\) (input gate) — сколько кандидата \(\tilde C_t\) дописать, и эти ручки независимы. Третья ручка, read gate \(o_t\) (output gate), решает, что из памяти показать наружу.</p>
+
+  <p><mark class="key">Gated Recurrent Unit</mark> (<abbr title="Gated Recurrent Unit">GRU</abbr>, Cho et al., 2014) — пульт с кроссфейдером: он склеивает две ручки в одну, сливает память с выходом и меняет ещё кое-что ("It combines the forget and input gates into a single 'update gate.' It also merges the cell state and hidden state, and makes some other changes", <a class="slide-ref" href="assets/slides/s04_022.webp" data-deck="s04" data-slide="22">лекция 4, слайд 22</a>).</p>
+
+  <div class="formula">
+    \[ z_t = \sigma\left(W_z \cdot [h_{t-1}, x_t]\right) \]
+    \[ r_t = \sigma\left(W_r \cdot [h_{t-1}, x_t]\right) \]
+    \[ \tilde h_t = \tanh\left(W \cdot [r_t * h_{t-1},\ x_t]\right) \]
+    \[ h_t = (1 - z_t) * h_{t-1} + z_t * \tilde h_t \]
+    <dl class="legend">
+      <dt>\(z_t\)</dt><dd><span class="en" lang="en">update gate</span>, ворота обновления: какую долю каждого числа состояния заменить новым</dd>
+      <dt>\(r_t\)</dt><dd><span class="en" lang="en">reset gate</span>, ворота сброса: сколько прошлого пустить в кандидата</dd>
+      <dt>\(\tilde h_t\)</dt><dd><span class="en" lang="en">candidate</span>, кандидат: новое содержание, каждое число в \((-1, 1)\)</dd>
+      <dt>\(h_t\)</dt><dd>состояние: оно же память и оно же выход ячейки</dd>
+      <dt>\(W_z, W_r, W\)</dt><dd>три матрицы весов, каждая размера \(n \times (n + d)\), где \(n\) — размер состояния, \(d\) — размер входа; смещений на слайде нет</dd>
+    </dl>
+  </div>
+
+  <aside class="margin-note">В конспекте (уравнения 115–118) у трёх строк с весами есть смещения \(b_z\), \(b_r\), \(b_h\), матрица кандидата названа \(W_h\), а произведение записано как \(\odot\).</aside>
+
+  <p><mark class="key">Update gate</mark> \(z_t\) — тот самый кроссфейдер, свой у каждого числа состояния. При \(z = 0\) число копируется как есть: \(h_t = h_{t-1}\). При \(z = 1\) оно целиком заменяется кандидатом. Между ними — смесь. Значит, \(z_t\) делает работу write gate, а \(1 - z_t\) — работу keep gate: в этой формуле GRU ведёт себя как LSTM, у которой две ручки связали правилом \(f = 1 - i\).</p>
+
+  <p class="memo"><mark class="key">Сколько нового GRU записывает, столько старого стирает: \(h_t\) — смесь \(h_{t-1}\) и \(\tilde h_t\) с долями \(1 - z_t\) и \(z_t\).</mark></p>
+
+  <p><mark class="key">Reset gate</mark> \(r_t\) работает раньше, внутри кандидата: прежде чем смешать прошлое с новым входом, GRU умножает \(h_{t-1}\) на \(r_t\). При \(r \approx 0\) кандидат строится из одного \(x_t\), как с чистого листа; при \(r \approx 1\) прошлое учитывается целиком. На пульте это ручка наушников: сколько старого микса слышно, пока готовишь новую дорожку; в колонки идёт только то, что выставил кроссфейдер. В формулу для \(h_t\) ворота \(r_t\) не входят и влияют на состояние только через кандидата. Роль input gate LSTM в GRU играет update gate \(z_t\), а у reset gate прямого аналога в LSTM нет (на стр. 272 конспекта они названы похожими, и это неточно). Это главная из «some other changes» слайда.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-cells">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="LSTM: память C идёт по верхней полосе через умножение на f и сложение с произведением i на кандидата; через tanh и ворота o она выходит наружу как h; четыре блока весов f, i, кандидат и o читают прошлое h и вход x">
+        <line x1="80" y1="150" x2="80" y2="64" class="hl"/>
+        <polyline points="130,150 130,110 139,110" class="hl"/>
+        <line x1="14" y1="50" x2="284" y2="50" class="sw-3" marker-end="url(#arr)"/>
+        <line x1="80" y1="150" x2="80" y2="63" marker-end="url(#arr)"/>
+        <polyline points="130,150 130,110 138,110" marker-end="url(#arr)"/>
+        <polyline points="175,150 175,110 162,110" marker-end="url(#arr)"/>
+        <line x1="150" y1="100" x2="150" y2="63" marker-end="url(#arr)"/>
+        <line x1="232" y1="50" x2="232" y2="70"/>
+        <line x1="232" y1="88" x2="232" y2="99"/>
+        <line x1="232" y1="150" x2="232" y2="123" marker-end="url(#arr)"/>
+        <line x1="242" y1="110" x2="284" y2="110" marker-end="url(#arr)"/>
+        <polyline points="80,174 80,198 232,198 232,174" class="st-muted"/>
+        <line x1="130" y1="174" x2="130" y2="198" class="st-muted"/>
+        <line x1="175" y1="174" x2="175" y2="198" class="st-muted"/>
+        <circle cx="80" cy="50" r="10" class="fi-paper"/>
+        <circle cx="150" cy="50" r="10" class="fi-paper"/>
+        <circle cx="150" cy="110" r="10" class="fi-paper"/>
+        <circle cx="232" cy="110" r="10" class="fi-paper"/>
+        <rect x="213" y="70" width="38" height="18" rx="9" class="fi-paper"/>
+        <rect x="65" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <rect x="115" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <rect x="160" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <rect x="217" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <text x="80" y="55" class="tx-mid">×</text>
+        <text x="150" y="55" class="tx-mid">+</text>
+        <text x="150" y="115" class="tx-mid">×</text>
+        <text x="232" y="115" class="tx-mid">×</text>
+        <text x="232" y="83" class="tx-mid tx-sm">tanh</text>
+        <text x="80" y="167" class="tx-mid">f</text>
+        <text x="130" y="167" class="tx-mid">i</text>
+        <text x="175" y="167" class="tx-mid">C̃</text>
+        <text x="232" y="167" class="tx-mid">o</text>
+        <text x="14" y="36">Cₜ₋₁</text>
+        <text x="286" y="36" class="tx-end">Cₜ</text>
+        <text x="286" y="98" class="tx-end">hₜ</text>
+        <text x="156" y="222" class="tx-mid tx-sm tx-muted">вход всех блоков: hₜ₋₁ и xₜ</text>
+      </svg>
+      <p class="fig-label">До: LSTM — две независимые ручки \(f\) и \(i\), отдельная память, 4 блока весов</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 236" role="img" aria-label="GRU: одна полоса h, она же выход; старое h умножается на 1 минус z, к нему прибавляется z, умноженное на кандидата; одна ручка z управляет обеими долями; ворота r влияют только на кандидата; три блока весов z, кандидат и r">
+        <polyline points="80,118 80,132 150,132 150,121" class="hl"/>
+        <line x1="115" y1="150" x2="115" y2="132" class="hl"/>
+        <line x1="14" y1="50" x2="284" y2="50" class="sw-3" marker-end="url(#arr)"/>
+        <line x1="80" y1="91" x2="80" y2="63" marker-end="url(#arr)"/>
+        <line x1="115" y1="150" x2="115" y2="132"/>
+        <line x1="80" y1="132" x2="150" y2="132"/>
+        <line x1="80" y1="132" x2="80" y2="119" marker-end="url(#arr)"/>
+        <line x1="150" y1="132" x2="150" y2="122" marker-end="url(#arr)"/>
+        <polyline points="190,150 190,110 162,110" marker-end="url(#arr)"/>
+        <line x1="150" y1="100" x2="150" y2="63" marker-end="url(#arr)"/>
+        <line x1="232" y1="162" x2="207" y2="162" marker-end="url(#arr)"/>
+        <polyline points="115,174 115,198 247,198 247,174" class="st-muted"/>
+        <line x1="190" y1="174" x2="190" y2="198" class="st-muted"/>
+        <circle cx="80" cy="50" r="10" class="fi-paper"/>
+        <circle cx="150" cy="50" r="10" class="fi-paper"/>
+        <circle cx="80" cy="104" r="13" class="fi-paper"/>
+        <circle cx="150" cy="110" r="10" class="fi-paper"/>
+        <rect x="100" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <rect x="175" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <rect x="232" y="150" width="30" height="24" class="fi-paper sw-2"/>
+        <text x="80" y="55" class="tx-mid">×</text>
+        <text x="150" y="55" class="tx-mid">+</text>
+        <text x="80" y="108" class="tx-mid tx-sm">1−</text>
+        <text x="150" y="115" class="tx-mid">×</text>
+        <text x="115" y="167" class="tx-mid">z</text>
+        <text x="190" y="167" class="tx-mid">h̃</text>
+        <text x="247" y="167" class="tx-mid">r</text>
+        <text x="14" y="36">hₜ₋₁</text>
+        <text x="286" y="36" class="tx-end">hₜ</text>
+        <text x="156" y="222" class="tx-mid tx-sm tx-muted">вход всех блоков: hₜ₋₁ и xₜ</text>
+      </svg>
+      <p class="fig-label">После: GRU — одна ручка \(z\), память и выход совпадают, 3 блока весов</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Слева память \(C\) идёт по своей полосе; ручки \(f\) и \(i\) независимы, наружу память выходит через tanh и ворота \(o\). Справа полоса одна, и \(h\) на ней — и память, и выход. Ручка тоже одна: нового берём долю \(z\), старого оставляем \(1 - z\). Ворота \(r\) влияют только на кандидата. Полная схема проводов — на <a class="slide-ref" href="assets/slides/s04_022.webp" data-deck="s04" data-slide="22">слайде 22 лекции 4</a>.</figcaption>
+  </figure>
+
+  <p>Из LSTM в GRU ведут три хода:</p>
+  <ol>
+    <li>связать ворота правилом \(f_t = 1 - i_t\) и назвать \(i_t\) буквой \(z_t\);</li>
+    <li>убрать output gate и отдельную память: \(h_t\) становится и памятью, и выходом;</li>
+    <li>добавить reset gate внутрь кандидата.</li>
+  </ol>
+
+  <div class="pitfall">
+    <p>«\(z = 1\) — значит, сохранить прошлое». На слайде и в конспекте наоборот: \(z = 1\) берёт кандидата. Но в статье Cho et al. (2014), где GRU появился, в <code>nn.GRU</code> из PyTorch и в Keras формула зеркальная: \(h_t = z_t * h_{t-1} + (1 - z_t) * \tilde h_t\), и там \(z = 1\) сохраняет прошлое. Модель та же, с точностью до замены \(z \leftrightarrow 1 - z\). На экзамене пиши форму слайда и называй, что значит \(z = 1\); в коде читай \(z\) по документации.</p>
+    <p>PyTorch вдобавок умножает на \(r_t\) уже после матрицы: \(r_t * (W_{hn} h_{t-1} + b_{hn})\). Это важно, только если сверять с <code>nn.GRU</code> числа ручной реализации.</p>
+  </div>
+
+  <h3>Смесь не умеет считать</h3>
+
+  <p>У смеси есть свойство, которого нет у суммы: она не выходит за границы того, что смешивают. Кроссфейдер не сделает звук громче самой громкой дорожки, а два фейдера, поднятые до упора, складывают громкости. Отсюда главное ограничение GRU.</p>
+
+  <ol class="steps" id="l33-steps-bound">
+    <li><p>Кандидат проходит через tanh, поэтому каждое его число лежит в \((-1, 1)\):</p>
+      \[ \lvert \tilde h_t \rvert \lt 1 . \]</li>
+    <li><p>Пусть и старое состояние там же: \(\lvert h_{t-1} \rvert \lt 1\). Новое — средневзвешенное двух чисел с неотрицательными долями \(1 - z_t\) и \(z_t\), сумма которых равна 1:</p>
+      \[ \lvert h_t \rvert \le (1 - z_t) \lvert h_{t-1} \rvert + z_t \lvert \tilde h_t \rvert \lt 1 . \]</li>
+    <li><p>Начнём с \(h_0 = 0\) и применим шаг 2 к каждому \(t\) по очереди: состояние GRU никогда не выходит из \((-1, 1)\).</p></li>
+    <li><p>У памяти LSTM долей нет: \(f_t\) и \(i_t\) независимы, вместе они дают до 2, и за шаг \(C_t\) может вырасти почти на 1:</p>
+      \[ \lvert C_t \rvert \lt \lvert C_{t-1} \rvert + 1 . \]
+      <p>Поэтому память LSTM способна считать события, а состояние GRU — только усреднять их.</p></li>
+  </ol>
+
+  <p>Зато путь «скопировать без изменений» у GRU есть. Пока \(z_t\) около нуля, состояние, а с ним и градиент, проходит шаг почти без потерь: вдоль прямого пути \(\partial h_t / \partial h_{t-1} = 1 - z_t\) для каждого числа. Это аналог constant error carousel из <a href="l32.html">урока 32</a>, только множителем служит \(1 - z_t\) вместо \(f_t\).</p>
+
+  <div class="widget" id="l33-w-mixer">
+    <h3 class="widget-title">Кроссфейдер против фейдеров</h3>
+    <p class="widget-intro">На каждом шаге приходит одно и то же событие: кандидат у обеих ячеек равен +1, пределу tanh (\(\tilde C_t = 1\) у LSTM, \(\tilde h_t = 1\) у GRU). Ворота держим постоянными, чтобы видеть, что умеет сама формула обновления; reset gate здесь не нужен, потому что кандидат задан заранее.</p>
+    <ol class="tasks">
+      <li>Сейчас \(f = i = z = 0.5\). Совпадут ли память LSTM и состояние GRU? Проверь, потом поставь \(z = 0.8\): какие \(f\) и \(i\) вернут совпадение?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Совпадают: при \(f = 1 - z\) и \(i = z\) формулы обновления одинаковы. Для \(z = 0.8\) нужно \(f = 0.2\), \(i = 0.8\). Это и есть «combines the forget and input gates into a single update gate».</p></details>
+      </li>
+      <li>Главное, что показывает виджет. Есть ли такое \(z\), при котором состояние GRU после 12 событий станет больше 1? Ответь, потом проверь ползунком \(z\). А какой станет память LSTM, если поднять \(f\) и \(i\) до 1?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Такого \(z\) нет: состояние GRU равно \(1 - (1 - z)^t\) и только подползает к 1 (при \(z = 0.5\): 0.5, 0.75, 0.875, …). Память LSTM при \(f = i = 1\) прибавляет по единице и после 12 событий равна 12: она считает, а GRU усредняет.</p></details>
+      </li>
+      <li>Оставь \(f = i = 1\) и опусти \(o\) до 0. Что видит следующий слой и что хранится внутри?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Снаружи \(h_t = 0\), а память \(C_t\) по-прежнему растёт до 12: read gate прячет память, не стирая её. У GRU такой ручки нет — всё состояние сразу уходит наружу.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-mixer', function (root, ui) {
+    var N = 12;
+    var f = ui.slider({ label: 'LSTM: keep gate f', min: 0, max: 1, step: 0.05, value: 0.5 });
+    var i = ui.slider({ label: 'LSTM: write gate i', min: 0, max: 1, step: 0.05, value: 0.5 });
+    var o = ui.slider({ label: 'LSTM: read gate o', min: 0, max: 1, step: 0.05, value: 1 });
+    var z = ui.slider({ label: 'GRU: update gate z', min: 0, max: 1, step: 0.05, value: 0.5 });
+    var roC = ui.readout('LSTM: память C₁₂'), roH = ui.readout('LSTM: выход h₁₂'), roG = ui.readout('GRU: h₁₂');
+    function show(v) { return Course.fmt(v, Math.abs(v) < 2 ? 4 : 2); }   // near 1 the fourth digit matters, at 12 it does not
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0, 12.5], y: [-0.15, 1.4], xLabel: 't', yLabel: 'значение', aspect: 1.9, xTicks: [0, 2, 4, 6, 8, 10, 12],
+      label: 'Память LSTM, её выход и состояние GRU на двенадцати одинаковых событиях' });
+
+    function run() {
+      var C = [0], hL = [0], hG = [0];
+      for (var t = 1; t <= N; t++) {
+        C.push(f.value * C[t - 1] + i.value);
+        hL.push(o.value * Math.tanh(C[t]));
+        hG.push((1 - z.value) * hG[t - 1] + z.value);
+      }
+      return { C: C, hL: hL, hG: hG };
+    }
+    function pts(a) { return a.map(function (v, t) { return [t, v]; }); }
+
+    plot.draw(function (g) {
+      var s = run();
+      g.hline(1, { color: 'muted', dash: true, label: '1' });
+      g.line(pts(s.hL), { color: 'soft', width: 2, dash: true });
+      // GRU underneath, wider: where the LSTM memory coincides with it, the small squares sit on the dots
+      g.line(pts(s.hG), { color: 's3', width: 4 });
+      g.points(pts(s.hG), { color: 's3', r: 6 });
+      g.line(pts(s.C), { color: 'ink', width: 1.8 });
+      g.points(pts(s.C), { color: 'ink', shape: 'square', r: 3 });
+    });
+    ui.legend([
+      { label: 'LSTM: память Cₜ', color: 'ink', mark: 'square' },
+      { label: 'LSTM: выход hₜ = o·tanh(Cₜ)', color: 'soft', mark: 'dash' },
+      { label: 'GRU: состояние hₜ', color: 's3', mark: 'dot' }
+    ]);
+
+    ui.onChange(function () {
+      var s = run(), top = Math.max(1.4, Math.max.apply(null, s.C) * 1.08);
+      plot.setView({ x: [0, 12.5], y: [-0.15, top] });
+      roC.set(show(s.C[N]));
+      roH.set(show(s.hL[N]));
+      roG.set(show(s.hG[N]));
+      var same = Math.abs(f.value - (1 - z.value)) < 1e-9 && Math.abs(i.value - z.value) < 1e-9;
+      var txt;
+      if (same) txt = 'Сейчас f = 1 − z и i = z: память LSTM совпадает с состоянием GRU, квадраты лежат на кружках.';
+      else if (s.C[N] > 1.0001) txt = 'Память LSTM ушла выше 1: C₁₂ = ' + Course.fmt(s.C[N], 2) + '. Состояние GRU выше 1 не поднимется ни при каком z.';
+      else txt = 'Обе ячейки пока держатся не выше 1: у LSTM это выбор ворот, у GRU — свойство смеси.';
+      if (o.value < 1e-9 && s.C[N] > 0.01) txt += ' Наружу LSTM сейчас не показывает ничего, а внутри хранит C₁₂ = ' + Course.fmt(s.C[N], 2) + '.';
+      note.set(txt);
+    });
+  });
+  </script>
+
+  <h3>LSTM или GRU</h3>
+
+  <p>По устройству различий два. Первое — связка ворот: LSTM может разом сохранить всё старое и дописать новое (\(f = 1\), \(i = 1\)), GRU — нет. Второе — у GRU нет output gate: следующий слой всегда видит всё состояние, а LSTM может держать память скрытой (\(o \approx 0\)), не стирая её.</p>
+
+  <p>По цене разница одна: блоки весов. У LSTM их четыре (\(W_f, W_i, W_C, W_o\)), у GRU три (\(W_z, W_r, W\)), и каждый — матрица \(n \times (n + d)\). Поэтому GRU ровно на четверть легче, если считать обе ячейки одинаково. По формулам слайдов выходит \(3n(n + d)\) у GRU, где смещений нет, и \(4n(n + d) + 4n\) у LSTM, где смещение одно на блок. У GRU меньше именно параметров, то есть весов, а не гиперпараметров: размер состояния, число слоёв, dropout и learning rate (<a href="l21.html">урок 21</a>) выбираешь ты, и набор у обеих ячеек одинаковый (на стр. 271 конспекта написано «fewer hyperparameters»).</p>
+
+  <p>Кто точнее, заранее не скажешь. В больших сравнениях двух ячеек (Chung et al., 2014; Jozefowicz et al., 2015) постоянного победителя не нашлось: на одних задачах лучше одна ячейка, на других другая. Рабочее правило — попробовать обе: GRU дешевле, LSTM гибче.</p>
+</section>
+
+<section id="l33-stack">
+  <h2>Из ячеек — сеть, из сетей — стопка</h2>
+
+  <p>Ячейка — это правило одного шага: из \(x_t\) и прошлого состояния получить новое. Сеть получается, когда правило применяют к каждому элементу последовательности по очереди: одна и та же ячейка, одни и те же веса на всех шагах, меняются только входы и состояния. Развёрнутая во времени, она становится одним большим графом из непрерывных преобразований ("You can build a computation graph with continuous transformations", <a class="slide-ref" href="assets/slides/s04_023.webp" data-deck="s04" data-slide="23">лекция 4, слайд 23</a>), и <span class="en" lang="en">BPTT</span> из <a href="l30.html">урока 30</a> учит его целиком.</p>
+
+  <p>Отсюда два следствия, которые понадобятся при подсчёте. Число параметров не зависит от длины последовательности: сеть на 10 шагов и на 10&nbsp;000 весит одинаково. А градиент общего веса собирается со всех шагов.</p>
+
+  <p>Теперь в глубину. Представь двух стенографистов. Нижний записывает речь слово за словом в свою тетрадь. Верхний слушает не речь, а нижнего: в тот же момент он пересказывает в своей тетради то, что нижний только что записал, и делает это по своим правилам. Это и есть многослойная (<span class="en" lang="en">stacked</span>, или <span class="en" lang="en">deep</span>) рекуррентная сеть.</p>
+
+  <aside class="margin-note">Номер слоя пишем верхним индексом в скобках, время — нижним: \(h_t^{(\ell)}\). В тексте и на рис. 36 конспекта наоборот: \(h_\ell^{(t)}\), \(c_\ell^{(t)}\).</aside>
+
+  <p>На шаге \(t\) слой 1 читает \(x_t\), а слой \(\ell \ge 2\) — выход слоя под ним на том же шаге, \(h_t^{(\ell-1)}\). По горизонтали у каждого слоя течёт своё состояние. В уравнениях LSTM меняется только то, что читают ворота:</p>
+
+  <div class="formula">
+    \[ h_t^{(0)} = x_t \]
+    \[ f_t^{(\ell)} = \sigma\left(W_f^{(\ell)} \cdot [h_{t-1}^{(\ell)},\ h_t^{(\ell-1)}] + b_f^{(\ell)}\right) \]
+    \[ C_t^{(\ell)} = f_t^{(\ell)} * C_{t-1}^{(\ell)} + i_t^{(\ell)} * \tilde C_t^{(\ell)} \]
+    \[ h_t^{(\ell)} = o_t^{(\ell)} * \tanh\left(C_t^{(\ell)}\right) \]
+    <dl class="legend">
+      <dt>\(h_{t-1}^{(\ell)}\)</dt><dd>прошлое своего слоя — вход «слева»</dd>
+      <dt>\(h_t^{(\ell-1)}\)</dt><dd>выход слоя ниже на том же шаге — вход «снизу»</dd>
+      <dt>\(i_t^{(\ell)}, o_t^{(\ell)}, \tilde C_t^{(\ell)}\)</dt><dd>по той же схеме, что \(f_t^{(\ell)}\); кандидат через tanh</dd>
+    </dl>
+  </div>
+
+  <p>Веса общие вдоль времени внутри слоя и свои у каждого слоя: \(W^{(1)} \ne W^{(2)}\). Память \(C\) наверх не уходит: следующий слой читает только \(h\).</p>
+
+  <figure class="fig fig--plain" id="l33-fig-stack">
+    <svg class="dia" viewBox="0 0 560 380" role="img" aria-label="Двухслойная LSTM на трёх шагах: снизу входы x1, x2, x3, над ними два ряда ячеек LSTM, выше ряд ReLU и выходы y. Начальное состояние входит в первую ячейку каждого слоя слева. Выделенная ячейка второго слоя на шаге 2 получает своё прошлое слева и выход нижнего слоя на том же шаге снизу">
+      <rect x="265" y="160" width="70" height="40" rx="8" class="hl"/>
+      <line x1="225" y1="180" x2="262" y2="180" class="hl"/>
+      <line x1="300" y1="258" x2="300" y2="203" class="hl"/>
+      <line x1="190" y1="339" x2="190" y2="301" marker-end="url(#arr)"/>
+      <line x1="300" y1="339" x2="300" y2="301" marker-end="url(#arr)"/>
+      <line x1="410" y1="339" x2="410" y2="301" marker-end="url(#arr)"/>
+      <line x1="190" y1="258" x2="190" y2="202" marker-end="url(#arr)"/>
+      <line x1="300" y1="258" x2="300" y2="202" marker-end="url(#arr)"/>
+      <line x1="410" y1="258" x2="410" y2="202" marker-end="url(#arr)"/>
+      <line x1="190" y1="160" x2="190" y2="115" marker-end="url(#arr)"/>
+      <line x1="300" y1="160" x2="300" y2="115" marker-end="url(#arr)"/>
+      <line x1="410" y1="160" x2="410" y2="115" marker-end="url(#arr)"/>
+      <line x1="190" y1="83" x2="190" y2="45" marker-end="url(#arr)"/>
+      <line x1="300" y1="83" x2="300" y2="45" marker-end="url(#arr)"/>
+      <line x1="410" y1="83" x2="410" y2="45" marker-end="url(#arr)"/>
+      <line x1="40" y1="278" x2="153" y2="278" marker-end="url(#arr)"/>
+      <line x1="225" y1="278" x2="263" y2="278" marker-end="url(#arr)"/>
+      <line x1="335" y1="278" x2="373" y2="278" marker-end="url(#arr)"/>
+      <line x1="445" y1="278" x2="470" y2="278" class="st-muted dash"/>
+      <line x1="40" y1="180" x2="153" y2="180" marker-end="url(#arr)"/>
+      <line x1="225" y1="180" x2="263" y2="180" marker-end="url(#arr)"/>
+      <line x1="335" y1="180" x2="373" y2="180" marker-end="url(#arr)"/>
+      <line x1="445" y1="180" x2="470" y2="180" class="st-muted dash"/>
+      <rect x="166" y="17" width="48" height="26" rx="4" class="fi-paper"/>
+      <rect x="276" y="17" width="48" height="26" rx="4" class="fi-paper"/>
+      <rect x="386" y="17" width="48" height="26" rx="4" class="fi-paper"/>
+      <rect x="158" y="83" width="64" height="30" rx="6" class="fi-paper"/>
+      <rect x="268" y="83" width="64" height="30" rx="6" class="fi-paper"/>
+      <rect x="378" y="83" width="64" height="30" rx="6" class="fi-paper"/>
+      <rect x="155" y="160" width="70" height="40" rx="8" class="fi-paper sw-2"/>
+      <rect x="265" y="160" width="70" height="40" rx="8" class="fi-paper sw-2"/>
+      <rect x="375" y="160" width="70" height="40" rx="8" class="fi-paper sw-2"/>
+      <rect x="155" y="258" width="70" height="40" rx="8" class="fi-paper sw-2"/>
+      <rect x="265" y="258" width="70" height="40" rx="8" class="fi-paper sw-2"/>
+      <rect x="375" y="258" width="70" height="40" rx="8" class="fi-paper sw-2"/>
+      <rect x="166" y="339" width="48" height="26" rx="4" class="fi-paper"/>
+      <rect x="276" y="339" width="48" height="26" rx="4" class="fi-paper"/>
+      <rect x="386" y="339" width="48" height="26" rx="4" class="fi-paper"/>
+      <text x="190" y="35" class="tx-mid">y₁</text>
+      <text x="300" y="35" class="tx-mid">y₂</text>
+      <text x="410" y="35" class="tx-mid">y₃</text>
+      <text x="190" y="103" class="tx-mid tx-sm">ReLU</text>
+      <text x="300" y="103" class="tx-mid tx-sm">ReLU</text>
+      <text x="410" y="103" class="tx-mid tx-sm">ReLU</text>
+      <text x="190" y="185" class="tx-mid">LSTM</text>
+      <text x="300" y="185" class="tx-mid tx-bold">LSTM</text>
+      <text x="410" y="185" class="tx-mid">LSTM</text>
+      <text x="190" y="283" class="tx-mid">LSTM</text>
+      <text x="300" y="283" class="tx-mid">LSTM</text>
+      <text x="410" y="283" class="tx-mid">LSTM</text>
+      <text x="190" y="357" class="tx-mid">x₁</text>
+      <text x="300" y="357" class="tx-mid">x₂</text>
+      <text x="410" y="357" class="tx-mid">x₃</text>
+      <text x="96" y="170" class="tx-mid">h₀⁽²⁾, C₀⁽²⁾</text>
+      <text x="96" y="268" class="tx-mid">h₀⁽¹⁾, C₀⁽¹⁾</text>
+      <text x="245" y="150" class="tx-mid halo">h₁⁽²⁾, C₁⁽²⁾</text>
+      <text x="308" y="236" class="halo">h₂⁽¹⁾</text>
+      <text x="480" y="185">слой 2</text>
+      <text x="480" y="283">слой 1</text>
+      <text x="356" y="140" class="tx-mid tx-hand">два входа</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Двухслойная LSTM на трёх первых шагах, как на <a class="slide-ref" href="assets/slides/s04_024.webp" data-deck="s04" data-slide="24">слайде 24 лекции 4</a>. Начальное состояние входит в каждый слой слева, дальше \((h_t^{(\ell)}, C_t^{(\ell)})\) течёт по горизонтали. Выделенная ячейка (слой 2, шаг 2) получает своё прошлое слева и \(h_2^{(1)}\) снизу, с того же шага. Веса общие внутри строки и свои у каждой строки.</figcaption>
+  </figure>
+
+  <p>Зачем стопка? Она строит иерархию представлений ("Hierarchical representation", <a class="slide-ref" href="assets/slides/s04_024.webp" data-deck="s04" data-slide="24">лекция 4, слайд 24</a>): нижние слои ловят быстрые и короткие закономерности, верхние — медленные и более абстрактные; в речи это, например, фонемы, слоги и слова. Это интуиция, а не правило: роли слоям никто не назначает, сеть распределяет их сама.</p>
+
+  <p>Над верхним рекуррентным слоем на слайдах стоит ещё один слой, ReLU, и только над ним выход \(Y_t\) (<a class="slide-ref" href="assets/slides/s04_024.webp" data-deck="s04" data-slide="24,26">лекция 4, слайды 24 и 26</a>). Это обычный dense-слой, применённый к \(h_t^{(N)}\) верхнего слоя \(N\) на каждом шаге, с одними весами для всех \(t\). В конспекте выход записан прямо как \(y_t = h_t^{(N)}\); рисуя сеть на экзамене, рисуй, как на слайде.</p>
+
+  <p>Глубокую рекуррентную сеть учить труднее: градиент идёт и назад по времени, и вниз по слоям. Первое средство — <mark class="key">dropout между слоями</mark>: его ставят на \(h_t^{(\ell)}\), идущее вверх к следующему слою (на рис. 2 — стрелка между рядами LSTM), а не на рекуррентную связь. Там маска, которая на каждом шаге заново стирает куски \(h_{t-1}\), разрушает память (Zaremba et al., 2014). Так и работает аргумент <code>dropout</code> в <code>nn.LSTM</code>: он действует на выходы каждого слоя, кроме последнего.</p>
+
+  <p>Ещё помогают <span class="en" lang="en">residual connections</span> (вход слоя прибавляют к его выходу) и <span class="en" lang="en">layer normalization</span> (активации слоя приводят к нулевому среднему и единичной дисперсии) между слоями и <span class="en" lang="en">gradient clipping</span> из <a href="l31.html">урока 31</a>. Обычно хватает <span class="nw">двух–четырёх</span> слоёв. Этих средств, как и <span class="en" lang="en">dropout</span> между слоями, нет на слайдах этого года.</p>
+</section>
+
+<section id="l33-bidir">
+  <h2>В обе стороны</h2>
+
+  <p>Вернёмся к bank. Сеть, которая читает слева направо, на шаге \(t\) знает только \(x_1, \dots, x_t\). Чтобы узнать правую часть фразы, нужен второй читатель, который идёт с конца.</p>
+
+  <div class="def">
+    <p><dfn>Двунаправленная рекуррентная сеть</dfn> (<span class="en" lang="en">bidirectional RNN</span>) — две независимые рекуррентные цепочки над одним и тем же входом: одна читает его слева направо, другая справа налево, а состояние на шаге \(t\) — склейка их состояний ("Have one RNNs traverse the sequence left-to-right · Have another RNN traverse the sequence right-to-left · Use concatenation of hidden layers as feature representation", <a class="slide-ref" href="assets/slides/s04_027.webp" data-deck="s04" data-slide="27">лекция 4, слайд 27</a>).</p>
+  </div>
+
+  <div class="formula">
+    \[ \overrightarrow{h_t} = \text{LSTM}_{\to}\left(x_t,\ \overrightarrow{h_{t-1}}\right) \]
+    \[ \overleftarrow{h_t} = \text{LSTM}_{\leftarrow}\left(x_t,\ \overleftarrow{h_{t+1}}\right) \]
+    \[ h_t = \left[\overrightarrow{h_t} ;\ \overleftarrow{h_t}\right] \in \R^{2n} \]
+    <dl class="legend">
+      <dt>\(\overrightarrow{h_t}\)</dt><dd>прямая цепочка, шаги \(t = 1, \dots, T\): прочитала \(x_1, \dots, x_t\)</dd>
+      <dt>\(\overleftarrow{h_t}\)</dt><dd>обратная цепочка, шаги \(t = T, \dots, 1\): прочитала \(x_T, \dots, x_t\)</dd>
+      <dt>\([\,\cdot\,;\,\cdot\,]\)</dt><dd>склейка: два вектора по \(n\) чисел дают один из \(2n\)</dd>
+    </dl>
+  </div>
+
+  <p>Цепочки не связаны между собой: у каждой свои веса, и обратная не читает состояний прямой — обе читают сам вход \(x_t\) (на <a class="slide-ref" href="assets/slides/s04_026.webp" data-deck="s04" data-slide="26">слайде 26 лекции 4</a> у каждой строки своя копия \(X_t\)). Поэтому параметров вдвое больше, а следующий слой получает на вход \(2n\) чисел вместо \(n\). Слово \(x_t\) входит в оба состояния: \(\overleftarrow{h_t}\) видит не только будущее, но и сам шаг \(t\).</p>
+
+  <p>Вот и ответ на задачку из начала. На шаге 5 прямое состояние \(\overrightarrow{h_5}\) в обоих предложениях одно и то же: оно прочитало только "I arrived at the bank". А обратное прочитало "bank to deposit money" в первом предложении и "bank of the river" во втором — и эти состояния разные. Склейка \(h_5\) тоже разная, и ответы для bank могут различаться.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-bank">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Слева направо: в обоих предложениях к слову bank прочитаны одни и те же пять слов, поэтому прямое состояние на bank одинаковое и ответ один">
+        <rect x="135" y="28" width="32" height="18" class="fw-key st-none"/>
+        <rect x="135" y="112" width="32" height="18" class="fw-key st-none"/>
+        <text x="14" y="41" class="tx-mono">I arrived at the bank</text>
+        <text x="172" y="41" class="tx-mono tx-muted">to deposit money</text>
+        <text x="14" y="125" class="tx-mono">I arrived at the bank</text>
+        <text x="172" y="125" class="tx-mono tx-muted">of the river</text>
+        <line x1="14" y1="52" x2="164" y2="52" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="14" y1="136" x2="164" y2="136" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <text x="150" y="88" class="tx-mid tx-sm">→h₅ одно и то же</text>
+        <text x="150" y="182" class="tx-mid tx-bold">bank: один ответ на оба</text>
+      </svg>
+      <p class="fig-label">До: только слева направо</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="В обе стороны: обратная цепочка приходит к слову bank с конца фразы, в двух предложениях она прочитала разное, поэтому обратное состояние на bank разное и ответы могут различаться">
+        <rect x="135" y="28" width="32" height="18" class="fw-key st-none"/>
+        <rect x="135" y="112" width="32" height="18" class="fw-key st-none"/>
+        <text x="14" y="41" class="tx-mono">I arrived at the bank</text>
+        <text x="172" y="41" class="tx-mono">to deposit money</text>
+        <text x="14" y="125" class="tx-mono">I arrived at the bank</text>
+        <text x="172" y="125" class="tx-mono">of the river</text>
+        <line x1="14" y1="52" x2="164" y2="52" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="14" y1="136" x2="164" y2="136" class="st-s1 sw-2" marker-end="url(#arr-s1)"/>
+        <line x1="288" y1="60" x2="138" y2="60" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <line x1="259" y1="144" x2="138" y2="144" class="st-s2 sw-2 dash" marker-end="url(#arr-s2)"/>
+        <text x="150" y="84" class="tx-mid tx-sm">→h₅ одно и то же</text>
+        <text x="150" y="100" class="tx-mid tx-sm">←h₅ разные</text>
+        <text x="150" y="182" class="tx-mid tx-bold">bank: банк и берег</text>
+      </svg>
+      <p class="fig-label">После: ещё и справа налево</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Задачка из начала. Сплошная стрелка — прямая цепочка, пунктирная — обратная: к bank она приходит с конца фразы, поэтому её состояние \(\overleftarrow{h_5}\) в двух предложениях разное.</figcaption>
+  </figure>
+
+  <h3>Когда можно, а когда нельзя</h3>
+
+  <p>Можно, когда весь вход известен до того, как понадобился первый ответ ("When conditioning on full input sequence Bidirectional RNNs exploit it", <a class="slide-ref" href="assets/slides/s04_025.webp" data-deck="s04" data-slide="25">лекция 4, слайд 25</a>): разметка написанного текста, оценка готового отзыва, encoder в seq2seq (<a href="l41.html">урок 41</a>), кодирование окна измерений для прогноза.</p>
+
+  <p class="memo"><mark class="key">Двунаправленная сеть разрешена, только когда весь вход известен заранее: каждое её состояние зависит от всей последовательности.</mark></p>
+
+  <p>Нельзя в двух случаях, и второй отвечает на второй вопрос задачки.</p>
+  <ul>
+    <li><b>В реальном времени</b>: живые субтитры, поток с датчиков. Чтобы посчитать \(\overleftarrow{h_t}\), нужен \(x_T\), а он ещё не пришёл. Пришлось бы ждать конца фразы.</li>
+    <li><b>При генерации</b>: языковая модель и любой decoder, который выдаёт ответ слово за словом. Задача на шаге \(t\) — угадать \(x_{t+1}\), а \(\overleftarrow{h_t}\) его уже прочитал: на обучении ответ подсмотрен, а при генерации будущего ещё нет.</li>
+  </ul>
+
+  <p>Запрет касается только той части модели, которая генерирует или отвечает онлайн. Окно наблюдений, по которому строят прогноз (например, 7 прошлых дней для прогноза на 24 часа), целиком в прошлом, и его можно кодировать двунаправленной сетью: это и есть «conditioning on full input sequence». На стр. 283 конспекта запрет для прогнозирования сформулирован шире.</p>
+
+  <div class="widget" id="l33-w-who">
+    <h3 class="widget-title">Кто что видит</h3>
+    <p class="widget-intro">Фраза из задачки, по слову на шаг. Внизу входы, над ними прямая цепочка (сплошные стрелки, слева направо), обратная (пунктир, справа налево) и выходы \(h_t\). Линии под словами показывают, что успело прочитать каждое состояние. Шаг выбирается ползунком или щелчком по слову.</p>
+    <ol class="tasks">
+      <li>Режим «разметить каждое слово», \(t = 5\) (bank). Прежде чем смотреть на линии: какие слова прочитал \(\overrightarrow{h_5}\), какие \(\overleftarrow{h_5}\)? Входит ли bank в оба?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>\(\overrightarrow{h_5}\): "I arrived at the bank"; \(\overleftarrow{h_5}\): "bank to deposit money". Bank входит в оба, а вместе они покрывают все восемь слов. Это главное, что показывает виджет: каждое состояние двунаправленной сети зависит от всей фразы.</p></details>
+      </li>
+      <li>Переключи на «угадать следующее слово». Почему двунаправленная сеть здесь жульничает? Выключи двунаправленность и сравни.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>На шаге \(t\) ответ — слово \(x_{t+1}\), а \(\overleftarrow{h_t}\) его уже прочитал. На обучении такая сеть научится просто переписывать подсмотренный ответ, а дописывать текст не сможет: при генерации будущих слов ещё нет. Однонаправленная сеть ответа не видела — её задача честная.</p></details>
+      </li>
+      <li>Режим «субтитры вживую», \(t = 3\). Что сеть может посчитать сейчас, а что нет?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>\(\overrightarrow{h_3}\) готов: слова 1–3 уже прозвучали. \(\overleftarrow{h_3}\) посчитать нельзя: обратная цепочка начинается с \(x_8\), а он ещё не прозвучал. Двунаправленная сеть выдала бы субтитры только после конца фразы.</p></details>
+      </li>
+      <li>Режим «определить класс всей фразы». Какой вектор отдать классификатору — и почему не последний выход?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>\([\overrightarrow{h_8} ; \overleftarrow{h_1}]\): обе половины прочитали всю фразу. Последний выход — это \([\overrightarrow{h_8} ; \overleftarrow{h_8}]\), и его обратная половина прочитала только "money". В PyTorch правильный вектор — <code>torch.cat([h_n[-2], h_n[-1]], dim=-1)</code>, а не <code>output[:, -1, :]</code>.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-who', function (root, ui) {
+    var WORDS = ['I', 'arrived', 'at', 'the', 'bank', 'to', 'deposit', 'money'], T = WORDS.length;
+    var SUB = '₀₁₂₃₄₅₆₇₈₉';
+    function sub(k) { return String(k).replace(/\d/g, function (c) { return SUB.charAt(+c); }); }
+    function X(k) { return 56 + (k - 1) * 64; }
+    function words(a, b) { return WORDS.slice(a - 1, b).join(' '); }
+
+    var task = ui.select('задача', [
+      { value: 'tag', label: 'разметить каждое слово' },
+      { value: 'lm', label: 'угадать следующее слово' },
+      { value: 'live', label: 'субтитры вживую' },
+      { value: 'cls', label: 'определить класс всей фразы' }
+    ], null, 'tag');
+    var bi = ui.toggle('двунаправленная сеть', true);
+    var tS = ui.slider({ label: 'шаг t', min: 1, max: T, step: 1, value: 5,
+      format: function (v) { var k = Math.min(T, Math.max(1, Math.round(v))); return k + ' · ' + WORDS[k - 1]; } });
+    var svg = ui.svg(560, 340, { label: 'Двунаправленная сеть над фразой I arrived at the bank to deposit money: входы, прямая и обратная цепочки, выходы и то, что прочитало каждое состояние' });
+    var roF = ui.readout('прямая цепочка'), roB = ui.readout('обратная цепочка'), roV = ui.readout('итог');
+    ui.legend([
+      { label: '→ прямая цепочка и что она прочитала', color: 's1', mark: 'line' },
+      { label: '← обратная цепочка и что она прочитала', color: 's2', mark: 'dash' },
+      { label: 'что отдаём дальше', color: 'ink', mark: 'hl' }
+    ]);
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function rect(x, y, w, h, cls, rx) { return S('rect', { x: x, y: y, width: w, height: h, rx: rx || 0, 'class': cls }); }
+    function seg(x1, y1, x2, y2, cls, arrow) {
+      var a = { x1: x1, y1: y1, x2: x2, y2: y2, 'class': cls };
+      if (arrow) a['marker-end'] = 'url(#' + arrow + ')';
+      return S('line', a);
+    }
+    function txt(x, y, s, cls) { return S('text', { x: x, y: y, 'class': 'tx-mid' + (cls ? ' ' + cls : ''), text: s }); }
+
+    function state() {
+      var m = task.value, t = Math.min(T, Math.max(1, Math.round(tS.value)));
+      return { m: m, b: bi.value, t: m === 'cls' ? T : t };
+    }
+
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var k, t = s.t, live = s.m === 'live', cls = s.m === 'cls';
+      function here(j) { return !live || j <= t; }          // has word j arrived?
+      function fwdDone(j) { return !live || j <= t; }       // can the forward state j be computed?
+      var bwdOk = s.b && (!live || t === T);                // the backward chain needs the whole phrase: live, only after its last word
+      function outDone(j) { return s.b ? bwdOk : fwdDone(j); }   // can the output h_j be formed now?
+
+      /* 1. highlighter under what is passed on */
+      if (cls) {
+        rect(X(T) - 22, 165, 44, 30, 'hl', 8);
+        if (s.b) rect(X(1) - 22, 95, 44, 30, 'hl', 8);
+      } else if (outDone(t)) {
+        rect(X(t) - 22, 26, 44, 28, 'hl', 6);
+      }
+      /* 2. connectors: the input goes to both chains, both chains go to the output row */
+      for (k = 1; k <= T; k++) seg(X(k), 232, X(k), 54, here(k) ? 'st-muted' : 'st-muted dash');
+      /* 3. chain arrows */
+      for (k = 1; k < T; k++) {
+        var fOn = fwdDone(k + 1);
+        seg(X(k) + 22, 180, X(k + 1) - 23, 180, fOn ? 'st-s1 sw-2' : 'st-muted dash', fOn ? 'arr-s1' : 'arr-muted');
+        if (s.b) seg(X(k + 1) - 22, 110, X(k) + 23, 110, bwdOk ? 'st-s2 sw-2 dash' : 'st-muted dash', bwdOk ? 'arr-s2' : 'arr-muted');
+      }
+      /* 4. cells and tokens */
+      for (k = 1; k <= T; k++) {
+        rect(X(k) - 22, 26, 44, 28, outDone(k) ? 'fi-paper' : 'fi-paper st-muted dash', 6);
+        if (s.b) rect(X(k) - 22, 95, 44, 30, bwdOk ? 'fi-paper st-s2 dash' : 'fi-paper st-muted dash', 8);
+        rect(X(k) - 22, 165, 44, 30, fwdDone(k) ? 'fi-paper st-s1' : 'fi-paper st-muted dash', 8);
+        (function (j) {
+          S('rect', { x: X(j) - 24, y: 232, width: 48, height: 30, rx: 4, 'class': here(j) ? 'fi-paper' : 'fi-paper st-muted dash',
+            onclick: function () { tS.set(j); } });
+        })(k);
+      }
+      /* 5. the states that matter now */
+      if (cls) {
+        rect(X(T) - 22, 165, 44, 30, 'fw-s1 st-s1 sw-3', 8);
+        if (s.b) {
+          rect(X(1) - 22, 95, 44, 30, 'fw-s2 st-s2 sw-3', 8);
+          rect(X(T) - 27, 90, 54, 40, 'st-bad sw-2', 10);
+        }
+      } else {
+        if (fwdDone(t)) rect(X(t) - 22, 165, 44, 30, 'fw-s1 st-s1 sw-3', 8);
+        if (bwdOk) rect(X(t) - 22, 95, 44, 30, 'fw-s2 st-s2 sw-3', 8);
+        if (live && s.b && t < T) rect(X(t) - 27, 90, 54, 40, 'st-bad sw-2', 10);
+        if (s.m === 'lm' && t < T) rect(X(t + 1) - 28, 228, 56, 38, s.b ? 'st-bad sw-2' : 'st-good sw-2', 6);
+      }
+      /* 6. what each state has read: lines under the words */
+      var f1 = cls ? T : t;
+      seg(X(1) - 22, 272, X(f1) + 22, 272, 'st-s1 sw-3');
+      if (bwdOk) {
+        var b0 = cls ? 1 : t;
+        seg(X(b0) - 22, 280, X(T) + 22, 280, 'st-s2 sw-3 dash');
+      }
+      /* 7. labels */
+      for (k = 1; k <= T; k++) {
+        txt(X(k), 45, 'h' + sub(k), outDone(k) ? '' : 'tx-muted');
+        if (s.b) txt(X(k), 115, '←h' + sub(k), bwdOk ? '' : 'tx-muted');
+        txt(X(k), 185, '→h' + sub(k), fwdDone(k) ? '' : 'tx-muted');
+        txt(X(k), 252, 'x' + sub(k), here(k) ? '' : 'tx-muted');
+        txt(X(k), k % 2 ? 304 : 326, WORDS[k - 1], 'tx-sm' + (here(k) ? '' : ' tx-muted'));
+      }
+    }
+
+    ui.onChange(function () {
+      var s = state(), t = s.t, m = s.m;
+      tS.el.closest('.ctl').hidden = m === 'cls';
+      draw(s);
+      if (m === 'cls') {
+        roF.set('→h₈ (h_n[' + (s.b ? '−2' : '−1') + ']) прочитал всю фразу');
+        if (s.b) {
+          roB.set('←h₁ (h_n[−1]) прочитал всю фразу, а ←h₈ — только «money»');
+          roV.set('бери [→h₈ ; ←h₁], а не output[:, −1] = [→h₈ ; ←h₈]', 'good');
+        } else {
+          roB.set('нет: сеть однонаправленная');
+          roV.set('output[:, −1] = →h₈ = h_n[−1]: годится', 'good');
+        }
+        return;
+      }
+      roF.set((m === 'live' ? '→h' + sub(t) + ' готов: ' : '→h' + sub(t) + ' прочитал: ') + words(1, t));
+      if (!s.b) roB.set('нет: сеть однонаправленная');
+      else if (m === 'live' && t < T) roB.set('←h' + sub(t) + ' не посчитать: нужен x₈, а его ещё нет');
+      else if (m === 'live') roB.set('x₈ пришёл: только теперь можно пройти фразу справа налево');
+      else roB.set('←h' + sub(t) + ' прочитал: ' + words(t, T));
+      if (m === 'tag') {
+        if (s.b) roV.set('h' + sub(t) + ' зависит от всей фразы: можно', 'good');
+        else roV.set(t < T ? 'h' + sub(t) + ' не знает слов справа' : 'h₈ прочитал всю фразу');
+      } else if (m === 'lm') {
+        if (t === T) roV.set('после «money» угадывать нечего: выбери t меньше 8');
+        else if (s.b) roV.set('нельзя: ←h' + sub(t) + ' уже прочитал ответ «' + WORDS[t] + '»', 'bad');
+        else roV.set('можно: ответ «' + WORDS[t] + '» сеть ещё не видела', 'good');
+      } else {
+        if (s.b) roV.set(t < T ? 'нельзя: пришлось бы ждать конца фразы' : 'фраза кончилась, но ответы для всех слов опоздали', 'bad');
+        else roV.set('можно: ответ готов сразу после x' + sub(t), 'good');
+      }
+    });
+  });
+  </script>
+</section>
+
+<section id="l33-init">
+  <h2>С чего начинается память</h2>
+
+  <p>Прежде чем прочитать \(x_1\), ячейке нужно прошлое состояние, которого ещё нет: \(h_0\), а у LSTM ещё и \(C_0\) ("When initializing RNN we need to specify the initial state", <a class="slide-ref" href="assets/slides/s04_027.webp" data-deck="s04" data-slide="27">лекция 4, слайд 27</a>). Вариантов два.</p>
+
+  <p>Первый — фиксированное значение, обычно ноль ("Could initialize them to a fixed value (such as 0)"). Так делает PyTorch, если начальное состояние не передать.</p>
+
+  <p>Второй — считать <mark class="key">начальное состояние</mark> (<span class="en" lang="en">initial state</span>) параметрами и учить их, как веса ("Better to treat the initial state as learned parameters"). Рецепт со слайда в три шага:</p>
+  <ol>
+    <li>взять случайное начальное значение ("Start off with random guesses of the initial state values");</li>
+    <li>провести BPTT назад до самого начала и посчитать градиент ошибки по начальному состоянию ("Backpropagate the prediction error through time all the way to the initial state values and compute the gradient of the error with respect to these");</li>
+    <li>обновить его градиентным спуском ("Update these parameters by gradient descent").</li>
+  </ol>
+
+  <div class="formula">
+    \[ h_0 = \theta_h, \qquad C_0 = \theta_C \]
+    <dl class="legend">
+      <dt>\(\theta_h, \theta_C\)</dt><dd>обучаемые векторы по \(n\) чисел, общие для всех последовательностей</dd>
+    </dl>
+  </div>
+
+  <figure class="fig fig--pair fig--plain" id="l33-fig-init">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Нулевой старт: три последовательности начинаются с одного нулевого вектора; градиент BPTT доходит до первой ячейки, а ноль не обновляется">
+        <polyline points="255,38 255,22 100,22 100,37" class="st-muted dash" marker-end="url(#arr-muted)"/>
+        <polyline points="36,64 36,172 88,172" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="36" y1="120" x2="88" y2="120" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="56" y1="50" x2="88" y2="50" marker-end="url(#arr)"/>
+        <line x1="111" y1="50" x2="138" y2="50" marker-end="url(#arr)"/>
+        <line x1="161" y1="50" x2="188" y2="50" marker-end="url(#arr)"/>
+        <line x1="211" y1="50" x2="237" y2="50" marker-end="url(#arr)"/>
+        <line x1="111" y1="120" x2="138" y2="120" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="161" y1="120" x2="188" y2="120" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="111" y1="172" x2="138" y2="172" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="161" y1="172" x2="188" y2="172" class="st-muted" marker-end="url(#arr-muted)"/>
+        <rect x="16" y="36" width="40" height="28" rx="4" class="fi-paper sw-2"/>
+        <circle cx="100" cy="50" r="11" class="fi-paper"/>
+        <circle cx="150" cy="50" r="11" class="fi-paper"/>
+        <circle cx="200" cy="50" r="11" class="fi-paper"/>
+        <rect x="238" y="38" width="34" height="24" rx="4" class="fi-paper"/>
+        <circle cx="100" cy="120" r="11" class="fi-paper st-muted"/>
+        <circle cx="150" cy="120" r="11" class="fi-paper st-muted"/>
+        <circle cx="200" cy="120" r="11" class="fi-paper st-muted"/>
+        <circle cx="100" cy="172" r="11" class="fi-paper st-muted"/>
+        <circle cx="150" cy="172" r="11" class="fi-paper st-muted"/>
+        <circle cx="200" cy="172" r="11" class="fi-paper st-muted"/>
+        <text x="36" y="55" class="tx-mid tx-lg">0</text>
+        <text x="255" y="55" class="tx-mid">E</text>
+        <text x="178" y="15" class="tx-mid tx-sm tx-muted">BPTT</text>
+        <text x="48" y="98" class="tx-hand">константа</text>
+      </svg>
+      <p class="fig-label">До: \(h_0 = 0\), константа</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 200" role="img" aria-label="Выученный старт: три последовательности начинаются с одного и того же параметра theta; градиент BPTT доходит до theta, и theta обновляется градиентным спуском">
+        <polyline points="255,38 255,22 36,22 36,35" class="st-muted dash" marker-end="url(#arr-muted)"/>
+        <polyline points="36,64 36,172 88,172" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="36" y1="120" x2="88" y2="120" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="56" y1="50" x2="88" y2="50" marker-end="url(#arr)"/>
+        <line x1="111" y1="50" x2="138" y2="50" marker-end="url(#arr)"/>
+        <line x1="161" y1="50" x2="188" y2="50" marker-end="url(#arr)"/>
+        <line x1="211" y1="50" x2="237" y2="50" marker-end="url(#arr)"/>
+        <line x1="111" y1="120" x2="138" y2="120" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="161" y1="120" x2="188" y2="120" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="111" y1="172" x2="138" y2="172" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="161" y1="172" x2="188" y2="172" class="st-muted" marker-end="url(#arr-muted)"/>
+        <rect x="16" y="36" width="40" height="28" rx="4" class="hl"/>
+        <rect x="16" y="36" width="40" height="28" rx="4" class="fi-paper sw-2"/>
+        <circle cx="100" cy="50" r="11" class="fi-paper"/>
+        <circle cx="150" cy="50" r="11" class="fi-paper"/>
+        <circle cx="200" cy="50" r="11" class="fi-paper"/>
+        <rect x="238" y="38" width="34" height="24" rx="4" class="fi-paper"/>
+        <circle cx="100" cy="120" r="11" class="fi-paper st-muted"/>
+        <circle cx="150" cy="120" r="11" class="fi-paper st-muted"/>
+        <circle cx="200" cy="120" r="11" class="fi-paper st-muted"/>
+        <circle cx="100" cy="172" r="11" class="fi-paper st-muted"/>
+        <circle cx="150" cy="172" r="11" class="fi-paper st-muted"/>
+        <circle cx="200" cy="172" r="11" class="fi-paper st-muted"/>
+        <text x="36" y="56" class="tx-mid tx-lg">θ</text>
+        <text x="255" y="55" class="tx-mid">E</text>
+        <text x="146" y="15" class="tx-mid tx-sm tx-muted">BPTT до самого старта</text>
+        <text x="48" y="98" class="tx-hand">один на всех</text>
+      </svg>
+      <p class="fig-label">После: \(h_0 = \theta\), параметр</p>
+    </div>
+    <figcaption><b>Рис. 4.</b> Два варианта со <a class="slide-ref" href="assets/slides/s04_027.webp" data-deck="s04" data-slide="27">слайда 27 лекции 4</a> для трёх последовательностей батча (ошибка \(E\) нарисована у верхней). Слева старт — ноль: градиент доходит до первой ячейки, но ноль — константа, а не параметр, и его не обновляют. Справа старт — параметр \(\theta\): BPTT доводит градиент до него, вклады всех последовательностей складываются. Но \(\theta\) один на всех.</figcaption>
+  </figure>
+
+  <p>После обучения получается один вектор (у LSTM — пара векторов) на весь датасет: «типичная стартовая память», лучшая в среднем по всем последовательностям. Это как заводской пресет радио. С нулевым стартом приёмник включается на пустой частоте, и первые секунды уходят на настройку, а пресет сразу ставит станцию, которую слушает большинство, — одну для всех. Поэтому выученный старт сильнее всего помогает коротким последовательностям и первым шагам, где разгон с нуля занимает заметную долю.</p>
+
+  <p>Стоит это немного: \(n\) чисел на \(h_0\) и \(n\) на \(C_0\), то есть \(2n\) на слой и на направление, а у GRU — \(n\).</p>
+
+  <p class="memo"><mark class="key">Выученное начальное состояние одно на все последовательности: оно сдвигает общую точку старта, но не подстраивается под каждую.</mark></p>
+
+  <p>Если разным последовательностям нужен разный старт, его надо не выучить, а вычислить из того, что о последовательности известно заранее: \(h_0 = f(x)\). Это уже не заводской пресет, а радио, которое знает твой профиль и сразу ставит твою станцию. Так поступают, когда подписывают картинку: \(h_0\) получают из самой картинки (<a href="l34.html">урок 34</a>). А в seq2seq начальное состояние decoder — это последнее состояние encoder (<a href="l41.html">урок 41</a>).</p>
+</section>
+
+<section id="l33-torch">
+  <h2>Считаем параметры и формы в PyTorch</h2>
+
+  <p>Всё, что было в уроке, помещается в одну строку PyTorch. Ячейку выбирает класс, <code>nn.LSTM</code> или <code>nn.GRU</code>, остальное — аргументы: <code>input_size</code> \(= d\), <code>hidden_size</code> \(= n\), <code>num_layers</code> \(= L\), <code>bidirectional=True</code> даёт \(D = 2\) направления вместо одного, <code>dropout</code> ставит dropout между слоями.</p>
+
+  <p>Посчитаем параметры сети <code>nn.LSTM(3, 64, num_layers=2, bidirectional=True)</code> — например, для трёх осей акселерометра.</p>
+
+  <ol class="steps" id="l33-steps-count">
+    <li><p>Одно направление слоя 1. У LSTM четыре блока; в каждом матрица \(n \times (n + d) = 64 \times 67\) и, в PyTorch, два вектора смещений по 64 числа:</p>
+      \[ 4 \cdot 64 \cdot (64 + 3) + 2 \cdot 4 \cdot 64 = 17\,664 \]</li>
+    <li><p>Слой 1 двунаправленный: у обратной цепочки свои веса того же размера:</p>
+      \[ 2 \cdot 17\,664 = 35\,328 \]</li>
+    <li><p>Слой 2 читает склейку \([\overrightarrow{h_t} ; \overleftarrow{h_t}]\), то есть \(2n = 128\) чисел вместо \(d = 3\):</p>
+      \[ 4 \cdot 64 \cdot (64 + 128) + 512 = 49\,664 \]
+      \[ 2 \cdot 49\,664 = 99\,328 \]</li>
+    <li><p>Складываем слои. Длины последовательности \(T\) в счёте нет нигде:</p>
+      \[ 35\,328 + 99\,328 = 134\,656 \]</li>
+  </ol>
+
+  <p>Общее правило — для любого слоя \(\ell\):</p>
+
+  <div class="formula">
+    \[ P_\ell = D\,\bigl(G\,n\,(n + d_\ell) + b\,G\,n\bigr) \]
+    <dl class="legend">
+      <dt>\(G\)</dt><dd>блоков весов: 4 у LSTM, 3 у GRU</dd>
+      <dt>\(D\)</dt><dd>направлений: 1 или 2</dd>
+      <dt>\(d_\ell\)</dt><dd>размер входа слоя: \(d\) у первого, \(Dn\) у остальных</dd>
+      <dt>\(b\)</dt><dd>векторов смещения на блок: 2 в PyTorch (<code>b_ih</code> и <code>b_hh</code>), 1 в формулах конспекта и на слайде LSTM, 0 на слайде GRU</dd>
+    </dl>
+  </div>
+
+  <p>Из-за смещений числа расходятся (<a href="l32.html">урок 32</a>): одно направление слоя 1 из примера выше по формулам курса, с одним смещением на блок, весит 17&nbsp;408, а в PyTorch 17&nbsp;664. На экзамене считай по формулам курса и называй соглашение.</p>
+
+  <h3>Формы тензоров</h3>
+
+  <aside class="margin-note">В лабораторных пишут <code>batch_first=True</code>; без него <code>output</code> имеет форму \((T, B, Dn)\).</aside>
+
+  <p>Вход — тензор формы \((B, T, d)\): \(B\) последовательностей по \(T\) шагов. Возвращаются два объекта, и их легко перепутать:</p>
+  <ul>
+    <li><code>output</code> формы \((B, T, Dn)\) — состояние <em>верхнего</em> слоя на <em>каждом</em> шаге, оба направления склеены по последней оси;</li>
+    <li><code>h_n</code> формы \((LD, B, n)\) — <em>финальное</em> состояние <em>каждого</em> слоя и направления (у обратной цепочки это шаг 1): слой 1 вперёд, слой 1 назад, слой 2 вперёд и так далее. <code>batch_first</code> на него не действует. У LSTM рядом лежит <code>c_n</code> той же формы.</li>
+  </ul>
+
+<pre><code>lstm = nn.LSTM(input_size=3, hidden_size=64,
+               num_layers=2, bidirectional=True,
+               batch_first=True)
+x = torch.randn(32, 50, 3)      # (B, T, d)
+out, (h_n, c_n) = lstm(x)
+out.shape    # (32, 50, 128) = (B, T, D·n)
+h_n.shape    # (4, 32, 64)   = (L·D, B, n)
+feat = torch.cat([h_n[-2], h_n[-1]], dim=-1)</code></pre>
+
+  <p>Последняя строка — правильный вход классификатора для двунаправленной сети: <code>h_n[-2]</code> и <code>h_n[-1]</code> — финальные состояния обеих цепочек верхнего слоя, \(\overrightarrow{h_T}\) и \(\overleftarrow{h_1}\). Почему не <span class="nw"><code>output[:, -1, :]</code></span>, показывает режим «определить класс всей фразы» в виджете «Кто что видит». В лабораторной по классификации рядов то же самое записано через <code>h_n.view(L, 2, B, n)</code> и склейку срезов <code>[-1, 0]</code> и <code>[-1, 1]</code> (урок 46).</p>
+
+  <p>Выученное начальное состояние в PyTorch — свой параметр формы \((LD, 1, n)\), который перед каждым проходом растягивается на весь батч. Само растяжение и показывает, что старт один на всех:</p>
+
+<pre><code>self.h0 = nn.Parameter(0.1 * torch.randn(L * D, 1, n))
+self.c0 = nn.Parameter(0.1 * torch.randn(L * D, 1, n))
+# в forward:
+h0 = self.h0.expand(-1, B, -1).contiguous()
+c0 = self.c0.expand(-1, B, -1).contiguous()
+out, (h_n, c_n) = self.lstm(x, (h0, c0))</code></pre>
+
+  <div class="widget" id="l33-w-count">
+    <h3 class="widget-title">Стопка и счёт</h3>
+    <p class="widget-intro">Собери рекуррентную сеть, как в PyTorch с <code>batch_first=True</code> и батчем \(B = 32\). На рисунке слои снизу вверх; в каждом блоке — число его параметров и номер среза в <code>h_n</code>. Сплошная рамка — прямое направление, пунктирная — обратное.</p>
+    <ol class="tasks">
+      <li>Сейчас <code>nn.LSTM(3, 64, num_layers=2, bidirectional=True)</code>, 134&nbsp;656 параметров. Прежде чем двигать \(T\): сколько их станет при \(T = 500\)?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Столько же. Меняется только форма <code>output</code>, \((32, T, 128)\): веса общие для всех шагов, и длина последовательности в счёт не входит. Это главное, что показывает виджет.</p></details>
+      </li>
+      <li>Во сколько раз уменьшится число параметров, если поменять LSTM на GRU? Ответь, потом переключи ячейку и проверь при разных \(d\), \(n\) и \(L\).
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Ровно в \(4/3\) раза, то есть GRU — это \(3/4\) от LSTM: три блока вместо четырёх, а размер блока тот же. Так при любых размерах и любом соглашении о смещениях, если обе ячейки считать одинаково. Отношение сбивает только выученное начальное состояние: у LSTM оно вдвое больше.</p></details>
+      </li>
+      <li>Почему слой 2 почти втрое тяжелее слоя 1? Выключи <code>bidirectional</code> и сравни снова.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Слой 2 читает не \(d = 3\) числа, а склейку \(2n = 128\): \(4 \cdot 64 \cdot 192 + 512 = 49\,664\) на направление против \(17\,664\). Без двунаправленности на вход приходит \(n = 64\), и слой 2 весит \(33\,280\).</p></details>
+      </li>
+      <li>Сколько параметров добавит выученное начальное состояние? Посчитай, потом включи его и найди, какая это доля от всего.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>У LSTM \(2n\) на слой и направление: \(2 \cdot 64 \cdot 2 \cdot 2 = 512\), около 0.4&nbsp;% от 134&nbsp;656. У GRU вдвое меньше, \(n\) на слой и направление: \(C_0\) у неё нет.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l33-w-count', function (root, ui) {
+    var B = 32;
+    var cellS = ui.select('ячейка', [{ value: 'lstm', label: 'LSTM (nn.LSTM)' }, { value: 'gru', label: 'GRU (nn.GRU)' }], null, 'lstm');
+    var dS = ui.slider({ label: 'размер входа d (input_size)', min: 1, max: 64, step: 1, value: 3 });
+    var nS = ui.slider({ label: 'размер состояния n (hidden_size)', min: 2, max: 256, step: 2, value: 64 });
+    var LS = ui.slider({ label: 'слоёв L (num_layers)', min: 1, max: 4, step: 1, value: 2 });
+    var biT = ui.toggle('bidirectional=True', true);
+    var h0T = ui.toggle('выученное начальное состояние', false);
+    var biasS = ui.select('смещения', [
+      { value: '2', label: 'два на блок: b_ih и b_hh (PyTorch)' },
+      { value: '1', label: 'одно на блок (формулы конспекта)' },
+      { value: '0', label: 'без смещений (слайд GRU)' }
+    ], null, '2');
+    var TS = ui.slider({ label: 'длина последовательности T', min: 1, max: 500, step: 1, value: 50 });
+    var svg = ui.svg(560, 300, { label: 'Стопка рекуррентных слоёв: число параметров каждого блока, склейка направлений между слоями, формы входа и выхода' });
+    var roL1 = ui.readout('слой 1'), roLk = ui.readout('каждый следующий слой'), roInit = ui.readout('начальное состояние');
+    var roTot = ui.readout('всего параметров'), roOut = ui.readout('output'), roHn = ui.readout('h_n');
+    var note = ui.note('');
+
+    function F(x) { return String(Math.round(x)).replace(/\B(?=(\d{3})+(?!\d))/g, ' '); }
+    function state() {
+      var G = cellS.value === 'lstm' ? 4 : 3, D = biT.value ? 2 : 1, n = Math.round(nS.value), d = Math.round(dS.value);
+      var L = Math.round(LS.value), nb = +biasS.value, per = [], tot = 0;
+      for (var l = 1; l <= L; l++) {
+        var inp = l === 1 ? d : D * n, p = G * n * (n + inp) + nb * G * n;
+        per.push({ inp: inp, p: p });
+        tot += D * p;
+      }
+      var init = h0T.value ? (G === 4 ? 2 : 1) * n * L * D : 0;
+      return { G: G, D: D, n: n, d: d, L: L, nb: nb, per: per, init: init, tot: tot + init, T: Math.round(TS.value) };
+    }
+
+    function S(tag, a) { return Course.svg(tag, a, svg); }
+    function seg(x1, y1, x2, y2, cls, arrow) {
+      var a = { x1: x1, y1: y1, x2: x2, y2: y2, 'class': cls || '' };
+      if (arrow) a['marker-end'] = 'url(#' + arrow + ')';
+      return S('line', a);
+    }
+    function chip(cx, y, w, text) {
+      S('rect', { x: cx - w / 2, y: y, width: w, height: 26, rx: 13, 'class': 'fi-paper' });
+      S('text', { x: cx, y: y + 18, 'class': 'tx-mid tx-mono', text: text });
+    }
+
+    function draw(s) {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var rowH = 44, pitch = 96, top0 = 96, l, dir;
+      var bottom1 = top0 + (s.L - 1) * pitch + rowH, inY = bottom1 + 34, H = inY + 26 + 12;
+      svg.setAttribute('viewBox', '0 0 560 ' + H);
+      var xs = s.D === 2 ? [170, 390] : [280], bw = s.D === 2 ? 200 : 260, name = s.G === 4 ? 'LSTM' : 'GRU';
+      function top(k) { return top0 + (s.L - k) * pitch; }
+      /* connection from a row (its top edge at y0) to whatever sits above (bottom edge at y1) */
+      function link(y0, y1, toOutput) {
+        var mid = (y0 + y1) / 2;
+        if (s.D === 2) {
+          xs.forEach(function (x) { seg(x, y0, x, mid + 11, '', 'arr'); });
+          if (toOutput) seg(280, mid - 10, 280, y1 + 1, '', 'arr');
+          else xs.forEach(function (x) { seg(x, mid - 10, x, y1 + 1, '', 'arr'); });
+          S('rect', { x: 70, y: mid - 10, width: 420, height: 20, rx: 10, 'class': 'fi-paper st-muted' });
+          S('text', { x: 280, y: mid + 5, 'class': 'tx-mid tx-sm', text: 'склейка [→ ; ←]: 2n = ' + 2 * s.n + ' чисел на шаг' });
+        } else {
+          seg(280, y0, 280, y1 + 1, '', 'arr');
+          if (!toOutput) S('text', { x: 292, y: mid + 5, 'class': 'tx-mono', text: 'n = ' + s.n });
+        }
+      }
+      chip(280, 12, 380, 'output (B, T, D·n) = (' + B + ', ' + s.T + ', ' + s.D * s.n + ')');
+      link(top(s.L), 38, true);
+      for (l = 1; l < s.L; l++) link(top(l), top(l + 1) + rowH, false);
+      chip(280, inY, 300, 'x (B, T, d) = (' + B + ', ' + s.T + ', ' + s.d + ')');
+      xs.forEach(function (x) { seg(280, inY, x, bottom1 + 1, '', 'arr'); });
+      for (l = 1; l <= s.L; l++) {
+        for (dir = 0; dir < s.D; dir++) {
+          var x = xs[dir], y = top(l), k = (l - 1) * s.D + dir;
+          S('rect', { x: x - bw / 2, y: y, width: bw, height: rowH, rx: 8, 'class': dir ? 'fi-paper st-s2 sw-2 dash' : 'fi-paper st-s1 sw-2' });
+          S('text', { x: x, y: y + 19, 'class': 'tx-mid', text: (s.D === 2 ? (dir ? '← ' : '→ ') : '') + 'слой ' + l + ' · ' + name });
+          S('text', { x: x, y: y + 37, 'class': 'tx-mid tx-mono', text: F(s.per[l - 1].p) + ' · h_n[' + k + ']' });
+          if (s.init) {
+            var cx = s.D === 2 ? (dir ? 522 : 38) : 114;
+            S('rect', { x: cx - 26, y: y + 10, width: 52, height: 24, rx: 12, 'class': 'fi-paper st-muted dash' });
+            S('text', { x: cx, y: y + 27, 'class': 'tx-mid tx-mono', text: '+' + (s.G === 4 ? 2 * s.n : s.n) });
+          }
+        }
+      }
+    }
+
+    ui.onChange(function () {
+      var s = state(), p1 = s.per[0].p, G = s.G, n = s.n;
+      draw(s);
+      function both(p) { return s.D === 2 ? '2 × ' + F(p) + ' = ' + F(2 * p) : F(p); }
+      function arith(inp) { return G + '·' + n + '·(' + n + ' + ' + inp + ')' + (s.nb ? ' + ' + s.nb + '·' + G + '·' + n : ''); }
+      roL1.set(both(p1));
+      roLk.set(s.L > 1 ? both(s.per[1].p) : '— (слой один)');
+      roInit.set(s.init ? '+' + F(s.init) : 'нули: 0');
+      roTot.set(F(s.tot));
+      roOut.set('(' + B + ', ' + s.T + ', ' + s.D * n + ')');
+      roHn.set('(' + s.L * s.D + ', ' + B + ', ' + n + ')' + (G === 4 ? ', c_n такой же' : ''));
+      var txt = 'Одно направление слоя 1: ' + arith(s.d) + ' = ' + F(p1) + '.';
+      if (s.L > 1) txt += ' Слой 2 читает ' + (s.D === 2 ? '2n' : 'n') + ' = ' + s.D * n + ' чисел: ' + arith(s.D * n) + ' = ' + F(s.per[1].p) + '.';
+      if (s.init) txt += ' Начальное состояние: ' + (G === 4 ? '2n (h₀ и C₀)' : 'n (только h₀)') + ' на слой и направление.';
+      note.set(txt);
+    });
+  });
+  </script>
+</section>
+
+<section id="l33-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="open" id="l33-exam-gru">
+    <div class="exam-q" lang="en">
+      <p>Write the equations of a GRU cell as in the course slides. Which components of the LSTM are merged or removed, and what is added? Using the slides' convention, what happens to the state when \(z_t = 0\), and to the candidate when \(r_t = 0\)?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ z_t = \sigma(W_z \cdot [h_{t-1}, x_t]) \]
+        \[ r_t = \sigma(W_r \cdot [h_{t-1}, x_t]) \]
+        \[ \tilde h_t = \tanh(W \cdot [r_t * h_{t-1}, x_t]) \]
+        \[ h_t = (1 - z_t) * h_{t-1} + z_t * \tilde h_t \]
+        <p>Here \(*\) is the element-wise product; biases are omitted as on the slide. Compared with the LSTM, the forget and input gates are merged into the update gate \(z_t\) (\(z_t\) plays the input gate, \(1 - z_t\) the forget gate), and the cell state and the hidden state are merged into \(h_t\). There is no output gate, so the whole state is exposed. A reset gate \(r_t\) is added: it decides how much of \(h_{t-1}\) enters the candidate. The cell has 3 weight blocks instead of 4.</p>
+        <p>\(z_t = 0\): \(h_t = h_{t-1}\), the state is copied unchanged, and the gradient along this path passes with factor 1. \(r_t = 0\): the candidate ignores the past and depends only on \(x_t\); \(h_t\) still mixes it with \(h_{t-1}\) through \(z_t\). In PyTorch and in Cho et al. (2014) the roles of \(z_t\) and \(1 - z_t\) are swapped.</p>
+      </div>
+      <div class="exam-note"><p>В хорошем ответе три вещи: четыре уравнения с \(r_t\) в правильном месте (внутри кандидата, а не в формуле для \(h_t\)), карту «что слили, что убрали, что добавили» и смысл крайних значений. Типичные ошибки — назвать reset gate «аналогом input gate» и не сказать, в каком соглашении записан \(z\).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.68" data-tol="0.005" id="l33-exam-step">
+    <div class="exam-q" lang="en">
+      <p>A GRU with two hidden units has \(h_{t-1} = (0.6,\ {-0.4})\). At time \(t\) the update gate is \(z_t = (0.1,\ 0.9)\) and the candidate is \(\tilde h_t = (-0.5,\ 0.8)\). Using \(h_t = (1 - z_t) * h_{t-1} + z_t * \tilde h_t\), compute \(h_t\) and enter its second component.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        \[ h_{t,1} = 0.9 \cdot 0.6 + 0.1 \cdot (-0.5) = 0.49 \]
+        \[ h_{t,2} = 0.1 \cdot (-0.4) + 0.9 \cdot 0.8 = 0.68 \]
+        <p>\(h_t = (0.49,\ 0.68)\). Unit 1 mostly keeps its past value (\(z = 0.1\)); unit 2 is mostly overwritten by the candidate (\(z = 0.9\)).</p>
+      </div>
+      <div class="exam-note"><p>Если подставить числа в формулу PyTorch, где \(z\) сохраняет прошлое, выйдет \(({-0.39},\ {-0.28})\). Считай по формуле слайда и выпиши её перед подстановкой: так видно, какое соглашение взято.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="1860" data-tol="0.5" id="l33-exam-params">
+    <div class="exam-q" lang="en">
+      <p>How many trainable parameters does a single-layer GRU have with input size \(d = 10\) and hidden size \(n = 20\), with one bias vector per weight block as in the equations of the notes? How many does PyTorch's <code>nn.GRU(10, 20)</code> have, and why?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Three blocks (\(z\), \(r\), \(\tilde h\)), each with a matrix \(W \in \R^{n \times (n + d)}\) acting on a vector of size \(n + d\) (\([h_{t-1}, x_t]\), or \([r_t * h_{t-1}, x_t]\) for the candidate) and a bias \(b \in \R^n\):</p>
+        \[ 3\,(20 \cdot 30 + 20) = 3 \cdot 620 = 1860 \]
+        <p>Without biases, as on the slide, it is \(3 \cdot 20 \cdot 30 = 1800\). PyTorch keeps two bias vectors per block (<code>b_ih</code> and <code>b_hh</code>): \(3\,(20 \cdot 30 + 2 \cdot 20) = 1920\). With the same bias convention a GRU has exactly three quarters of the parameters of an LSTM of the same size (3 blocks instead of 4). The count does not depend on the sequence length.</p>
+      </div>
+      <div class="exam-note"><p>Ловушка — забыть, что блок читает склейку \([h_{t-1}, x_t]\) размера \(n + d\), а не один вход \(x_t\): тогда выходит 660. Если в задаче не сказано, сколько смещений, назови соглашение явно.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-bidir">
+    <div class="exam-q" lang="en">
+      <p>What is a bidirectional RNN, how is its representation at time \(t\) formed, and when can it not be used? Can a bidirectional LSTM be used for (a) part-of-speech tagging of a written sentence, (b) a next-word language model, (c) forecasting the next 24 hours of a time series from the last 7 days?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Two independent RNNs with separate weights run over the same input: one left-to-right, giving \(\overrightarrow{h_t}\), one right-to-left, giving \(\overleftarrow{h_t}\). The representation at time \(t\) is the concatenation \(h_t = [\overrightarrow{h_t} ; \overleftarrow{h_t}] \in \R^{2n}\). Since \(\overrightarrow{h_t}\) depends on \(x_1, \dots, x_t\) and \(\overleftarrow{h_t}\) on \(x_t, \dots, x_T\), every \(h_t\) is conditioned on the whole sequence.</p>
+        <p>It can be used only when conditioning on the full input sequence, i.e. when the whole input is available before the outputs are needed. It cannot be used for online/streaming prediction or for autoregressive generation.</p>
+        <p>(a) Yes: the whole sentence is known. (b) No: \(\overleftarrow{h_t}\) would already contain the word to be predicted, and at generation time the future does not exist. (c) Yes for encoding the observed 7-day window, which is entirely in the past; the part that emits the forecast step by step must be causal.</p>
+      </div>
+      <div class="exam-note"><p>Ключевые слова — "two independent RNNs", "concatenation", "conditioning on the full input sequence". Пункт (c) — ловушка: ответ «прогноз, значит, нельзя» неверен. Сильный ответ разделяет модель на части: encoder окна может быть двунаправленным, decoder прогноза — нет.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l33-exam-init">
+    <div class="exam-q" lang="en">
+      <p>How can the initial state of an RNN be set? Explain how a learned initial state is trained. Does it allow the network to start differently for different kinds of sequences?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Either fix it (typically \(h_0 = 0\), and \(C_0 = 0\) for an LSTM) or treat it as learned parameters: start from random guesses of the initial state values, backpropagate the prediction error through time all the way to the initial state, compute the gradient of the error with respect to it, and update it by gradient descent like any other weight.</p>
+        <p>It costs \(2n\) parameters per layer and direction for an LSTM (\(n\) for a GRU) and helps mostly short sequences and the first time steps. It does not give a different start per kind of sequence: after training it is one vector shared by all sequences, a dataset-level prior. A per-sequence start requires computing \(h_0\) from side information \(c\), \(h_0 = f(c)\): e.g. an image encoding in captioning or the encoder's last state in seq2seq.</p>
+      </div>
+      <div class="exam-note"><p>Три шага слайда стоит воспроизвести почти дословно. Последний вопрос проверяет, понимаешь ли ты, что выученный вектор после обучения — константа.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l33-exam-stack">
+    <div class="exam-q" lang="en">
+      <p>Which statements about a stacked (multi-layer) LSTM are correct? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>At time \(t\), layer \(\ell \ge 2\) receives \(h_t^{(\ell-1)}\), the hidden state of the layer below at the same time step. <span class="fb">Вход снизу — с того же шага; своё прошлое слой берёт слева.</span></li>
+      <li data-correct>The weights are shared across time steps within a layer, and each layer has its own weights. <span class="fb">\(W^{(1)} \ne W^{(2)}\), а внутри слоя одни и те же на всех шагах.</span></li>
+      <li>Layer \(\ell \ge 2\) receives the cell state \(C_t^{(\ell-1)}\) of the layer below. <span class="fb">Память \(C\) идёт только вправо, к следующему шагу своего слоя; наверх уходит \(h\).</span></li>
+      <li>Doubling the sequence length doubles the number of parameters. <span class="fb">Веса общие для всех шагов: длина на число параметров не влияет.</span></li>
+      <li data-correct>In the course slides, a ReLU layer sits between the top LSTM layer and the output \(Y_t\). <span class="fb">Так нарисовано на <a class="slide-ref" href="assets/slides/s04_024.webp" data-deck="s04" data-slide="24,26">слайдах 24 и 26 лекции 4</a>.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Correct: 1, 2 and 5. The cell state stays inside its layer and only moves forward in time, and the parameter count is independent of \(T\). Stacking gives a hierarchical representation: higher layers capture slower, more abstract temporal patterns.</p>
+      </div>
+      <div class="exam-note"><p>Ловушки здесь две: какой индекс времени у входа слоя сверху (\(t\), а не \(t - 1\)) и что передаётся наверх (\(h\), а не \(C\)).</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l33-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">В GRU (форма слайда) у одного числа состояния \(z_t = 0\) на всех шагах <span class="nw">с 11-го по 60-й</span>. Что происходит с этим числом?</p>
+    <ul class="options">
+      <li>Каждый шаг заменяется кандидатом <span class="fb">Это \(z = 1\) в форме слайда — или \(z = 0\) в форме PyTorch.</span></li>
+      <li data-correct>Копируется без изменений, и градиент вдоль этого пути проходит с множителем 1 <span class="fb">\(h_t = 1 \cdot h_{t-1} + 0 \cdot \tilde h_t\): пятьдесят шагов подряд — копия, как в carousel LSTM.</span></li>
+      <li>Убывает вдвое за шаг <span class="fb">Множитель старого значения — \(1 - z = 1\), а не 0.5.</span></li>
+      <li>Обнуляется <span class="fb">Обнулить число может только кандидат, например при \(z = 1\) и \(\tilde h = 0\); при \(z = 0\) кандидат в формулу не входит.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Reset gate \(r_t = 0\) для всех чисел состояния. Что получится?</p>
+    <ul class="options">
+      <li>Состояние \(h_t\) обнуляется <span class="fb">\(r_t\) не входит в формулу \(h_t = (1 - z_t) * h_{t-1} + z_t * \tilde h_t\).</span></li>
+      <li>Ячейка перестаёт читать вход <span class="fb">Наоборот: \(x_t\) остаётся единственным источником кандидата.</span></li>
+      <li data-correct>Кандидат \(\tilde h_t\) строится из одного \(x_t\), а \(h_t\) всё равно смешивает его с \(h_{t-1}\) <span class="fb">\(r_t\) стирает прошлое только внутри кандидата; доля прошлого в \(h_t\) — это \(1 - z_t\).</span></li>
+      <li>То же, что input gate LSTM, равный нулю <span class="fb">«Ничего не записывать» в GRU — это \(z_t = 0\). У reset gate прямого аналога в LSTM нет.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">LSTM и GRU одинаковых размеров \(d\) и \(n\). Что верно?</p>
+    <ul class="options">
+      <li data-correct>У GRU ровно 3/4 параметров LSTM, если смещения считать одинаково <span class="fb">Три блока против четырёх, каждый \(n(n + d)\) плюс одинаковые смещения.</span></li>
+      <li>GRU может прятать память от следующего слоя, не стирая её <span class="fb">Для этого нужен output gate, а у GRU его нет: всё состояние и есть выход.</span></li>
+      <li data-correct>Состояние GRU, начатое в \((-1, 1)\), из этого интервала не выходит <span class="fb">\(h_t\) — смесь \(h_{t-1}\) и \(\tilde h_t \in (-1, 1)\) с неотрицательными долями, сумма которых 1.</span></li>
+      <li>На длинных последовательностях LSTM всегда точнее <span class="fb">В больших сравнениях постоянного победителя нет.</span></li>
+      <li data-correct>Память LSTM \(C_t\) может считать события: 1, 2, 3, … <span class="fb">При \(f = i = 1\) и \(\tilde C = 1\) прибавляется по единице; потолка нет.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Где в двухслойной LSTM ставят dropout?</p>
+    <ul class="options">
+      <li>На рекуррентную связь \(h_{t-1} \to h_t\), с новой маской на каждом шаге <span class="fb">Такая маска на каждом шаге стирает куски памяти — именно этого избегают.</span></li>
+      <li data-correct>Между слоями: на \(h_t^{(1)}\), которое уходит вверх <span class="fb">Так работает аргумент dropout в nn.LSTM: на выходах каждого слоя, кроме последнего.</span></li>
+      <li>На память \(C_t\), чтобы она не переобучалась <span class="fb">\(C_t\) — тот самый путь, по которому идёт длинный градиент; его не трогают.</span></li>
+      <li>Только на вход \(x_t\) первого слоя <span class="fb">Аргумент dropout в nn.LSTM действует между рекуррентными слоями, а не на входе.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В какой задаче двунаправленная LSTM законна?</p>
+    <ul class="options">
+      <li>Подсказывать следующее слово при наборе сообщения <span class="fb">Это языковая модель: обратная цепочка прочитала бы ответ, а при наборе будущего ещё нет.</span></li>
+      <li>Субтитры к прямой трансляции <span class="fb">Для \(\overleftarrow{h_t}\) нужен конец фразы — пришлось бы ждать.</span></li>
+      <li data-correct>Оценить тональность отзыва, который уже написан целиком <span class="fb">Весь вход известен до ответа — "conditioning on full input sequence".</span></li>
+      <li>Decoder, который выдаёт перевод слово за словом <span class="fb">Генерация: следующего слова ещё не существует.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Ряды температур: половина начинается зимой, половина летом. Сеть с выученным начальным состоянием обучили. С чего стартуют зимний и летний ряд?</p>
+    <ul class="options">
+      <li>Каждый со своего, подобранного под сезон <span class="fb">Для этого старт надо не учить, а вычислять из сезона \(s\): \(h_0 = f(s)\).</span></li>
+      <li data-correct>С одного и того же вектора \(h_0 = \theta_h\) <span class="fb">\(\theta_h\) — один параметр на весь датасет; после обучения он константа.</span></li>
+      <li>С нуля: выученный старт действует только во время обучения <span class="fb">Выученный вектор остаётся в модели и используется при предсказании.</span></li>
+      <li>Каждый со своего, который подбирается градиентным спуском прямо во время предсказания <span class="fb">Во время предсказания градиентного спуска нет.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text"><code>nn.GRU(input_size=8, hidden_size=32, num_layers=3, bidirectional=True, batch_first=True)</code> получает батч формы (16, 50, 8). Какой формы <code>h_n</code>?</p>
+    <ul class="options">
+      <li>(16, 50, 64) <span class="fb">Это output: верхний слой на каждом шаге, направления склеены.</span></li>
+      <li>(3, 16, 64) <span class="fb">Направления в h_n не склеены, а лежат отдельными срезами.</span></li>
+      <li>(16, 6, 32) <span class="fb">batch_first на h_n не действует: батч всегда на второй оси.</span></li>
+      <li data-correct>(6, 16, 32) <span class="fb">\(LD = 3 \cdot 2 = 6\) срезов, по одному на слой и направление, в каждом \(B \times n\).</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l33-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>GRU склеивает keep и write gate в один update gate: \(h_t = (1 - z_t) * h_{t-1} + z_t * \tilde h_t\). Reset gate \(r_t\) решает, сколько прошлого попадёт в кандидата; отдельной памяти и output gate нет. В PyTorch и у Cho et al. роли \(z\) и \(1 - z\) переставлены.</li>
+    <li>У GRU три блока весов против четырёх у LSTM: при одном соглашении о смещениях это ровно на четверть меньше параметров. Состояние GRU — смесь, оно ограничено и не умеет считать. Постоянного победителя между ячейками нет.</li>
+    <li>Сеть — одна ячейка, развёрнутая во времени: веса общие по времени, и число параметров не зависит от \(T\). В стопке слой \(\ell\) читает \(h_t^{(\ell-1)}\) того же шага, веса у каждого слоя свои, сверху dense-слой (ReLU на слайдах), dropout — между слоями.</li>
+    <li>Двунаправленная сеть — две независимые цепочки и склейка \([\overrightarrow{h_t} ; \overleftarrow{h_t}]\); так bank получает правый контекст. Она законна только при "conditioning on full input sequence": не в реальном времени и не при генерации.</li>
+    <li>Начальное состояние — ноль или параметр, который учится BPTT до самого \(h_0\). Это один вектор на весь датасет (\(2n\) на слой и направление у LSTM), а не своё для каждой последовательности.</li>
+    <li>В PyTorch <code>output</code> имеет форму \((B, T, Dn)\), <code>h_n</code> — \((LD, B, n)\). Для классификации двунаправленной сетью бери <code>h_n[-2]</code> и <code>h_n[-1]</code>, а не <code>output[:, -1]</code>.</li>
+  </ul>
+</section>
+
+<section class="resources" id="l33-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://colah.github.io/posts/2015-08-Understanding-LSTMs/" target="_blank" rel="noopener">Understanding LSTM Networks</a>
+      <span class="res-by">Christopher Olah, 2015</span>
+      <p class="res-why">Из этого поста картинки слайдов про LSTM и GRU. Раздел о вариантах LSTM в конце: GRU нарисован так же, как на <a class="slide-ref" href="assets/slides/s04_022.webp" data-deck="s04" data-slide="22">слайде 22 лекции 4</a>, и записан в той же форме, где \(z = 1\) берёт кандидата. Есть <a href="https://habr.com/en/companies/wunderfund/articles/331310/" target="_blank" rel="noopener">перевод на Хабре</a>.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://d2l.ai/chapter_recurrent-modern/bi-rnn.html" target="_blank" rel="noopener">Dive into Deep Learning, 10.4: Bidirectional Recurrent Neural Networks</a>
+      <span class="res-by">Zhang, Lipton, Li, Smola</span>
+      <p class="res-why">Своя версия задачки про bank: «I am ___ hungry, and I can eat half a pig» — слова после пропуска меняют ответ. Соседний раздел 10.3 строит стопку слоёв с теми же индексами, код на PyTorch.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.LSTM.html" target="_blank" rel="noopener">torch.nn.LSTM</a>
+      <span class="res-by">документация PyTorch</span>
+      <p class="res-why">Формы <code>output</code> и <code>h_n</code>, аргумент <code>dropout</code> («on the outputs of each LSTM layer except the last layer») и предупреждение, что у двунаправленной сети <code>h_n</code> «is not equivalent to the last element of output».</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="после">
+      <a class="res-title" href="https://distill.pub/2019/memorization-in-rnns/" target="_blank" rel="noopener">Visualizing memorization in RNNs</a>
+      <span class="res-by">Andreas Madsen, Distill, 2019</span>
+      <p class="res-why">GRU и LSTM на автодополнении слов почти равны по точности, но картинки связей показывают, что они по-разному опираются на далёкие слова. Наглядно, почему «кто лучше» решают задача и данные, а не название ячейки.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Мы сделали сеть глубже и пустили её в обе стороны. Осталось понять, где у неё вход и где выход: ответ на каждом шаге, один ответ в конце или целая фраза из одной картинки — это пять форм задач.</p>
+</aside>
+
+</main>
+</body>
+</html>

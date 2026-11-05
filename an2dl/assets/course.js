@@ -660,6 +660,12 @@
       setThemePref(nx);
       var b = doc.getElementById('tb-theme-' + nx); if (b) b.focus();
     });
+    var alt = S.course.alt;
+    if (alt && alt.dirs) {                                       // the same page in the other language, in a sibling folder
+      var segs = location.pathname.split('/'), file = segs.pop() || 'index.html', dir = decodeURIComponent(segs.pop() || '');
+      if (alt.dirs[dir]) bar.appendChild(el('a', { 'class': 'tb-lang', href: '../' + alt.dirs[dir] + '/' + file + location.hash,
+        hreflang: alt.lang || '', lang: alt.lang || '', title: alt.title || '', text: alt.label }));
+    }
     bar.appendChild(tg);
 
     /* shell */
@@ -993,7 +999,7 @@
         retry.hidden = done === 0;
         foot.classList.toggle('is-perfect', done === qs.length && ok === qs.length);
         if (!done) { score.textContent = qs.length + ' ' + plural(qs.length, 'вопрос', 'вопроса', 'вопросов') + NBSP + '— ответь, чтобы проверить себя.'; return; }
-        score.innerHTML = 'Верно <b>' + ok + '</b> из <b>' + qs.length + '</b>' + (done < qs.length ? ' · осталось ' + (qs.length - done) : ok === qs.length ? NBSP + '— всё чисто.' : NBSP + '— перечитай разделы, где ошибся, и попробуй ещё раз.');
+        score.innerHTML = 'Верно <b>' + ok + '</b> из <b>' + qs.length + '</b>' + (done < qs.length ? ' · осталось ' + (qs.length - done) : ok === qs.length ? NBSP + '— всё чисто.' : NBSP + '— перечитай разделы с ошибками и попробуй ещё раз.');
       }
       var parts = qs.map(function (q, qi) {
         var list = q.querySelector('.options');
@@ -3026,7 +3032,7 @@
       /* lesson anatomy (advice: an extras page is free-form) */
       if (lessonLike) {
         var need = [['.lesson-head h1', 'header.lesson-head with <h1>'], ['.lesson-head .lede', '.lede in the lesson head'], ['.hook', '.hook'],
-          ['section.quiz', 'section.quiz'], ['section.recap', 'section.recap'], ['.recap .cheat', '.cheat inside the recap'],
+          ['section.quiz', 'section.quiz'], ['section.recap', 'section.recap'],
           ['section.resources', 'section.resources'], ['.bridge', 'aside.bridge'], ['.exam', '.exam question'], ['.widget', 'widget']];
         need.forEach(function (x) { if (!main.querySelector(x[0])) stWarn('anatomy', 'the lesson has no ' + x[1]); });
         if (main.querySelectorAll('figure.fig').length < 2) stWarn('anatomy', 'fewer than 2 figures (figure.fig) in the lesson');

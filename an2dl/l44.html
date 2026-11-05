@@ -1,0 +1,1021 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Лаба 2. Шесть попыток победить overfitting · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l44">
+
+<header class="lesson-head">
+  <h1>Лаба 2. Шесть попыток победить overfitting</h1>
+  <p class="lede">После этого урока ты напишешь по памяти цикл обучения с early stopping, добавишь в него dropout, L2-штраф и AdamW, скажешь, что каждая строка меняет в обновлении весов, и честно сравнишь шесть моделей: от одних начальных весов, по метрике, которая видит редкие классы, с одним заходом на test.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>Одна сеть, один прогон, два сохранённых момента. После второй эпохи validation loss равен 0.989 — ниже он не опустится до самого конца. После сотой он 3.421, в три с половиной раза хуже. А доля верных ответов на тех же 1&nbsp;685 статьях даже подросла.</p>
+  <div class="scroll-x">
+    <table class="tbl tbl--center">
+      <thead><tr><th>эпоха</th><th>validation loss</th><th>validation accuracy</th></tr></thead>
+      <tbody>
+        <tr><td class="num">2</td><td class="num">0.989</td><td class="num">0.775</td></tr>
+        <tr><td class="num">100</td><td class="num">3.421</td><td class="num">0.788</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Какую из двух моделей оставить? И как loss может так вырасти, если верных ответов стало больше? Разгадка — в конце урока.</p>
+</div>
+
+<section id="l44-data">
+  <h2>46 тем, и accuracy молчит</h2>
+
+  <p>Данные лабы — 11&nbsp;228 коротких новостей агентства Reuters, у каждой одна тема из 46. Темы очень неравны: <code>earn</code> (отчёты о прибыли) — 3&nbsp;972 статьи, 35&nbsp;% всех, а у <code>heat</code>, <code>lei</code> и <code>silver</code> по 16. Перекос 248&nbsp;:&nbsp;1.</p>
+
+  <p>Статья хранится как список рангов слов: 1 — самое частое слово коллекции, 2 — следующее. Сети нужен вход фиксированной длины, и статья становится <mark class="key">multi-hot</mark> вектором (<span class="en" lang="en">multi-hot encoding</span>): 2&nbsp;000 столбцов, по одному на самые частые слова, с единицей там, где слово встречается.</p>
+<pre><code>X = np.zeros((len(sequences), VOCAB_SIZE), dtype=np.float32)
+for i, sequence in enumerate(sequences):
+    ranks = np.array(sequence)
+    X[i, ranks[ranks &lt;= VOCAB_SIZE] - 1] = 1.0   # rank 1 goes to column 0
+y = labels.astype(np.int64)</code></pre>
+  <ul>
+    <li><code>ranks &lt;= VOCAB_SIZE</code> оставляет только словарь. Эти 2&nbsp;000 слов покрывают 86&nbsp;% всех слов коллекции, в средней статье их 67 разных. Порядок слов и повторы теряются.</li>
+    <li><code>astype(np.int64)</code> — <code>CrossEntropyLoss</code> ждёт номера классов типа int64. Входы — нули и единицы одного масштаба, scaler не нужен.</li>
+  </ul>
+
+  <p>Два вызова <code>train_test_split(..., stratify=...)</code> делят статьи на 7&nbsp;858 / 1&nbsp;685 / 1&nbsp;685: training, validation и test (урок <a href="l18.html">18</a>). <code>stratify</code> сохраняет доли тем, и даже тема из 16 статей получает 2–3 статьи в validation, а не выпадает из validation целиком.</p>
+
+  <div class="pitfall">
+    <p>«Словарь из 2&nbsp;000 слов ничего не знает о test». Знает: ранги — это частоты слов во всей коллекции, вместе с test. Утечка крошечная и без меток, но в своём проекте словарь строят только по training set.</p>
+  </div>
+
+  <p>Возьми «классификатор», который на любую статью отвечает <code>earn</code>: <code>majority = np.full_like(labels, counts.argmax())</code>. Его accuracy — 0.354, угадана каждая третья статья. Weighted F1 — 0.185. Macro F1 — 0.011.</p>
+
+  <p><mark class="key">Macro F1</mark> (<span class="en" lang="en">macro-averaged F1</span>) считает binary F1 из урока <a href="l01.html">1</a> для каждой темы отдельно — «эта тема против всех остальных» — и берёт простое среднее:</p>
+  \[ F_1^{\text{macro}} = \frac{1}{46}\sum_{k=1}^{46} F_{1,k} \]
+  <p><span class="en" lang="en">Weighted F1</span> усредняет те же 46 чисел с весами — долями тем, и <code>earn</code> весит в нём 35&nbsp;%. У нашего «классификатора» F1 темы <code>earn</code> равен 0.523 (precision 0.354, recall 1), у остальных 45 тем — ноль. Отсюда 0.523 / 46 = 0.011 и 0.354 · 0.523 = 0.185.</p>
+
+  <p>В функции <code>score</code> это <code>f1_score(y_true, y_pred, average='macro', zero_division=0)</code>. Темы, которые модель ни разу не назвала, входят в среднее с F1 = 0: верных ответов у них нет. <code>zero_division=0</code> только ставит 0 вместо их precision 0/0 и глушит предупреждение. За macro F1 следят и early stopping, и выбор модели (<code>METRIC = 'f1'</code>).</p>
+
+  <p class="memo"><mark class="key">Macro F1 — среднее F1 по темам: тема из 16 статей весит в нём столько же, сколько earn из 3&nbsp;972.</mark></p>
+
+  <figure class="fig fig--plain" id="l44-fig-pipeline">
+    <svg class="dia" viewBox="0 0 560 550" role="img" aria-label="Конвейер лабы: списки рангов слов, multi-hot X и y, разбиение, батчи train_loader, model, criterion и optimizer в цикле из 246 шагов за эпоху, после эпохи evaluate считает macro F1 на validation">
+      <rect x="24" y="192" width="520" height="272" rx="12" class="st-muted dash"/>
+      <text x="532" y="220" class="tx-end tx-hand">246 шагов за эпоху</text>
+      <path d="M 470 436 H 506 V 256 H 474" marker-end="url(#arr)"/>
+
+      <rect x="36" y="20" width="176" height="36" rx="6" class="fi-paper"/>
+      <text x="124" y="43" class="tx-mid tx-mono">sequences</text>
+      <text x="232" y="43">11 228 списков рангов слов</text>
+      <line x1="124" y1="56" x2="124" y2="78" marker-end="url(#arr)"/>
+
+      <rect x="36" y="80" width="176" height="36" rx="6" class="fi-paper"/>
+      <text x="124" y="103" class="tx-mid tx-mono">X, y</text>
+      <text x="232" y="103" class="tx-mono">X [11228, 2000] · y [11228]</text>
+      <line x1="124" y1="116" x2="124" y2="138" marker-end="url(#arr)"/>
+
+      <rect x="36" y="140" width="176" height="36" rx="6" class="fi-paper"/>
+      <text x="124" y="163" class="tx-mid tx-mono">train_test_split</text>
+      <text x="232" y="163" class="tx-mono">7 858 / 1 685 / 1 685</text>
+      <line x1="124" y1="176" x2="124" y2="236" marker-end="url(#arr)"/>
+
+      <rect x="36" y="238" width="176" height="36" rx="6" class="fi-paper st-s4 sw-2"/>
+      <text x="124" y="261" class="tx-mid tx-mono">train_loader</text>
+      <text x="232" y="261" class="tx-mono">x [32, 2000] · y [32]</text>
+      <line x1="124" y1="274" x2="124" y2="296" marker-end="url(#arr)"/>
+
+      <rect x="36" y="298" width="176" height="36" rx="6" class="fi-paper st-s3 sw-2"/>
+      <text x="124" y="321" class="tx-mid tx-mono">model</text>
+      <text x="232" y="321" class="tx-mono">logits [32, 46]</text>
+      <line x1="124" y1="334" x2="124" y2="356" marker-end="url(#arr)"/>
+
+      <rect x="36" y="358" width="176" height="36" rx="6" class="fi-paper"/>
+      <text x="124" y="381" class="tx-mid tx-mono">criterion</text>
+      <text x="232" y="381">loss — одно число</text>
+      <line x1="124" y1="394" x2="124" y2="416" marker-end="url(#arr)"/>
+
+      <rect x="36" y="418" width="176" height="36" rx="6" class="fi-paper"/>
+      <text x="124" y="441" class="tx-mid tx-mono">optimizer</text>
+      <text x="232" y="441" class="tx-mono">backward(), step()</text>
+      <line x1="124" y1="454" x2="124" y2="488" marker-end="url(#arr)"/>
+
+      <rect x="36" y="490" width="176" height="36" rx="6" class="fi-paper st-s5 sw-2"/>
+      <text x="124" y="513" class="tx-mid tx-mono">evaluate</text>
+      <text x="232" y="513">argmax → macro F1 на 1 685</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Конвейер лабы с формами тензоров нашего прогона. <code>model</code> — три блока Linear → ReLU (→ Dropout) и <code>Linear(512, 46)</code>. Внутри пунктира — эпоха: 246 шагов по батчу; после неё <code>evaluate</code> считает macro F1 на validation.</figcaption>
+  </figure>
+</section>
+
+<section id="l44-loop">
+  <h2>Сеть, цикл и одна изменённая строка</h2>
+
+  <p>Сеть — <code>FeedForwardNet</code>, обычный MLP (урок <a href="l09.html">9</a>):</p>
+<pre><code>layers, width = [], in_features
+for _ in range(hidden_layers):
+    layers += [nn.Linear(width, hidden_size), nn.ReLU()]
+    if dropout_rate &gt; 0:
+        layers.append(nn.Dropout(dropout_rate))
+    width = hidden_size
+
+# Output layer: one logit per class
+layers.append(nn.Linear(width, num_classes))
+self.net = nn.Sequential(*layers)</code></pre>
+  <p>Три скрытых слоя по 512 ReLU и выход на 46 чисел. Softmax в сети нет: <code>forward</code> возвращает <span class="en" lang="en">logits</span> (логиты), а <code>CrossEntropyLoss</code> сам применяет log-softmax (уроки <a href="l11.html">11</a> и <a href="l15.html">15</a>). Параметров 1&nbsp;573&nbsp;422 — около двухсот на обучающую статью: сеть нарочно велика, чтобы было чем переобучаться (урок <a href="l17.html">17</a>). Слои <code>nn.Dropout</code> появляются только при <code>dropout_rate &gt; 0</code>, и номера модулей от этого сдвигаются — это всплывёт при загрузке весов.</p>
+
+  <figure class="fig fig--plain" id="l44-fig-keys">
+    <svg class="dia" viewBox="0 0 560 360" role="img" aria-label="Модули self.net без dropout и с dropout: без него линейные слои стоят под номерами 0, 2, 4, 6, с ним под номерами 0, 3, 6, 9, потому что номер получают и ReLU, и Dropout">
+      <text x="150" y="30" class="tx-mid tx-mono tx-bold">make_model()</text>
+      <text x="410" y="30" class="tx-mid tx-mono tx-bold">make_model(0.5)</text>
+
+      <rect x="40" y="48" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="54" y="65" class="tx-mono tx-bold">net.0 · Linear</text>
+      <rect x="40" y="78" width="220" height="24" rx="4" class="fi-paper st-muted"/>
+      <text x="54" y="95" class="tx-mono tx-muted">net.1 · ReLU</text>
+      <rect x="40" y="108" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="54" y="125" class="tx-mono tx-bold">net.2 · Linear</text>
+      <rect x="40" y="138" width="220" height="24" rx="4" class="fi-paper st-muted"/>
+      <text x="54" y="155" class="tx-mono tx-muted">net.3 · ReLU</text>
+      <rect x="40" y="168" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="54" y="185" class="tx-mono tx-bold">net.4 · Linear</text>
+      <rect x="40" y="198" width="220" height="24" rx="4" class="fi-paper st-muted"/>
+      <text x="54" y="215" class="tx-mono tx-muted">net.5 · ReLU</text>
+      <rect x="40" y="228" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="54" y="245" class="tx-mono tx-bold">net.6 · Linear</text>
+      <text x="150" y="297" class="tx-mid tx-hand">номер занимают</text>
+      <text x="150" y="329" class="tx-mid tx-hand">и ReLU, и Dropout</text>
+
+      <rect x="300" y="48" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="314" y="65" class="tx-mono tx-bold">net.0 · Linear</text>
+      <rect x="300" y="78" width="220" height="24" rx="4" class="fi-paper st-muted"/>
+      <text x="314" y="95" class="tx-mono tx-muted">net.1 · ReLU</text>
+      <rect x="300" y="108" width="220" height="24" rx="4" class="fi-paper st-muted dash"/>
+      <text x="314" y="125" class="tx-mono tx-muted">net.2 · Dropout</text>
+      <rect x="300" y="138" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="314" y="155" class="tx-mono tx-bold">net.3 · Linear</text>
+      <rect x="300" y="168" width="220" height="24" rx="4" class="fi-paper st-muted"/>
+      <text x="314" y="185" class="tx-mono tx-muted">net.4 · ReLU</text>
+      <rect x="300" y="198" width="220" height="24" rx="4" class="fi-paper st-muted dash"/>
+      <text x="314" y="215" class="tx-mono tx-muted">net.5 · Dropout</text>
+      <rect x="300" y="228" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="314" y="245" class="tx-mono tx-bold">net.6 · Linear</text>
+      <rect x="300" y="258" width="220" height="24" rx="4" class="fi-paper st-muted"/>
+      <text x="314" y="275" class="tx-mono tx-muted">net.7 · ReLU</text>
+      <rect x="300" y="288" width="220" height="24" rx="4" class="fi-paper st-muted dash"/>
+      <text x="314" y="305" class="tx-mono tx-muted">net.8 · Dropout</text>
+      <rect x="300" y="318" width="220" height="24" rx="4" class="fi-soft st-ink sw-2"/>
+      <text x="314" y="335" class="tx-mono tx-bold">net.9 · Linear</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Модули <code>self.net</code> и их номера — начала ключей <code>state_dict</code>, например <code>net.3.weight</code>. Веса есть только у Linear (выделены), а номер получает каждый модуль.</figcaption>
+  </figure>
+
+  <p>Шесть экспериментов отличаются одной строкой, а честность сравнения держит <code>make_model</code>:</p>
+<pre><code>def make_model(dropout_rate=0.0):
+    """Build a fresh network; reseeding gives every experiment the same initial weights."""
+    torch.manual_seed(SEED)
+    return FeedForwardNet(input_features, HIDDEN_LAYERS, HIDDEN_SIZE, num_classes, dropout_rate).to(device)</code></pre>
+  <p>Первый эффект <code>torch.manual_seed(SEED)</code> — одинаковые начальные веса у всех шести прогонов. Второй менее заметен: <code>DataLoader</code> с <code>shuffle=True</code> берёт seed перемешивания из того же глобального генератора. Поэтому у прогонов без dropout совпадают и батчи всех эпох, а у dropout-прогонов, чьи маски тянут числа из того же генератора, — только порядок первой эпохи.</p>
+
+  <p>Одна эпоха обучения — <code>train_one_epoch</code> без ветки L1-штрафа и без сбора ответов для метрики:</p>
+<pre><code>model.train()                                    # (1)
+for x, y in loader:
+    x, y = x.to(device), y.to(device)
+    logits = model(x)
+    loss = criterion(logits, y)
+    penalty = 0.0
+    if l2_lambda &gt; 0:                            # (2)
+        penalty += l2_lambda * sum(p.pow(2).sum() for p in model.parameters())
+    optimizer.zero_grad()                        # (3)
+    (loss + penalty).backward()
+    optimizer.step()
+    total_loss += loss.item() * x.size(0)        # (4)</code></pre>
+  <ol>
+    <li><code>model.train()</code> включает dropout (а batch normalization, будь она в сети, переводит на статистики батча); <code>evaluate</code> переключает сеть в <code>eval()</code>, и без этой строки все эпохи после первой молча шли бы без dropout.</li>
+    <li>L2-штраф (о нём ниже) минимизируют, но не записывают: кривые всех прогонов меряют один и тот же loss.</li>
+    <li><code>zero_grad()</code> стирает градиенты прошлого шага: PyTorch накапливает их в <code>.grad</code>, и без этой строки шаг шёл бы по сумме всех прошлых (урок <a href="l43.html">43</a>).</li>
+    <li><code>loss</code> — среднее по батчу; умножение на <code>x.size(0)</code> и деление на <code>len(loader.dataset)</code> дают среднее по статьям, ведь последний батч — 18 статей.</li>
+  </ol>
+  <p><code>evaluate</code> — тот же проход без обновлений: <code>model.eval()</code> выключает dropout, <code>with torch.no_grad():</code> не строит граф для backward (на числа это не влияет), ответ — <code>logits.argmax(dim=1)</code>: softmax порядок логитов не меняет.</p>
+
+  <div class="pitfall">
+    <p>«Training F1 на графике — это насколько сеть выучила training set». Не совсем: <code>train_one_epoch</code> считает его по ходу эпохи — в режиме <code>train()</code> и на весах, которые за эпоху 246 раз меняются. Из-за смены весов validation loss на первой эпохе ниже training loss (1.15 против 1.52): в среднее вошли первые батчи, когда сеть ещё ничего не умела. Из-за режима <code>train()</code> dropout-прогон пишет на 30-й эпохе training F1 0.87, хотя веса его 29-й эпохи дают на training set 0.963 в режиме <code>eval()</code> — и 0.884 с включённым dropout. Честное сравнение — <code>evaluate(model, train_loader, criterion, device, metric)</code> после эпохи.</p>
+  </div>
+</section>
+
+<section id="l44-stop">
+  <h2>Baseline и early stopping — один и тот же прогон</h2>
+
+  <p>Baseline обучает <code>torch.optim.Adam</code> с <code>lr=1e-3</code> (это \(\eta\) урока <a href="l27.html">27</a>) 100 эпох без всякой регуляризации. Training set выучен к 8-й эпохе (training F1 0.93). Validation loss минимален на 2-й эпохе (0.989) и дальше растёт до 3.42, а validation macro F1 с 8-й эпохи стоит около 0.5: 0.533 на 8-й, лучший 0.540 на 59-й, 0.530 в конце. Классический overfitting по loss, а validation F1 при этом не падает: загадка из начала урока.</p>
+
+  <p>Early stopping (урок <a href="l20.html#l20-patience">20</a>) в PyTorch пишут сами; в <code>fit</code> это несколько строк:</p>
+<pre><code>best_score, best_state, wait = -np.inf, None, 0
+for epoch in range(1, epochs + 1):
+    ...  # train_one_epoch, evaluate
+    if val_score &gt; best_score:                          # (1)
+        best_score, wait = val_score, 0
+        best_state = copy.deepcopy(model.state_dict())  # (2)
+    else:
+        wait += 1
+    stop = patience &gt; 0 and wait &gt;= patience            # (3)
+    if stop:
+        break
+if patience &gt; 0:
+    model.load_state_dict(best_state)                   # (4)</code></pre>
+  <ol>
+    <li>Рекорд — строго лучше прежнего, как в уроке 20, только здесь ищут максимум macro F1, а не минимум ошибки: отсюда старт с <code>-np.inf</code>.</li>
+    <li><code>state_dict()</code> отдаёт ссылки на живые тензоры модели. Без <code>deepcopy</code> каждый следующий <code>optimizer.step()</code> менял бы и «лучшее состояние», и откат вернул бы веса последней эпохи.</li>
+    <li><code>PATIENCE = 20</code>: стоп после 20 эпох подряд без рекорда; при <code>patience=0</code>, как у baseline, — все 100 эпох и веса последней.</li>
+    <li>Откат к checkpoint — весам эпохи рекорда.</li>
+  </ol>
+
+  <p>Прогоны baseline и early stopping печатают одинаковые строки до четвёртого знака — все, какие есть у обоих. Причина — <code>make_model</code>: те же веса и те же батчи, а <code>patience</code> до остановки на обучение не влияет. Early stopping — это baseline, остановленный после 49-й эпохи и откатившийся к 29-й (macro F1 0.537).</p>
+
+  <div class="widget" id="l44-w-patience">
+    <h3 class="widget-title">Patience и то, за чем следишь</h3>
+    <p class="widget-intro">Baseline нашего прогона, все 100 эпох. Виджет ничего не обучает заново: он прокручивает early stopping из <code>fit</code> по этим кривым, эпоха за эпохой. Выбери, за чем следить, и patience. Жёлтая полоса — эпохи ожидания после последнего рекорда, бледная часть кривых — эпохи, до которых обучение не дошло бы. Наведи курсор на кривую, чтобы прочитать эпоху.</p>
+    <ol class="tasks">
+      <li>Выбери validation loss. Предскажи: веса какой эпохи вернёт <code>fit</code> при P&nbsp;=&nbsp;5, 20 и 60? Потом проверь.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Всегда 2-й. Validation loss минимален на 2-й эпохе (0.989) и ниже не опускается ни разу, рекорд не обновляется, и <code>fit</code> останавливается после эпохи 2 + P. Вернувшаяся модель: accuracy 0.775 — на вид неплохо, но macro F1 0.256. Следить здесь за loss — значит выбросить всё, что сеть выучила о редких темах, и patience этого не исправит.</p></details>
+      </li>
+      <li>Верни macro F1 и поставь P&nbsp;=&nbsp;20, как в лабе. После какой эпохи стоп и чьи веса вернутся? Сравни с прогоном early stopping: стоп после 49-й, лучшая 29-я, F1 0.5374.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Ровно они: стоп после 49-й, веса 29-й, macro F1 0.537, loss 2.344, хотя виджет читает только кривую baseline.</p></details>
+      </li>
+      <li>С macro F1 пройди P от 1 до 60. Сколько разных моделей может вернуть <code>fit</code> и насколько они отличаются?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Три: эпоха 8 (P от 1 до 15, F1 0.533), эпоха 29 (P от 16 до 29, 0.537) и эпоха 59 (P от 30, 0.540). Разброс 0.008 — столько же сдвигает macro F1 одна статья редкой темы. Длинный patience покупает лишние эпохи, а не качество: при P от 30 обучение идёт 89–100 эпох. Решает не P, а то, за чем следить.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l44-w-patience', function (root, ui) {
+    /* Baseline of our run, epochs 1-100: validation macro F1, validation loss, validation accuracy, training loss (data.json runs.Baseline.per_epoch) */
+    var VF1 = [0.1385, 0.256, 0.3491, 0.429, 0.4291, 0.452, 0.4842, 0.5329, 0.5072, 0.5061, 0.4948, 0.4683, 0.4987, 0.5134, 0.5115, 0.481, 0.5201, 0.5013, 0.4923, 0.5129, 0.4815, 0.5016, 0.5125, 0.5345, 0.5367, 0.5087, 0.5345, 0.5225, 0.5374, 0.5197, 0.5311, 0.4738, 0.4564, 0.4976, 0.4876, 0.4889, 0.4972, 0.4926, 0.5076, 0.5032, 0.5008, 0.5024, 0.4954, 0.5008, 0.5027, 0.5009, 0.4898, 0.4936, 0.4753, 0.4383, 0.5158, 0.4868, 0.5032, 0.5221, 0.5308, 0.5332, 0.5289, 0.5271, 0.5404, 0.5372, 0.5359, 0.5222, 0.5264, 0.5253, 0.5305, 0.5124, 0.5138, 0.5106, 0.4903, 0.492, 0.495, 0.5105, 0.5001, 0.4968, 0.4963, 0.4926, 0.4983, 0.5025, 0.4916, 0.4997, 0.4914, 0.5049, 0.4889, 0.4978, 0.5015, 0.5007, 0.494, 0.5099, 0.4938, 0.517, 0.4856, 0.4287, 0.5091, 0.5291, 0.5276, 0.5123, 0.5297, 0.5301, 0.5337, 0.5298];
+    var VL = [1.1473, 0.9886, 1.0183, 1.0888, 1.2149, 1.2961, 1.2899, 1.4237, 1.5172, 1.642, 1.6282, 2.0156, 1.7198, 1.8036, 1.9482, 2.1251, 1.9985, 2.1463, 2.1721, 1.9804, 2.1271, 2.3949, 2.3465, 2.1831, 2.2826, 2.2777, 2.3159, 2.4613, 2.3435, 2.6113, 2.4278, 2.338, 2.2855, 2.1685, 2.1513, 2.3505, 2.5006, 2.5949, 2.6562, 2.664, 2.703, 2.7859, 2.7481, 2.7097, 2.781, 2.7501, 2.7979, 2.7123, 2.7192, 2.3243, 2.3859, 2.6283, 2.465, 2.5961, 2.4332, 2.6556, 2.6669, 2.6816, 2.7716, 2.8253, 2.9085, 2.9189, 2.9342, 2.8483, 2.8987, 2.8908, 3.0197, 2.9126, 3.3318, 3.8253, 2.835, 3.1221, 3.2992, 3.2133, 3.0335, 3.1499, 3.2099, 3.2315, 3.354, 3.3709, 3.3945, 3.2964, 3.3488, 3.293, 3.1923, 3.1177, 3.4862, 3.2185, 3.2803, 3.7478, 3.4565, 3.4471, 3.614, 3.4399, 3.1718, 3.4744, 3.4191, 3.3718, 3.3867, 3.4208];
+    var VA = [0.7151, 0.7751, 0.7774, 0.778, 0.7703, 0.7769, 0.7727, 0.7828, 0.7763, 0.7774, 0.7745, 0.7727, 0.781, 0.7798, 0.7881, 0.7632, 0.7786, 0.7792, 0.7769, 0.784, 0.7685, 0.784, 0.784, 0.7911, 0.7858, 0.781, 0.784, 0.7804, 0.7899, 0.7816, 0.7798, 0.7602, 0.7644, 0.7715, 0.7751, 0.7727, 0.7792, 0.7786, 0.7798, 0.7786, 0.7798, 0.7804, 0.7792, 0.7774, 0.7786, 0.7727, 0.7733, 0.7774, 0.7721, 0.7596, 0.778, 0.7727, 0.7751, 0.784, 0.7881, 0.7858, 0.784, 0.7852, 0.7923, 0.7881, 0.7875, 0.7846, 0.7846, 0.784, 0.7816, 0.7792, 0.7816, 0.7816, 0.765, 0.7697, 0.7828, 0.7798, 0.7786, 0.7774, 0.7792, 0.7792, 0.7822, 0.7822, 0.7792, 0.781, 0.7804, 0.778, 0.7786, 0.7763, 0.7786, 0.7769, 0.7786, 0.778, 0.7769, 0.7757, 0.7786, 0.7543, 0.7709, 0.7881, 0.7786, 0.7869, 0.7905, 0.7875, 0.7935, 0.7881];
+    var TL = [1.5204, 0.8456, 0.5499, 0.3719, 0.2789, 0.214, 0.1744, 0.1363, 0.1192, 0.1155, 0.1054, 0.1161, 0.1296, 0.0914, 0.0786, 0.0827, 0.0911, 0.0844, 0.0758, 0.0809, 0.0804, 0.071, 0.0624, 0.0644, 0.0586, 0.0578, 0.0586, 0.0571, 0.0571, 0.0567, 0.0603, 0.0686, 0.1566, 0.0987, 0.0737, 0.0565, 0.0524, 0.0499, 0.0501, 0.0507, 0.0508, 0.0505, 0.0505, 0.0511, 0.0512, 0.0526, 0.054, 0.0616, 0.082, 0.137, 0.106, 0.0675, 0.0651, 0.0529, 0.053, 0.048, 0.049, 0.0481, 0.0489, 0.0474, 0.0479, 0.0492, 0.05, 0.049, 0.0493, 0.0505, 0.0512, 0.0524, 0.0871, 0.1222, 0.0908, 0.0622, 0.0509, 0.0488, 0.0517, 0.0468, 0.0465, 0.0463, 0.0464, 0.0467, 0.0478, 0.0486, 0.0496, 0.0494, 0.0488, 0.0526, 0.0499, 0.0514, 0.0489, 0.0596, 0.0644, 0.0831, 0.1221, 0.0895, 0.0572, 0.0537, 0.0484, 0.0501, 0.0461, 0.0455];
+    var N = VF1.length;
+
+    var mon = ui.select('за чем следит fit', [
+      { value: 'f1', label: 'macro F1, рекорд — максимум' },
+      { value: 'loss', label: 'loss, рекорд — минимум' }
+    ], null, 'f1');
+    var pat = ui.slider({ label: 'patience P', min: 1, max: 60, step: 1, value: 20 });
+    var roStop = ui.readout('остановка');
+    var roBest = ui.readout('вернулись веса');
+    var roF1 = ui.readout('их macro F1', { digits: 3 });
+    var roAcc = ui.readout('их accuracy', { digits: 3 });
+    var roLoss = ui.readout('их validation loss', { digits: 3 });
+    var note = ui.note('');
+
+    /* the early stopping of fit (cell 30), replayed on the logged curve: a record is strictly better than the best so far */
+    function replay() {
+      var P = Math.round(pat.value), byF1 = mon.value === 'f1';
+      var best = null, bestEp = 1, wait = 0, stop = N, stopped = false;
+      for (var e = 1; e <= N; e++) {
+        var v = byF1 ? VF1[e - 1] : VL[e - 1];
+        if (best === null || (byF1 ? v > best : v < best)) { best = v; bestEp = e; wait = 0; }
+        else wait += 1;
+        if (wait >= P) { stop = e; stopped = true; break; }
+      }
+      return { P: P, byF1: byF1, best: bestEp, stop: stop, stopped: stopped };
+    }
+    function pts(arr, a, b) { var out = []; for (var e = a; e <= b; e++) out.push([e, arr[e - 1]]); return out; }
+    function epochAt(x) { return Math.max(1, Math.min(N, Math.round(x))); }
+    function epochs(n) {
+      var m10 = n % 10, m100 = n % 100;
+      var w = (m10 === 1 && m100 !== 11) ? 'эпоха' : (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) ? 'эпохи' : 'эпох';
+      return n + ' ' + w;
+    }
+
+    var pF = ui.plot({ x: [0, 100], y: [0, 1], xLabel: 'эпоха', yLabel: 'validation', aspect: 2.4,
+      label: 'Validation macro F1 и accuracy baseline по эпохам; отмечены окно ожидания, остановка и эпоха вернувшихся весов',
+      hover: function (p) { var e = epochAt(p.x); return { text: 'эпоха ' + e + ': F1 ' + VF1[e - 1].toFixed(3) + ', accuracy ' + VA[e - 1].toFixed(3), x: e, y: VF1[e - 1] }; } });
+    var pL = ui.plot({ x: [0, 100], y: [0, 4], xLabel: 'эпоха', yLabel: 'loss', aspect: 2.4,
+      label: 'Training loss и validation loss baseline по эпохам; отмечены окно ожидания, остановка и эпоха вернувшихся весов',
+      hover: function (p) { var e = epochAt(p.x); return { text: 'эпоха ' + e + ': validation ' + VL[e - 1].toFixed(3) + ', training ' + TL[e - 1].toFixed(3), x: e, y: VL[e - 1] }; } });
+    ui.legend([
+      { label: 'validation: macro F1 и loss', color: 's5', mark: 'line' },
+      { label: 'validation accuracy', color: 's5', mark: 'dash' },
+      { label: 'training loss', color: 's4', mark: 'line' },
+      { label: 'ожидание: эпохи без рекорда', color: 'key', mark: 'area' },
+      { label: 'эпоха вернувшихся весов', color: 'muted', mark: 'dash' },
+      { label: 'остановка', color: 'soft', mark: 'line' }
+    ]);
+
+    function frame(g, r, top) {
+      g.rect(r.best, 0, r.stop, top, { color: 'key', alpha: 0.25, stroke: false });
+      g.line([[r.best, 0], [r.best, top]], { color: 'muted', dash: true, width: 1.5 });
+      if (r.stopped) g.line([[r.stop, 0], [r.stop, top]], { color: 'soft', width: 1.5 });
+    }
+    function curve(g, arr, r, opt) {
+      g.line(pts(arr, 1, r.stop), opt);
+      if (r.stop < N) g.line(pts(arr, r.stop, N), Object.assign({}, opt, { alpha: 0.25 }));
+    }
+    pF.draw(function (g) {
+      var r = replay();
+      frame(g, r, 1);
+      curve(g, VA, r, { color: 's5', width: 1.6, dash: true });
+      curve(g, VF1, r, { color: 's5', width: 2.4 });
+      g.points([[r.best, VF1[r.best - 1]]], { color: 'ink', r: 4.5 });
+      var roomLeft = r.best >= 16;
+      g.text(r.best, 0.93, 'веса ' + r.best, { color: 'ink', align: roomLeft ? 'right' : 'left', dx: roomLeft ? -6 : 6, size: 11 });
+      if (r.stopped) {
+        var atRight = r.stop > 86;
+        g.text(r.stop, roomLeft ? 0.93 : 0.8, 'стоп ' + r.stop, { color: 'ink', align: atRight ? 'right' : 'left', dx: atRight ? -6 : 6, size: 11 });
+      }
+    });
+    pL.draw(function (g) {
+      var r = replay();
+      frame(g, r, 4);
+      curve(g, TL, r, { color: 's4', width: 2 });
+      curve(g, VL, r, { color: 's5', width: 2.4 });
+      g.points([[r.best, VL[r.best - 1]]], { color: 'ink', r: 4.5 });
+    });
+
+    ui.onChange(function () {
+      var r = replay(), e = r.best;
+      roStop.set(r.stopped ? 'после эпохи ' + r.stop : 'нет: все 100 эпох');
+      roBest.set('эпохи ' + e);
+      roF1.set(VF1[e - 1], VF1[e - 1] < 0.3 ? 'bad' : null);
+      roAcc.set(VA[e - 1]);
+      roLoss.set(VL[e - 1]);
+      var msg;
+      if (!r.byF1) msg = 'Минимум validation loss — эпоха 2 (0.989), и ниже он не опускается: при любом P вернутся её веса.';
+      else if (e === 29 && r.stop === 49) msg = 'Это ровно прогон early stopping из лабы: стоп после 49-й эпохи, веса 29-й, macro F1 0.537.';
+      else if (r.stopped) msg = 'После рекорда на эпохе ' + e + ' fit ждёт ' + epochs(r.P) + ' без нового рекорда и останавливается.';
+      else msg = 'После рекорда на эпохе ' + e + ' осталось ' + epochs(N - e) + ', меньше P: обучение идёт до конца, веса откатываются к эпохе ' + e + '.';
+      note.set(msg);
+    });
+  });
+  </script>
+</section>
+
+<section id="l44-reg">
+  <h2>Dropout, L2 и AdamW</h2>
+
+  <p>Early stopping выбирает checkpoint, но в обучение не вмешивается. Три других средства меняют само обучение, и каждому хватает одной строки.</p>
+
+  <p>Dropout (урок <a href="l23.html">23</a>) включается одним аргументом: <code>make_model(DROPOUT_RATE)</code> с <code>DROPOUT_RATE = 0.5</code> ставит <code>nn.Dropout(0.5)</code> после каждого скрытого ReLU. Число в скобках — вероятность выключить нейрон (<span class="en" lang="en">drop probability</span>), а \(p\) урока 23 — вероятность оставить; здесь обе равны 0.5. PyTorch делает <mark class="key"><span class="en" lang="en">inverted dropout</span></mark>: в <code>train()</code> выход обнуляется с вероятностью 0.5, а выжившие умножаются на 2, поэтому в <code>eval()</code> слой пропускает всё как есть (урок <a href="l23.html#l23-test">23</a>). Итог — macro F1 0.592, лучший из одиночных средств.</p>
+
+  <p>L2-штраф лаба пишет руками — строка (2) в <code>train_one_epoch</code>, с <code>L2_LAMBDA = 1e-4</code>. Это weight decay урока <a href="l22.html#l22-update">22</a>:</p>
+  \[ E(\vb{w}) = \bar L(\vb{w}) + \lambda \sum_q w_q^2 \]
+  <p>Здесь \(\bar L\) — средний loss батча, а \(\lambda\) = <code>l2_lambda</code> — это \(\gamma\) урока 22. Но значение \(\lambda\) в формулы с другой записью штрафа не переносится: в лабе нет ни ½, ни суммы по примерам, а штрафуются и смещения — <code>model.parameters()</code> отдаёт всё. Тот же штраф даёт <code>torch.optim.Adam(..., weight_decay=2e-4)</code>: он прибавляет к градиенту \(2 \cdot 10^{-4}\, w\), производную \(10^{-4} w^2\).</p>
+
+  <p>У градиентного спуска такой штраф даёт усадку \(1 - 2\eta\lambda\) за шаг (урок 22). У Adam (урок <a href="l27.html#l27-adaptive">27</a>) иначе: градиент штрафа \(2\lambda w\) попадает в \(m\) и \(v\) и делится на \(\sqrt{\hat v}\) вместе с градиентом данных. Если данные о весе молчат — нейрон мёртв или слово редкое, — остаётся один штраф, \(\hat m / \sqrt{\hat v} \approx \sign(w)\), и вес идёт к нулю шагом около \(\eta = 10^{-3}\), какой бы малой ни была \(\lambda\). Это «первый шаг Adam ≈ η·sign(g)» из урока 27 — на каждом шаге.</p>
+
+  <p><mark class="key">AdamW</mark> (<span class="en" lang="en">decoupled weight decay</span>, отделённое затухание весов) выносит усадку за нормировку (рис. 3):</p>
+  \[ w \leftarrow (1 - \eta\lambda)\,w - \eta\,\frac{\hat m}{\sqrt{\hat v} + \varepsilon} \]
+  <p>Здесь <code>lr</code> = \(\eta\), <code>weight_decay</code> = \(\lambda\) (уже другое число, не <code>l2_lambda</code>), а \(\hat m\) и \(\hat v\) считаются по градиенту одних данных. В лабе это <code>torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)</code> с <code>WEIGHT_DECAY = 1e-1</code>: каждый шаг умножает все веса на \(1 - 10^{-3} \cdot 0.1 = 0.9999\), снимая 0.01&nbsp;% при любом градиенте (по умолчанию <code>weight_decay=0.01</code>).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l44-fig-lambda">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 290" role="img" aria-label="Adam с L2-штрафом: штраф 2λw складывается с градиентом данных в g и вместе с ним проходит через моменты m, v и деление на корень из v">
+        <path d="M 240 46 V 84 H 109" class="hl"/>
+        <line x1="95" y1="96" x2="95" y2="122" class="hl"/>
+        <line x1="95" y1="156" x2="95" y2="180" class="hl"/>
+        <line x1="95" y1="214" x2="95" y2="238" class="hl"/>
+
+        <rect x="20" y="14" width="150" height="32" rx="6" class="fi-paper"/>
+        <text x="95" y="35" class="tx-mid">данные: ∇L</text>
+        <rect x="190" y="14" width="100" height="32" rx="6" class="fw-key"/>
+        <text x="240" y="35" class="tx-mid">штраф 2λw</text>
+
+        <line x1="95" y1="46" x2="95" y2="70" marker-end="url(#arr)"/>
+        <path d="M 240 46 V 84 H 109" marker-end="url(#arr)"/>
+        <circle cx="95" cy="84" r="12" class="fi-paper"/>
+        <text x="95" y="89" class="tx-mid">+</text>
+
+        <line x1="95" y1="96" x2="95" y2="122" marker-end="url(#arr)"/>
+        <text x="110" y="114" class="tx-mono">g = ∇L + 2λw</text>
+        <rect x="20" y="124" width="150" height="32" rx="6" class="fi-paper"/>
+        <text x="95" y="145" class="tx-mid">m, v из g</text>
+
+        <line x1="95" y1="156" x2="95" y2="180" marker-end="url(#arr)"/>
+        <rect x="20" y="182" width="150" height="32" rx="6" class="fi-paper"/>
+        <text x="95" y="203" class="tx-mid tx-mono">÷ (√v̂ + ε)</text>
+        <text x="184" y="194" class="tx-hand">делит</text>
+        <text x="184" y="222" class="tx-hand">и штраф</text>
+
+        <line x1="95" y1="214" x2="95" y2="238" marker-end="url(#arr)"/>
+        <rect x="10" y="240" width="280" height="32" rx="6" class="fi-paper sw-2"/>
+        <text x="49" y="261" class="tx-mono">w ← w − η·m̂ / (√v̂ + ε)</text>
+      </svg>
+      <p class="fig-label">Adam + L2: штраф делится вместе с данными</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 290" role="img" aria-label="AdamW: градиент данных проходит через моменты m, v и деление на корень из v, а усадка ηλw вычитается из веса в обход нормировки">
+        <line x1="240" y1="46" x2="240" y2="238" class="hl"/>
+
+        <rect x="20" y="14" width="150" height="32" rx="6" class="fi-paper"/>
+        <text x="95" y="35" class="tx-mid">данные: ∇L</text>
+        <rect x="190" y="14" width="100" height="32" rx="6" class="fw-key"/>
+        <text x="240" y="35" class="tx-mid">усадка λ</text>
+
+        <line x1="95" y1="46" x2="95" y2="122" marker-end="url(#arr)"/>
+        <text x="110" y="90" class="tx-mono">g = ∇L</text>
+        <rect x="20" y="124" width="150" height="32" rx="6" class="fi-paper"/>
+        <text x="95" y="145" class="tx-mid">m, v из g</text>
+
+        <line x1="95" y1="156" x2="95" y2="180" marker-end="url(#arr)"/>
+        <rect x="20" y="182" width="150" height="32" rx="6" class="fi-paper"/>
+        <text x="95" y="203" class="tx-mid tx-mono">÷ (√v̂ + ε)</text>
+        <text x="184" y="205" class="tx-hand">мимо</text>
+
+        <line x1="95" y1="214" x2="95" y2="238" marker-end="url(#arr)"/>
+        <line x1="240" y1="46" x2="240" y2="238" marker-end="url(#arr)"/>
+        <rect x="10" y="240" width="280" height="32" rx="6" class="fi-paper sw-2"/>
+        <text x="49" y="261" class="tx-mono">w ← w − η·m̂ / (√v̂ + ε) − ηλw</text>
+      </svg>
+      <p class="fig-label">AdamW: усадка идёт мимо нормировки</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Путь \(\lambda\) за один шаг выделен жёлтым. У AdamW та же формула, что выше, только скобки раскрыты: \((1 - \eta\lambda)\,w = w - \eta\lambda w\).</figcaption>
+  </figure>
+
+  <div class="widget" id="l44-w-decay">
+    <h3 class="widget-title">Один вес, два вида затухания</h3>
+    <p class="widget-intro">Один вес в float32 под тремя оптимизаторами с настройками лабы: \(\eta = 10^{-3}\), \(\beta_1 = 0.9\), \(\beta_2 = 0.999\), \(\varepsilon = 10^{-8}\); у Adam + L2 \(\lambda = 10^{-4}\), у AdamW weight decay 0.1. Данные тянут вес к 0.02 «пружиной» жёсткости K: градиент данных \(K(w - 0.02)\), старт тоже 0.02. При K = 0 данные о весе молчат — так живут веса мёртвого нейрона и редкого слова. Шкала |w| логарифмическая, 10 эпох — 2&nbsp;460 шагов; острые провалы кривой — шаги, на которых вес проскакивает ноль.</p>
+    <ol class="tasks">
+      <li>Режим «никак». Предскажи, прежде чем смотреть: за сколько шагов Adam + L2 опустит вес 0.02 ниже \(10^{-3}\)? Сколько от него оставит AdamW за 10 эпох?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>За 23 шага. Градиент штрафа \(2\lambda w\) крошечный, но Adam делит его на его же масштаб, \(\sqrt{\hat v}\), и шаг выходит около \(\eta = 0.001\) — как будто \(\lambda\) огромна. На 25-м шаге вес проскакивает ноль и дальше колеблется вокруг него, меняя знак, а размах колебаний тает экспоненциально. AdamW за 2&nbsp;460 шагов умножает вес на \(0.9999^{2460} \approx 0.78\): остаётся 0.0156.</p></details>
+      </li>
+      <li>Переключай «слабо», «наравне со штрафом» и «крепко». Где к концу окажется вес у Adam + L2 и у AdamW?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Adam + L2 приходит туда, где градиент данных уравновешивает штраф, \(K(w - 0.02) + 2\lambda w = 0\): 0.0018 при «слабо», 0.0100 «наравне», около 0.020 при «крепко». AdamW держит 0.0200 во всех трёх режимах: нормировка Adam превращает даже слабый градиент данных в шаг порядка \(\eta\), а усадка — всего 0.01&nbsp;% за шаг. Вес, который данные крепко держат, почти не замечает ни того, ни другого; разница — у тех, кого данные защищают плохо.</p></details>
+      </li>
+      <li>Режим «никак»: веди шаг k от 1&nbsp;500 к концу. Где у Adam + L2 |w| впервые меньше \(1.2 \cdot 10^{-38}\), и что с весом дальше?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Впервые на шаге 1&nbsp;538. Это граница обычных (normal) чисел float32, ниже идут subnormal-числа с меньшей точностью. Вес ещё несколько десятков шагов скачет вокруг нуля, а с шага 1&nbsp;607 замирает на \(-7.2 \cdot 10^{-40}\): PyTorch сначала умножает \(\hat m\) на \(\eta\), и у такого веса это произведение меньше самого маленького числа float32, \(1.4 \cdot 10^{-45}\). Оно округляется до нуля, а с ним и весь шаг. Ровно нулём сам вес так и не становится. Почему это важно для скорости — в ловушке ниже.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l44-w-decay', function (root, ui) {
+    /* one weight in float32 (Math.fround) with the settings of the lab; this replica of one torch.optim.Adam / AdamW step
+       was checked against the real optimisers step by step (equal values at every step) */
+    var f = Math.fround;
+    var LR = 1e-3, L2 = 1e-4, WD = 0.1, STEPS = 2460, W0 = 0.02, WSTAR = 0.02, B1 = 0.9, B2 = 0.999, EPS = 1e-8;
+    var GRIP = { k0: 0, k1: 2e-5, k2: 2e-4, k3: 2e-2 };
+    function run(kind, K) {
+      var w = f(W0), m = 0, v = 0, traj = [w];
+      var c1 = f(1 - B1), b2 = f(B2), c2 = f(1 - B2), eps = f(EPS);
+      for (var k = 1; k <= STEPS; k++) {
+        var g = 0;
+        if (K) g = f(f(K) * f(w - f(WSTAR)));                  /* data: d/dw of K/2 (w - w*)^2 */
+        if (kind === 'l2') g = f(g + f(f(L2) * f(2 * w)));      /* hand-written penalty: d/dw of lambda w^2 */
+        if (kind === 'w') w = f(w * f(1 - LR * WD));             /* AdamW: decay applied to the weight itself */
+        m = f(m + f(c1 * f(g - m)));
+        v = f(f(v * b2) + f(f(c2 * g) * g));
+        var stepSize = LR / (1 - Math.pow(B1, k)), bc2s = Math.sqrt(1 - Math.pow(B2, k));
+        var denom = f(f(f(Math.sqrt(v)) / f(bc2s)) + eps);
+        w = f(w + f(f(f(-stepSize) * m) / denom));
+        traj.push(w);
+      }
+      return traj;
+    }
+    function lg(w) { return Math.log10(Math.max(Math.abs(w), 1e-45)); }
+    var cache = {};
+    function data(key) {
+      if (!cache[key]) {
+        var K = GRIP[key], d = { a: run('a', K), l2: run('l2', K), w: run('w', K), lines: {} }, lo = Infinity;
+        ['a', 'l2', 'w'].forEach(function (n) {
+          d.lines[n] = d[n].map(function (x, k) { lo = Math.min(lo, lg(x)); return [k / 246, lg(x)]; });
+        });
+        d.lo = K === 0 ? -41 : Math.floor((lo - 0.25) * 2) / 2;
+        cache[key] = d;
+      }
+      return cache[key];
+    }
+
+    var grip = ui.select('как данные держат вес', [
+      { value: 'k0', label: 'никак: градиент данных всегда 0' },
+      { value: 'k1', label: 'слабо: K = 2·10⁻⁵' },
+      { value: 'k2', label: 'наравне со штрафом: K = 2λ = 2·10⁻⁴' },
+      { value: 'k3', label: 'крепко: K = 2·10⁻²' }
+    ], null, 'k0');
+    var stepS = ui.slider({ label: 'шаг k', min: 0, max: STEPS, step: 1, value: STEPS,
+      format: function (v) { var k = Math.round(v); return k + ' (эпоха ' + (k / 246).toFixed(1) + ')'; } });
+    var roA = ui.readout('|w|: Adam без штрафа'), roL = ui.readout('|w|: Adam + L2'), roW = ui.readout('|w|: AdamW');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0, 10], y: [-41, -1.5], xLabel: 'эпоха (246 шагов)', yLabel: 'log_{10} |w|', aspect: 1.8,
+      label: 'Модуль одного веса в логарифмической шкале за 10 эпох: Adam без штрафа, Adam с L2-штрафом и AdamW' });
+    ui.legend([
+      { label: 'Adam + L2, λ = 10⁻⁴', color: 's3', mark: 'line' },
+      { label: 'AdamW, weight decay 0.1', color: 'ink', mark: 'line' },
+      { label: 'Adam без штрафа', color: 'soft', mark: 'dash' },
+      { label: 'уровни 10⁻³ и 1.2·10⁻³⁸ (граница normal float32)', color: 'muted', mark: 'dash' },
+      { label: 'выбранный шаг', color: 'ink', mark: 'hl' }
+    ]);
+    /* |w| for a readout: 4 decimals, or the e-notation Python prints for small numbers */
+    function sci(x) {
+      x = Math.abs(x);
+      if (x >= 1e-3) return x.toFixed(4);
+      if (x === 0) return '0';
+      var e = Math.floor(Math.log10(x)), mnt = x / Math.pow(10, e);
+      if (mnt >= 9.995) { mnt /= 10; e += 1; }
+      return mnt.toFixed(2) + 'e' + e;
+    }
+    var NORMAL = Math.log10(1.1754944e-38);
+
+    plot.draw(function (g) {
+      var d = data(grip.value), k = Math.round(stepS.value), x = k / 246;
+      /* level labels where no curve passes: 10^-3 under its line at 8.6 epochs, 1.2e-38 above its line at 7 epochs */
+      if (d.lo <= -38) {
+        g.hline(NORMAL, { color: 'muted', dash: true });
+        g.text(7, NORMAL, '1.2·10⁻³⁸', { color: 'soft', align: 'left', baseline: 'bottom', dy: -4, size: 11.5 });
+      }
+      if (d.lo <= -3) {
+        g.hline(-3, { color: 'muted', dash: true });
+        g.text(8.6, -3, '10⁻³', { color: 'soft', align: 'left', baseline: 'top', dy: 4, size: 11.5 });
+      }
+      g.line([[x, d.lo], [x, -1.5]], { color: 'ink', width: 1.5, highlight: true });
+      g.line(d.lines.a, { color: 'soft', width: 2, dash: true });
+      g.line(d.lines.w, { color: 'ink', width: 2 });
+      g.line(d.lines.l2, { color: 's3', width: 2.6 });
+      g.points([[x, lg(d.a[k])], [x, lg(d.w[k])], [x, lg(d.l2[k])]], { color: 'ink', r: 4 });
+    });
+
+    var MSG = {
+      k0: 'Данные молчат: у Adam + L2 остаётся один градиент штрафа 2λw, и Adam делит его на его же масштаб — шаг около η при любой λ.',
+      k1: 'Данные тянут слабее штрафа: Adam + L2 сначала ныряет, потом устанавливается там, где K(w − 0.02) + 2λw = 0.',
+      k2: 'Сила данных равна 2λ: Adam + L2 останавливается посередине, на 0.0100. AdamW держит 0.0200.',
+      k3: 'Данные держат вес крепко: штраф почти незаметен обоим оптимизаторам.'
+    };
+    ui.onChange(function () {
+      var d = data(grip.value), k = Math.round(stepS.value);
+      plot.setView({ y: [d.lo, -1.5] });
+      roA.set(sci(d.a[k]));
+      roL.set(sci(d.l2[k]));
+      roW.set(sci(d.w[k]));
+      note.set(MSG[grip.value]);
+    });
+  });
+  </script>
+
+  <p>В L2-модели нашего прогона по модулю меньше \(10^{-3}\) от 29 до 56&nbsp;% весов каждого слоя (у остальных моделей 0.6–2.7&nbsp;%), а 11&nbsp;% всех параметров меньше \(10^{-38}\). В третьем скрытом слое мертвы 207 нейронов из 512 (урок <a href="l24.html#l24-dying">24</a>; у baseline 139), и у 165 нейронов этого слоя все входящие веса меньше \(10^{-3}\). В первом слое чаще всего гаснут веса редких слов: данные защищают их реже всего.</p>
+
+  <div class="pitfall">
+    <p>«L2-прогон медленный, потому что штраф считается в Python». Нет: он шёл 43&nbsp;мин 32&nbsp;с на 48 эпох, в 8 раз дольше на эпоху, чем baseline. Числа меньше \(1.2 \cdot 10^{-38}\) float32 хранит как subnormal, и арифметика с ними на CPU в разы медленнее. В нашей проверке шаг обучения от финальных весов L2-модели занял 99&nbsp;мс против 37&nbsp;мс у baseline, а после <code>torch.set_flush_denormal(True)</code>, которая заменяет subnormal-числа нулями, — 31&nbsp;мс. <code>Adam(weight_decay=2e-4)</code> упёрся бы в то же: дело в нормировке Adam, а не в записи штрафа. Лекарства — та же <code>set_flush_denormal(True)</code> или AdamW: прогон AdamW шёл 7&nbsp;с на эпоху, как baseline.</p>
+  </div>
+
+  <p>RMS (корень из среднего квадрата) весов каждого слоя финальных моделей показывает, чем средства отличаются:</p>
+  <div class="scroll-x">
+    <table class="tbl tbl--center">
+      <thead><tr><th></th><th>слой 1</th><th>слой 2</th><th>слой 3</th><th>выход</th></tr></thead>
+      <tbody>
+        <tr><td>старт</td><td class="num">0.013</td><td class="num">0.026</td><td class="num">0.026</td><td class="num">0.026</td></tr>
+        <tr><td>Baseline</td><td class="num">0.105</td><td class="num">0.110</td><td class="num">0.089</td><td class="num">0.403</td></tr>
+        <tr><td>Early stopping</td><td class="num">0.062</td><td class="num">0.070</td><td class="num">0.057</td><td class="num">0.115</td></tr>
+        <tr><td>Dropout</td><td class="num">0.073</td><td class="num">0.086</td><td class="num">0.083</td><td class="num">0.159</td></tr>
+        <tr class="is-key"><td>L2</td><td class="num">0.032</td><td class="num">0.030</td><td class="num">0.026</td><td class="num">0.069</td></tr>
+        <tr><td>AdamW</td><td class="num">0.050</td><td class="num">0.056</td><td class="num">0.046</td><td class="num">0.114</td></tr>
+        <tr><td>AdamW + dropout</td><td class="num">0.056</td><td class="num">0.063</td><td class="num">0.062</td><td class="num">0.122</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>L2 прижимает веса сильнее всех. У AdamW и early stopping скрытые слои в полтора-два раза мельче, чем у baseline, а выходной — в три с половиной. У dropout на той же 29-й эпохе веса крупнее, чем у early stopping: он регуляризует шумом, а не размером. Главное число таблицы — выходной слой baseline: 0.40 при старте 0.026 (урок <a href="l25.html">25</a>); к нему вернёмся в разгадке.</p>
+</section>
+
+<section id="l44-verdict">
+  <h2>Кто победил и сколько этому верить</h2>
+
+  <p>Шесть финальных моделей на validation; «что изменено» — строка, которой прогон отличается от early stopping.</p>
+  <div class="scroll-x">
+    <table class="tbl">
+      <thead><tr><th>эксперимент</th><th>что изменено</th><th>эпох</th><th>веса эпохи</th><th>macro F1</th><th>accuracy</th><th>loss</th></tr></thead>
+      <tbody>
+        <tr><td>Baseline</td><td><code>patience=0</code></td><td class="num">100</td><td class="num">100</td><td class="num">0.530</td><td class="num">0.788</td><td class="num">3.42</td></tr>
+        <tr><td>Early stopping</td><td>—</td><td class="num">49</td><td class="num">29</td><td class="num">0.537</td><td class="num">0.790</td><td class="num">2.34</td></tr>
+        <tr><td>Dropout</td><td><code>make_model(DROPOUT_RATE)</code></td><td class="num">49</td><td class="num">29</td><td class="num">0.592</td><td class="num">0.801</td><td class="num">1.68</td></tr>
+        <tr><td>L2</td><td><code>l2_lambda=L2_LAMBDA</code></td><td class="num">48</td><td class="num">28</td><td class="num">0.552</td><td class="num">0.791</td><td class="num">1.58</td></tr>
+        <tr><td>AdamW</td><td><code>torch.optim.AdamW(...)</code></td><td class="num">59</td><td class="num">39</td><td class="num">0.564</td><td class="num">0.786</td><td class="num">1.86</td></tr>
+        <tr class="is-key"><td>AdamW + dropout</td><td>обе строки выше</td><td class="num">55</td><td class="num">35</td><td class="num">0.616</td><td class="num">0.809</td><td class="num">1.45</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Каждое средство сдерживает validation loss: 1.45–2.34 против 3.42 у baseline. По macro F1 выделяются только прогоны с dropout, а accuracy почти не различает модели: 0.786–0.809.</p>
+
+  <p>Победителя выбирают по validation: <code>best_name = max(val_scores, key=val_scores.get)</code> — это AdamW + dropout, 0.616. На test его проверяют один раз, уже после выбора: macro F1 0.561, accuracy 0.804. Минус 5.5 пункта.</p>
+
+  <figure class="fig fig--plain" id="l44-fig-valtest">
+    <svg class="dia" viewBox="0 0 560 340" role="img" aria-label="Macro F1 шести моделей на validation и на test: победитель AdamW + dropout падает с 0.616 до 0.561, порядок моделей без dropout на test меняется, модели с dropout остаются впереди">
+      <line x1="190" y1="44" x2="190" y2="306" class="st-grid"/>
+      <line x1="275" y1="44" x2="275" y2="306" class="st-grid"/>
+      <line x1="360" y1="44" x2="360" y2="306" class="st-grid"/>
+      <line x1="445" y1="44" x2="445" y2="306" class="st-grid"/>
+      <line x1="530" y1="44" x2="530" y2="306" class="st-grid"/>
+      <line x1="190" y1="306" x2="530" y2="306" class="st-muted"/>
+      <text x="190" y="326" class="tx-mid tx-mono tx-sm tx-muted">0.45</text>
+      <text x="275" y="326" class="tx-mid tx-mono tx-sm tx-muted">0.50</text>
+      <text x="360" y="326" class="tx-mid tx-mono tx-sm tx-muted">0.55</text>
+      <text x="445" y="326" class="tx-mid tx-mono tx-sm tx-muted">0.60</text>
+      <text x="530" y="326" class="tx-mid tx-mono tx-sm tx-muted">0.65</text>
+      <circle cx="196" cy="24" r="6" class="fi-s5 st-paper"/>
+      <text x="208" y="29">validation</text>
+      <circle cx="330" cy="24" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="342" y="29">test (посчитан потом)</text>
+      <text x="20" y="71">Baseline</text>
+      <line x1="339.1" y1="66" x2="325.7" y2="66" class="st-muted sw-2"/>
+      <circle cx="325.7" cy="66" r="6" class="fi-s5 st-paper"/>
+      <circle cx="339.1" cy="66" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="20" y="115">Early stopping</text>
+      <line x1="278.6" y1="110" x2="338.6" y2="110" class="st-muted sw-2"/>
+      <circle cx="338.6" cy="110" r="6" class="fi-s5 st-paper"/>
+      <circle cx="278.6" cy="110" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="20" y="159">Dropout</text>
+      <line x1="371.7" y1="154" x2="430.9" y2="154" class="st-muted sw-2"/>
+      <circle cx="430.9" cy="154" r="6" class="fi-s5 st-paper"/>
+      <circle cx="371.7" cy="154" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="20" y="203">L2</text>
+      <line x1="236.1" y1="198" x2="363.4" y2="198" class="st-muted sw-2"/>
+      <circle cx="363.4" cy="198" r="6" class="fi-s5 st-paper"/>
+      <circle cx="236.1" cy="198" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="20" y="247">AdamW</text>
+      <line x1="295.9" y1="242" x2="383.8" y2="242" class="st-muted sw-2"/>
+      <circle cx="383.8" cy="242" r="6" class="fi-s5 st-paper"/>
+      <circle cx="295.9" cy="242" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="20" y="291" class="tx-bold">AdamW + dropout</text>
+      <line x1="378.0" y1="286" x2="471.5" y2="286" class="hl"/>
+      <line x1="378.0" y1="286" x2="471.5" y2="286" class="sw-2"/>
+      <circle cx="471.5" cy="286" r="6" class="fi-s5 st-paper"/>
+      <circle cx="378.0" cy="286" r="6" class="fi-paper st-s5 sw-2"/>
+      <text x="471.5" y="272" class="tx-mid tx-mono tx-sm">0.616</text>
+      <text x="378.0" y="272" class="tx-mid tx-mono tx-sm">0.561</text>
+    </svg>
+    <figcaption><b>Рис. 4.</b> Macro F1 шести моделей на validation, по которому выбирали, и на test. Test всех шести посчитан только для этого рисунка, по сохранённым весам; лаба смотрит на test один раз, у победителя.</figcaption>
+  </figure>
+
+  <div class="pitfall">
+    <p>«Победитель на validation покажет то же на test». Validation здесь выбирал дважды: эпоху в каждом прогоне и победителя из шести, а максимум шумных оценок завышен — это winner's curse (урок <a href="l19.html#l19-curse">19</a>). Честная оценка — test, на который смотрят один раз, после выбора: 0.561. Лаба так и делает.</p>
+  </div>
+
+  <div class="pitfall">
+    <p>«Разница 0.02 в macro F1 — это разница методов». В validation у 11 тем не больше трёх статей, и одна статья такой темы, сменившая ответ, двигает macro F1 на 0.7–1.4 пункта. На test порядок моделей без dropout меняется: худший из них на validation, baseline, выходит первым (0.538), а второй по validation, L2, — последним (0.477). И каждое средство взято в одной, неподобранной дозе, так что «AdamW лучше L2» сравнивает две случайные силы, а не два метода. Честно мерить разницу — работа cross-validation и нескольких seed, это лаба 3 (урок <a href="l45.html">45</a>).</p>
+  </div>
+
+  <p>Прогон на GPU в Colab или с другим seed даст другие числа: лучшие эпохи, сотые доли F1, порядок early stopping, L2 и AdamW, время. Устойчиво то, что следует из механики: training set выучен за десяток эпох при растущем validation loss и стоящем F1; регуляризация сдерживает loss; у L2 самые мелкие веса, у выхода baseline — самые крупные; Adam + L2 гасит веса, которые данные не защищают. Лидерство dropout правдоподобно, но и оно — одно разбиение и один seed.</p>
+
+  <h3>Сохранение и новый текст</h3>
+  <p>Остаётся сохранить победителя и спросить его о новом тексте:</p>
+<pre><code>torch.save(best_model.state_dict(), weights_path('best model'))
+
+# Load them into a new network: the architecture must match, dropout layers included
+dropout_rate = next((module.p for module in best_model.modules() if isinstance(module, nn.Dropout)), 0.0)
+loaded_model = make_model(dropout_rate)
+loaded_model.load_state_dict(torch.load(weights_path('best model'), map_location=device))
+loaded_model.eval()</code></pre>
+  <ul>
+    <li><code>state_dict()</code> — словарь «имя → тензор»: только веса, архитектура живёт в коде; 6.3&nbsp;МБ — это 1.57 млн чисел float32 по 4 байта.</li>
+    <li>Имена ключей — номера модулей в <code>nn.Sequential</code> (рис. 2), и <code>make_model()</code> без dropout этот файл не примет: <code>RuntimeError</code> о missing и unexpected keys. Поэтому <code>next(...)</code> достаёт drop probability из самой модели.</li>
+    <li><code>map_location=device</code> кладёт тензоры туда, где будет работать сеть: веса, сохранённые на GPU, откроются и на CPU.</li>
+  </ul>
+  <p>Новый текст <code>encode</code> кодирует как статьи: слова — в ранги через <code>word_index</code>, ранги — в multi-hot по тому же словарю; слова вне словаря отбрасываются. Дальше:</p>
+<pre><code>with torch.no_grad():
+    logits = loaded_model(torch.from_numpy(x).unsqueeze(0).to(device))
+probabilities = torch.softmax(logits, dim=1)[0].cpu().numpy()</code></pre>
+  <p><code>unsqueeze(0)</code> делает из вектора <code>[2000]</code> батч из одной статьи, <code>[1, 2000]</code>; softmax нужен только чтобы показать вероятности. Новость о том, что страны ОПЕК договорились сократить добычу нефти, получает <code>crude</code> с вероятностью 1.00, а фраза о том, что Япония и США договорились снизить пошлины на рис, — <code>trade</code> 0.91 и <code>grain</code> 0.07. Без <code>loaded_model.eval()</code> dropout остался бы включён, и каждый вызов шёл бы через новую прореженную сеть: в нашей проверке пять вызовов подряд дали этой фразе <code>trade</code> от 0.04 до 0.97.</p>
+</section>
+
+<section id="l44-answer">
+  <h2>Разгадка: loss растёт от уверенности</h2>
+
+  <p>По macro F1 спор двух моделей из начала решается сразу: 0.256 у эпохи 2 против 0.530 у эпохи 100. Откуда разница — видно по темам.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l44-fig-topics">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="F1 каждой из 46 тем на validation после эпохи 2: у 25 тем F1 равен нулю">
+        <line x1="40" y1="111" x2="290" y2="111" class="st-grid"/>
+        <line x1="40" y1="46" x2="290" y2="46" class="st-grid"/>
+        <rect x="40.8" y="54.1" width="3.8" height="121.9" class="fi-s5 st-none"/><rect x="46.3" y="63.2" width="3.8" height="112.8" class="fi-s5 st-none"/><rect x="51.7" y="85.4" width="3.8" height="90.6" class="fi-s5 st-none"/><rect x="57.1" y="88.8" width="3.8" height="87.2" class="fi-s5 st-none"/><rect x="62.6" y="78.4" width="3.8" height="97.6" class="fi-s5 st-none"/><rect x="68.0" y="78.8" width="3.8" height="97.2" class="fi-s5 st-none"/><rect x="73.4" y="88.4" width="3.8" height="87.6" class="fi-s5 st-none"/><rect x="78.9" y="93.3" width="3.8" height="82.7" class="fi-s5 st-none"/><rect x="84.3" y="98.0" width="3.8" height="78.0" class="fi-s5 st-none"/><rect x="89.7" y="91.6" width="3.8" height="84.4" class="fi-s5 st-none"/><rect x="95.2" y="94.5" width="3.8" height="81.5" class="fi-s5 st-none"/><rect x="100.6" y="93.8" width="3.8" height="82.2" class="fi-s5 st-none"/><rect x="106.0" y="101.1" width="3.8" height="74.9" class="fi-s5 st-none"/><rect x="111.5" y="113.6" width="3.8" height="62.4" class="fi-s5 st-none"/><rect x="116.9" y="101.8" width="3.8" height="74.2" class="fi-s5 st-none"/><rect x="122.3" y="154.3" width="3.8" height="21.7" class="fi-s5 st-none"/><rect x="127.8" y="136.5" width="3.8" height="39.5" class="fi-s5 st-none"/><rect x="133.2" y="128.7" width="3.8" height="47.3" class="fi-s5 st-none"/><rect x="160.4" y="150.0" width="3.8" height="26.0" class="fi-s5 st-none"/><rect x="171.3" y="147.1" width="3.8" height="28.9" class="fi-s5 st-none"/><rect x="209.3" y="124.0" width="3.8" height="52.0" class="fi-s5 st-none"/>
+        <line x1="40" y1="176" x2="290" y2="176" class="st-muted"/>
+        <line x1="140.5" y1="181" x2="140.5" y2="189" class="st-bad sw-2"/><line x1="146.0" y1="181" x2="146.0" y2="189" class="st-bad sw-2"/><line x1="151.4" y1="181" x2="151.4" y2="189" class="st-bad sw-2"/><line x1="156.8" y1="181" x2="156.8" y2="189" class="st-bad sw-2"/><line x1="167.7" y1="181" x2="167.7" y2="189" class="st-bad sw-2"/><line x1="178.6" y1="181" x2="178.6" y2="189" class="st-bad sw-2"/><line x1="184.0" y1="181" x2="184.0" y2="189" class="st-bad sw-2"/><line x1="189.5" y1="181" x2="189.5" y2="189" class="st-bad sw-2"/><line x1="194.9" y1="181" x2="194.9" y2="189" class="st-bad sw-2"/><line x1="200.3" y1="181" x2="200.3" y2="189" class="st-bad sw-2"/><line x1="205.8" y1="181" x2="205.8" y2="189" class="st-bad sw-2"/><line x1="216.6" y1="181" x2="216.6" y2="189" class="st-bad sw-2"/><line x1="222.1" y1="181" x2="222.1" y2="189" class="st-bad sw-2"/><line x1="227.5" y1="181" x2="227.5" y2="189" class="st-bad sw-2"/><line x1="232.9" y1="181" x2="232.9" y2="189" class="st-bad sw-2"/><line x1="238.4" y1="181" x2="238.4" y2="189" class="st-bad sw-2"/><line x1="243.8" y1="181" x2="243.8" y2="189" class="st-bad sw-2"/><line x1="249.2" y1="181" x2="249.2" y2="189" class="st-bad sw-2"/><line x1="254.7" y1="181" x2="254.7" y2="189" class="st-bad sw-2"/><line x1="260.1" y1="181" x2="260.1" y2="189" class="st-bad sw-2"/><line x1="265.5" y1="181" x2="265.5" y2="189" class="st-bad sw-2"/><line x1="271.0" y1="181" x2="271.0" y2="189" class="st-bad sw-2"/><line x1="276.4" y1="181" x2="276.4" y2="189" class="st-bad sw-2"/><line x1="281.8" y1="181" x2="281.8" y2="189" class="st-bad sw-2"/><line x1="287.3" y1="181" x2="287.3" y2="189" class="st-bad sw-2"/>
+        <line x1="94.3" y1="40" x2="94.3" y2="194" class="st-muted dash"/>
+        <text x="32" y="180" class="tx-end tx-mono tx-sm tx-muted">0</text>
+        <text x="32" y="115" class="tx-end tx-mono tx-sm tx-muted">0.5</text>
+        <text x="32" y="50" class="tx-end tx-mono tx-sm tx-muted">1</text>
+        <text x="67" y="210" class="tx-mid tx-sm">10 крупных</text>
+        <text x="192" y="210" class="tx-mid tx-sm">36 остальных</text>
+        <text x="290" y="24" class="tx-end tx-sm">F1 = 0 у 25 тем</text>
+      </svg>
+      <p class="fig-label">Эпоха 2: loss 0.989, macro F1 0.256</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="F1 каждой из 46 тем на validation после эпохи 100: у 6 тем F1 равен нулю">
+        <line x1="40" y1="111" x2="290" y2="111" class="st-grid"/>
+        <line x1="40" y1="46" x2="290" y2="46" class="st-grid"/>
+        <rect x="40.8" y="57.7" width="3.8" height="118.3" class="fi-s5 st-none"/><rect x="46.3" y="63.3" width="3.8" height="112.7" class="fi-s5 st-none"/><rect x="51.7" y="86.3" width="3.8" height="89.7" class="fi-s5 st-none"/><rect x="57.1" y="91.0" width="3.8" height="85.0" class="fi-s5 st-none"/><rect x="62.6" y="78.9" width="3.8" height="97.1" class="fi-s5 st-none"/><rect x="68.0" y="88.8" width="3.8" height="87.2" class="fi-s5 st-none"/><rect x="73.4" y="97.7" width="3.8" height="78.3" class="fi-s5 st-none"/><rect x="78.9" y="84.7" width="3.8" height="91.3" class="fi-s5 st-none"/><rect x="84.3" y="89.3" width="3.8" height="86.7" class="fi-s5 st-none"/><rect x="89.7" y="91.4" width="3.8" height="84.6" class="fi-s5 st-none"/><rect x="95.2" y="84.6" width="3.8" height="91.4" class="fi-s5 st-none"/><rect x="100.6" y="82.1" width="3.8" height="93.9" class="fi-s5 st-none"/><rect x="106.0" y="67.7" width="3.8" height="108.3" class="fi-s5 st-none"/><rect x="111.5" y="98.0" width="3.8" height="78.0" class="fi-s5 st-none"/><rect x="116.9" y="62.9" width="3.8" height="113.1" class="fi-s5 st-none"/><rect x="122.3" y="141.3" width="3.8" height="34.7" class="fi-s5 st-none"/><rect x="127.8" y="84.2" width="3.8" height="91.8" class="fi-s5 st-none"/><rect x="133.2" y="147.1" width="3.8" height="28.9" class="fi-s5 st-none"/><rect x="138.6" y="89.3" width="3.8" height="86.7" class="fi-s5 st-none"/><rect x="144.1" y="127.2" width="3.8" height="48.8" class="fi-s5 st-none"/><rect x="149.5" y="96.8" width="3.8" height="79.2" class="fi-s5 st-none"/><rect x="154.9" y="89.3" width="3.8" height="86.7" class="fi-s5 st-none"/><rect x="160.4" y="68.9" width="3.8" height="107.1" class="fi-s5 st-none"/><rect x="165.8" y="124.0" width="3.8" height="52.0" class="fi-s5 st-none"/><rect x="171.3" y="132.7" width="3.8" height="43.3" class="fi-s5 st-none"/><rect x="176.7" y="96.0" width="3.8" height="80.0" class="fi-s5 st-none"/><rect x="187.6" y="98.0" width="3.8" height="78.0" class="fi-s5 st-none"/><rect x="198.4" y="115.9" width="3.8" height="60.1" class="fi-s5 st-none"/><rect x="203.9" y="124.0" width="3.8" height="52.0" class="fi-s5 st-none"/><rect x="209.3" y="138.8" width="3.8" height="37.2" class="fi-s5 st-none"/><rect x="220.2" y="78.5" width="3.8" height="97.5" class="fi-s5 st-none"/><rect x="225.6" y="89.3" width="3.8" height="86.7" class="fi-s5 st-none"/><rect x="231.0" y="154.3" width="3.8" height="21.7" class="fi-s5 st-none"/><rect x="252.8" y="98.0" width="3.8" height="78.0" class="fi-s5 st-none"/><rect x="258.2" y="124.0" width="3.8" height="52.0" class="fi-s5 st-none"/><rect x="263.6" y="111.0" width="3.8" height="65.0" class="fi-s5 st-none"/><rect x="269.1" y="46.0" width="3.8" height="130.0" class="fi-s5 st-none"/><rect x="274.5" y="111.0" width="3.8" height="65.0" class="fi-s5 st-none"/><rect x="279.9" y="72.0" width="3.8" height="104.0" class="fi-s5 st-none"/><rect x="285.4" y="89.3" width="3.8" height="86.7" class="fi-s5 st-none"/>
+        <line x1="40" y1="176" x2="290" y2="176" class="st-muted"/>
+        <line x1="184.0" y1="181" x2="184.0" y2="189" class="st-bad sw-2"/><line x1="194.9" y1="181" x2="194.9" y2="189" class="st-bad sw-2"/><line x1="216.6" y1="181" x2="216.6" y2="189" class="st-bad sw-2"/><line x1="238.4" y1="181" x2="238.4" y2="189" class="st-bad sw-2"/><line x1="243.8" y1="181" x2="243.8" y2="189" class="st-bad sw-2"/><line x1="249.2" y1="181" x2="249.2" y2="189" class="st-bad sw-2"/>
+        <line x1="94.3" y1="40" x2="94.3" y2="194" class="st-muted dash"/>
+        <text x="32" y="180" class="tx-end tx-mono tx-sm tx-muted">0</text>
+        <text x="32" y="115" class="tx-end tx-mono tx-sm tx-muted">0.5</text>
+        <text x="32" y="50" class="tx-end tx-mono tx-sm tx-muted">1</text>
+        <text x="67" y="210" class="tx-mid tx-sm">10 крупных</text>
+        <text x="192" y="210" class="tx-mid tx-sm">36 остальных</text>
+        <text x="290" y="24" class="tx-end tx-sm">F1 = 0 у 6 тем</text>
+      </svg>
+      <p class="fig-label">Эпоха 100: loss 3.421, macro F1 0.530</p>
+    </div>
+    <figcaption><b>Рис. 5.</b> F1 каждой из 46 тем у baseline на validation, от самой большой (earn) до самых маленьких (16 статей); красные засечки — темы без единого верного ответа.</figcaption>
+  </figure>
+
+  <p>После эпохи 2 у 25 тем из 46 нет ни одного верного ответа, к сотой — у 6. Десять крупных тем почти не меняются (средний F1 0.72 оба раза), а остальные 36 растут с 0.13 до 0.48. Эпохи, в которые loss «портится», — это эпохи, когда сеть учит редкие темы, а accuracy этого почти не видит.</p>
+
+  <p>Почему же растёт loss? Cross-entropy штрафует \(-\ln p\) верной темы, а accuracy и F1 смотрят только на argmax. RMS выходных весов за 100 эпох вырастает с 0.026 до 0.40, логиты — вместе с ним, softmax насыщается, и ошибки сеть делает почти наверняка: у 152 из 357 ошибок на validation вероятность неверной темы больше 0.99. Самая дорогая статья стоит 155 nats, а 98&nbsp;% validation loss дают неверные ответы. Это <mark class="key"><span class="en" lang="en">over-confidence</span></mark> (самоуверенность), и её можно измерить, не тронув ни одного ответа.</p>
+
+  <div class="widget" id="l44-w-scale">
+    <h3 class="widget-title">Те же ответы, другой loss</h3>
+    <p class="widget-intro">Три финальные модели нашего прогона. Все логиты модели умножаются на одно число s, и для каждого s заново считается validation cross-entropy; при s = 1 это тот loss, который печатал <code>fit</code>. Argmax от умножения на положительное число не меняется, поэтому ответы, accuracy и macro F1 одинаковы при любом s. Шкала s логарифмическая.</p>
+    <ol class="tasks">
+      <li>Сейчас s = 1 — логиты такие, какими их выдаёт сеть. Предскажи: если все логиты baseline уменьшить примерно в пять раз (s ≈ 0.2), loss вырастет или упадёт? Изменится ли хоть один ответ? Сдвинь ползунок.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Loss падает с 3.42 до 1.31 (s = 0.194), а ответов не меняется ни одного: macro F1 остаётся 0.530. Почти две трети loss baseline — не неверные ответы, а лишняя уверенность в них.</p></details>
+      </li>
+      <li>Найди минимум каждой кривой. Чьи логиты приходится ужимать сильнее всего?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Baseline — 1.31 при s ≈ 0.19, его логиты надо ужать впятеро. Early stopping — 1.16 при s ≈ 0.3 (втрое), AdamW + dropout — 1.00 при s ≈ 0.45 (примерно вдвое). Все три слишком уверены; регуляризация это уменьшает, но не убирает. И даже при лучшем s регуляризованные модели ниже: одной общей уверенностью разница не исчерпывается.</p></details>
+      </li>
+      <li>Уведи s к 0.01. Почему все кривые приближаются к пунктиру ln 46?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>При s → 0 все логиты стремятся к нулю, softmax даёт каждой из 46 тем 1/46, и cross-entropy стремится к ln 46 = 3.83 — у любой модели. А ответы всё те же: argmax крошечных логитов прежний.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l44-w-scale', function (root, ui) {
+    /* validation cross-entropy of three final models of our run with every logit multiplied by s (data.json logit_scale);
+       s = 1 is the final validation loss of each run, inserted into the logged grid */
+    var S = [0.01, 0.0109, 0.012, 0.0131, 0.0143, 0.0157, 0.0171, 0.0188, 0.0205, 0.0224, 0.0245, 0.0269, 0.0294, 0.0321, 0.0352, 0.0385, 0.0421, 0.046, 0.0504, 0.0551, 0.0603, 0.0659, 0.0721, 0.0789, 0.0863, 0.0944, 0.1033, 0.113, 0.1236, 0.1352, 0.1479, 0.1618, 0.177, 0.1936, 0.2118, 0.2317, 0.2535, 0.2773, 0.3034, 0.3319, 0.3631, 0.3972, 0.4345, 0.4754, 0.52, 0.5689, 0.6223, 0.6808, 0.7448, 0.8148, 0.8913, 0.975, 1, 1.0667, 1.1669, 1.2765, 1.3965, 1.5277, 1.6712, 1.8282, 2.0];
+    var CE = {
+      base: [3.3118, 3.2701, 3.2204, 3.1718, 3.1202, 3.0617, 3.005, 2.9386, 2.8748, 2.8064, 2.7342, 2.6559, 2.5789, 2.5006, 2.4166, 2.3336, 2.25, 2.1668, 2.0815, 1.9992, 1.9177, 1.8398, 1.764, 1.6918, 1.6245, 1.5623, 1.5057, 1.4556, 1.4125, 1.3767, 1.3487, 1.3288, 1.3175, 1.3149, 1.3214, 1.3374, 1.3631, 1.399, 1.4454, 1.5028, 1.5718, 1.6529, 1.7469, 1.8547, 1.9768, 2.1147, 2.269, 2.4416, 2.6337, 2.8468, 3.0823, 3.3426, 3.4208, 3.6301, 3.9464, 4.2943, 4.6771, 5.0973, 5.5585, 6.0644, 6.6193],
+      es: [3.5578, 3.5341, 3.5054, 3.4769, 3.446, 3.4103, 3.3749, 3.3324, 3.2903, 3.2439, 3.1933, 3.1364, 3.0783, 3.0168, 2.9479, 2.8765, 2.8009, 2.7218, 2.6359, 2.5482, 2.4559, 2.3619, 2.2641, 2.1641, 2.0637, 1.963, 1.8629, 1.7652, 1.671, 1.5813, 1.4974, 1.4204, 1.3517, 1.2922, 1.2428, 1.2042, 1.177, 1.1616, 1.1582, 1.167, 1.1881, 1.2215, 1.2672, 1.3255, 1.3963, 1.4802, 1.5775, 1.689, 1.8151, 1.9568, 2.1149, 2.2906, 2.3435, 2.4855, 2.7006, 2.9378, 3.1991, 3.4863, 3.8016, 4.1478, 4.5275],
+      awd: [3.6386, 3.6219, 3.6015, 3.5812, 3.5592, 3.5337, 3.5083, 3.4777, 3.4473, 3.4136, 3.3767, 3.3349, 3.2919, 3.246, 3.194, 3.1395, 3.081, 3.0188, 2.95, 2.8783, 2.8011, 2.7204, 2.6339, 2.5427, 2.4476, 2.3485, 2.2454, 2.14, 2.0326, 1.9241, 1.8156, 1.7085, 1.6041, 1.5041, 1.4095, 1.3221, 1.243, 1.1737, 1.1148, 1.0674, 1.0317, 1.0082, 0.9967, 0.9973, 1.0098, 1.0339, 1.0693, 1.1161, 1.1743, 1.2438, 1.3249, 1.4179, 1.4464, 1.5237, 1.6425, 1.7753, 1.9231, 2.0868, 2.2677, 2.4672, 2.6869]
+    };
+    var ONE = S.indexOf(1);
+    function fmtS(s) { return s >= 1 ? s.toFixed(2) : s >= 0.1 ? s.toFixed(3) : s.toFixed(4); }
+    var sl = ui.slider({ label: 'множитель логитов s', min: 0, max: S.length - 1, step: 1, value: ONE,
+      format: function (v) { return fmtS(S[Math.round(v)]); } });
+    var roB = ui.readout('loss Baseline', { digits: 3 });
+    var roE = ui.readout('loss Early stopping', { digits: 3 });
+    var roA = ui.readout('loss AdamW + dropout', { digits: 3 });
+    var roF = ui.readout('macro F1 Baseline');
+    var roN = ui.readout('изменилось ответов');
+    var plot = ui.plot({ x: [-2, Math.log10(2)], y: [0, 7], xLabel: 'log_{10} s', yLabel: 'validation loss', aspect: 1.8,
+      label: 'Validation cross-entropy трёх финальных моделей в зависимости от общего множителя логитов s, шкала s логарифмическая' });
+    ui.legend([
+      { label: 'Baseline', color: 's5', mark: 'line' },
+      { label: 'Early stopping', color: 'soft', mark: 'line' },
+      { label: 'AdamW + dropout', color: 'soft', mark: 'dash' },
+      { label: 'ln 46: все темы равновероятны', color: 'muted', mark: 'dash' },
+      { label: 'выбранный s', color: 'ink', mark: 'hl' }
+    ]);
+    function curve(arr) { return S.map(function (s, i) { return [Math.log10(s), arr[i]]; }); }
+    var LINES = { base: curve(CE.base), es: curve(CE.es), awd: curve(CE.awd) };
+    plot.draw(function (g) {
+      var i = Math.round(sl.value), x = Math.log10(S[i]);
+      g.hline(Math.log(46), { color: 'muted', dash: true });
+      g.vline(0, { color: 'muted', dash: true, label: 's = 1' });
+      g.line([[x, 0], [x, 7]], { color: 'ink', width: 1.5, highlight: true });
+      g.line(LINES.es, { color: 'soft', width: 2 });
+      g.line(LINES.awd, { color: 'soft', width: 2, dash: true });
+      g.line(LINES.base, { color: 's5', width: 2.6 });
+      g.points([[x, CE.base[i]], [x, CE.es[i]], [x, CE.awd[i]]], { color: 'ink', r: 4 });
+    });
+    ui.onChange(function () {
+      var i = Math.round(sl.value);
+      roB.set(CE.base[i]);
+      roE.set(CE.es[i]);
+      roA.set(CE.awd[i]);
+      roF.set('0.530, не меняется');
+      roN.set('0 из 1 685');
+    });
+  });
+  </script>
+
+  <p>Отсюда главный вывод лабы. Большая часть видимого overfitting — over-confidence, и её укрощает любое из пяти средств, а верных ответов заметно прибавляет только dropout. Модель эпохи 100 лучше модели эпохи 2: она выучила редкие темы и заплатила уверенностью, которую снимает один множитель после обучения — так работает <span class="en" lang="en">temperature scaling</span>, где логиты делят на температуру \(T = 1/s\), подобранную на validation. Следить при early stopping надо за тем, по чему модель будут судить: здесь за macro F1, за loss — когда важны сами вероятности.</p>
+
+  <p class="memo"><mark class="key">Loss меряет и правильность, и уверенность, accuracy и F1 — только правильность: когда они спорят, сначала проверь уверенность.</mark></p>
+</section>
+
+<section id="l44-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="open" id="l44-exam-deepcopy">
+    <div class="exam-q" lang="en">
+      <p>In <code>fit</code>, the checkpoint of the best epoch is taken like this:</p>
+<pre><code>if val_score &gt; best_score:
+    best_score, wait = val_score, 0
+    best_state = copy.deepcopy(model.state_dict())</code></pre>
+      <p>What happens if the last line is replaced by <code>best_state = model.state_dict()</code>? Does the code raise an error?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p><code>model.state_dict()</code> returns a dictionary whose values reference the live parameter tensors of the model. <code>optimizer.step()</code> updates these tensors in place, so without a copy <code>best_state</code> always equals the current weights. At the end, <code>model.load_state_dict(best_state)</code> loads the weights of the last epoch: early stopping silently returns the final model instead of the best one. No error is raised, because names and shapes match. <code>copy.deepcopy</code> stores an independent snapshot of the tensors at the record epoch.</p>
+      </div>
+      <div class="exam-note"><p>Проверяют, что state_dict — ссылки, а не копия. Ответ «упадёт с ошибкой» неверен: всё работает и молча возвращает не ту модель — это и надо сказать.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l44-exam-train">
+    <div class="exam-q" lang="en">
+      <p>The first line of <code>train_one_epoch</code>, <code>model.train()</code>, is deleted; <code>evaluate</code> still begins with <code>model.eval()</code>. What changes in the baseline run, and what in the run with dropout?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A new module starts in training mode, so epoch 1 trains normally. After the first call to <code>evaluate</code> the network stays in evaluation mode for the rest of the run: from epoch 2 on the <code>nn.Dropout</code> layers are identities, and the dropout run silently becomes a run without dropout. The baseline has neither dropout nor batch normalisation, so it is not affected. No error is raised; only the results change.</p>
+      </div>
+      <div class="exam-note"><p>Важно сказать, что ломается только поведение, зависящее от режима (Dropout, BatchNorm), и что ошибки не будет. Частая неточность — «без train() не считаются градиенты»: градиенты выключает no_grad(), а не eval().</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l44-exam-adamw">
+    <div class="exam-q" lang="en">
+      <p>Training uses Adam and a hand-written L2 penalty with <code>l2_lambda = 1e-4</code>:</p>
+<pre><code>penalty += l2_lambda * sum(p.pow(2).sum() for p in model.parameters())</code></pre>
+      <p>(a) Which of these two optimisers, used without the penalty, gives the same updates?</p>
+<pre><code>torch.optim.Adam(params, lr=1e-3, weight_decay=2e-4)
+torch.optim.AdamW(params, lr=1e-3, weight_decay=2e-4)</code></pre>
+      <p>(b) A weight \(w\) receives no gradient from the data. Write its update for Adam with this penalty and for AdamW with weight decay \(\lambda\). What happens to \(w\) in each case?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) <code>Adam(..., weight_decay=2e-4)</code>. It adds \(2 \cdot 10^{-4}\, w\), the gradient of \(10^{-4} w^2\), to the gradient before the moment estimates, exactly as the hand-written penalty does (coupled L2). AdamW decouples the decay: a different method.</p>
+        <p>(b) Adam with the penalty: \(g = 2\lambda w\), and \(m\), \(v\) are built from \(g\):</p>
+        \[ w \leftarrow w - \eta\,\frac{\hat m}{\sqrt{\hat v} + \varepsilon} \]
+        <p>Since \(\hat m / \sqrt{\hat v} \approx g / |g| = \sign(w)\), the weight moves towards zero by about \(\eta\) per step, whatever \(\lambda\) is: with \(\eta = 10^{-3}\) a weight of 0.02 falls below \(10^{-3}\) in about 20 steps, then overshoots zero and oscillates around it with a shrinking amplitude. AdamW: the data gradient is zero, so \(m = v = 0\) and</p>
+        \[ w \leftarrow (1 - \eta\lambda)\,w \]
+        <p>a geometric decay by the same fraction \(\eta\lambda\) per step for every weight. With plain gradient descent both forms give \(w \leftarrow (1 - 2\eta\lambda)\,w - \eta\, \partial L / \partial w\), up to a factor 2 in \(\lambda\): they differ only because Adam normalises the gradient.</p>
+      </div>
+      <div class="exam-note"><p>Главное — сказать, что Adam делит градиент штрафа на его собственный масштаб. Без последней фразы ответ неполон: равенство L2 и weight decay верно только для обычного градиентного спуска.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l44-exam-load">
+    <div class="exam-q" lang="en">
+      <p>The best model of the lab has dropout layers. It is saved and reloaded:</p>
+<pre><code>torch.save(best_model.state_dict(), path)
+loaded_model = make_model()
+loaded_model.load_state_dict(torch.load(path, map_location=device))</code></pre>
+      <p>The last line raises a <code>RuntimeError</code> about missing and unexpected keys. Why, if <code>nn.Dropout</code> has no parameters? How do you fix it, and what must you call before using the model for predictions?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>A state_dict stores tensors by name, and the names are the positions of the modules in the <code>nn.Sequential</code>. With dropout the modules are Linear, ReLU, Dropout, Linear, …, so the linear layers are <code>net.0</code>, <code>net.3</code>, <code>net.6</code>, <code>net.9</code>; <code>make_model()</code> without dropout puts them at <code>net.0</code>, <code>net.2</code>, <code>net.4</code>, <code>net.6</code>. Keys such as <code>net.2.weight</code> are missing, and <code>net.3.weight</code>, <code>net.9.weight</code> are unexpected; <code>net.6.weight</code> exists in both, but with a different shape (512 × 512 in the file, 46 × 512 in the model). Fix: rebuild the same architecture, <code>make_model(dropout_rate)</code> with the rate of the saved model, then load. Before predicting call <code>loaded_model.eval()</code>: otherwise dropout stays active, each forward pass samples a different thinned network and the probabilities change from call to call. <code>torch.no_grad()</code> saves memory and time but does not change the numbers.</p>
+      </div>
+      <div class="exam-note"><p>Проверяют, что файл весов не хранит архитектуру: её восстанавливает код. Хорошо отличить eval() (меняет поведение слоёв) от no_grad() (выключает только запись графа).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="0.0114" data-tol="0.0005" id="l44-exam-majority">
+    <div class="exam-q" lang="en">
+      <p>A data set has 46 classes, and the largest class holds 35.38 % of the samples. A classifier always predicts this class. What is its macro-averaged F1 score? (Classes that are never predicted count with F1 = 0.)</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>For the largest class precision is 0.3538 (every prediction is this class) and recall is 1:</p>
+        \[ F_1 = \frac{2 \cdot 0.3538 \cdot 1}{0.3538 + 1} = 0.523 \]
+        <p>The other 45 classes have no true positives, so their F1 is 0. Macro F1 = 0.523 / 46 = 0.0114. For comparison, accuracy is 0.354 and weighted F1 is 0.3538 · 0.523 = 0.185: only the macro average exposes the classifier.</p>
+      </div>
+      <div class="exam-note"><p>Частые ошибки — дать в ответ F1 крупного класса (0.523) или среднее с весами (0.185). Здесь всё решают 45 нулей.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l44-exam-monitor">
+    <div class="exam-q" lang="en">
+      <p>While a classifier trains, its validation cross-entropy is lowest at epoch 2 and more than triples by epoch 100, while validation accuracy stays almost flat and validation macro F1 doubles. Explain how this is possible. Which quantity should early stopping monitor here, and why?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Cross-entropy depends on the probability given to the true class; accuracy and F1 depend only on the arg max. After epoch 2 the network keeps learning the rare classes: macro F1 grows, while accuracy hardly moves because these classes have few samples. At the same time the weights, and with them the logits, keep growing; the softmax saturates and many of the remaining mistakes are made with probabilities close to 1, each costing a large \(-\ln p\). The loss rises from over-confidence, not from worse decisions: scaling all logits by one factor chosen on validation lowers it a lot without changing a single prediction.</p>
+        <p>Early stopping should monitor the quantity the model is judged on, here validation macro F1, and restore the best checkpoint; monitoring the loss would return the epoch-2 model. The loss is the right monitor when calibrated probabilities matter.</p>
+      </div>
+      <div class="exam-note"><p>Проверяют разницу между правильностью и уверенностью. Хороший ответ называет механизм (рост логитов, насыщение softmax) и делает вывод о том, за чем следить.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l44-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Модель на любую статью отвечает <code>earn</code> — 35&nbsp;% данных. Что верно?</p>
+    <ul class="options">
+      <li data-correct>Accuracy около 0.35 <span class="fb">Угаданы все статьи earn, а это 35&nbsp;% всех.</span></li>
+      <li data-correct>Macro F1 около 0.01 <span class="fb">F1 темы earn 0.52, у остальных 45 тем ноль; 0.52 / 46 ≈ 0.011.</span></li>
+      <li>Weighted F1 равен accuracy <span class="fb">Weighted F1 = 0.354 · 0.523 = 0.185 — F1 одной темы с весом её доли.</span></li>
+      <li>Темы, которые модель ни разу не называет, в macro F1 не входят <span class="fb">Входят: верных ответов у них нет, их F1 = 0, и 45 нулей тянут среднее вниз. zero_division на F1 здесь не влияет.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">В <code>fit</code> строку заменили на <code>best_state = model.state_dict()</code>, без <code>deepcopy</code>. Какие веса будут у модели после early stopping с <code>patience=20</code>?</p>
+    <ul class="options">
+      <li>Веса лучшей эпохи, как и раньше <span class="fb">state_dict() хранит ссылки на тензоры модели; step() меняет их на месте, и «лучшее состояние» меняется вместе с моделью.</span></li>
+      <li data-correct>Веса последней эпохи <span class="fb">Откат загружает словарь, который всё время совпадал с текущими весами. Ошибки при этом нет.</span></li>
+      <li>Ошибка при load_state_dict <span class="fb">Имена и формы совпадают, загрузка проходит молча — в этом и опасность.</span></li>
+      <li>Начальные веса сети <span class="fb">Начальные веса нигде не сохранялись; словарь смотрит на текущие.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text"><code>load_state_dict</code> падает: missing key <code>net.2.weight</code>, unexpected key <code>net.3.weight</code>. Что произошло?</p>
+    <ul class="options">
+      <li>Файл весов повреждён <span class="fb">Повреждённый файл не прочитался бы вовсе; здесь ключи читаются, но не те.</span></li>
+      <li data-correct>Веса сети с dropout загружают в сеть без dropout <span class="fb">Dropout занимает места в nn.Sequential, и Linear стоят на позициях 0, 3, 6, 9, а не 0, 2, 4, 6.</span></li>
+      <li>Забыли map_location <span class="fb">map_location меняет устройство тензоров, а не их имена.</span></li>
+      <li>Модель не переключили в eval() <span class="fb">Режим train или eval на имена ключей не влияет, загрузка от него не зависит.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Все логиты baseline умножили на s = 0.19. Что изменилось на validation?</p>
+    <ul class="options">
+      <li data-correct>Validation loss <span class="fb">Он упал с 3.42 до 1.31, уверенные ошибки стали дешевле.</span></li>
+      <li>Предсказанные темы <span class="fb">Argmax не меняется от умножения на положительное число.</span></li>
+      <li>Macro F1 <span class="fb">Он зависит только от ответов — 0.530, как и был.</span></li>
+      <li data-correct>Вероятность, которую сеть даёт своей лучшей теме <span class="fb">Softmax стал мягче, и максимум вероятности уменьшился.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Градиент данных по весу 0.02 всё время равен нулю, \(\eta = 10^{-3}\). Что с ним будет за 2&nbsp;460 шагов?</p>
+    <ul class="options">
+      <li>С Adam + L2 (\(\lambda = 10^{-4}\)) он умножается на \(1 - 2\eta\lambda\) за шаг и почти не меняется <span class="fb">Так было бы у SGD. Adam делит градиент штрафа на его же масштаб, и шаг выходит около η.</span></li>
+      <li data-correct>С Adam + L2 он падает ниже \(10^{-3}\) за пару десятков шагов, а с AdamW (weight decay 0.1) теряет 0.01&nbsp;% за шаг <span class="fb">У Adam + L2 меньше 10⁻³ за 23 шага и меньше 10⁻³⁸ к шагу 1 538; у AdamW остаётся 0.02 · 0.9999²⁴⁶⁰ ≈ 0.0156.</span></li>
+      <li>С AdamW он тоже исчезает: усадку нормирует Adam <span class="fb">В AdamW усадка (1 − ηλ) применяется к весу напрямую, мимо нормировки.</span></li>
+      <li>Ни с одним оптимизатором он не меняется: градиент же ноль <span class="fb">Нулевой здесь только градиент данных; штраф и weight decay действуют на вес и без него.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Победитель по validation (macro F1 0.616) показал на test 0.561. Главная причина?</p>
+    <ul class="options">
+      <li>Статьи test сложнее <span class="fb">Разбиение случайное и стратифицированное, в среднем test не сложнее validation; разницу объясняет то, как выбирали.</span></li>
+      <li data-correct>Validation выбирал эпоху и победителя, а максимум шести шумных оценок завышен <span class="fb">Это winner's curse: честна только оценка на нетронутом test.</span></li>
+      <li>Модель переобучилась на test <span class="fb">На test не обучали и по нему не выбирали: на него посмотрели один раз.</span></li>
+      <li>На test забыли выключить dropout <span class="fb">predict вызывает model.eval(), dropout выключен.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l44-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>При перекосе 248 : 1 accuracy молчит: «всегда earn» даёт 0.354. Macro F1, среднее F1 по темам, даёт ему 0.011 — поэтому он служит метрикой и для early stopping, и для выбора модели.</li>
+    <li>Честное сравнение: <code>make_model</code> заново ставит seed — те же начальные веса и те же батчи, и прогоны различаются одной строкой.</li>
+    <li>Цикл: <code>train()</code>, <code>zero_grad()</code>, <code>(loss + penalty).backward()</code>, <code>step()</code>; проверка — <code>eval()</code> и <code>no_grad()</code>; early stopping — рекорд, <code>deepcopy</code>, <code>wait &gt;= patience</code>, <code>load_state_dict</code>.</li>
+    <li>Validation loss и macro F1 спорят из-за over-confidence: растущие логиты удорожают ошибки, не меняя ответов. Early stopping по loss вернул бы эпоху 2 с F1 0.256.</li>
+    <li>Adam + L2 — не AdamW: в Adam градиент штрафа нормируется, и веса, которые данные не защищают, падают ниже \(10^{-38}\); AdamW снимает с каждого веса \(\eta\lambda\) = 0.01&nbsp;% за шаг.</li>
+    <li>Validation выбирал дважды, поэтому 0.616 на test стало 0.561; разница между средствами, кроме dropout, — внутри шума одного разбиения.</li>
+    <li>Сохраняют <code>state_dict</code>, загружают в ту же архитектуру, с теми же слоями dropout, и перед ответами вызывают <code>eval()</code>.</li>
+  </ul>
+</section>
+
+<section class="resources" id="l44-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html" target="_blank" rel="noopener">torch.optim.AdamW</a>
+      <span class="res-by">PyTorch documentation</span>
+      <p class="res-why">Алгоритм AdamW псевдокодом: усадка весов \(\gamma\lambda\theta\) (у документации \(\gamma\) — это lr) стоит отдельной строкой, до нормированного шага. Открой рядом с виджетом «Один вес, два вида затухания»; там же видно, что по умолчанию weight_decay = 0.01.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Dropout.html" target="_blank" rel="noopener">torch.nn.Dropout</a>
+      <span class="res-by">PyTorch documentation</span>
+      <p class="res-why">Короткая страница: p — вероятность обнулить элемент, при обучении выжившие умножаются на 1/(1 − p), в режиме оценки слой ничего не делает. Ровно то, что включают и выключают model.train() и model.eval().</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://docs.pytorch.org/docs/stable/notes/serialization.html" target="_blank" rel="noopener">Serialization semantics</a>
+      <span class="res-by">PyTorch documentation</span>
+      <p class="res-why">Почему сохраняют state_dict, а не модель целиком, и как его загрузить через load_state_dict. Пригодится, когда будешь сохранять модель своего проекта.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="http://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">A Recipe for Training Neural Networks</a>
+      <span class="res-by">Andrej Karpathy, 2019</span>
+      <p class="res-why">Как опытный практик строит обучение по шагам: сначала добиться, чтобы сеть переобучилась, потом регуляризовать — тот же порядок, что в этой лабе. Хорошее чтение перед собственным проектом.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Шесть моделей, одно разбиение, 1&nbsp;685 статей в validation — и победитель потерял на test 5.5 пункта. Как подбирать \(\lambda\), drop probability и patience так, чтобы оценка не обманывала: не одно разбиение, а несколько, и test — только в самом конце?</p>
+</aside>
+
+</main>
+</body>
+</html>

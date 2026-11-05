@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Микрофон у колонки · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+</head>
+<body>
+<main class="lesson" data-lesson="l31">
+
+<header class="lesson-head">
+  <h1>Микрофон у колонки</h1>
+  <p class="lede">После этого урока ты по весу петли и функции активации оценишь, как далеко назад во времени доходит градиент рекуррентной сети, и объяснишь, почему обычная RNN без ворот (<span class="en" lang="en">vanilla RNN</span>) учит только короткие зависимости, что лечит <span class="en" lang="en">gradient clipping</span> и зачем в петлю ставят линейный нейрон с весом 1.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>Поднеси микрофон к колонке — и зал накроет вой. Отодвинь его — и хлопок затихнет после пары отголосков. Всё решает одно число: во сколько раз звук усиливается за один круг «микрофон → усилитель → колонка → снова микрофон».</p>
+  <p>У рекуррентной сети есть такая же петля, и при обучении по ней ходит градиент: один круг — один шаг назад во времени. Вот пример, где кругов нужно много (<span class="nw"><a class="slide-ref" href="assets/slides/s04_012.webp" data-deck="s04" data-slide="12">лекция 4, слайд 12</a></span>): <span class="en" lang="en">"Jane walked into the room. John walked in too. It was late in the day. Jane said hi to &lt;???&gt;"</span>. Чтобы ответить «John», сеть должна связать ответ со словом, прочитанным за 13 шагов до последнего слова «to». Если за круг градиент теряет половину, какая его доля дойдёт до «John»? Прикинь в уме.</p>
+  <p>Хочется просто поставить в петлю вес побольше. Возьмём нейрон с <span class="en" lang="en">tanh</span> и весом петли 2, который запомнил единицу: его состояние держится около 0.96. Оценка с той же лекции разрешает градиенту за 10 шагов вырасти в \(2^{10} = 1024\) раза. На деле он уменьшится примерно в 60 миллионов раз. К концу урока станет ясно, почему, и что вместо этого предлагает <a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">слайд 14</a>.</p>
+</div>
+
+<section id="l31-loop">
+  <h2>Градиент ходит по петле</h2>
+
+  <p>Сначала картинка. В обеих петлях на рис. 1 сигнал обходит один и тот же круг снова и снова, и на каждом круге его умножают на <mark class="key">усиление петли</mark> (<span class="en" lang="en">loop gain</span>). Больше единицы — растёт, меньше — гаснет.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l31-fig-loops">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="Петля звука: микрофон, усилитель, колонка и звук по воздуху обратно в микрофон; за каждый круг звук умножается на одно и то же усиление">
+        <path d="M58 92 C58 58 78 48 108 48" marker-end="url(#arr)"/>
+        <path d="M192 48 C228 48 248 56 251 78" marker-end="url(#arr)"/>
+        <path d="M234 152 C208 188 104 188 76 140" class="st-muted dash" marker-end="url(#arr-muted)"/>
+        <rect x="112" y="26" width="76" height="44" rx="4" class="fi-paper sw-2"/>
+        <path d="M138 36 L138 60 L164 48 Z"/>
+        <rect x="44" y="94" width="24" height="40" rx="12" class="fi-paper sw-2"/>
+        <line x1="56" y1="134" x2="56" y2="158"/>
+        <line x1="42" y1="158" x2="70" y2="158"/>
+        <rect x="226" y="100" width="12" height="28" class="fi-paper"/>
+        <path d="M238 100 L262 82 L262 146 L238 128 Z" class="fi-paper sw-2"/>
+        <text x="150" y="92" class="tx-mid tx-sm">усилитель</text>
+        <text x="150" y="136" class="tx-mid tx-hand">круг за кругом</text>
+        <text x="154" y="202" class="tx-mid tx-sm tx-muted">звук по воздуху</text>
+        <text x="56" y="222" class="tx-mid">микрофон</text>
+        <text x="248" y="222" class="tx-mid">колонка</text>
+      </svg>
+      <p class="fig-label">Петля звука</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 230" role="img" aria-label="Петля рекуррентного нейрона: вход x с весом w, нейрон с функцией активации, петля с весом v и выход y; градиент за один круг назад умножается на v·h′">
+        <line x1="58" y1="84" x2="108" y2="84" marker-end="url(#arr)"/>
+        <line x1="170" y1="84" x2="226" y2="84" marker-end="url(#arr)"/>
+        <path d="M156 106 C178 152 102 152 124 106" class="sw-2" marker-end="url(#arr)"/>
+        <circle cx="40" cy="84" r="18" class="fi-paper"/>
+        <circle cx="140" cy="84" r="28" class="fi-paper sw-2"/>
+        <path d="M124 95 C134 95 136 84 140 84 C144 84 146 73 156 73"/>
+        <text x="40" y="89" class="tx-mid">x</text>
+        <text x="83" y="72" class="tx-mid">w</text>
+        <text x="244" y="89" class="tx-mid">y</text>
+        <text x="140" y="168" class="tx-mid tx-bold">v</text>
+        <text x="150" y="32" class="tx-mid tx-hand">один круг = шаг</text>
+        <text x="150" y="206" class="tx-mid tx-sm">назад за круг: × v · h′</text>
+      </svg>
+      <p class="fig-label">Петля рекуррентного нейрона</p>
+    </div>
+    <figcaption><b>Рис. 1.</b> Одна и та же схема. У звука усиление за круг — это усилитель, урезанный колонкой: на большой громкости она упирается в свой предел. У градиента RNN — вес петли \(v\), умноженный на наклон функции активации \(h'\), который в насыщении падает почти до нуля.</figcaption>
+  </figure>
+
+  <p>Чтобы понять, почему <span class="en" lang="en">Backpropagation Through Time</span> не дотягивается далеко назад, профессор берёт упрощённый случай (<span class="en" lang="en">"consider a simplified case"</span>, <span class="nw"><a class="slide-ref" href="assets/slides/s04_013.webp" data-deck="s04" data-slide="13">лекция 4, слайд 13</a></span>): вход, один рекуррентный нейрон с петлёй и один выходной нейрон.</p>
+
+  <div class="formula">
+    \[ h^t = h\big(v^{(1)} h^{t-1} + w^{(1)} x^t\big) \]
+    \[ y^t = g\big(w^{(2)} h^t\big) \]
+    <dl class="legend">
+      <dt>\(h^t\)</dt><dd>состояние нейрона на шаге \(t\); время на слайдах пишут сверху</dd>
+      <dt>\(x^t,\ y^t\)</dt><dd>вход и выход сети на шаге \(t\)</dd>
+      <dt>\(v^{(1)}\)</dt><dd>вес петли (<span class="en" lang="en">recurrent weight</span>): по нему состояние возвращается в нейрон на следующем шаге</dd>
+      <dt>\(w^{(1)},\ w^{(2)}\)</dt><dd>вес входа и вес выхода</dd>
+      <dt>\(h(\cdot),\ g(\cdot)\)</dt><dd>функции активации рекуррентного и выходного нейрона</dd>
+      <dt>\(E^t,\ E\)</dt><dd>ошибка шага \(t\) и вся ошибка \(E = \sum_{t=1}^{S} E^t\) последовательности длины \(S\)</dd>
+    </dl>
+  </div>
+
+  <p>Теперь проследим, как ошибка шага \(t\) добирается до веса. Это пять шагов цепного правила (<span class="en" lang="en">chain rule</span>).</p>
+
+  <ol class="steps" id="l31-steps-chain">
+    <li>
+      <p>Ошибка последовательности — сумма ошибок шагов, поэтому и градиент по любому весу \(w\) — сумма (<span class="en" lang="en">"Backpropagation over an entire sequence S is computed as"</span>):</p>
+      \[ \pd{E}{w} = \sum_{t=1}^{S} \pd{E^t}{w} \]
+    </li>
+    <li>
+      <p>Пусть \(w\) — вес рекуррентного нейрона (\(w^{(1)}\) или \(v^{(1)}\)). Ошибка шага \(t\) зависит от него через каждое прошлое состояние: на каждом шаге \(k \le t\) работает своя копия (<span class="en" lang="en">replica</span>, <a href="l30.html">урок 30</a>) того же веса. Одно слагаемое на копию:</p>
+      \[ \pd{E^t}{w} = \sum_{k=1}^{t} \pd{E^t}{y^t}\, \pd{y^t}{h^t}\, \pd{h^t}{h^k}\, \pd{h^k}{w} \]
+      <p>Последний множитель — прямое влияние копии шага \(k\) на \(h^k\) при неизменном \(h^{k-1}\). На слайде индекс этой суммы напечатан как \(t\); суммируют по \(k\).</p>
+    </li>
+    <li>
+      <p>Всё, что лежит между шагами \(k\) и \(t\), собрано в третьем множителе. Он распадается на переходы через промежуточные состояния, их ровно \(t - k\):</p>
+      \[ \pd{h^t}{h^k} = \prod_{i=k+1}^{t} \pd{h^i}{h^{i-1}} \]
+    </li>
+    <li>
+      <p>Один переход. Обозначим аргумент функции активации \(a^i = v^{(1)} h^{i-1} + w^{(1)} x^i\) (<span class="en" lang="en">pre-activation</span>), тогда \(h^i = h(a^i)\):</p>
+      \[ \begin{aligned} \pd{h^i}{h^{i-1}} &amp;= h'(a^i) \cdot \pd{a^i}{h^{i-1}} \\ &amp;= v^{(1)}\, h'(a^i) \end{aligned} \]
+      <p>Вес петли, умноженный на наклон активации там, где нейрон сидит на шаге \(i\).</p>
+    </li>
+    <li>
+      <p>Собираем:</p>
+      \[ \pd{h^t}{h^k} = \prod_{i=k+1}^{t} v^{(1)}\, h'(a^i) \]
+      <p>Один и тот же \(v^{(1)}\) стоит во всех \(t - k\) множителях: это усиление петли с рис. 1, взятое \(t - k\) раз.</p>
+    </li>
+  </ol>
+
+  <figure class="fig fig--plain" id="l31-fig-unrolled">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="Развёрнутая петля: состояния h от шага k до шага t и ошибка E шага t. Градиент идёт справа налево и на каждой передаче умножается на v·h′; до шага k таких умножений t − k">
+      <line x1="86" y1="80" x2="132" y2="80" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="186" y1="80" x2="222" y2="80" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="278" y1="80" x2="312" y2="80" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="366" y1="80" x2="412" y2="80" class="st-muted" marker-end="url(#arr-muted)"/>
+      <line x1="466" y1="80" x2="490" y2="80" class="st-muted" marker-end="url(#arr-muted)"/>
+      <polyline points="519,104 519,140 458,140" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="426" y1="140" x2="356" y2="140" class="sw-2" marker-end="url(#arr)"/>
+      <line x1="326" y1="140" x2="284" y2="140" class="sw-2 dash"/>
+      <line x1="216" y1="140" x2="176" y2="140" class="sw-2 dash" marker-end="url(#arr)"/>
+      <line x1="146" y1="140" x2="76" y2="140" class="sw-2" marker-end="url(#arr)"/>
+      <circle cx="60" cy="80" r="24" class="fi-paper sw-2"/>
+      <circle cx="160" cy="80" r="24" class="fi-paper sw-2"/>
+      <circle cx="340" cy="80" r="24" class="fi-paper sw-2"/>
+      <circle cx="440" cy="80" r="24" class="fi-paper sw-2"/>
+      <rect x="494" y="58" width="50" height="44" class="fi-paper sw-2"/>
+      <path d="M60 170 L60 178 L440 178 L440 170" class="st-muted"/>
+      <text x="57" y="86" class="tx-mid tx-lg">h<tspan dy="-8" font-size="0.65em">k</tspan></text>
+      <text x="157" y="86" class="tx-mid tx-lg">h<tspan dy="-8" font-size="0.65em">k+1</tspan></text>
+      <text x="250" y="86" class="tx-mid tx-lg">…</text>
+      <text x="337" y="86" class="tx-mid tx-lg">h<tspan dy="-8" font-size="0.65em">t−1</tspan></text>
+      <text x="437" y="86" class="tx-mid tx-lg">h<tspan dy="-8" font-size="0.65em">t</tspan></text>
+      <text x="516" y="86" class="tx-mid tx-lg">E<tspan dy="-8" font-size="0.65em">t</tspan></text>
+      <text x="109" y="68" class="tx-mid tx-sm tx-muted">v</text>
+      <text x="389" y="68" class="tx-mid tx-sm tx-muted">v</text>
+      <text x="111" y="128" class="tx-mid tx-mono">×v·h′</text>
+      <text x="391" y="128" class="tx-mid tx-mono">×v·h′</text>
+      <text x="250" y="212" class="tx-mid tx-hand">t − k множителей</text>
+    </svg>
+    <figcaption><b>Рис. 2.</b> Сеть, развёрнутая во времени. Тонкие серые стрелки — прямой проход, толстые — путь градиента от ошибки \(E^t\) назад к состоянию \(h^k\). На каждой передаче он умножается на \(v^{(1)} h'(a^i)\): вес петли один и тот же, наклон свой у каждого шага.</figcaption>
+  </figure>
+
+  <p class="memo"><mark class="key">На пути в \(t - k\) шагов назад градиент умножается на \(t - k\) множителей \(v^{(1)} h'(a^i)\), и вес петли в них всегда один и тот же.</mark></p>
+
+  <aside class="margin-note">В уроке 24 сообщение передавали по цепочке разные люди. Здесь его передаёт один и тот же человек, круг за кругом.</aside>
+
+  <p>В <a href="l24.html">уроке 24</a> такое же произведение получилось в глубокой сети: там множителей было столько, сколько слоёв. Развёрнутая RNN — та же глубокая сеть, только её «слои» — шаги времени, и вес петли у всех общий. Поэтому отклонение множителя от единицы копится как сложные проценты при постоянной ставке: \(0.9^{50} \approx 0.005\), а \(1.1^{50} \approx 117\).</p>
+
+</section>
+
+<section id="l31-bound">
+  <h2>Потолок, а не прогноз</h2>
+
+  <p>Произведение зависит от того, где сидит нейрон на каждом шаге: наклон \(h'(a^i)\) у каждого шага свой, и заранее его не знать. Зато его можно ограничить сверху. Профессор берёт нормы множителей (<span class="en" lang="en">"If we consider the norm of these terms"</span>, <span class="nw"><a class="slide-ref" href="assets/slides/s04_013.webp" data-deck="s04" data-slide="13">лекция 4, слайд 13</a></span>); для одного нейрона норма — просто модуль.</p>
+
+  <div class="formula">
+    \[ \Big\lVert \pd{h^i}{h^{i-1}} \Big\rVert \le \lVert v^{(1)} \rVert\, \lVert h'(\cdot) \rVert = \gamma_v\, \gamma_{h'} \]
+    \[ \Big\lVert \pd{h^t}{h^k} \Big\rVert \le (\gamma_v\, \gamma_{h'})^{t-k} \]
+    <dl class="legend">
+      <dt>\(\gamma_v\)</dt><dd>граница веса петли; у одного нейрона это \(|v^{(1)}|\)</dd>
+      <dt>\(\gamma_{h'}\)</dt><dd>наибольший наклон функции активации: \(1/4\) у <span class="en" lang="en">sigmoid</span>, \(1\) у <span class="en" lang="en">tanh</span>, оба в точке \(a = 0\) (<a href="l24.html">урок 24</a>)</dd>
+    </dl>
+  </div>
+
+  <div class="theorem" data-label="Достаточное условие затухания">
+    <p>Если \(\gamma_v \gamma_{h'} \lt 1\), вклад шага \(k\) в градиент шага \(t\) стремится к нулю экспоненциально по \(t - k\) (<span class="en" lang="en">"If \((\gamma_v \cdot \gamma_{h'}) \lt 1\) this converges to 0 …"</span>).</p>
+  </div>
+
+  <p>Масштаб. У <span class="en" lang="en">sigmoid</span> множитель не больше \(|v^{(1)}|/4\): при \(|v^{(1)}| \le 1\) за 10 шагов от градиента остаётся не больше \(0.25^{10} \approx 10^{-6}\), а гарантия пропадает только при \(|v^{(1)}| \ge 4\). У <span class="en" lang="en">tanh</span> граница — \(|v^{(1)}| = 1\): при \(\gamma_v = 0.8\) за 10 шагов остаётся не больше 0.107, за 20 — не больше 0.0115. Отсюда вывод слайда: <span class="en" lang="en">"With Sigmoids and Tanh we have vanishing gradients"</span>.</p>
+
+  <p>Обрати внимание на направление неравенства. Если потолок падает к нулю, градиент падает вместе с ним. Если потолок растёт, градиент может расти, а может и падать: потолку это не мешает. Поэтому на слайде вывод только про затухание (<span class="en" lang="en">vanishing gradient</span>).</p>
+
+  <div class="widget" id="l31-w-gain">
+    <h3 class="widget-title">Усиление петли</h3>
+    <p class="widget-intro">Нейрон со <a class="slide-ref" href="assets/slides/s04_013.webp" data-deck="s04" data-slide="13">слайда 13 лекции 4</a> прочитал 40 шагов: вес входа \(w^{(1)} = 1\), старт \(h^0 = 0.5\), на каждом шаге один и тот же вход \(x\). Фиолетовая линия — настоящий множитель \(|\partial h^t / \partial h^k|\), с которым градиент шага \(t = 40\) доходит до шага \(k\); пунктир — потолок \((\gamma_v \gamma_{h'})^{t-k}\). Шкала логарифмическая: деление вниз — в 10 раз меньше. Главное здесь: фиолетовая линия никогда не поднимается над пунктиром, поэтому гарантию даёт только пунктир, уходящий вниз.</p>
+    <ol class="tasks">
+      <li>Стартовые настройки: <span class="en" lang="en">tanh</span>, \(v = 0.8\), \(x = 0\). Сколько градиента останется через 10 шагов? Предскажи, потом сравни с показаниями. Почему фиолетовая линия почти совпадает с пунктиром?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>\(0.8^{10} \approx 0.107\). Без входа состояние тает к нулю, а там наклон <span class="en" lang="en">tanh</span> почти ровно 1, поэтому каждый множитель почти равен \(v = 0.8\), то есть потолку. Одинаковые множители дают прямую: каждый шаг назад опускает её на одну и ту же высоту, \(\log_{10} 0.8 \approx -0.1\). Только у правого края, на лагах около 40, линия чуть ниже: там градиент доходит до первых шагов, где состояние ещё около 0.5.</p></details>
+      </li>
+      <li>Подай вход \(x = 0.5\). Куда пойдёт фиолетовая линия: выше пунктира, по нему или ниже?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Ниже, и намного. Вход держит состояние около 0.82, где наклон <span class="en" lang="en">tanh</span> всего \(1 - 0.82^2 \approx 0.33\). Множитель за шаг \(0.8 \cdot 0.33 \approx 0.26\), и через 10 шагов остаётся \(1.6 \cdot 10^{-6}\) вместо потолка 0.107. Нейрон в насыщении теряет градиент быстрее, чем обещает оценка.</p></details>
+      </li>
+      <li>Переключи на <span class="en" lang="en">sigmoid</span>. Найди вес, при котором пунктир пойдёт вверх.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Не получится: у <span class="en" lang="en">sigmoid</span> \(\gamma_{h'} = 1/4\), и даже при \(|v| = 3\) потолок за шаг \(3/4\). Затухание гарантировано на всём ползунке; гарантия пропала бы только при \(|v| \ge 4\).</p></details>
+      </li>
+      <li>Нейрон из задачки: <span class="en" lang="en">tanh</span>, \(v = 2\), \(x = 0\). Он запомнил единицу — посмотри на \(h^t\). Потолок за 10 шагов — 1024. Предскажи настоящий множитель. Потом переключи активацию на линейную, не трогая \(v\).
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>У <span class="en" lang="en">tanh</span> — \(1.6 \cdot 10^{-8}\): нейрон сидит в насыщении (\(h \approx 0.96\)), наклон 0.083, множитель за шаг 0.166. Вперёд память держится, а градиент назад гаснет. У линейной активации тот же потолок \(2^{10} = 1024\) достигается точно: градиент взрывается, а состояние уходит к \(5.5 \cdot 10^{11}\). Одна и та же оценка выше единицы — и два противоположных исхода.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l31-w-gain', function (root, ui) {
+    var T = 40, H0 = 0.5;
+    function dSig(a) { var s = Course.sigmoid(a); return s * (1 - s); }
+    function dTanh(a) { var t = Course.tanh(a); return 1 - t * t; }
+    var ACT = {
+      tanh:    { f: Course.tanh, d: dTanh, g: 1 },
+      sigmoid: { f: Course.sigmoid, d: dSig, g: 0.25 },
+      lin:     { f: function (a) { return a; }, d: function () { return 1; }, g: 1 },
+      relu:    { f: function (a) { return a > 0 ? a : 0; }, d: function (a) { return a > 0 ? 1 : 0; }, g: 1 }
+    };
+    var act = ui.select('функция активации h', [
+      { value: 'tanh', label: 'tanh' }, { value: 'sigmoid', label: 'sigmoid' },
+      { value: 'lin', label: 'линейная (identity)' }, { value: 'relu', label: 'ReLU' }], null, 'tanh');
+    var v = ui.slider({ label: 'вес петли v<sup>(1)</sup>', min: -3, max: 3, step: 0.1, value: 0.8 });
+    var x = ui.slider({ label: 'вход x на каждом шаге', min: -1, max: 1, step: 0.05, value: 0 });
+    var lag = ui.slider({ label: 'шагов назад t − k', min: 1, max: T, step: 1, value: 10 });
+    var roG = ui.readout('потолок за шаг γ<sub>v</sub>·γ<sub>h′</sub>');
+    var roF = ui.readout('настоящий множитель на шаге t');
+    var roP = ui.readout('через t − k шагов');
+    var roH = ui.readout('состояние h<sup>t</sup>');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [0, T], y: [-8, 3], xLabel: 't − k', yLabel: 'log_{10} множителя', aspect: 1.7,
+      label: 'Множитель, с которым градиент доходит на t − k шагов назад, и его верхняя оценка, в логарифмической шкале' });
+    ui.legend([
+      { label: 'настоящий |∂h<sup>t</sup>/∂h<sup>k</sup>|', color: 's3', mark: 'line' },
+      { label: 'потолок (γ<sub>v</sub>γ<sub>h′</sub>)<sup>t−k</sup>', color: 'soft', mark: 'dash' },
+      { label: 'выбранное t − k', color: 'muted', mark: 'dash' }
+    ]);
+
+    function LG(z) { return z > 0 ? Math.log(z) / Math.LN10 : -Infinity; }
+    /* the neuron reads T steps; f[i-1] = v·h'(a^i); lp[L] = log10 of the product of the last L factors */
+    function state() {
+      var A = ACT[act.value] || ACT.tanh, vv = v.value, xx = x.value, h = H0, f = [], i, L, s = 0, lp = [0];
+      for (i = 1; i <= T; i++) { var a = vv * h + xx; f.push(vv * A.d(a)); h = A.f(a); }
+      for (L = 1; L <= T; L++) { s += LG(Math.abs(f[T - L])); lp.push(s); }
+      var gam = Math.abs(vv) * A.g;
+      return { lp: lp, gam: gam, lg: LG(gam), h: h, last: f[T - 1] };
+    }
+    function range(s) {
+      var lo = 0, hi = 0, L;
+      for (L = 0; L <= T; L++) if (isFinite(s.lp[L])) { lo = Math.min(lo, s.lp[L]); hi = Math.max(hi, s.lp[L]); }
+      if (isFinite(s.lg)) { lo = Math.min(lo, T * s.lg); hi = Math.max(hi, T * s.lg); }
+      return [lo > -7.5 ? -8 : lo > -15.5 ? -16 : -24, hi < 2.5 ? 3 : hi < 7.5 ? 8 : hi < 15.5 ? 16 : 20];
+    }
+    /* 10^lg as html: plain decimals near 1, m·10^e otherwise */
+    function sci(lg) {
+      if (lg === -Infinity) return '0';
+      if (!isFinite(lg)) return '∞';
+      if (lg > -3 && lg < 4) {
+        var val = Math.pow(10, lg);
+        return Course.fmt(val, val >= 100 ? 0 : val >= 10 ? 1 : val >= 1 ? 2 : val >= 0.1 ? 3 : val >= 0.01 ? 4 : 5);
+      }
+      var e = Math.floor(lg), m = Math.pow(10, lg - e);
+      if (m >= 9.95) { m = 1; e += 1; }
+      return Course.fmt(m, 1) + '·10<sup>' + (e < 0 ? '−' : '') + Math.abs(e) + '</sup>';
+    }
+    function stateText(h) {
+      if (Math.abs(h) < 1000) return Course.fmt(h, 2);
+      return (h < 0 ? '−' : '') + sci(LG(Math.abs(h)));
+    }
+
+    plot.draw(function (g) {
+      var s = state(), L = lag.value, pts = [], k;
+      for (k = 0; k <= T; k++) pts.push([k, s.lp[k]]);
+      g.line(pts, { color: 's3', width: 3 });
+      /* the ceiling is drawn on top: where the two coincide its dashes still show over the violet line */
+      if (isFinite(s.lg)) g.line([[0, 0], [T, T * s.lg]], { color: 'soft', width: 2, dash: [7, 6] });
+      g.vline(L, { color: 'muted', dash: true });
+      if (isFinite(s.lg)) g.points([[L, L * s.lg]], { color: 'soft', r: 4.5, hollow: true });
+      if (isFinite(s.lp[L])) g.points([[L, s.lp[L]]], { color: 's3', r: 5 });
+      g.text(T, 0, 'множитель 1: без потерь', { align: 'right', dx: -6, dy: -9, color: 'soft', size: 11 });
+    });
+
+    ui.onChange(function () {
+      var s = state(), L = lag.value, real = s.lp[L], bound = isFinite(s.lg) ? L * s.lg : -Infinity, msg, how;
+      plot.setView({ x: [0, T], y: range(s) });
+      roG.set(Course.fmt(s.gam, 2));
+      roF.set(Course.fmt(s.last, 3));
+      roP.set('на деле ' + sci(real) + ' · потолок ' + sci(bound));
+      roH.set(stateText(s.h));
+      if (s.gam === 0) {
+        msg = 'v = 0: петли нет, и градиент назад не проходит совсем.';
+      } else if (s.gam < 1 - 1e-9) {
+        msg = 'Потолок за шаг ' + Course.fmt(s.gam, 2) + ' &lt; 1: затухание гарантировано. Через ' + L + ' шагов от градиента остаётся не больше ' + sci(bound) + '.';
+      } else {
+        if (real === -Infinity) how = 'оборвался: нейрон выключен, его множитель 0';
+        else if (Math.abs(real) < 1e-9) how = 'не изменился: каждый множитель ровно 1';
+        else if (real > 0) how = 'вырос в ' + sci(real) + ' раза';
+        else how = 'упал до ' + sci(real);
+        msg = (Math.abs(s.gam - 1) < 1e-9 ? 'Потолок за шаг ровно 1: оценка не обещает ни роста, ни затухания.'
+          : 'Потолок за шаг ' + Course.fmt(s.gam, 2) + ' &gt; 1: про взрыв и затухание оценка ничего не говорит.') +
+          ' На деле за ' + L + ' шагов градиент ' + how + '.';
+      }
+      note.set(msg);
+    });
+  });
+  </script>
+
+  <h3>Когда нейронов много</h3>
+
+  <aside class="margin-note">\((W_h^T)^T\) на стр. 256 конспекта — степень матрицы петли: внешнее \(T\) там длина последовательности, а не транспонирование.</aside>
+
+  <p>В настоящей RNN состояние — вектор, а вес петли — матрица \(V\) (на слайдах \(V_B^{(1)}\), в конспекте \(W_h\)). Каждый множитель становится матрицей производных — якобианом (<span class="en" lang="en">Jacobian</span>). Это матрица весов, а перед ней диагональ наклонов, по одному на нейрон: функция активации действует на каждую компоненту отдельно.</p>
+
+  <div class="formula">
+    \[ \pd{h^t}{h^k} = D^t V \, D^{t-1} V \cdots D^{k+1} V \]
+    \[ D^i = \mathrm{diag}\big(h'(a^i)\big) \]
+  </div>
+
+  <p>Модуль заменяется нормой матрицы — наибольшим растяжением, которое она даёт вектору (<span class="en" lang="en">spectral norm</span>, она же наибольшее сингулярное число). У диагональной \(D^i\) это её наибольший по модулю элемент, так что \(\norm{D^i} \le \gamma_{h'}\). Так как \(\norm{AB} \le \norm{A}\,\norm{B}\), получается та же оценка с \(\gamma_v = \norm{V}\). Затухание гарантировано при \(\norm{V} \lt 1/\gamma_{h'}\): у <span class="en" lang="en">tanh</span> при \(\norm{V} \lt 1\), у <span class="en" lang="en">sigmoid</span> даже при \(\norm{V} \lt 4\).</p>
+
+  <details class="why">
+    <summary>А при чём тут собственные числа?</summary>
+    <p>Если забыть про \(D^i\), произведение превращается в степень \(V^{t-k}\). Степени матрицы в долгую растут или гаснут по её собственным числам (<span class="en" lang="en">eigenvalues</span>): \(Vq = \lambda q\) значит, что за шаг составляющая вдоль \(q\) умножается на \(\lambda\). Решает модуль, а не само \(\lambda\): при \(|\lambda| \lt 1\) она гаснет, при \(|\lambda| \gt 1\) растёт, так что \(\lambda = -3\) меньше единицы, но растягивает втрое. Отрицательное \(\lambda\) ещё и переворачивает составляющую, комплексное — поворачивает. Наибольший модуль собственного числа никогда не больше нормы \(\norm{V}\): из \(\norm{V} \lt 1\) следует \(|\lambda| \lt 1\), но не наоборот. Оценка через норму надёжнее: она верна на каждом шаге, а собственные числа описывают только поведение в пределе. И, как норма, большое собственное число не обещает взрыва: насыщенные нейроны в \(D^i\) его гасят.</p>
+  </details>
+
+  <figure class="tbl-fig" id="l31-tbl-notation">
+    <figcaption>Как читать стр. 256–261 конспекта рядом со <a class="slide-ref" href="assets/slides/s04_013.webp" data-deck="s04" data-slide="13">слайдом 13 лекции 4</a>.</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Слайд</th><th>Конспект</th><th>Что это</th></tr></thead>
+        <tbody>
+          <tr><td>\(h^t\), \(h^{t-1}\)</td><td>\(h_t\), \(h_{t-1}\)</td><td>состояние; время сверху на слайде, снизу в конспекте</td></tr>
+          <tr><td>\(v^{(1)}\)</td><td>\(W_h\)</td><td>вес петли; в конспекте сразу матрица</td></tr>
+          <tr><td>\(w^{(1)}\)</td><td>\(W_x\)</td><td>вес входа</td></tr>
+          <tr><td>\(h(\cdot)\), \(h'(\cdot)\)</td><td>\(f\) или \(\phi\); \(\phi'\)</td><td>функция активации и её производная</td></tr>
+          <tr><td>\(\gamma_v\), \(\gamma_{h'}\)</td><td>\(\gamma_v\), \(\gamma'_h\)</td><td>границы двух частей множителя</td></tr>
+          <tr><td>\(S\)</td><td>\(T\)</td><td>длина последовательности</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+</section>
+
+<section id="l31-credit">
+  <h2>Кому достаётся заслуга</h2>
+
+  <p>Вернёмся ко второму шагу вывода. Градиент по весу — не один путь назад, а сумма: по слагаемому на каждый прошлый шаг \(k\), и в каждом своё произведение из \(t - k\) множителей. Слагаемое шага \(k\) — это заслуга (или вина) шага \(k\) в ошибке шага \(t\). Распределение этой заслуги по шагам называют <span class="en" lang="en">credit assignment</span>.</p>
+
+  <p>Если множитель меньше единицы, слагаемые с большим \(t - k\) экспоненциально малы. Сумма от этого не обнуляется: её почти целиком дают последние шаги. Сеть получает сигнал «поправь, как ответ зависит от последних слов» и почти никакого сигнала про слова, стоящие далеко.</p>
+
+  <p>Поэтому <span class="en" lang="en">vanilla RNN</span> учит <mark class="key">короткие зависимости</mark> (<span class="en" lang="en">short-term dependencies</span>), а связи через много шагов (<span class="en" lang="en">long-term dependencies</span>) ей не даются. Грубая оценка из практики: такая сеть учится опираться лишь на последние 5–10 шагов. А ответ бывает связан со словом, прочитанным давно, как «John» в задачке (<span class="en" lang="en">"Sometime output might be related to some input happened quite long before"</span>, <span class="nw"><a class="slide-ref" href="assets/slides/s04_012.webp" data-deck="s04" data-slide="12">лекция 4, слайд 12</a></span>).</p>
+
+  <div class="widget" id="l31-w-credit">
+    <h3 class="widget-title">Кому достанется заслуга</h3>
+    <p class="widget-intro">Сеть прочитала фразу со <a class="slide-ref" href="assets/slides/s04_012.webp" data-deck="s04" data-slide="12">слайда 12 лекции 4</a> и на слове «to» должна ответить «John». Столбик над словом — его вклад в градиент веса \(w^{(1)}\), равный \(\rho^{t-k}\), где \(\rho\) — модуль множителя за шаг. Для наглядности \(\rho\) на всех шагах одинаковый, а собственный вклад каждого слова равен 1. Шкала логарифмическая; справа — сумма, то есть длина градиента. Всё, что ниже пунктира «1&nbsp;% суммы», в обновлении веса не слышно. Главное здесь: дальние слова тонут в ближних.</p>
+    <ol class="tasks">
+      <li>Стартовые настройки: множитель 0.5, как в задачке. Предскажи: какая доля градиента достанется «John»? А трём последним словам?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>«John» — около 0.006&nbsp;%: \(0.5^{13} \approx 1.2 \cdot 10^{-4}\) от вклада слова «to». Три последних слова — 87.5&nbsp;%. Столбики выстроились в ровную лестницу: шаг влево — в 2 раза меньше, на 0.3 деления. Над линией «1&nbsp;% суммы» только шесть последних слов, «John» — на два с лишним деления ниже неё.</p></details>
+      </li>
+      <li>Подними множитель до 0.9, потом до 1. Сколько слов теперь над линией «1&nbsp;% суммы»? Сколько получает «John»?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>При 0.9 над линией все 19 слов, «John» получает 2.9&nbsp;%, но три последних слова — всё ещё 31&nbsp;%. При 1 все столбики одинаковы: каждому слову \(1/19 \approx 5.3\)&nbsp;%. Это петля с усилением ровно 1 — нейрон со <a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">слайда 14 лекции 4</a>.</p></details>
+      </li>
+      <li>Теперь 1.3. Кто получает заслугу и какой длины градиент?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Всё наоборот: лестница идёт вверх влево. Первое слово получает 23&nbsp;%, три последних — меньше 1&nbsp;%, а длина градиента 484, в 25 раз больше, чем при множителе 1. Это взрыв градиента (<span class="en" lang="en">exploding gradient</span>): ошибку «объясняют» самые старые шаги, а шаг по весам огромный.</p></details>
+      </li>
+      <li>Включи <span class="en" lang="en">clipping</span>: если длина градиента больше порога \(\tau = 20\), его укорачивают до 20 (подробно — в следующем разделе). Предскажи, что изменится при множителе 1.3 и что — при 0.5.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>При 1.3 длина 484 срезается до порога 20: все столбики опускаются на одно и то же расстояние (\(\log_{10} 24 \approx 1.4\) деления), доли не меняются — направление градиента прежнее, шаг стал разумным. При 0.5 не меняется ничего: длина 2 меньше порога. «John» остаётся на своих 0.006&nbsp;%: удлинять <span class="en" lang="en">clipping</span> не умеет.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l31-w-credit', function (root, ui) {
+    var W = ['Jane', 'walked', 'into', 'the', 'room', 'John', 'walked', 'in', 'too', 'It', 'was', 'late', 'in', 'the', 'day', 'Jane', 'said', 'hi', 'to'];
+    var T = W.length, JOHN = 6, TAU = 20, BOT = -10, YLO = -13.8, YHI = 4.6, XS = 20.7, X0 = 0.3, X1 = 21.6;
+    var rho = ui.slider({ label: 'множитель за шаг ρ = |v·h′|', min: 0.25, max: 1.5, step: 0.05, value: 0.5 });
+    var clip = ui.toggle('gradient clipping по норме, порог τ = 20', false);
+    var roJ = ui.readout('доля «John»'), roL = ui.readout('доля трёх последних слов');
+    var roN = ui.readout('длина градиента ‖g‖'), roC = ui.readout('после clipping');
+    var note = ui.note('');
+    var plot = ui.plot({ x: [X0, X1], y: [YLO, YHI], xTicks: [], yTicks: [-10, -8, -6, -4, -2, 0, 2, 4], yLabel: 'log_{10} вклада', aspect: 1.8,
+      label: 'Вклад каждого слова фразы в градиент веса и их сумма, в логарифмической шкале' });
+    ui.legend([
+      { label: 'вклад слова', color: 's3', mark: 'area' },
+      { label: 'сумма = длина градиента', color: 'ink', mark: 'area' },
+      { label: '1 % суммы', color: 'soft', mark: 'dash' },
+      { label: 'порог τ', color: 'muted', mark: 'dash' },
+      { label: '«John»', color: 'key', mark: 'area' }
+    ]);
+    var MONO = (function () {
+      try { return window.getComputedStyle(root).getPropertyValue('--f-mono').trim() || 'monospace'; } catch (e) { return 'monospace'; }
+    })();
+
+    function LG(z) { return Math.log(z) / Math.LN10; }
+    function state() {
+      var r = rho.value, c = [], S = 0, k;
+      for (k = 1; k <= T; k++) { var val = Math.pow(r, T - k); c.push(val); S += val; }
+      return { r: r, c: c, S: S, s: clip.value && S > TAU ? TAU / S : 1 };
+    }
+    function sci(lg) {
+      var e = Math.floor(lg), m = Math.pow(10, lg - e);
+      if (m >= 9.95) { m = 1; e += 1; }
+      return Course.fmt(m, 1) + '·10<sup>' + (e < 0 ? '−' : '') + Math.abs(e) + '</sup>';
+    }
+    function pct(p) {
+      var v = 100 * p;
+      if (v >= 10) return Course.fmt(v, 1) + ' %';
+      if (v >= 1) return Course.fmt(v, 2) + ' %';
+      if (v >= 0.001) return Course.fmt(v, Math.min(6, 1 - Math.floor(LG(v)))) + ' %';
+      return sci(LG(v)) + ' %';
+    }
+    function len(S) { return Course.fmt(S, S >= 100 ? 0 : 2); }
+    function times(q) { return q < 1e4 ? Course.fmt(q, q >= 100 ? 0 : 1) : sci(LG(q)); }
+
+    plot.draw(function (g) {
+      var st = state(), ls = LG(st.s), k, ctx = g.ctx, C = g.colors;
+      var one = LG(0.01 * st.S * st.s), tl = LG(TAU), oneUp = one > tl;
+      g.rect(JOHN - 0.5, YLO, JOHN + 0.5, YHI, { color: 'key', alpha: 0.3, stroke: false });
+      g.hline(one, { color: 'soft', dash: true, width: 1.5 });
+      g.hline(tl, { color: 'muted', dash: [2, 4], width: 1.5 });
+      for (k = 1; k <= T; k++) {
+        var y = LG(st.c[k - 1]) + ls;
+        if (y > BOT) g.rect(k - 0.36, BOT, k + 0.36, y, { color: 's3', alpha: 0.42, width: 1.4 });
+      }
+      g.rect(XS - 0.42, BOT, XS + 0.42, LG(st.S) + ls, { color: 'ink', alpha: 0.1, width: 1.4 });
+      g.line([[X0, BOT], [X1, BOT]], { color: 'muted', width: 1.25 });
+      /* the two line labels go where the bars are low: on the left while the old words fade, on the right when they explode */
+      var lx = st.r > 1 + 1e-9 ? 19.55 : 0.45, la = st.r > 1 + 1e-9 ? 'right' : 'left';
+      g.text(lx, one, '1 % суммы', { color: 'soft', size: 11, align: la, halo: false, baseline: oneUp ? 'bottom' : 'top', dy: oneUp ? -3 : 3 });
+      g.text(lx, tl, 'порог τ = 20', { color: 'soft', size: 11, align: la, halo: false, baseline: oneUp ? 'top' : 'bottom', dy: oneUp ? 3 : -3 });
+      /* the words hang below the baseline, rotated so that 19 of them fit a phone */
+      var slot = Math.abs(g.px(2) - g.px(1)), size = Math.max(8, Math.min(12, slot * 0.7));
+      ctx.save();
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      for (k = 1; k <= T; k++) {
+        ctx.save();
+        ctx.translate(g.px(k), g.py(BOT) + 5);
+        ctx.rotate(-Math.PI / 2);
+        ctx.font = (k === JOHN ? '700 ' : '500 ') + size.toFixed(1) + 'px ' + MONO;
+        ctx.fillStyle = k === JOHN ? C.ink : C.soft;
+        ctx.fillText(W[k - 1], 0, 0);
+        ctx.restore();
+      }
+      ctx.restore();
+      g.text(XS, BOT, 'Σ', { align: 'center', baseline: 'top', dy: 5, size: 13, weight: 700 });
+    });
+
+    ui.onChange(function () {
+      var st = state(), c = st.c, S = st.S, above = 0, k, cmp;
+      for (k = 0; k < T; k++) if (c[k] >= 0.01 * S) above++;
+      roJ.set(pct(c[JOHN - 1] / S));
+      roL.set(pct((c[T - 1] + c[T - 2] + c[T - 3]) / S));
+      roN.set(len(S));
+      roC.set(!clip.value ? 'выключен' : S > TAU ? len(TAU) + ' — короче в ' + times(S / TAU) + ' раза' : len(S) + ' — не тронут');
+      if (Math.abs(st.r - 1) < 1e-9) cmp = 'Все вклады равны: «John» получает столько же, сколько «to».';
+      else if (st.r < 1) cmp = '«John» получает в ' + times(Math.pow(st.r, -(T - JOHN))) + ' раза меньше, чем «to».';
+      else cmp = '«John» получает в ' + times(Math.pow(st.r, T - JOHN)) + ' раза больше, чем «to».';
+      note.set('Над линией «1 % суммы»: ' + above + ' слов из ' + T + '. ' + cmp);
+    });
+  });
+  </script>
+
+  <div class="pitfall">
+    <p>«<span class="en" lang="en">Vanishing gradient</span> — это когда градиент по весу почти ноль и сеть не учится». Нет: градиент может быть вполне большим, его дают ближние шаги, и сеть учится — коротким связям. Исчезают только дальние слагаемые суммы, а вместе с ними способность выучить дальние связи. И это проблема обучения, а не памяти: вперёд информация может доехать (в первом виджете нейрон с \(v = 2\) помнит единицу все 40 шагов), но научиться ею пользоваться сеть не может.</p>
+  </div>
+</section>
+
+<section id="l31-explode">
+  <h2>Вой: <span class="en" lang="en">exploding gradients</span> и <span class="en" lang="en">gradient clipping</span></h2>
+
+  <p>Этого нет на слайдах этого года: в лекции 4 разобрано только затухание. Но в коде взрыв встречается, и в лабораторной про классификацию временных рядов (урок 46) градиент обрезают ровно так, как описано ниже. Поэтому коротко.</p>
+
+  <p>Если множитель за шаг больше единицы — например, у линейного нейрона или ReLU с весом петли больше 1, — дальние слагаемые растут как степень \((v^{(1)})^{t-k}\). Это взрыв градиента (<span class="en" lang="en">exploding gradient</span>) из <a href="l24.html">урока 24</a>, только во времени; во втором виджете при множителе 1.3 сумма оказалась в 25 раз больше, чем при 1.</p>
+
+  <p>При обучении взрыв виден сразу: ошибка ровно падает и вдруг подскакивает (<span class="en" lang="en">loss spike</span>), шаг по весам огромный, числа выходят за предел float32 (около \(3.4 \cdot 10^{38}\)), становятся бесконечностью, а потом NaN (<span class="en" lang="en">not a number</span>) — и обучение умирает.</p>
+
+  <div class="def">
+    <p><dfn><span class="en" lang="en">Gradient clipping</span></dfn> по норме (обрезка градиента): если длина всего градиента \(g\) больше порога \(\tau\), его укорачивают до длины \(\tau\), не меняя направления.</p>
+    \[ g \leftarrow g \cdot \min\Big(1,\ \frac{\tau}{\norm{g}}\Big) \]
+    <p>Здесь \(g\) — градиент по всем параметрам сразу, как один вектор. Обрезают после обратного прохода и до шага оптимизатора.</p>
+  </div>
+
+  <p>Направление говорит, куда двигать веса, а длина — насколько. <span class="en" lang="en">Clipping</span> по значению, который обрезает каждую компоненту отдельно, направление портит.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l31-fig-clip">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Clipping по норме: градиент (6, 8) длины 10 укорачивается до окружности радиуса 5 и становится (3, 4); направление то же">
+        <line x1="44" y1="220" x2="286" y2="220" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="60" y1="236" x2="60" y2="22" class="st-muted" marker-end="url(#arr-muted)"/>
+        <path d="M150 220 A90 90 0 0 0 60 130" class="st-muted dash"/>
+        <line x1="60" y1="220" x2="168" y2="76" class="st-muted sw-2 dash" marker-end="url(#arr-muted)"/>
+        <line x1="60" y1="220" x2="114" y2="148" class="hl"/>
+        <line x1="60" y1="220" x2="114" y2="148" class="sw-3" marker-end="url(#arr)"/>
+        <text x="176" y="80" class="tx-mono">g = (6, 8)</text>
+        <text x="130" y="150" class="tx-mono">(3, 4)</text>
+        <text x="150" y="242" class="tx-mid tx-muted">τ = 5</text>
+        <text x="50" y="135" class="tx-end tx-mono">5</text>
+        <text x="284" y="242" class="tx-end tx-muted">g₁</text>
+        <text x="50" y="34" class="tx-end tx-muted">g₂</text>
+        <text x="172" y="40" class="tx-mid tx-hand">направление то же</text>
+      </svg>
+      <p class="fig-label">По норме: \(g \cdot \tau / \norm{g}\)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="Clipping по значению: каждая компонента градиента (6, 8) обрезается до 5, получается (5, 5) — стрелка повернулась">
+        <line x1="44" y1="220" x2="286" y2="220" class="st-muted" marker-end="url(#arr-muted)"/>
+        <line x1="60" y1="236" x2="60" y2="22" class="st-muted" marker-end="url(#arr-muted)"/>
+        <polyline points="150,220 150,130 60,130" class="st-muted dash"/>
+        <line x1="60" y1="220" x2="168" y2="76" class="st-muted sw-2 dash" marker-end="url(#arr-muted)"/>
+        <line x1="60" y1="220" x2="150" y2="130" class="hl"/>
+        <line x1="60" y1="220" x2="150" y2="130" class="sw-3" marker-end="url(#arr)"/>
+        <text x="176" y="80" class="tx-mono">g = (6, 8)</text>
+        <text x="158" y="150" class="tx-mono">(5, 5)</text>
+        <text x="150" y="242" class="tx-mid tx-muted">τ = 5</text>
+        <text x="50" y="135" class="tx-end tx-mono">5</text>
+        <text x="284" y="242" class="tx-end tx-muted">g₁</text>
+        <text x="50" y="34" class="tx-end tx-muted">g₂</text>
+        <text x="172" y="40" class="tx-mid tx-hand">направление сбито</text>
+      </svg>
+      <p class="fig-label">По значению: каждая компонента в \([-\tau,\ \tau]\)</p>
+    </div>
+    <figcaption><b>Рис. 3.</b> Градиент \(g = (6, 8)\) длины 10 и порог \(\tau = 5\). По норме стрелка укорачивается до окружности радиуса \(\tau\) и становится \((3, 4)\): направление прежнее. По значению каждая компонента обрезается до 5, получается \((5, 5)\): стрелка повернулась с 53° на 45°, и шаг идёт уже в другом направлении.</figcaption>
+  </figure>
+
+  <p>Почему взрыв считают лёгкой болезнью, а затухание — тяжёлой? Взрыв громкий: скачки ошибки и NaN видны сразу, а лечится он одной строкой. Затухание тихое: обучение идёт, ошибка падает, сеть просто не учит дальних связей. И <span class="en" lang="en">clipping</span> тут бессилен, он умеет только укорачивать: слагаемое «John» в тысячные доли процента он больше не сделает. Как лимитер на пульте — вой срезает, но шёпот громче не делает.</p>
+
+  <div class="tip">
+    <p>В PyTorch <span class="en" lang="en">clipping</span> — одна строка между <code>loss.backward()</code> и <code>optimizer.step()</code>: <code>torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)</code>. Порог подбирают как гиперпараметр; Sutskever, Vinyals и Le в 2014 году обучали свои LSTM-переводчики с порогом 5.</p>
+  </div>
+</section>
+
+<section id="l31-fix">
+  <h2>Петля с усилением ровно 1</h2>
+
+  <p>Множитель \(v^{(1)} h'(a)\) состоит из двух частей, и чинить можно каждую.</p>
+
+  <h3>Частичные лекарства: ReLU и единичная инициализация</h3>
+
+  <p>ReLU делает \(h' = 1\) у активного нейрона (<a href="l24.html#l24-relu">урок 24</a>): активация перестаёт гасить градиент. Но множитель остаётся равным \(v^{(1)}\): при \(|v^{(1)}| \lt 1\) затухание, при \(|v^{(1)}| \gt 1\) взрыв, а выключенный нейрон (\(a \le 0\)) обрывает путь совсем. К тому же выход ReLU ничем не ограничен, и при весе петли больше 1 растёт уже само состояние: в первом виджете ReLU с \(v = 1.2\) и \(x = 0\) за 40 шагов уходит к сотням. Это один из минусов ReLU: <span class="en" lang="en">"unbounded value (could potentially blow up)"</span> (<span class="nw"><a class="slide-ref" href="assets/slides/s03_027.webp" data-deck="s03" data-slide="27">лекция 3, слайд 27</a></span>).</p>
+
+  <p>Вторая часть — вес. Если начать обучение с \(v^{(1)} = 1\) (для матрицы — с единичной, \(V = I\)), у активных ReLU-нейронов множитель в начале ровно 1. Так устроена IRNN (Le, Jaitly, Hinton, 2015). Это хороший старт, но не гарантия: обучение сдвигает \(V\) от единичной, и ничто не держит множитель на 1.</p>
+
+  <h3>Решение профессора: линейная петля с весом 1</h3>
+
+  <p>Профессор делает следующий шаг: <span class="en" lang="en">"Build Recurrent Neural Networks using small modules designed to remember values for a long time"</span> (<span class="nw"><a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">лекция 4, слайд 14</a></span>). На слайде обведены две вещи — функция активации \(h(\cdot)\) и вес петли \(v^{(1)}\). Меняются обе: активация становится линейной, вес петли — ровно 1.</p>
+
+  <div class="formula">
+    \[ h^t = h^{t-1} + w^{(1)} x^t \]
+    \[ \pd{h^t}{h^k} = \prod_{i=k+1}^{t} 1 \cdot 1 = 1 \]
+  </div>
+
+  <p>Каждый множитель \(v^{(1)} h' = 1 \cdot 1\), и градиент проходит назад любое число шагов без потерь и без роста (<span class="en" lang="en">"Linear memory update …"</span>). Нужны обе замены. Линейный нейрон с \(v^{(1)} \ne 1\) даёт \(\partial h^t / \partial h^k = (v^{(1)})^{t-k}\), то есть затухание или взрыв. А <span class="en" lang="en">tanh</span> с \(v = 1\) и входом 0.3 в первом виджете снова теряет градиент: наклон <span class="en" lang="en">tanh</span> равен 1 только в нуле.</p>
+
+  <figure class="fig fig--pair fig--plain" id="l31-fig-fix">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="До: нейрон с функцией активации и весом петли v, обе вещи отмечены маркером; градиент назад тает: 1, 0.5, 0.25, 0.13">
+        <line x1="54" y1="64" x2="102" y2="64" marker-end="url(#arr)"/>
+        <line x1="160" y1="64" x2="208" y2="64" marker-end="url(#arr)"/>
+        <path d="M148 86 C168 128 96 128 116 86" class="hl"/>
+        <path d="M148 86 C168 128 96 128 116 86" class="sw-2" marker-end="url(#arr)"/>
+        <circle cx="36" cy="64" r="16" class="fi-paper"/>
+        <circle cx="132" cy="64" r="26" class="hl"/>
+        <circle cx="132" cy="64" r="26" class="fi-paper sw-2"/>
+        <path d="M116 74 C126 74 128 64 132 64 C136 64 138 54 148 54"/>
+        <line x1="40" y1="226" x2="260" y2="226" class="st-muted"/>
+        <rect x="55" y="218" width="30" height="8" class="fw-s3 st-s3"/>
+        <rect x="105" y="210" width="30" height="16" class="fw-s3 st-s3"/>
+        <rect x="155" y="194" width="30" height="32" class="fw-s3 st-s3"/>
+        <rect x="205" y="162" width="30" height="64" class="fw-s3 st-s3"/>
+        <text x="36" y="69" class="tx-mid">x</text>
+        <text x="78" y="52" class="tx-mid">w</text>
+        <text x="222" y="69">y</text>
+        <text x="170" y="126" class="tx-bold">v</text>
+        <text x="70" y="210" class="tx-mid tx-mono">0.13</text>
+        <text x="120" y="202" class="tx-mid tx-mono">0.25</text>
+        <text x="170" y="186" class="tx-mid tx-mono">0.5</text>
+        <text x="220" y="154" class="tx-mid tx-mono">1</text>
+        <text x="150" y="245" class="tx-mid tx-sm tx-muted">← назад во времени</text>
+        <text x="244" y="32" class="tx-mid tx-hand">тает</text>
+      </svg>
+      <p class="fig-label">До: \(h^t = h(v^{(1)} h^{t-1} + w^{(1)} x^t)\)</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 250" role="img" aria-label="После: линейный нейрон с весом петли 1; градиент назад не меняется: 1, 1, 1, 1">
+        <line x1="54" y1="64" x2="102" y2="64" marker-end="url(#arr)"/>
+        <line x1="160" y1="64" x2="208" y2="64" marker-end="url(#arr)"/>
+        <path d="M148 86 C168 128 96 128 116 86" class="sw-2" marker-end="url(#arr)"/>
+        <circle cx="36" cy="64" r="16" class="fi-paper"/>
+        <circle cx="132" cy="64" r="26" class="fi-paper sw-2"/>
+        <line x1="118" y1="76" x2="146" y2="52"/>
+        <line x1="40" y1="226" x2="260" y2="226" class="st-muted"/>
+        <rect x="55" y="162" width="30" height="64" class="fw-s3 st-s3"/>
+        <rect x="105" y="162" width="30" height="64" class="fw-s3 st-s3"/>
+        <rect x="155" y="162" width="30" height="64" class="fw-s3 st-s3"/>
+        <rect x="205" y="162" width="30" height="64" class="fw-s3 st-s3"/>
+        <text x="36" y="69" class="tx-mid">x</text>
+        <text x="78" y="52" class="tx-mid">w</text>
+        <text x="222" y="69">y</text>
+        <text x="166" y="126" class="tx-bold">v = 1</text>
+        <text x="70" y="154" class="tx-mid tx-mono">1</text>
+        <text x="120" y="154" class="tx-mid tx-mono">1</text>
+        <text x="170" y="154" class="tx-mid tx-mono">1</text>
+        <text x="220" y="154" class="tx-mid tx-mono">1</text>
+        <text x="150" y="245" class="tx-mid tx-sm tx-muted">← назад во времени</text>
+        <text x="236" y="32" class="tx-mid tx-hand">без потерь</text>
+      </svg>
+      <p class="fig-label">После: \(h^t = h^{t-1} + w^{(1)} x^t\)</p>
+    </div>
+    <figcaption><b>Рис. 4.</b> Решение со <a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">слайда 14 лекции 4</a>. Маркером отмечены две вещи, которые меняют: функция активации и вес петли. Слева множитель 0.5: на каждом шаге назад градиент тает вдвое. Справа активация линейная, а вес петли ровно 1: множитель 1, и до четвёртого шага назад доходит столько же, сколько до первого.</figcaption>
+  </figure>
+
+  <p>Но у такой петли есть и обратная сторона: <span class="en" lang="en">"It only accumulates the input …"</span>. Нейрон только складывает. При \(w^{(1)} = 1\) и \(h^0 = 0\) на входах 1, 0, 0 его состояние 1, 1, 1 — помнит вечно; на входах 1, 1, 1 — 1, 2, 3, и растёт без предела. Забыть ненужное, выбрать, что записать, и решить, когда показать запомненное, он не может. Отсюда следующий шаг — поставить на вход, на петлю и на выход множители, которые сеть открывает и закрывает сама: ворота записи, хранения и чтения, <span class="en" lang="en">"write"</span>, <span class="en" lang="en">"keep"</span> и <span class="en" lang="en">"read"</span> (<span class="nw"><a class="slide-ref" href="assets/slides/s04_015.webp" data-deck="s04" data-slide="15">лекция 4, слайд 15</a></span>). Это LSTM, ей посвящён <a href="l32.html">урок 32</a>. LSTM смягчает затухание, но от взрыва градиентов не защищает: ворота защищают путь по ячейке памяти, а через выход, ворота и матрицы весов градиент идёт как в обычной RNN, поэтому LSTM тоже обучают с <span class="en" lang="en">gradient clipping</span> (в конспекте на стр. 263 сказано, что она справляется и со взрывом, это преувеличение).</p>
+</section>
+
+<section id="l31-answer">
+  <h2>Развязка: «John», вес 2 и петля с единицей</h2>
+
+  <p><b>«John».</b> При множителе 0.5 до слова, прочитанного за 13 шагов до ответа, доходит \(0.5^{13} = 1/8192 \approx 1.2 \cdot 10^{-4}\) того, что получает последнее слово, — около 0.006&nbsp;% всего градиента. Вторая «Jane», за 3 шага до ответа, получает в 1024 раза больше. Градиент объясняет ошибку последними словами, и связь с «John» сеть не выучит: <span class="en" lang="en">"backpropagation through time was not able to train recurrent neural networks significantly back in time …"</span> — <span class="en" lang="en">"Was due to not being able to backprop through many layers …"</span> (<span class="nw"><a class="slide-ref" href="assets/slides/s04_012.webp" data-deck="s04" data-slide="12">лекция 4, слайд 12</a></span>).</p>
+
+  <p><b>Вес 2.</b> Нейрон, запомнивший единицу, сидит в насыщении: \(h^* = \tanh(2h^*) \approx 0.9575\). Наклон <span class="en" lang="en">tanh</span> там \(1 - 0.9575^2 \approx 0.083\), множитель за шаг \(2 \cdot 0.083 \approx 0.166\), за 10 шагов \(0.166^{10} \approx 1.6 \cdot 10^{-8}\): градиент уменьшается примерно в 60 миллионов раз. Оценка \(2^{10}\) не соврала: она потолок. А чем больше вес петли, тем глубже насыщение, так что увеличивать \(v\) бесполезно.</p>
+
+  <p><b>Петля с единицей.</b> Выйти из этой ловушки можно, только убрав насыщение из петли: линейный нейрон с весом 1 (<span class="nw"><a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">лекция 4, слайд 14</a></span>) проводит градиент без потерь. Ему не хватает одного — умения выбирать, и это добавит LSTM.</p>
+
+  <div class="story" data-year="1994">
+    <p>Статья Bengio, Simard и Frasconi так и называется: <span class="en" lang="en">"Learning long-term dependencies with gradient descent is difficult"</span>. В ней показан тот самый размен: либо сеть надёжно хранит информацию долго (<span class="en" lang="en">latching</span>), либо градиент эффективно доходит назад, но не то и другое сразу. Через три года появилась LSTM — петля с усилением ровно 1 и ворота вокруг неё.</p>
+  </div>
+</section>
+
+<section id="l31-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="open" id="l31-exam-derive">
+    <div class="exam-q" lang="en">
+      <p>Consider the simplified recurrent network seen in class, \(h^t = h(v^{(1)} h^{t-1} + w^{(1)} x^t)\), \(y^t = g(w^{(2)} h^t)\), trained with backpropagation through time on a sequence of length \(S\). (a) Write \(\partial E / \partial w\) as a sum over time and \(\partial E^t / \partial w\) as a sum over the earlier time steps. (b) Express \(\partial h^t / \partial h^k\) and derive an upper bound on its norm. (c) What does the bound imply for sigmoid and tanh units, and what does it not imply?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>(a) The error of the sequence is \(E = \sum_t E^t\). For a weight \(w\) of the recurrent unit (\(w^{(1)}\) or \(v^{(1)}\)), \(E^t\) depends on the copy of \(w\) used at every step \(k \le t\):</p>
+        \[ \pd{E}{w} = \sum_{t=1}^{S} \pd{E^t}{w} \]
+        \[ \pd{E^t}{w} = \sum_{k=1}^{t} \pd{E^t}{y^t}\, \pd{y^t}{h^t}\, \pd{h^t}{h^k}\, \pd{h^k}{w} \]
+        <p>where the last factor is the immediate derivative of \(h^k\) with respect to the copy of \(w\) used at step \(k\).</p>
+        <p>(b) With \(a^i = v^{(1)} h^{i-1} + w^{(1)} x^i\), the chain rule gives \(t - k\) factors:</p>
+        \[ \begin{aligned} \pd{h^t}{h^k} &amp;= \prod_{i=k+1}^{t} \pd{h^i}{h^{i-1}} \\ &amp;= \prod_{i=k+1}^{t} v^{(1)}\, h'(a^i) \end{aligned} \]
+        <p>Each factor is bounded, and so is their product:</p>
+        \[ \lVert v^{(1)} h'(a^i) \rVert \le \lVert v^{(1)} \rVert\, \lVert h'(\cdot) \rVert = \gamma_v\, \gamma_{h'} \]
+        \[ \Big\lVert \pd{h^t}{h^k} \Big\rVert \le (\gamma_v\, \gamma_{h'})^{t-k} \]
+        <p>(c) \(\gamma_{h'} = 1/4\) for the sigmoid and \(1\) for tanh. If \(\gamma_v \gamma_{h'} \lt 1\) (\(|v^{(1)}| \lt 4\) for the sigmoid, \(|v^{(1)}| \lt 1\) for tanh), the terms with a large lag \(t - k\) go to zero exponentially: they are swamped by the short-lag terms, so the network learns only short-term dependencies (vanishing gradient). The bound is only a sufficient condition: \(\gamma_v \gamma_{h'} \gt 1\) does not imply exploding gradients, because saturated units have \(h' \approx 0\).</p>
+      </div>
+      <div class="exam-note">
+        <p>В ответе важны три вещи: сумма по \(k\) (на <a class="slide-ref" href="assets/slides/s04_013.webp" data-deck="s04" data-slide="13">слайде 13 лекции 4</a> её индекс напечатан как \(t\) — пиши \(k\)), ровно \(t - k\) множителей с одним и тем же \(v^{(1)}\) и правильное чтение оценки: она гарантирует затухание при \(\gamma_v \gamma_{h'} \lt 1\) и ничего не обещает выше. Числа \(1/4\) и \(1\) для \(\gamma_{h'}\) нужно знать наизусть.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-answer="31" data-tol="0" id="l31-exam-steps">
+    <div class="exam-q" lang="en">
+      <p>A tanh RNN has a recurrent weight matrix with spectral norm \(\lVert V \rVert = 0.8\). Using the bound \((\gamma_v \gamma_{h'})^{t-k}\), find the smallest lag \(t - k\) for which the bound guarantees that \(\lVert \partial h^t / \partial h^k \rVert\) is below \(10^{-3}\).</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>For tanh \(\gamma_{h'} = 1\), so \(\gamma_v \gamma_{h'} = 0.8\). We need \(0.8^{n} \lt 10^{-3}\):</p>
+        \[ n \gt \frac{\ln 10^{-3}}{\ln 0.8} \approx 30.96 \quad\Rightarrow\quad n = 31 \]
+        <p>Check: \(0.8^{30} \approx 1.24 \cdot 10^{-3}\), \(0.8^{31} \approx 0.99 \cdot 10^{-3}\).</p>
+      </div>
+      <div class="exam-note">
+        <p>Типичная ошибка — забыть, что \(\ln 0.8 \lt 0\), и перевернуть неравенство не туда. Проверь ответ прямой подстановкой: калькулятор это позволяет. Для <span class="en" lang="en">sigmoid</span> с той же нормой хватило бы 5 шагов: \(0.2^{5} = 3.2 \cdot 10^{-4}\).</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" id="l31-exam-mcq">
+    <div class="exam-q" lang="en">
+      <p>Select all correct statements about a vanilla RNN trained with backpropagation through time.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>If \(\gamma_v \gamma_{h'} \lt 1\), the contribution of step \(k\) to the gradient at step \(t\) vanishes exponentially in \(t - k\). <span class="fb">Каждый из \(t - k\) множителей не больше \(\gamma_v \gamma_{h'} \lt 1\): это вывод <a class="slide-ref" href="assets/slides/s04_013.webp" data-deck="s04" data-slide="13">слайда 13 лекции 4</a>.</span></li>
+      <li>If \(\gamma_v \gamma_{h'} \gt 1\), the gradients explode. <span class="fb">Оценка — потолок. У <span class="en" lang="en">tanh</span> с \(v = 2\) в насыщении потолок \(2^{10}\), а на деле \(1.6 \cdot 10^{-8}\).</span></li>
+      <li data-correct>With sigmoid units, vanishing is guaranteed for every \(|v^{(1)}| \lt 4\). <span class="fb">\(\gamma_{h'} = 1/4\), поэтому \(\gamma_v \gamma_{h'} \lt 1\) при \(|v^{(1)}| \lt 4\).</span></li>
+      <li>Gradient clipping solves the vanishing gradient problem. <span class="fb">Clipping только укорачивает длинный градиент. Крошечные дальние слагаемые он не увеличит.</span></li>
+      <li>A vanishing gradient means that the gradient of the recurrent weight is close to zero. <span class="fb">Градиент может быть большим: его дают ближние шаги. Исчезают дальние слагаемые суммы.</span></li>
+      <li data-correct>The linear unit \(h^t = h^{t-1} + w^{(1)} x^t\) passes the gradient back through any number of steps unchanged. <span class="fb">Каждый множитель \(1 \cdot 1\), поэтому \(\partial h^t / \partial h^k = 1\).</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Correct: the first, third and sixth statements. The bound \((\gamma_v \gamma_{h'})^{t-k}\) is an upper bound, so it proves vanishing when \(\gamma_v \gamma_{h'} \lt 1\) and proves nothing when it is above 1. Clipping can only shrink the gradient. With vanishing gradients the total gradient is dominated by the short-lag terms; it is the long-lag terms that vanish. A linear unit with self-weight 1 has all factors equal to 1.</p>
+      </div>
+      <div class="exam-note">
+        <p>Две ловушки: второе утверждение (из растущего потолка рост не следует) и пятое (затухание — это не «градиент ноль», а «дальние слагаемые ноль»). Если пятое кажется верным, вернись к столбикам второго виджета.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l31-exam-clip">
+    <div class="exam-q" lang="en">
+      <p>What are exploding gradients in a recurrent network, how do they show up during training, and why are they considered easier to deal with than vanishing gradients? Describe gradient clipping by norm (give the formula) and say what it does not solve.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>Each long-lag term of the gradient contains the product of \(t - k\) per-step factors \(v^{(1)} h'(a^i)\) (in general the Jacobians \(D^i V\)). When the actual factors are larger than 1 in absolute value, for example in a linear or active ReLU unit with \(|v^{(1)}| \gt 1\), the product grows exponentially with the lag and the gradient explodes. The bound \(\gamma_v \gamma_{h'} \gt 1\) is only a necessary condition for this, not a sufficient one. During training the loss suddenly spikes, the weight updates become huge, and the values finally overflow to inf and NaN.</p>
+        <p>They are easier to deal with because they are visible and can be cut directly. Gradient clipping by norm rescales the whole gradient vector \(g\) when its norm exceeds a threshold \(\tau\):</p>
+        \[ g \leftarrow g \cdot \min\Big(1,\ \frac{\tau}{\lVert g \rVert}\Big) \]
+        <p>The direction is kept and only the step length is capped (clipping each component separately would change the direction). It is applied after backpropagation and before the optimizer step.</p>
+        <p>Clipping does nothing for vanishing gradients: it can only shrink the gradient, and the tiny long-range terms are not recovered. That needs a different architecture with a memory path of gain 1, as in the LSTM.</p>
+      </div>
+      <div class="exam-note">
+        <p>Полный ответ — три части: механизм (настоящие множители больше 1, произведение растёт с лагом), симптомы (скачки ошибки, NaN) и формула <span class="en" lang="en">clipping</span> по норме с оговоркой, что направление сохраняется. Две фразы-ошибки: <span class="en" lang="en">"clipping helps with vanishing gradients"</span> и <span class="en" lang="en">"\(\gamma_v \gamma_{h'} \gt 1\) means exploding gradients"</span>.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" id="l31-exam-linear">
+    <div class="exam-q" lang="en">
+      <p>To fix the simplified recurrent network \(h^t = h(v^{(1)} h^{t-1} + w^{(1)} x^t)\), the lecture replaces it with a linear unit with \(v^{(1)} = 1\). Explain why this removes the vanishing gradient, why both changes (linear activation and \(v^{(1)} = 1\)) are needed, and what problem remains.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>With \(h^t = h^{t-1} + w^{(1)} x^t\) every factor is \(v^{(1)} h' = 1 \cdot 1\), so \(\partial h^t / \partial h^k = 1\) for every lag: the error flows back through any number of steps without vanishing or exploding (linear memory update).</p>
+        <p>Both changes are needed. With \(v^{(1)} = 1\) but a tanh activation the factor of step \(i\) is \(1 - (h^i)^2 \lt 1\) as soon as the state is not zero, and close to 0 in saturation. With a linear activation but \(v^{(1)} \ne 1\) the product is \((v^{(1)})^{t-k}\), which vanishes or explodes.</p>
+        <p>The remaining problem: the unit only accumulates the input. It cannot forget, cannot choose what to store, and its value can grow without bound (with \(w^{(1)} = 1\), a constant input 1 gives 1, 2, 3, …). The LSTM builds its memory cell on this linear loop and adds multiplicative gates that decide when to write, keep and read.</p>
+      </div>
+      <div class="exam-note">
+        <p>Опорные фразы — облака <a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">слайда 14 лекции 4</a>: <span class="en" lang="en">"Linear memory update"</span> и <span class="en" lang="en">"It only accumulates the input"</span>. Ответ без второй половины — почему такого нейрона мало — неполон. Про ворота хватит одной фразы: подробно они в следующем уроке.</p>
+      </div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l31-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Градиент ошибки шага \(t = 20\) по весу петли. Множитель за шаг всё время около 0.6, собственные вклады шагов одинаковы. Чей вклад больше — шага 19 или шага 5 — и во сколько раз?</p>
+    <ul class="options">
+      <li data-correct>Шага 19, примерно в 1300 раз <span class="fb">До шага 5 путь назад длиннее на 14 множителей: \(0.6^{-14} \approx 1.3 \cdot 10^{3}\).</span></li>
+      <li>Шага 5: он раньше и успел повлиять на большее число шагов <span class="fb">На пути к ошибке шага 20 каждый лишний шаг умножает вклад на 0.6, так что ранний вклад меньше.</span></li>
+      <li>Одинаковые: вес на всех шагах один и тот же <span class="fb">Вес один, но пути назад разной длины: у шага 5 он длиннее на 14 множителей.</span></li>
+      <li>Шага 19, в 14 раз <span class="fb">14 — это число лишних множителей. Каждый уменьшает вклад в \(1/0.6\) раза, всего \(0.6^{-14} \approx 1300\).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">RNN с <span class="en" lang="en">tanh</span>, \(|v^{(1)}| = 0.9\). Что можно сказать наверняка про множитель \(|\partial h^t / \partial h^k|\) при \(t - k = 20\)?</p>
+    <ul class="options">
+      <li data-correct>Он не больше \(0.9^{20} \approx 0.12\) <span class="fb">Это и есть потолок \((\gamma_v \gamma_{h'})^{t-k}\) с \(\gamma_{h'} = 1\).</span></li>
+      <li>Он ровно 0.12 <span class="fb">Это потолок. Если нейроны отходят от нуля, \(\tanh' \lt 1\), и множитель меньше.</span></li>
+      <li>Он может взорваться <span class="fb">Каждый множитель не больше 0.9 по модулю: расти произведению не из чего.</span></li>
+      <li>Ничего: оценка верна только для <span class="en" lang="en">sigmoid</span> <span class="fb">Оценка верна для любой активации с ограниченной производной; у <span class="en" lang="en">tanh</span> \(\gamma_{h'} = 1\).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">А если \(|v^{(1)}| = 1.5\) и <span class="en" lang="en">tanh</span>?</p>
+    <ul class="options">
+      <li data-correct>Потолок \(1.5^{t-k}\) растёт и ничего не говорит ни о взрыве, ни о затухании <span class="fb">Потолок выше 1 не запрещает ни рост, ни падение: у нуля множитель \(1.5\), в насыщении — много меньше 1.</span></li>
+      <li>Градиент взрывается <span class="fb">Растущий потолок рост не доказывает: в первом виджете <span class="en" lang="en">tanh</span> с \(v = 2\) затухает.</span></li>
+      <li>Градиент затухает <span class="fb">Может затухнуть, а может и вырасти: пока состояние около нуля, множитель \(1.5 \cdot 1 \gt 1\).</span></li>
+      <li>Градиент постоянен <span class="fb">Постоянство бывает, только когда множитель на каждом шаге ровно 1.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Что верно про <span class="en" lang="en">gradient clipping</span> по норме?</p>
+    <ul class="options">
+      <li data-correct>Направление градиента не меняется <span class="fb">Весь вектор умножается на одно положительное число \(\tau / \norm{g}\).</span></li>
+      <li data-correct>Он срабатывает, только когда норма градиента больше порога <span class="fb">При \(\norm{g} \le \tau\) множитель \(\min(1, \tau / \norm{g}) = 1\).</span></li>
+      <li>Он делает вклад дальних шагов заметнее <span class="fb">Все слагаемые умножаются на одно и то же число, доли не меняются. Это было видно во втором виджете.</span></li>
+      <li>Он обрезает каждую компоненту до отрезка \([-\tau, \tau]\) <span class="fb">Это <span class="en" lang="en">clipping</span> по значению — другой приём, и он меняет направление (рис. 3).</span></li>
+    </ul>
+    <p class="q-fb">Картинка для памяти: лимитер срезает громкость, мелодию не трогает.</p>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Почему мало поставить \(v^{(1)} = 1\), оставив <span class="en" lang="en">tanh</span>?</p>
+    <ul class="options">
+      <li data-correct>Наклон <span class="en" lang="en">tanh</span> равен 1 только в нуле; стоит состоянию отойти от нуля, множитель \(1 \cdot \tanh'\) меньше 1 <span class="fb">В первом виджете: <span class="en" lang="en">tanh</span>, \(v = 1\), вход 0.3 — градиент снова тает.</span></li>
+      <li>Вес 1 слишком мал, нужен больше <span class="fb">Больший вес глубже загоняет нейрон в насыщение: при \(v = 2\) множитель около 0.17.</span></li>
+      <li>Достаточно: так и сделано на слайде <span class="fb">На <a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">слайде 14 лекции 4</a> обведены две вещи, и функция активации тоже заменена — на линейную.</span></li>
+      <li><span class="en" lang="en">tanh</span> не дифференцируема в нуле <span class="fb">Дифференцируема везде; в нуле её наклон как раз наибольший, 1.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Линейный нейрон с весом петли 1. Что верно?</p>
+    <ul class="options">
+      <li data-correct>Градиент проходит назад любое число шагов без изменений <span class="fb">Каждый множитель \(1 \cdot 1\).</span></li>
+      <li data-correct>Однажды записанное значение он хранит сколько угодно <span class="fb">На входах 1, 0, 0, … состояние 1, 1, 1, …</span></li>
+      <li>Он сам забывает ненужное <span class="fb">Забыть он не может: каждый вход только прибавляется. Для этого нужны ворота — <a href="l32.html">урок 32</a>.</span></li>
+      <li>Его состояние всегда ограничено <span class="fb">На постоянном входе 1 оно растёт: 1, 2, 3, … — <span class="en" lang="en">"It only accumulates the input"</span>.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Ошибка на обучении ровно падала, потом подскочила в сотни раз, а ещё через шаг стала NaN. Что это и что сделать первым делом?</p>
+    <ul class="options">
+      <li data-correct>Взрыв градиента; включить <span class="en" lang="en">gradient clipping</span> по норме <span class="fb">Скачок ошибки и NaN — типичные симптомы взрыва; clipping ограничит длину шага.</span></li>
+      <li>Затухание градиента; заменить <span class="en" lang="en">tanh</span> на ReLU <span class="fb">Затухание тихое: ошибка не прыгает и не даёт NaN, сеть просто не учит дальних связей.</span></li>
+      <li>Переобучение; ранняя остановка <span class="fb">Переобучение видно на валидации и развивается постепенно, без NaN.</span></li>
+      <li>Слишком маленький <span class="en" lang="en">learning rate</span> <span class="fb">Маленький шаг делает обучение медленным, а не взрывным.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l31-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>Градиент, прошедший \(t - k\) шагов назад по петле, умножается на \(t - k\) множителей \(v^{(1)} h'(a^i)\) с одним и тем же весом петли; причина затухания — длина этого произведения, а общий вес лишь делает его почти степенью одного числа.</li>
+    <li>Оценка \(\lVert \partial h^t / \partial h^k \rVert \le (\gamma_v \gamma_{h'})^{t-k}\) с \(\gamma_{h'} = 1/4\) у <span class="en" lang="en">sigmoid</span> и \(1\) у <span class="en" lang="en">tanh</span>: при \(\gamma_v \gamma_{h'} \lt 1\) затухание гарантировано, выше 1 оценка не говорит ничего.</li>
+    <li>Градиент по весу — сумма вкладов всех прошлых шагов; дальние вклады тонут в ближних, поэтому <span class="en" lang="en">vanilla RNN</span> учит только короткие зависимости, хотя сам градиент не ноль.</li>
+    <li>Взрыв (множители больше 1) виден по скачкам ошибки и NaN и лечится <span class="en" lang="en">gradient clipping</span> по норме: направление то же, длина не больше \(\tau\). Против затухания clipping бессилен.</li>
+    <li>ReLU и единичная начальная матрица петли помогают частично: множитель становится \(v^{(1)}\), но ничто не держит его на 1.</li>
+    <li>Линейный нейрон с весом петли 1 (<span class="nw"><a class="slide-ref" href="assets/slides/s04_014.webp" data-deck="s04" data-slide="14">лекция 4, слайд 14</a></span>) проводит градиент без потерь, но только копит вход; чтобы выбирать, что записать, хранить и прочитать, нужны ворота — LSTM.</li>
+  </ul>
+
+</section>
+
+<section class="resources" id="l31-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="до урока">
+      <a class="res-title" href="https://www.youtube.com/watch?v=d02VkQ9MP44" target="_blank" rel="noopener">MIT 6.S191: Recurrent Neural Networks, Transformers, and Attention</a>
+      <span class="res-by">Ava Amini, MIT 6.S191</span>
+      <p class="res-why">Нужна часть про BPTT и градиенты (в PDF со слайдами это страницы 41–54): много множителей больше 1 — взрыв и clipping, меньше 1 — затухание и три способа с ним бороться. Дальше идут ворота и attention: это уже другие темы.</p>
+    </li>
+    <li class="res" data-kind="interactive" data-when="во время">
+      <a class="res-title" href="https://distill.pub/2019/memorization-in-rnns/" target="_blank" rel="noopener">Visualizing memorization in RNNs</a>
+      <span class="res-by">Andreas Madsen, Distill</span>
+      <p class="res-why">Наведи курсор на букву и увидишь, насколько каждая из предыдущих повлияла на предсказание: затухание градиента, нарисованное прямо на тексте. Главная мысль: «может помнить» и «пользуется длинным контекстом» — не одно и то же.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://d2l.ai/chapter_recurrent-neural-networks/rnn-scratch.html" target="_blank" rel="noopener">Dive into Deep Learning, §9.5.3: Gradient Clipping</a>
+      <span class="res-by">Zhang, Lipton, Li, Smola</span>
+      <p class="res-why">Та же формула clipping по норме в коде на PyTorch и честная оценка приёма: направление сохраняется, но от затухания он не спасает.</p>
+    </li>
+    <li class="res" data-kind="paper" data-when="после">
+      <a class="res-title" href="https://arxiv.org/abs/1211.5063" target="_blank" rel="noopener">On the difficulty of training Recurrent Neural Networks</a>
+      <span class="res-by">Pascanu, Mikolov, Bengio, ICML 2013</span>
+      <p class="res-why">Статья, где предложен clipping по норме. Та же оценка через норму матрицы петли разобрана аккуратно: когда она гарантирует затухание и почему для взрыва её мало.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Петля с весом 1 проводит градиент сквозь любое число шагов, но сама ничего не решает: копит всё подряд. Как дать ей право выбирать, что записать, что хранить и что прочитать, и не испортить при этом усиление 1?</p>
+</aside>
+
+</main>
+</body>
+</html>
