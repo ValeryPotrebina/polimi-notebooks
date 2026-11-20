@@ -1,5 +1,5 @@
 window.SYLLABUS = {
-  course: { id: 'an2dl', title: 'Тетрадь AN2DL', subtitle: 'Нейросети с нуля: главы 1–6 конспекта и лабы на PyTorch, с рисунками и живыми демонстрациями', sourceLabel: 'Конспект, стр.', sourceGenitive: 'конспекта', examLang: 'en', footer: 'самостоятельный разбор неофициального конспекта курса Artificial Neural Networks and Deep Learning (Politecnico di Milano) и его лабораторных на PyTorch. Где конспект ошибается, урок говорит, как правильно.',
+  course: { id: 'an2dl', title: 'Тетрадь AN2DL', subtitle: 'Нейросети с нуля: главы 1–7 конспекта и лабы на PyTorch, с рисунками и живыми демонстрациями', sourceLabel: 'Конспект, стр.', sourceGenitive: 'конспекта', examLang: 'en', footer: 'самостоятельный разбор неофициального конспекта курса Artificial Neural Networks and Deep Learning (Politecnico di Milano) и его лабораторных на PyTorch. Где конспект ошибается, урок говорит, как правильно.',
     decks: {
       s01: { lecture: 1, label: 'Лекция 1', title: 'Machine Learning vs Deep Learning', file: '01 - DeepLearningIntro.pdf', slides: 36 },
       s02: { lecture: 2, label: 'Лекция 2', title: 'From Perceptrons to Feed Forward Neural Networks', file: '02 - Perceptron2NeuralNetworks.pdf', slides: 55, printed: { from: 52, offset: 1 } },
@@ -7,7 +7,8 @@ window.SYLLABUS = {
       s00: { lecture: 0, label: 'Вводная лекция', title: 'Introduction to the course', file: '00 - AN2DL Intro.pdf', slides: 27, printed: { from: 14, offset: 1 } },
       s04: { lecture: 4, label: 'Лекция 4', title: 'Recurrent Neural Networks', file: '04 - RecurrentNeuralNetworks.pdf', slides: 70,
              printed: [{ from: 5, to: 5, offset: 1 }, { from: 6, to: 14, offset: 3 }, { from: 15, to: 31, offset: 4 }, { from: 33, to: 53, offset: 4 }, { from: 55, offset: 10 }] },
-      s06: { lecture: 6, label: 'Лекция 6', title: 'Image Classification', file: '2026_AN2DL_06_Image_Classification.pdf', slides: 128 }
+      s06: { lecture: 6, label: 'Лекция 6', title: 'Image Classification', file: '2026_AN2DL_06_Image_Classification_updated.pdf', slides: 130 },
+      s07: { lecture: 7, label: 'Лекция 7', title: 'Convolutional Neural Networks', file: '2026_AN2DL_07_CNNs.pdf', slides: 143 }
     } },
   modules: [
     { id: 'm1', title: 'Что такое deep learning', source: 'Конспект, гл. 1 · стр. 8–34 · слайды лекции 1', lessons: [
@@ -72,17 +73,31 @@ window.SYLLABUS = {
       { id: 'l47', file: 'l47.html', title: 'Лаба 5. Прогноз на много шагов вперёд', teaser: 'Качество воздуха: naive baselines, direct и autoregressive forecasting и seq2seq с attention.', minutes: 45, pages: '', ready: false }
     ] },
     { id: 'm8', title: 'Классификация изображений', source: 'Конспект, гл. 6 · стр. 402–469 · слайды лекции 6', lessons: [
-      { id: 'l48', file: 'l48.html', title: 'Картинка — это таблица чисел', teaser: 'Что такое computer vision, изображение как массив R×C×3 и видео как R×C×3×T, сколько это байт — и intensity transformations, от grayscale до min–max normalization.', minutes: 30, pages: '402–409', slides: 'лекция 6, слайды 1–30' },
-      { id: 'l49', file: 'l49.html', title: 'Девять чисел в скользящем окне', teaser: 'Local spatial transformations: окрестность пикселя, displacement vectors и space invariance — и correlation, где фильтр (2L+1)×(2L+1) целиком задаёт операцию.', minutes: 30, pages: '410–418', slides: 'лекция 6, слайды 31–42' },
-      { id: 'l50', file: 'l50.html', title: 'Найти шаблон на картинке', teaser: 'Template matching корреляцией: пик там, где шаблон, белые пятна, которые его обманывают, normalization — и корреляция цветных изображений.', minutes: 30, pages: '419–423', slides: 'лекция 6, слайды 43–51' },
-      { id: 'l51', file: 'l51.html', title: 'Картинка как вектор', teaser: 'Задача image classification, column-wise unfolding, однослойная сеть как linear classifier s = Wx + b, подсчёт параметров и почему линейные слои бесполезно ставить друг на друга.', minutes: 35, pages: '424–436', slides: 'лекция 6, слайды 52–80' },
-      { id: 'l52', file: 'l52.html', title: 'Лошадь с двумя головами', teaser: 'Что выучил linear classifier: гиперплоскости в пространстве картинок и шаблоны классов CIFAR-10 — и почему из них вырастает image augmentation.', minutes: 35, pages: '437–446', slides: 'лекция 6, слайды 81–97' },
-      { id: 'l53', file: 'l53.html', title: 'Почему картинку трудно узнать', teaser: 'Пять трудностей image classification: dimensionality, label ambiguity, transformations, изменчивость внутри класса и perceptual similarity.', minutes: 35, pages: '447–455', slides: 'лекция 6, слайды 98–113' },
-      { id: 'l54', file: 'l54.html', title: 'Похожие пиксели, разные картинки', teaser: 'Nearest neighbour и k-NN, расстояния L1 и L2 — и почему расстояние между пикселями не видит, что изображено; отсюда следующая лекция про CNN.', minutes: 35, pages: '456–469', slides: 'лекция 6, слайды 114–128' }
+      { id: 'l48', file: 'l48.html', title: 'Картинка — это таблица чисел', teaser: 'Что такое computer vision, изображение как массив R×C×3 и видео как R×C×3×T, сколько это байт — и intensity transformations, от grayscale до min–max normalization.', minutes: 30, pages: '402–409', slides: 'лекция 6, слайды 1–32' },
+      { id: 'l49', file: 'l49.html', title: 'Девять чисел в скользящем окне', teaser: 'Local spatial transformations: окрестность пикселя, displacement vectors и space invariance — и correlation, где фильтр (2L+1)×(2L+1) целиком задаёт операцию.', minutes: 30, pages: '410–418', slides: 'лекция 6, слайды 33–44' },
+      { id: 'l50', file: 'l50.html', title: 'Найти шаблон на картинке', teaser: 'Template matching корреляцией: пик там, где шаблон, белые пятна, которые его обманывают, normalization — и корреляция цветных изображений.', minutes: 30, pages: '419–423', slides: 'лекция 6, слайды 45–53' },
+      { id: 'l51', file: 'l51.html', title: 'Картинка как вектор', teaser: 'Задача image classification, column-wise unfolding, однослойная сеть как linear classifier s = Wx + b, подсчёт параметров и почему линейные слои бесполезно ставить друг на друга.', minutes: 30, pages: '424–436', slides: 'лекция 6, слайды 54–82' },
+      { id: 'l52', file: 'l52.html', title: 'Лошадь с двумя головами', teaser: 'Что выучил linear classifier: гиперплоскости в пространстве картинок и шаблоны классов CIFAR-10 — и почему из них вырастает image augmentation.', minutes: 35, pages: '437–446', slides: 'лекция 6, слайды 83–99' },
+      { id: 'l53', file: 'l53.html', title: 'Почему картинку трудно узнать', teaser: 'Пять трудностей image classification: dimensionality, label ambiguity, transformations, изменчивость внутри класса и perceptual similarity.', minutes: 35, pages: '447–455', slides: 'лекция 6, слайды 100–115' },
+      { id: 'l54', file: 'l54.html', title: 'Похожие пиксели, разные картинки', teaser: 'Nearest neighbour и k-NN, расстояния L1 и L2 — и почему расстояние между пикселями не видит, что изображено; отсюда следующая лекция про CNN.', minutes: 35, pages: '456–469', slides: 'лекция 6, слайды 116–130' }
+    ] },
+    { id: 'm9', title: 'Свёрточные сети', source: 'Конспект, гл. 7 · стр. 470–598 · слайды лекции 7', lessons: [
+      { id: 'l55', file: 'l55.html', title: 'Два числа и три if', teaser: 'Hand-crafted features на сортировке посылок: зачем признаки, чем они хороши и почему для «машина или мотоцикл» их не написать руками — отсюда data-driven features.', minutes: 35, pages: '470–490', slides: 'лекция 7, слайды 1–26' },
+      { id: 'l56', file: 'l56.html', title: 'Кто выбирает девять чисел', teaser: 'Галерея фильтров лекции: identity, усреднение 3×3 и 5×5, motion blur — и шаг к CNN: операция та же, а числа фильтра находит gradient descent.', minutes: 35, pages: '491–504', slides: 'лекция 7, слайды 27–41' },
+      { id: 'l57', file: 'l57.html', title: 'Конвейер объёмов', teaser: 'Типичная архитектура CNN: картинка идёт через свёртки, нелинейности и pooling как volume — глубина растёт, размер падает, а в конце вектор уходит в обычную сеть.', minutes: 20, pages: '505–511', slides: 'лекция 7, слайды 42–51' },
+      { id: 'l58', file: 'l58.html', title: 'Фильтр — это коробка', teaser: 'Что считает convolutional layer: фильтр на всю глубину входа даёт одно число, один фильтр — одну карту, а общая формула слоя собирает их в volume.', minutes: 25, pages: '512–518, 525–529', slides: 'лекция 7, слайды 52–62, 64–65, 80' },
+      { id: 'l59', file: 'l59.html', title: '152', teaser: 'CNN arithmetic: сколько параметров у свёрточного слоя, почему размер картинки в формулу не входит и почему один и тот же Conv2D стоит по-разному в разных местах сети.', minutes: 25, pages: '519–524, 530–533', slides: 'лекция 7, слайды 62–63, 66–79' },
+      { id: 'l60', file: 'l60.html', title: 'Края, шаги и одно ложное имя', teaser: 'Convolution, которая на деле correlation, фильтрация RGB против фильтра CNN, padding, stride — и одна формула для размера выхода.', minutes: 25, pages: '534–546', slides: 'лекция 7, слайды 81–87' },
+      { id: 'l61', file: 'l61.html', title: 'Порог, а потом сжатие', teaser: 'Зачем между свёртками нелинейность, ReLU как порог на feature map, Leaky ReLU, tanh и sigmoid — и max pooling, который нарочно выбрасывает 75 % чисел.', minutes: 30, pages: '547–558', slides: 'лекция 7, слайды 44, 88–98' },
+      { id: 'l62', file: 'l62.html', title: 'От объёма к ответу', teaser: 'Flatten, dense layers и вся сеть целиком: размеры слой за слоем, где живут параметры, а где числа, feature extraction network и latent representation.', minutes: 25, pages: '559–568', slides: 'лекция 7, слайды 99–107' },
+      { id: 'l63', file: 'l63.html', title: 'Что видит обученная сеть', teaser: 'Activations по слоям: что CONV, RELU и POOL делают с картинкой, 160 чисел перед классификатором — и ошибка в знаменитой схеме CNN.', minutes: 25, pages: '569–573', slides: 'лекция 7, слайды 108–114' },
+      { id: 'l64', file: 'l64.html', title: 'LeNet-5 по слоям', teaser: 'Первая знаменитая CNN: архитектура, код, размеры и 61 706 параметров слой за слоем — и почему с padding их становится 136 586.', minutes: 20, pages: '574–583', slides: 'лекция 7, слайды 115–126' },
+      { id: 'l65', file: 'l65.html', title: 'Цвет стоит 300 параметров', teaser: 'Почему свёртка выигрывает у MLP на пикселях: local connectivity и общие веса, цветной вход, размер картинки и результаты LeNet-5.', minutes: 25, pages: '584–587', slides: 'лекция 7, слайды 127–131' },
+      { id: 'l66', file: 'l66.html', title: 'Пространство, где похожее рядом', teaser: 'Latent representation: t-SNE признаков AlexNet против t-SNE пикселей, поиск похожих картинок и 1-NN в пространстве признаков.', minutes: 30, pages: '588–598', slides: 'лекция 7, слайды 132–143' }
     ] }
   ],
   extras: [
-    { id: 'exam', file: 'exam.html', title: 'Экзаменационный тренажёр', teaser: '319 вопросов в формате экзамена AN2DL с модельными ответами на английском: фильтры по типу и модулю, случайная десятка.' },
+    { id: 'exam', file: 'exam.html', title: 'Экзаменационный тренажёр', teaser: '383 вопроса в формате экзамена AN2DL с модельными ответами на английском: фильтры по типу и модулю, случайная десятка.' },
     { id: 'glossary', file: 'glossary.html', title: 'Словарь EN → RU', teaser: '258 терминов из уроков 1–27, которые прозвучат на лекции и на экзамене: что они значат и в каком уроке разобраны. С поиском.' }
   ]
 };

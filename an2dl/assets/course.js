@@ -327,6 +327,37 @@
       if (out !== n.nodeValue) n.nodeValue = out;
     });
   }
+  /** Latin names joined by a hyphen to a number or to a single character ("LeNet-5", "CIFAR-10", "k-NN", "t-SNE") never
+      break at the hyphen: each is wrapped in .nw. Raw TeX inside the text stays whole in its own text node. */
+  function glueTokens(scope) {
+    if (!scope) return;
+    var walker = doc.createTreeWalker(scope, NodeFilter.SHOW_TEXT, null), tn, list = [];
+    while ((tn = walker.nextNode())) if (/[A-Za-z0-9]-[A-Za-z0-9]/.test(tn.nodeValue)) list.push(tn);
+    list.forEach(function (n) {
+      var p = n.parentNode;
+      if (!p || (p.closest && p.closest('script, style, code, pre, textarea, svg, select, option, .nw, .no-math, mjx-container'))) return;
+      var parts = n.nodeValue.split(/(\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\])/), frag = null, buf = '';
+      for (var i = 0; i < parts.length; i++) {
+        if (i % 2) { buf += parts[i]; continue; }
+        var s = parts[i], re = /[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+/g, m, last = 0;
+        while ((m = re.exec(s))) {
+          var seg = m[0].split('-'), glue = false;
+          for (var k = 1; k < seg.length; k++) if (seg[k - 1].length === 1 || /^\d+$/.test(seg[k])) glue = true;
+          if (!glue) continue;
+          frag = frag || doc.createDocumentFragment();
+          buf += s.slice(last, m.index);
+          if (buf) frag.appendChild(doc.createTextNode(buf));
+          buf = '';
+          frag.appendChild(el('span', { 'class': 'nw', text: m[0] }));
+          last = m.index + m[0].length;
+        }
+        buf += s.slice(last);
+      }
+      if (!frag) return;
+      if (buf) frag.appendChild(doc.createTextNode(buf));
+      p.replaceChild(frag, n);
+    });
+  }
   /** Punctuation next to an inline formula must not wrap away from it: wrap "(" + formula + ".,;:?!)»" (or NBSP + dash) in .nw */
   function glueMath(scope) {
     if (!scope || !scope.querySelectorAll) return;
@@ -1063,6 +1094,13 @@
     if (m[2] != null) { var d = parseFloat(m[2]); if (!d) return null; v = v / d; }
     return isFinite(v) ? v : null;
   }
+  /** "163,766", "1,607,992.5": commas as thousands separators, as an answer in English is written; anything else -> null */
+  function parseGrouped(s) {
+    s = String(s == null ? '' : s).replace(/\s+/g, '').replace(/[−–—]/g, '-');
+    if (!/^[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(s)) return null;
+    var v = parseFloat(s.replace(/,/g, ''));
+    return isFinite(v) ? v : null;
+  }
 
   /* 12 exam-style questions */
   function initExams() {
@@ -1082,11 +1120,13 @@
           var input = el('input', { type: 'text', inputmode: 'decimal', autocomplete: 'off', id: id + '-input', placeholder: '0.00' });
           var verdict = el('span', { 'class': 'exam-verdict', role: 'status' });
           var check = function () {
-            var val = parseNumber(input.value);
+            /* "163,766" is 163.766 to a reader of Russian and 163766 to a reader of English: either reading may match */
+            var val = parseNumber(input.value), alt = parseGrouped(input.value);
             verdict.className = 'exam-verdict';
             while (verdict.firstChild) verdict.removeChild(verdict.firstChild);
+            if (val == null) val = alt;
             if (val == null) { verdict.textContent = UI.number; return; }
-            var ok = Math.abs(val - ans) <= tol + 1e-12;
+            var ok = Math.abs(val - ans) <= tol + 1e-12 || (alt != null && Math.abs(alt - ans) <= tol + 1e-12);
             verdict.classList.add(ok ? 'is-right' : 'is-wrong');
             verdict.appendChild(icon(ok ? 'check' : 'cross'));
             verdict.appendChild(doc.createTextNode(ok ? UI.right : UI.retry));
@@ -1539,6 +1579,7 @@
       });
     }
     glueDashes(main);
+    glueTokens(main);
   }
 
   /* ------------------------------------------------------------------------
@@ -3311,7 +3352,10 @@
     authorStyles = Array.prototype.slice.call(doc.querySelectorAll('style:not([data-host])'));
     step('sprite', injectSprite);
     step('chrome', buildChrome);
-    step('typography', function () { glueDashes(chrome.main); glueDashes(doc.querySelector('.site-foot')); });
+    step('typography', function () {
+      var foot = doc.querySelector('.site-foot');
+      glueDashes(chrome.main); glueDashes(foot); glueTokens(chrome.main); glueTokens(foot);
+    });
     step('lesson head', initLessonHead);
     step('steps', initSteps);
     step('quiz', initQuizzes);
