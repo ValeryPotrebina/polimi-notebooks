@@ -1,0 +1,895 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Сеть для телефона · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+/* grey pixels from two theme tokens (the technique of l49): value 0 is the dark one, maximum the light one, in both themes */
+.l77-px0 { fill: var(--ink); stroke: none; }
+.l77-px1 { fill: var(--stage); stroke: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .l77-px0 { fill: var(--stage); }
+  :root:not([data-theme="light"]) .l77-px1 { fill: var(--ink); }
+}
+:root[data-theme="dark"] .l77-px0 { fill: var(--stage); }
+:root[data-theme="dark"] .l77-px1 { fill: var(--ink); }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l77">
+
+<header class="lesson-head">
+  <h1>Сеть для телефона</h1>
+  <p class="lede">После этого урока ты посчитаешь параметры и умножения обычной и depthwise separable свёртки, разберёшь блок squeeze-and-excitation по формам и параметрам и прочитаешь график, где у каждой сети три числа: точность, операции и параметры.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>VGG-16 из урока 73 хранит около 138 миллионов параметров и тратит на одну картинку около 31 миллиарда операций. Сервер это переживёт. Телефон, который узнаёт предметы прямо в видоискателе, — нет: сеть должна и поместиться в его память, и успевать за камерой.</p>
+  <p>Теперь таблица со <a class="slide-ref" href="assets/slides/s10_132.webp" data-deck="s10" data-slide="132">слайда 132 лекции 10</a>. ResNet-152 из урока 76: <span class="num">77.8</span>&#160;% top-1 на ImageNet при 60 миллионах параметров. EfficientNet-B1: <span class="num">78.8</span>&#160;% при 7.8 миллиона. Сеть точнее и при этом "7.6x smaller and 5.7x faster than ResNet-152".</p>
+  <p>Нового типа слоя в EfficientNet нет. Её собрали из трёх идей, которые разбирает этот урок: свёртки, разрезанной на два шага, регулятора громкости для каналов и правила, как растить сеть. Как они дают такой выигрыш — в конце урока.</p>
+</div>
+
+<section id="l77-split">
+  <h2>Два дела одного фильтра</h2>
+
+  <p>Возьми один фильтр 3&#160;×&#160;3 на объёме с 32 каналами. В каждой позиции он смотрит на окно 3&#160;×&#160;3 сразу во всех 32 картах и складывает всё в одно число (<a href="l58.html">урок 58</a>). Весов у него \(3 \cdot 3 \cdot 32 = 288\), и он делает два дела сразу: ищет узор в пространстве и решает, с какими весами смешать каналы. "Each filter, mixes all the input channels" (<a class="slide-ref" href="assets/slides/s09_063.webp" data-deck="s09" data-slide="63">слайд 63 лекции 9</a>). Слой из 64 таких фильтров хранит <span class="num">18&#8239;432</span> веса: у каждого фильтра свой узор для каждого канала.</p>
+
+  <p>MobileNet (Howard et al., 2017) придуман против этой цены: "Designed to reduce the number of parameters and of operations, to embed networks in mobile applications" (<a class="slide-ref" href="assets/slides/s09_061.webp" data-deck="s09" data-slide="61">слайд 61 лекции 9</a>). Мешают две вещи: у свёрточных слоёв всё ещё много параметров, и считать их дорого. Решение — развести два дела по двум шагам (<a class="slide-ref" href="assets/slides/s09_063.webp" data-deck="s09" data-slide="63">слайд 63 лекции 9</a>):</p>
+
+  <ol>
+    <li><mark class="key"><span class="en" lang="en">Depthwise convolution</span></mark> (поканальная свёртка): у каждого входного канала свой фильтр \(D_K \times D_K \times 1\). Каналы не смешиваются: "it is like 2D convolution on each channel of input activation F". Из \(M\) карт выходит \(M\) карт.</li>
+    <li><mark class="key"><span class="en" lang="en">Pointwise convolution</span></mark> (точечная свёртка): \(N\) фильтров \(1 \times 1 \times M\) смешивают каналы в каждой клетке, и только: "It does not perform spatial convolution anymore". Это свёртка 1&#160;×&#160;1 из <a href="l74.html">урока 74</a>.</li>
+  </ol>
+
+  <p>Вместе два шага называются <span class="en" lang="en">depthwise separable convolution</span>. Буквы — как на слайдах MobileNet: вход \(F\) размером \(D_F \times D_F \times M\), фильтры \(D_K \times D_K\), их \(N\). В обозначениях <a href="l58.html">урока 58</a> это \(C = M\) каналов, \(N_F = N\) фильтров и \(h_r = h_c = D_K\).</p>
+
+  <aside class="margin-note">Обычная свёртка — N поваров, и каждый сам режет все M продуктов по-своему. Separable: каждый продукт режут один раз, а повара только смешивают готовое в своих пропорциях. Подвох: все блюда собраны из одной и той же нарезки.</aside>
+
+  <figure class="fig fig--plain" id="l77-fig-filters">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="Три вида фильтров. Обычная свёртка: N фильтров 3 на 3 на M, каждый смотрит в окно 3 на 3 во всех каналах. Depthwise: M фильтров 3 на 3 на 1, каждый в одном канале. Pointwise: N фильтров 1 на 1 на M, каждый смешивает каналы одной клетки. Последние два вместе — depthwise separable">
+      <text x="95" y="26" class="tx-mid tx-bold">Conv 3×3</text>
+      <text x="280" y="26" class="tx-mid tx-bold">depthwise 3×3</text>
+      <text x="465" y="26" class="tx-mid tx-bold">pointwise 1×1</text>
+
+      <rect x="30" y="50" width="30" height="30" class="fi-paper"/>
+      <rect x="36" y="56" width="30" height="30" class="fi-paper"/>
+      <rect x="42" y="62" width="30" height="30" class="fi-paper"/>
+      <rect x="48" y="68" width="30" height="30" class="fi-paper"/>
+      <path d="M58 68v30M68 68v30M48 78h30M48 88h30" class="st-muted"/>
+      <rect x="90" y="50" width="30" height="30" class="fi-paper"/>
+      <rect x="96" y="56" width="30" height="30" class="fi-paper"/>
+      <rect x="102" y="62" width="30" height="30" class="fi-paper"/>
+      <rect x="108" y="68" width="30" height="30" class="fi-paper"/>
+      <path d="M118 68v30M128 68v30M108 78h30M108 88h30" class="st-muted"/>
+      <text x="158" y="82" class="tx-lg">…</text>
+
+      <rect x="196" y="60" width="30" height="30" class="fi-paper"/>
+      <path d="M206 60v30M216 60v30M196 70h30M196 80h30" class="st-muted"/>
+      <rect x="238" y="60" width="30" height="30" class="fi-paper"/>
+      <path d="M248 60v30M258 60v30M238 70h30M238 80h30" class="st-muted"/>
+      <text x="282" y="82" class="tx-lg">…</text>
+      <rect x="320" y="60" width="30" height="30" class="fi-paper"/>
+      <path d="M330 60v30M340 60v30M320 70h30M320 80h30" class="st-muted"/>
+
+      <rect x="398" y="58" width="10" height="10" class="fi-paper"/>
+      <rect x="404" y="64" width="10" height="10" class="fi-paper"/>
+      <rect x="410" y="70" width="10" height="10" class="fi-paper"/>
+      <rect x="416" y="76" width="10" height="10" class="fi-paper"/>
+      <rect x="440" y="58" width="10" height="10" class="fi-paper"/>
+      <rect x="446" y="64" width="10" height="10" class="fi-paper"/>
+      <rect x="452" y="70" width="10" height="10" class="fi-paper"/>
+      <rect x="458" y="76" width="10" height="10" class="fi-paper"/>
+      <text x="480" y="82" class="tx-lg">…</text>
+      <rect x="506" y="58" width="10" height="10" class="fi-paper"/>
+      <rect x="512" y="64" width="10" height="10" class="fi-paper"/>
+      <rect x="518" y="70" width="10" height="10" class="fi-paper"/>
+      <rect x="524" y="76" width="10" height="10" class="fi-paper"/>
+
+      <text x="95" y="134" class="tx-mid tx-mono">N × (3×3×M)</text>
+      <text x="280" y="134" class="tx-mid tx-mono">M × (3×3×1)</text>
+      <text x="465" y="134" class="tx-mid tx-mono">N × (1×1×M)</text>
+      <text x="95" y="164" class="tx-mid tx-sm">окно 3×3 во всех</text>
+      <text x="95" y="184" class="tx-mid tx-sm">каналах сразу</text>
+      <text x="280" y="164" class="tx-mid tx-sm">окно 3×3</text>
+      <text x="280" y="184" class="tx-mid tx-sm">в одном канале</text>
+      <text x="465" y="164" class="tx-mid tx-sm">одна клетка,</text>
+      <text x="465" y="184" class="tx-mid tx-sm">смесь каналов</text>
+      <path d="M196 200v8h338v-8" class="st-muted"/>
+      <text x="365" y="238" class="tx-mid tx-hand">вместе: depthwise separable</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Три вида фильтров, по <a class="slide-ref" href="assets/slides/s09_063.webp" data-deck="s09" data-slide="63">слайду 63 лекции 9</a>. Обычный фильтр — коробка во всю глубину входа. Depthwise-фильтр — плоская плитка на один канал. Pointwise-фильтр — столбик в одну клетку во всю глубину.</figcaption>
+  </figure>
+</section>
+
+<section id="l77-bill">
+  <h2>Счёт за один слой</h2>
+
+  <p>Сколько это экономит? Считаем, как на <a class="slide-ref" href="assets/slides/s09_064.webp" data-deck="s09" data-slide="64-65">слайдах 64–65 лекции 9</a>: stride 1 и padding "same" (выход тоже \(D_F \times D_F\)), bias не считаем, одна операция — одно умножение со сложением (<span class="en" lang="en">multiply-add</span>).</p>
+
+  <ol class="steps" id="l77-steps-cost">
+    <li><p>Обычная свёртка. Одно число выхода — скалярное произведение окна \(D_K \times D_K \times M\) на фильтр, это \(D_K^2 M\) умножений-сложений. Чисел на выходе \(D_F^2 N\):</p>
+      \[ \text{ops}_{\text{std}} = M \cdot D_F^2 \cdot D_K^2 \cdot N \]</li>
+    <li><p>Depthwise. Одно число стоит \(D_K^2\): окно одного канала. Чисел на выходе \(D_F^2 M\):</p>
+      \[ \text{ops}_{\text{dw}} = D_K^2 \cdot M \cdot D_F^2 \]</li>
+    <li><p>Pointwise. Одно число стоит \(M\): столбик \(1 \times 1 \times M\). Чисел на выходе \(D_F^2 N\):</p>
+      \[ \text{ops}_{\text{pw}} = M \cdot D_F^2 \cdot N \]</li>
+    <li><p>Делим сумму двух шагов на обычную свёртку. Общий множитель \(M D_F^2\) сокращается:</p>
+      \[ \frac{M D_F^2 (D_K^2 + N)}{M D_F^2 D_K^2 N} = \frac{D_K^2 + N}{D_K^2 N} \]
+      \[ = \frac{1}{N} + \frac{1}{D_K^2} \]</li>
+    <li><p>Параметры. У обычной свёртки \(D_K^2 M N\) весов, у depthwise \(D_K^2 M\), у pointwise \(M N\). Каждый вес работает во всех \(D_F^2\) позициях, поэтому параметры — те же счета без множителя \(D_F^2\), и отношение то же (<a class="slide-ref" href="assets/slides/s09_065.webp" data-deck="s09" data-slide="65">слайд 65</a>):</p>
+      \[ \frac{M (D_K^2 + N)}{D_K^2 M N} = \frac{1}{N} + \frac{1}{D_K^2} \]</li>
+  </ol>
+
+  <p class="memo"><mark class="key">Depthwise separable свёртка стоит \(1/N + 1/D_K^2\) от обычной — и по параметрам, и по операциям.</mark></p>
+
+  <p>Пример: вход <code>32@112x112</code>, выход <code>64@112x112</code>, фильтры 3&#160;×&#160;3 — так выглядит один из первых слоёв MobileNet. Обычная свёртка: <span class="num">18&#8239;432</span> веса и <span class="num">231&#8239;211&#8239;008</span> умножений-сложений. Separable: \(288 + 2\,048 = 2\,336\) весов и <span class="num">29&#8239;302&#8239;784</span> операции. Отношение \(1/64 + 1/9 \approx 0.127\): почти в 8 раз дешевле (на слайдах этого примера нет, числа посчитаны по их формулам).</p>
+
+  <figure class="fig fig--pair fig--plain" id="l77-fig-beads">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 270" role="img" aria-label="Обычная свёртка 32 в 64 каналов: 288 клеток по 64 веса, всего 18 432 веса">
+        <path d="M34 20h11v11h-11zM47 20h11v11h-11zM60 20h11v11h-11zM73 20h11v11h-11zM86 20h11v11h-11zM99 20h11v11h-11zM112 20h11v11h-11zM125 20h11v11h-11zM138 20h11v11h-11zM151 20h11v11h-11zM164 20h11v11h-11zM177 20h11v11h-11zM190 20h11v11h-11zM203 20h11v11h-11zM216 20h11v11h-11zM229 20h11v11h-11zM242 20h11v11h-11zM255 20h11v11h-11zM34 33h11v11h-11zM47 33h11v11h-11zM60 33h11v11h-11zM73 33h11v11h-11zM86 33h11v11h-11zM99 33h11v11h-11zM112 33h11v11h-11zM125 33h11v11h-11zM138 33h11v11h-11zM151 33h11v11h-11zM164 33h11v11h-11zM177 33h11v11h-11zM190 33h11v11h-11zM203 33h11v11h-11zM216 33h11v11h-11zM229 33h11v11h-11zM242 33h11v11h-11zM255 33h11v11h-11zM34 46h11v11h-11zM47 46h11v11h-11zM60 46h11v11h-11zM73 46h11v11h-11zM86 46h11v11h-11zM99 46h11v11h-11zM112 46h11v11h-11zM125 46h11v11h-11zM138 46h11v11h-11zM151 46h11v11h-11zM164 46h11v11h-11zM177 46h11v11h-11zM190 46h11v11h-11zM203 46h11v11h-11zM216 46h11v11h-11zM229 46h11v11h-11zM242 46h11v11h-11zM255 46h11v11h-11zM34 59h11v11h-11zM47 59h11v11h-11zM60 59h11v11h-11zM73 59h11v11h-11zM86 59h11v11h-11zM99 59h11v11h-11zM112 59h11v11h-11zM125 59h11v11h-11zM138 59h11v11h-11zM151 59h11v11h-11zM164 59h11v11h-11zM177 59h11v11h-11zM190 59h11v11h-11zM203 59h11v11h-11zM216 59h11v11h-11zM229 59h11v11h-11zM242 59h11v11h-11zM255 59h11v11h-11zM34 72h11v11h-11zM47 72h11v11h-11zM60 72h11v11h-11zM73 72h11v11h-11zM86 72h11v11h-11zM99 72h11v11h-11zM112 72h11v11h-11zM125 72h11v11h-11zM138 72h11v11h-11zM151 72h11v11h-11zM164 72h11v11h-11zM177 72h11v11h-11zM190 72h11v11h-11zM203 72h11v11h-11zM216 72h11v11h-11zM229 72h11v11h-11zM242 72h11v11h-11zM255 72h11v11h-11zM34 85h11v11h-11zM47 85h11v11h-11zM60 85h11v11h-11zM73 85h11v11h-11zM86 85h11v11h-11zM99 85h11v11h-11zM112 85h11v11h-11zM125 85h11v11h-11zM138 85h11v11h-11zM151 85h11v11h-11zM164 85h11v11h-11zM177 85h11v11h-11zM190 85h11v11h-11zM203 85h11v11h-11zM216 85h11v11h-11zM229 85h11v11h-11zM242 85h11v11h-11zM255 85h11v11h-11zM34 98h11v11h-11zM47 98h11v11h-11zM60 98h11v11h-11zM73 98h11v11h-11zM86 98h11v11h-11zM99 98h11v11h-11zM112 98h11v11h-11zM125 98h11v11h-11zM138 98h11v11h-11zM151 98h11v11h-11zM164 98h11v11h-11zM177 98h11v11h-11zM190 98h11v11h-11zM203 98h11v11h-11zM216 98h11v11h-11zM229 98h11v11h-11zM242 98h11v11h-11zM255 98h11v11h-11zM34 111h11v11h-11zM47 111h11v11h-11zM60 111h11v11h-11zM73 111h11v11h-11zM86 111h11v11h-11zM99 111h11v11h-11zM112 111h11v11h-11zM125 111h11v11h-11zM138 111h11v11h-11zM151 111h11v11h-11zM164 111h11v11h-11zM177 111h11v11h-11zM190 111h11v11h-11zM203 111h11v11h-11zM216 111h11v11h-11zM229 111h11v11h-11zM242 111h11v11h-11zM255 111h11v11h-11zM34 124h11v11h-11zM47 124h11v11h-11zM60 124h11v11h-11zM73 124h11v11h-11zM86 124h11v11h-11zM99 124h11v11h-11zM112 124h11v11h-11zM125 124h11v11h-11zM138 124h11v11h-11zM151 124h11v11h-11zM164 124h11v11h-11zM177 124h11v11h-11zM190 124h11v11h-11zM203 124h11v11h-11zM216 124h11v11h-11zM229 124h11v11h-11zM242 124h11v11h-11zM255 124h11v11h-11zM34 137h11v11h-11zM47 137h11v11h-11zM60 137h11v11h-11zM73 137h11v11h-11zM86 137h11v11h-11zM99 137h11v11h-11zM112 137h11v11h-11zM125 137h11v11h-11zM138 137h11v11h-11zM151 137h11v11h-11zM164 137h11v11h-11zM177 137h11v11h-11zM190 137h11v11h-11zM203 137h11v11h-11zM216 137h11v11h-11zM229 137h11v11h-11zM242 137h11v11h-11zM255 137h11v11h-11zM34 150h11v11h-11zM47 150h11v11h-11zM60 150h11v11h-11zM73 150h11v11h-11zM86 150h11v11h-11zM99 150h11v11h-11zM112 150h11v11h-11zM125 150h11v11h-11zM138 150h11v11h-11zM151 150h11v11h-11zM164 150h11v11h-11zM177 150h11v11h-11zM190 150h11v11h-11zM203 150h11v11h-11zM216 150h11v11h-11zM229 150h11v11h-11zM242 150h11v11h-11zM255 150h11v11h-11zM34 163h11v11h-11zM47 163h11v11h-11zM60 163h11v11h-11zM73 163h11v11h-11zM86 163h11v11h-11zM99 163h11v11h-11zM112 163h11v11h-11zM125 163h11v11h-11zM138 163h11v11h-11zM151 163h11v11h-11zM164 163h11v11h-11zM177 163h11v11h-11zM190 163h11v11h-11zM203 163h11v11h-11zM216 163h11v11h-11zM229 163h11v11h-11zM242 163h11v11h-11zM255 163h11v11h-11zM34 176h11v11h-11zM47 176h11v11h-11zM60 176h11v11h-11zM73 176h11v11h-11zM86 176h11v11h-11zM99 176h11v11h-11zM112 176h11v11h-11zM125 176h11v11h-11zM138 176h11v11h-11zM151 176h11v11h-11zM164 176h11v11h-11zM177 176h11v11h-11zM190 176h11v11h-11zM203 176h11v11h-11zM216 176h11v11h-11zM229 176h11v11h-11zM242 176h11v11h-11zM255 176h11v11h-11zM34 189h11v11h-11zM47 189h11v11h-11zM60 189h11v11h-11zM73 189h11v11h-11zM86 189h11v11h-11zM99 189h11v11h-11zM112 189h11v11h-11zM125 189h11v11h-11zM138 189h11v11h-11zM151 189h11v11h-11zM164 189h11v11h-11zM177 189h11v11h-11zM190 189h11v11h-11zM203 189h11v11h-11zM216 189h11v11h-11zM229 189h11v11h-11zM242 189h11v11h-11zM255 189h11v11h-11zM34 202h11v11h-11zM47 202h11v11h-11zM60 202h11v11h-11zM73 202h11v11h-11zM86 202h11v11h-11zM99 202h11v11h-11zM112 202h11v11h-11zM125 202h11v11h-11zM138 202h11v11h-11zM151 202h11v11h-11zM164 202h11v11h-11zM177 202h11v11h-11zM190 202h11v11h-11zM203 202h11v11h-11zM216 202h11v11h-11zM229 202h11v11h-11zM242 202h11v11h-11zM255 202h11v11h-11zM34 215h11v11h-11zM47 215h11v11h-11zM60 215h11v11h-11zM73 215h11v11h-11zM86 215h11v11h-11zM99 215h11v11h-11zM112 215h11v11h-11zM125 215h11v11h-11zM138 215h11v11h-11zM151 215h11v11h-11zM164 215h11v11h-11zM177 215h11v11h-11zM190 215h11v11h-11zM203 215h11v11h-11zM216 215h11v11h-11zM229 215h11v11h-11zM242 215h11v11h-11zM255 215h11v11h-11z" class="fw-ink st-muted"/>
+        <text x="150" y="254" class="tx-mid tx-mono">18 432</text>
+      </svg>
+      <p class="fig-label">До: обычная свёртка</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 270" role="img" aria-label="Depthwise separable свёртка того же слоя: 4.5 клетки depthwise и 32 клетки pointwise, всего 2 336 весов; пунктиром — площадь обычной свёртки">
+        <rect x="32" y="18" width="236" height="210" class="st-muted dash"/>
+        <path d="M34 20h11v11h-11zM47 20h11v11h-11zM60 20h11v11h-11zM73 20h11v11h-11zM86 20h5.5v11h-5.5z" class="fi-ink"/>
+        <path d="M34 40h11v11h-11zM47 40h11v11h-11zM60 40h11v11h-11zM73 40h11v11h-11zM86 40h11v11h-11zM99 40h11v11h-11zM112 40h11v11h-11zM125 40h11v11h-11zM138 40h11v11h-11zM151 40h11v11h-11zM164 40h11v11h-11zM177 40h11v11h-11zM190 40h11v11h-11zM203 40h11v11h-11zM216 40h11v11h-11zM229 40h11v11h-11zM242 40h11v11h-11zM255 40h11v11h-11zM34 53h11v11h-11zM47 53h11v11h-11zM60 53h11v11h-11zM73 53h11v11h-11zM86 53h11v11h-11zM99 53h11v11h-11zM112 53h11v11h-11zM125 53h11v11h-11zM138 53h11v11h-11zM151 53h11v11h-11zM164 53h11v11h-11zM177 53h11v11h-11zM190 53h11v11h-11zM203 53h11v11h-11z" class="fw-ink st-muted"/>
+        <text x="100" y="29" class="tx-sm">depthwise: 288</text>
+        <text x="40" y="90" class="tx-sm">pointwise: 2 048</text>
+        <text x="150" y="150" class="tx-mid tx-hand">в 8 раз меньше</text>
+        <text x="150" y="254" class="tx-mid tx-mono">2 336</text>
+      </svg>
+      <p class="fig-label">После: depthwise + pointwise</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> Один слой <code>32@112x112</code> → <code>64@112x112</code>, фильтры 3&#160;×&#160;3, в масштабе: одна клетка — 64 веса. Пунктир справа — площадь левой картинки. Залитые клетки — depthwise, пустые — pointwise: основная часть весов уже в свёртке 1&#160;×&#160;1.</figcaption>
+  </figure>
+
+  <p>Слагаемые формулы — доли двух шагов: \(\text{ops}_{\text{dw}} / \text{ops}_{\text{std}} = 1/N\), \(\text{ops}_{\text{pw}} / \text{ops}_{\text{std}} = 1/D_K^2\). Pointwise — та же обычная свёртка, только с окном 1&#160;×&#160;1 вместо \(D_K \times D_K\), поэтому она одна стоит \(1/D_K^2\) обычной.</p>
+
+  <p>Отсюда предел. С ростом \(N\) доля depthwise \(1/N\) исчезает, и отношение стремится к \(1/D_K^2\): для фильтров 3&#160;×&#160;3 экономия не больше чем в 9 раз, как ни расширяй слой ("substantial savings when N and D_K are large", <a class="slide-ref" href="assets/slides/s09_064.webp" data-deck="s09" data-slide="64">слайд 64</a>). На практике выходит 8–9 раз: "About 8–9 times cheaper than a standard convolution" (лабораторная курса).</p>
+
+  <p>И отсюда же — кто платит. Pointwise дороже depthwise в \(N / D_K^2\) раз: в примере \(2\,048\) весов против 288, и <span class="num">88</span>&#160;% операций separable-слоя уходит на свёртку 1&#160;×&#160;1. В самой MobileNet свёртки 1&#160;×&#160;1 забирают около 95&#160;% умножений (по статье; на слайдах этого нет). Если сеть ещё надо ужать, ужимают именно их.</p>
+
+  <div class="widget" id="l77-w-bill">
+    <h3 class="widget-title">Два счёта за один слой</h3>
+    <p class="widget-intro">Полосы — параметры и умножения-сложения обычной свёртки и depthwise separable, разбитой на два шага; в каждой паре длинная полоса во всю ширину. Внизу — во сколько раз separable дешевле при текущих \(D_K\) и разном \(N\); точка — текущий \(N\). Кнопки ставят готовые примеры.</p>
+    <ol class="tasks">
+      <li>Нажми «32 → 64, 112 × 112». Угадай, какой шаг separable-слоя дороже, и проверь по полосам. Потом уменьши \(D_F\) до 7: изменится ли отношение?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Pointwise: 2 048 весов против 288, 88 % операций. Отношение \(1/64 + 1/9 \approx 0.127\) от \(D_F\) не зависит: \(D_F^2\) умножает оба счёта операций одинаково, а параметров не касается вовсе.</p></details>
+      </li>
+      <li>Оставь \(D_K = 3\) и двигай \(N\) до 1024. Предскажи, до какого числа дорастёт «дешевле в» — до 100? до 1000?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Кривая упирается в пунктир \(D_K^2 = 9\): при \(N = 1024\) получается 8.92. Предел ставит pointwise-шаг: он один стоит \(1/D_K^2\) обычной свёртки, и эта доля от \(N\) не зависит. Доля depthwise, \(1/N\), с ростом \(N\) тает.</p></details>
+      </li>
+      <li>Нажми «N = 1». Что покажут полосы?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Separable-полоса длиннее обычной: отношение \(1 + 1/9 \approx 1.11\). При одном фильтре разделять нечего, и pointwise добавляет \(M\) лишних весов.</p></details>
+      </li>
+      <li>Поставь \(D_K = 7\) и большое \(N\). Во сколько раз теперь можно сэкономить и почему?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>До 49 раз (при \(N = 1024\) — 46.8): предел \(D_K^2\) растёт с размером фильтра. Большой фильтр дорог именно тем, что умножает \(D_K^2\) на все \(M N\) пар каналов, а separable платит \(D_K^2\) только \(M\) раз.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l77-w-bill', function (root, ui) {
+    var MS = [1, 3, 8, 16, 32, 64, 128, 256, 512];
+    var NS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+    var FS = [7, 14, 28, 56, 112, 224];
+    function pick(list, v) { return list[Course.clamp(Math.round(v), 0, list.length - 1)]; }
+    function sp(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' '); }
+    function short(n) {
+      if (n < 1e6) return sp(n);
+      if (n < 1e9) return (n / 1e6).toFixed(1) + ' млн';
+      if (n < 1e12) return (n / 1e9).toFixed(2) + ' млрд';
+      return (n / 1e12).toFixed(2) + ' трлн';
+    }
+    var sK = ui.slider({ label: 'сторона фильтра D<sub>K</sub>', min: 1, max: 7, step: 1, value: 3 });
+    var sM = ui.slider({ label: 'каналов на входе M', min: 0, max: MS.length - 1, step: 1, value: 4, format: function (v) { return String(pick(MS, v)); } });
+    var sN = ui.slider({ label: 'фильтров N', min: 0, max: NS.length - 1, step: 1, value: 6, format: function (v) { return String(pick(NS, v)); } });
+    var sF = ui.slider({ label: 'сторона карты D<sub>F</sub>', min: 0, max: FS.length - 1, step: 1, value: 4, format: function (v) { return String(pick(FS, v)); } });
+    ui.button('32 → 64, 112 × 112', function () { sK.set(3, true); sM.set(4, true); sN.set(6, true); sF.set(4, true); }, { kind: 'ghost' });
+    ui.button('N = 1', function () { sN.set(0, true); }, { kind: 'ghost' });
+    ui.button('512 → 512, 14 × 14', function () { sK.set(3, true); sM.set(8, true); sN.set(9, true); sF.set(1, true); }, { kind: 'ghost' });
+
+    function state() {
+      var K = Math.round(sK.value), M = pick(MS, sM.value), N = pick(NS, sN.value), F = pick(FS, sF.value);
+      var s = { K: K, M: M, N: N, F: F };
+      s.pStd = K * K * M * N; s.pDw = K * K * M; s.pPw = M * N;
+      s.oStd = s.pStd * F * F; s.oDw = s.pDw * F * F; s.oPw = s.pPw * F * F;
+      s.ratio = 1 / N + 1 / (K * K);
+      return s;
+    }
+
+    var svg = ui.svg(560, 196, { label: 'Полосы параметров и умножений-сложений: обычная свёртка и depthwise separable, разбитая на depthwise и pointwise' });
+    var layer = Course.svg('g', {}, svg);
+    function S(tag, attrs) { return Course.svg(tag, attrs, layer); }
+    function group(y0, title, std, dw, pw, fmt) {
+      var max = Math.max(std, dw + pw), W = 300, x0 = 112;
+      var Ls = W * std / max, Ld = W * dw / max, Lp = W * pw / max;
+      S('text', { x: 10, y: y0, class: 'tx-bold', text: title });
+      S('text', { x: 10, y: y0 + 27, class: 'tx-sm', text: 'обычная' });
+      S('rect', { x: x0, y: y0 + 12, width: Math.max(Ls, 1), height: 20, class: 'fw-ink st-ink' });
+      S('text', { x: 550, y: y0 + 27, class: 'tx-mono tx-end', text: fmt(std) });
+      S('text', { x: 10, y: y0 + 57, class: 'tx-sm', text: 'separable' });
+      S('rect', { x: x0, y: y0 + 42, width: Math.max(Ld, 1), height: 20, class: 'fi-ink' });
+      S('rect', { x: x0 + Ld, y: y0 + 42, width: Math.max(Lp, 1), height: 20, class: 'fi-muted' });
+      S('text', { x: 550, y: y0 + 57, class: 'tx-mono tx-end', text: fmt(dw + pw) });
+    }
+    function paint() {
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      var s = state();
+      group(20, 'параметры', s.pStd, s.pDw, s.pPw, sp);
+      group(118, 'умножения-сложения', s.oStd, s.oDw, s.oPw, short);
+    }
+
+    var plot = ui.plot({ x: [0, 10], y: [0, 10], xTicks: [0, 2, 4, 6, 8, 10], xLabel: 'log_2 N', yLabel: 'дешевле в, раз', aspect: 2.2,
+      label: 'Во сколько раз depthwise separable свёртка дешевле обычной в зависимости от числа фильтров N при текущем D_K' });
+    plot.draw(function (g) {
+      var s = state(), K2 = s.K * s.K;
+      g.hline(K2, { dash: true, label: K2 > 1 ? 'предел D_K² = ' + K2 : 'D_K² = 1: экономии нет' });
+      if (K2 > 1.5) g.hline(1, { dash: true, color: 'muted', label: 'поровну' });
+      g.line(function (t) { var N = Math.pow(2, t); return 1 / (1 / N + 1 / K2); }, { color: 'ink', width: 2, samples: 200 });
+      var x = Math.log(s.N) / Math.LN2, y = 1 / s.ratio;
+      g.circle(x, y, 9, { px: true, color: 'key', alpha: 0.7, stroke: false });
+      g.points([[x, y]], { color: 'ink', r: 4 });
+    });
+    ui.legend([{ label: 'обычная', color: 'ink', mark: 'area' }, { label: 'depthwise', color: 'ink', mark: 'square' },
+      { label: 'pointwise', color: 'muted', mark: 'square' }, { label: 'текущий N', color: 'ink', mark: 'hl' }]);
+
+    var roP = ui.readout('параметры: обычная / separable'), roO = ui.readout('умножения-сложения');
+    var roR = ui.readout('1/N + 1/D<sub>K</sub><sup>2</sup>'), roS = ui.readout('дешевле в, раз');
+    var note = ui.note('');
+    ui.onChange(function () {
+      var s = state();
+      paint();
+      plot.setView({ x: [0, 10], y: [0, Math.max(1.6, s.K * s.K * 1.15)] });
+      roP.set(sp(s.pStd) + ' / ' + sp(s.pDw + s.pPw));
+      roO.set(sp(s.oStd) + ' / ' + sp(s.oDw + s.oPw));
+      roR.set(s.ratio.toFixed(4), s.ratio > 1 ? 'bad' : null);
+      roS.set(1 / s.ratio, s.ratio > 1 ? 'bad' : null);
+      var share = Math.round(100 * s.oPw / (s.oDw + s.oPw));
+      if (s.ratio > 1) note.set('Separable дороже обычной: при ' + (s.N === 1 ? 'N = 1' : 'D_K = 1') + ' разделять нечего, а второй шаг добавляет свои веса.');
+      else note.set('Pointwise забирает ' + share + ' % операций separable-слоя, depthwise — ' + (100 - share) + ' %.');
+    });
+  });
+  </script>
+
+  <h3>Чем платим</h3>
+
+  <p>Экономия не бесплатна. Распишем выход фильтра \(n\) separable-слоя. Depthwise сворачивает канал \(m\) своим ядром \(d_m\), pointwise складывает результаты с весами \(p_{n,m}\):</p>
+
+  <div class="formula">
+    \[ \sum_{m=1}^{M} p_{n,m}\, (d_m \star F_m) \]
+    \[ = \sum_{m=1}^{M} (p_{n,m}\, d_m) \star F_m \]
+    <dl class="legend">
+      <dt>\(F_m\)</dt><dd>канал \(m\) входа</dd>
+      <dt>\(d_m\)</dt><dd>ядро \(D_K \times D_K\) канала \(m\), одно на весь слой</dd>
+      <dt>\(p_{n,m}\)</dt><dd>вес канала \(m\) в pointwise-фильтре \(n\)</dd>
+    </dl>
+  </div>
+
+  <p>Справа — обычная свёртка, у которой срез \(m\) фильтра \(n\) равен \(p_{n,m} d_m\). Значит, все \(N\) фильтров собраны из одних и тех же \(M\) пространственных ядер и отличаются только числами \(p_{n,m}\). Обычный слой выбирает \(D_K^2 M N\) весов свободно, separable — только \(M (D_K^2 + N)\). Это урезанная обычная свёртка: дешевле, потому что умеет меньше (этого вывода на слайдах нет).</p>
+
+  <p>При \(N = 1\) урезать нечего: любой фильтр \(D_K \times D_K \times M\) получается при \(d_m = w(\cdot,\cdot,m)\) и \(p_m = 1\), а лишний множитель \(p_m\) всегда можно внести в ядро. Обе свёртки умеют ровно одно и то же, но separable при этом дороже: отношение \(1 + 1/D_K^2\), у фильтра <span class="nw">3 × 3 × 3</span> это 30 весов против 27. Так и надо читать фразу "when N = 1 they coincide as it is possible to rescale the coefficients of each filter" (<a class="slide-ref" href="assets/slides/s09_064.webp" data-deck="s09" data-slide="64-65">слайды 64–65 лекции 9</a>): совпадает то, что слои умеют, а не их стоимость. Экзамен может взять фразу слайда дословно, так что знай и её, и это уточнение.</p>
+
+  <p>Сколько стоит урезание в точности, измерили авторы MobileNet: та же сеть с обычными свёртками даёт 71.7&#160;% top-1 на ImageNet при 29.3 млн параметров, с separable — 70.6&#160;% при 4.2 млн, и умножений в 8.5 раза меньше (таблица 4 статьи; на слайдах этого нет). Один процентный пункт за семикратно меньшую сеть.</p>
+
+  <h3>В PyTorch</h3>
+
+  <p>Так separable-блок записан в лабораторной курса:</p>
+
+  <pre><code>def separable(in_channels, filters):
+    """Depthwise 3×3 convolution (one filter per channel), then pointwise 1×1, each with BN and ReLU."""
+    return nn.Sequential(
+        nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
+        nn.BatchNorm2d(in_channels), nn.ReLU(),
+        nn.Conv2d(in_channels, filters, 1, bias=False), nn.BatchNorm2d(filters), nn.ReLU())</code></pre>
+
+  <p>Всё решает <code>groups=in_channels</code>: каналы делятся на \(M\) групп по одному, и каждый выходной канал видит только свой входной. Вес такого слоя имеет форму <code>(M, 1, 3, 3)</code>, а не <code>(M, M, 3, 3)</code>. Bias не нужен: следом идёт BatchNorm со своим сдвигом \(\beta\) (<a href="l72.html">урок 72</a>). У <code>separable(32, 64)</code> обучаемых параметров <span class="num">2&#8239;528</span>: 288 весов depthwise, 2&#160;048 весов pointwise и по \(2C\) на каждую BatchNorm, \(64 + 128\).</p>
+
+  <p>Весь счёт выше — для stride 1. MobileNet уменьшает карты depthwise-свёрткой со stride 2: сторона выхода вдвое меньше, все счета операций делятся на 4, а отношение остаётся тем же.</p>
+</section>
+
+<section id="l77-se">
+  <h2>Регулятор громкости для каналов</h2>
+
+  <p>Посмотри на карты признаков на выходе слоя. Каждая — ответ одного детектора: шерсть, глаз, колесо, прямой край. На фото кота карта колёс почти пуста и только шумит, на фото машины бесполезна шерсть. Свёртка этого не знает: её веса одни на все картинки, и каждый канал идёт дальше с той силой, с какой получился.</p>
+
+  <p>Блок <mark class="key"><span class="en" lang="en">squeeze-and-excitation</span></mark> (SE; Hu, Shen, Sun, 2018) ставит после слоя пульт звукорежиссёра. Каналы — дорожки песни. Звукорежиссёр слушает всю песню, записывает среднюю громкость каждой дорожки и по этим числам выставляет каждой дорожке ползунок от 0 до 1. Мелодия дорожки не меняется, меняется её громкость, а для другой песни ползунки встанут иначе. На <a class="slide-ref" href="assets/slides/s09_067.webp" data-deck="s09" data-slide="67">слайде 67 лекции 9</a>: "The Squeeze-and-Excitation (SE) block adaptively recalibrates channel-wise feature responses by explicitly modelling interdependencies between channels".</p>
+
+  <figure class="fig fig--plain" id="l77-fig-se">
+    <svg class="dia" viewBox="0 0 560 440" role="img" aria-label="SE-блок. Объём U из C карт сжимается GAP в вектор F из C чисел, dense-слой W1 с ReLU сжимает его до C′ чисел, dense-слой W2 с сигмоидой разжимает обратно до C множителей F′ от 0 до 1. Каждая карта U умножается на свой множитель, и получается объём X̃ того же размера, у которого карты стали ярче или тусклее">
+      <rect x="160" y="34" width="60" height="60" class="fi-paper"/>
+      <rect x="167" y="41" width="60" height="60" class="fi-paper"/>
+      <rect x="174" y="48" width="60" height="60" class="fi-paper"/>
+      <rect x="181" y="55" width="60" height="60" class="fi-paper"/>
+      <text x="146" y="74" class="tx-end tx-lg">U</text>
+      <text x="146" y="98" class="tx-end tx-mono">C@HxW</text>
+      <path d="M248 70H420V281" marker-end="url(#arr)"/>
+      <text x="334" y="56" class="tx-mid tx-hand">весь объём</text>
+
+      <line x1="200" y1="122" x2="200" y2="154" marker-end="url(#arr)"/>
+      <text x="214" y="143">GAP: squeeze</text>
+      <rect x="155" y="160" width="90" height="18" class="fi-paper"/>
+      <path d="M173 160v18M191 160v18M209 160v18M227 160v18" class="st-muted"/>
+      <text x="143" y="175" class="tx-end">F</text>
+      <text x="256" y="175" class="tx-mono">1x1xC</text>
+
+      <line x1="200" y1="186" x2="200" y2="218" marker-end="url(#arr)"/>
+      <text x="214" y="207">FC W₁ + ReLU</text>
+      <rect x="182" y="224" width="36" height="18" class="fi-paper"/>
+      <path d="M200 224v18" class="st-muted"/>
+      <text x="170" y="239" class="tx-end tx-mono">C′ = C/r</text>
+      <text x="230" y="239" class="tx-mono">1x1xC′</text>
+
+      <line x1="200" y1="250" x2="200" y2="282" marker-end="url(#arr)"/>
+      <text x="214" y="271">FC W₂ + sigmoid</text>
+      <rect x="155" y="288" width="90" height="18" class="fi-paper"/>
+      <rect x="155" y="288" width="18" height="18" class="fi-ink" fill-opacity="0.85"/>
+      <rect x="173" y="288" width="18" height="18" class="fi-ink" fill-opacity="0.15"/>
+      <rect x="191" y="288" width="18" height="18" class="fi-ink" fill-opacity="0.6"/>
+      <rect x="209" y="288" width="18" height="18" class="fi-ink" fill-opacity="0.3"/>
+      <rect x="227" y="288" width="18" height="18" class="fi-ink" fill-opacity="0.75"/>
+      <rect x="155" y="288" width="90" height="18" class="fi-none"/>
+      <text x="143" y="303" class="tx-end">F′</text>
+      <line x1="252" y1="297" x2="403" y2="297" marker-end="url(#arr)"/>
+      <text x="318" y="324" class="tx-mid tx-sm">C множителей в (0, 1)</text>
+
+      <circle cx="420" cy="297" r="14" class="fi-paper"/>
+      <text x="420" y="303" class="tx-mid tx-lg">×</text>
+      <line x1="420" y1="313" x2="420" y2="336" marker-end="url(#arr)"/>
+      <rect x="392" y="344" width="56" height="56" class="fi-paper"/>
+      <rect x="392" y="344" width="56" height="56" class="fi-ink" fill-opacity="0.6"/>
+      <rect x="399" y="351" width="56" height="56" class="fi-paper"/>
+      <rect x="399" y="351" width="56" height="56" class="fi-ink" fill-opacity="0.1"/>
+      <rect x="406" y="358" width="56" height="56" class="fi-paper"/>
+      <rect x="406" y="358" width="56" height="56" class="fi-ink" fill-opacity="0.42"/>
+      <rect x="413" y="365" width="56" height="56" class="fi-paper"/>
+      <rect x="413" y="365" width="56" height="56" class="fi-ink" fill-opacity="0.2"/>
+      <rect x="420" y="372" width="56" height="56" class="fi-paper"/>
+      <rect x="420" y="372" width="56" height="56" class="fi-ink" fill-opacity="0.52"/>
+      <text x="490" y="388" class="tx-lg">X̃</text>
+      <text x="490" y="412" class="tx-mono">C@HxW</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> SE-блок по <a class="slide-ref" href="assets/slides/s09_067.webp" data-deck="s09" data-slide="67">слайду 67 лекции 9</a>. Слева вниз — ветка, которая из всего объёма \(U\) делает \(C\) множителей. Справа каждая карта \(U\) умножается на свой множитель: у \(\tilde X\) те же размеры, но карты теперь разной силы (тон карты — её множитель).</figcaption>
+  </figure>
+
+  <p>По формулам — три шага (<a class="slide-ref" href="assets/slides/s09_068.webp" data-deck="s09" data-slide="68">слайд 68 лекции 9</a>):</p>
+
+  <div class="formula">
+    \[ \vb{F}_k = \frac{1}{H \cdot W} \sum_{(x,y)} U_k(x, y) \]
+    \[ \vb{h} = \mathrm{ReLU}(W_1 \vb{F} + \vb{b}_1) \]
+    \[ \vb{F}' = \mathrm{Sigmoid}\big(W_2\, \vb{h} + \vb{b}_2\big) \]
+    \[ \tilde{X}_k = \vb{F}'_k\, U_k \]
+    <dl class="legend">
+      <dt>\(U_k\)</dt><dd>карта \(k\) на выходе свёртки, \(H \times W\); \(k = 1, \dots, C\)</dd>
+      <dt>\(\vb{F}\)</dt><dd><span class="en" lang="en">squeeze</span>: среднее каждой карты, вектор из \(C\) чисел — это GAP из <a href="l74.html">урока 74</a></dd>
+      <dt>\(W_1, W_2\)</dt><dd><span class="en" lang="en">excitation</span>: два dense-слоя, \(W_1 \in \R^{C' \times C}\) сжимает \(C\) чисел до \(C' \lt C\), \(W_2 \in \R^{C \times C'}\) разжимает обратно</dd>
+      <dt>\(\vb{h}\)</dt><dd>скрытый слой из \(C'\) чисел; на слайде он подставлен внутрь одной формулы</dd>
+      <dt>\(\vb{F}'_k\)</dt><dd>множитель канала \(k\), число от 0 до 1</dd>
+      <dt>\(\tilde{X}_k\)</dt><dd><span class="en" lang="en">rescaling</span>: карта \(k\) после блока</dd>
+    </dl>
+  </div>
+
+  <p>Ширину узкого места в статье пишут как \(C' = C/r\), обычно \(r = 16\); на рисунке <a class="slide-ref" href="assets/slides/s09_067.webp" data-deck="s09" data-slide="67">слайда 67</a> буквой \(C'\) обозначено другое — число каналов входа \(X\) свёрточного слоя.</p>
+
+  <p>Зачем squeeze? Каждое число \(U_k(x, y)\) видит только своё receptive field (урок 68), а среднее \(\vb{F}_k\) зависит от всех позиций. Множитель канала решается по всей картинке сразу — это и значит "extract global information by a GAP, thus expanding the receptive field" (<a class="slide-ref" href="assets/slides/s09_068.webp" data-deck="s09" data-slide="68">слайд 68 лекции 9</a>). Сама свёртка своё поле зрения не расширяет, глобальной становится только ветка, которая считает множители.</p>
+
+  <div class="widget" id="l77-w-se">
+    <h3 class="widget-title">Ползунки каналов</h3>
+    <p class="widget-intro">Игрушечный SE-блок с \(C = 4\) и \(C' = 2\), веса подобраны вручную. Верхний ряд — карты \(U_k\) <span class="nw">6 × 6</span> для выбранной картинки. Под ними squeeze \(\vb{F}_k\) (среднее карты) и множитель \(\vb{F}'_k\) с полоской от 0 до 1. Нижний ряд — карты после блока, \(\tilde X_k = \vb{F}'_k U_k\).</p>
+    <ol class="tasks">
+      <li>На входе кот. Прежде чем смотреть на полоски \(\vb{F}'\): какие два канала блок усилит, какие приглушит?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Шерсть и глаза получают 0.94 и 0.97, колёса и края — по 0.06: их карты внизу почти гаснут. Узор каждой карты остался прежним, изменилась только яркость.</p></details>
+      </li>
+      <li>Переключи на машину. Что изменилось в блоке, а что осталось как было?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Параметры блока — те же 22 числа: \(W_1, W_2\) и смещения. Изменились средние \(\vb{F}\), а за ними множители: колёса 0.90, края 0.85, шерсть и глаза 0.15. Множитель — не выученная константа, его заново считают для каждой картинки.</p></details>
+      </li>
+      <li>Выбери машину с круглыми фарами. Канал «глаза» откликается на фары так же сильно, как на глаза кота: \(\vb{F}_2 = 0.067\) в обоих случаях. Угадай его множитель.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>0.19 вместо 0.97. Отклик канала тот же, но шерсти нет, а колёса и края есть, и блок решает, что «глаза» здесь — ложная тревога. Множитель канала зависит от других каналов: это и есть "interdependencies between channels".</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l77-w-se', function (root, ui) {
+    function Z() { var m = []; for (var i = 0; i < 6; i++) m.push([0, 0, 0, 0, 0, 0]); return m; }
+    function put(m, cells) { cells.forEach(function (c) { m[c[0]][c[1]] = c[2]; }); return m; }
+    var furCat = [[0.2, 0.5, 0.6, 0.6, 0.5, 0.2], [0.5, 0.8, 0.9, 0.9, 0.8, 0.5], [0.6, 0.9, 0.7, 0.7, 0.9, 0.6],
+                  [0.6, 0.9, 0.8, 0.8, 0.9, 0.6], [0.5, 0.8, 0.9, 0.9, 0.8, 0.5], [0.2, 0.4, 0.5, 0.5, 0.4, 0.2]];
+    var eyesCat = put(Z(), [[2, 1, 1], [2, 4, 1], [2, 2, 0.2], [2, 3, 0.2]]);
+    var wheelCat = put(Z(), [[5, 0, 0.1]]);
+    var edgeCat = put(Z(), [[5, 1, 0.2], [5, 2, 0.2], [5, 3, 0.2], [5, 4, 0.2]]);
+    var furCar = put(Z(), [[0, 0, 0.1], [3, 3, 0.1]]);
+    var wheelCar = put(Z(), [[4, 1, 1], [4, 4, 1], [5, 1, 0.8], [5, 4, 0.8], [4, 0, 0.3], [4, 2, 0.3], [4, 3, 0.3], [4, 5, 0.3]]);
+    var edgeCar = [[0, 0.2, 0.2, 0.2, 0.2, 0], [0.8, 0.8, 0.8, 0.8, 0.8, 0.8], [0, 0, 0, 0, 0, 0],
+                   [0.9, 0.9, 0.9, 0.9, 0.9, 0.9], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]];
+    var eyesLamp = put(Z(), [[3, 0, 1], [3, 5, 1], [3, 1, 0.2], [3, 4, 0.2]]);
+    var IMGS = { cat: [furCat, eyesCat, wheelCat, edgeCat], car: [furCar, Z(), wheelCar, edgeCar], lamp: [furCar, eyesLamp, wheelCar, edgeCar] };
+    var NAMES = ['шерсть', 'глаза', 'колёса', 'края'];
+    var W1 = [[2, 2, -2, -2], [-2, -2, 2, 2]], b1 = [0, 0];
+    var W2 = [[2, -2], [2.5, -2], [-2, 2.5], [-2, 2]], b2 = [0, 0, 0, 0];
+
+    var sel = ui.select('картинка на входе', [{ value: 'cat', label: 'кот' }, { value: 'car', label: 'машина' },
+      { value: 'lamp', label: 'машина с круглыми фарами' }], null, 'cat');
+
+    function mean(m) { var s = 0; m.forEach(function (r) { r.forEach(function (v) { s += v; }); }); return s / 36; }
+    function compute() {
+      var U = IMGS[sel.value] || IMGS.cat, F = U.map(mean);
+      var h = W1.map(function (row, j) { return Math.max(0, row.reduce(function (s, w, i) { return s + w * F[i]; }, b1[j])); });
+      var g = W2.map(function (row, j) { return Course.sigmoid(row.reduce(function (s, w, i) { return s + w * h[i]; }, b2[j])); });
+      return { U: U, F: F, h: h, g: g };
+    }
+
+    var svg = ui.svg(560, 316, { label: 'Четыре карты признаков до и после SE-блока, их средние и множители' });
+    var layer = Course.svg('g', {}, svg);
+    function S(tag, attrs) { return Course.svg(tag, attrs, layer); }
+    function map(m, x0, y0, gain) {
+      for (var r = 0; r < 6; r++) for (var c = 0; c < 6; c++) {
+        var v = m[r][c] * gain;
+        S('rect', { x: x0 + 14 * c, y: y0 + 14 * r, width: 14, height: 14, class: 'l77-px0' });
+        if (v > 0.005) S('rect', { x: x0 + 14 * c, y: y0 + 14 * r, width: 14, height: 14, class: 'l77-px1', 'fill-opacity': v.toFixed(3) });
+      }
+      S('rect', { x: x0, y: y0, width: 84, height: 84, class: 'fi-none st-ink' });
+    }
+    function paint(s) {
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      for (var k = 0; k < 4; k++) {
+        var x0 = 26 + 136 * k, cx = x0 + 42;
+        S('text', { x: cx, y: 24, class: 'tx-mid', text: NAMES[k] });
+        map(s.U[k], x0, 36, 1);
+        S('text', { x: cx, y: 144, class: 'tx-mid tx-mono', text: 'F = ' + s.F[k].toFixed(3) });
+        S('rect', { x: x0, y: 152, width: 84, height: 10, class: 'fi-none st-muted' });
+        S('rect', { x: x0, y: 152, width: Math.max(84 * s.F[k], 0.5), height: 10, class: 'fi-muted' });
+        S('text', { x: cx, y: 186, class: 'tx-mid tx-mono', text: 'F′ = ' + s.g[k].toFixed(2) });
+        S('rect', { x: x0, y: 194, width: 84, height: 10, class: 'fi-none st-muted' });
+        S('rect', { x: x0, y: 194, width: Math.max(84 * s.g[k], 0.5), height: 10, class: 'fi-ink' });
+        map(s.U[k], x0, 222, s.g[k]);
+      }
+    }
+    var roH = ui.readout('скрытый слой, C′ = 2'), roP = ui.readout('параметров блока');
+    ui.onChange(function () {
+      var s = compute();
+      paint(s);
+      roH.set('h = (' + s.h[0].toFixed(2) + ', ' + s.h[1].toFixed(2) + ')');
+      roP.set('W₁ 8 + b₁ 2 + W₂ 8 + b₂ 4 = 22');
+    });
+  });
+  </script>
+
+  <p>Это <span class="en" lang="en">feature recalibration</span> (<a class="slide-ref" href="assets/slides/s09_069.webp" data-deck="s09" data-slide="69">слайд 69 лекции 9</a>): блок может "emphasize channels providing relevant activations" и "suppress channels providing uninformative activations". Множитель один на весь канал, \(\tilde X_k(x, y) = \vb{F}'_k\, U_k(x, y)\) во всех позициях: узор карты не меняется, меняется её сила.</p>
+
+  <p>Стоит блок копейки. Параметров \(2 C C' + C' + C\), без смещений около \(2C^2/r\). При \(C = 256\) и \(C' = 16\) это <span class="num">8&#8239;464</span>, а у одной свёртки 3&#160;×&#160;3 с 256 каналов на 256 — <span class="num">589&#8239;824</span> веса: плюс 1.4&#160;%. Операций ещё меньше: MLP работает с \(C\) числами, а не с картами \(H \times W\). Поэтому "SE blocks are computationally lightweight" и годятся как "a drop-in replacement for the original block at any depth in the architecture" (<a class="slide-ref" href="assets/slides/s09_069.webp" data-deck="s09" data-slide="69">слайд 69 лекции 9</a>). С ними SENet выиграла ILSVRC 2017: ошибка top-5 2.251&#160;% против 2.991&#160;% у победителя прошлого года, примерно на 25&#160;% меньше (там же).</p>
+
+  <p>Почему в конце сигмоида, а не softmax (на слайдах этого нет): ползунки независимы, и важными могут быть сразу несколько каналов. Softmax заставил бы каналы делить единицу между собой.</p>
+
+  <p>В PyTorch dense-слой над вектором \(1 \times 1 \times C\) удобно писать свёрткой 1&#160;×&#160;1 — так делает и лабораторная курса, где SE сидит внутри блока EfficientNet (там \(C' = C/4\) и SiLU вместо ReLU):</p>
+
+  <pre><code>class SE(nn.Module):
+    def __init__(self, C, r=16):
+        super().__init__()
+        self.excitation = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),             # (B, C, 1, 1)
+            nn.Conv2d(C, C // r, 1), nn.ReLU(),  # W1, b1
+            nn.Conv2d(C // r, C, 1), nn.Sigmoid())  # W2, b2
+    def forward(self, u):
+        return u * self.excitation(u)  # gains broadcast over H, W</code></pre>
+
+  <p>Умножение растягивает множители \((B, C, 1, 1)\) на все \(H \times W\) позиций — это и есть \(\tilde X_k = \vb{F}'_k U_k\). Готовый блок есть в torchvision: <code>torchvision.ops.SqueezeExcitation(input_channels, squeeze_channels)</code>.</p>
+</section>
+
+<section id="l77-scale">
+  <h2>Растить сеть по правилу</h2>
+
+  <p>Сеть проектируют под бюджет, а когда бюджет растёт, её увеличивают. Ручки три: <span class="en" lang="en">depth</span> — больше слоёв, как от ResNet-18 к ResNet-152; <span class="en" lang="en">width</span> — больше каналов в каждом слое; <span class="en" lang="en">resolution</span> — больше картинка на входе. EfficientNet (Tan, Le, 2019) крутит все три сразу: "We propose a new scaling method that uniformly scales all dimensions of depth/width/resolution using a simple yet highly effective compound coefficient" (<a class="slide-ref" href="assets/slides/s10_132.webp" data-deck="s10" data-slide="132">слайд 132 лекции 10</a>).</p>
+
+  <p>Почему не одну ручку? Сначала — сколько стоит каждая. У свёрточного слоя \((h_r h_c C) N_F\) весов, и каждый работает во всех позициях выхода (<a href="l59.html">урок 59</a>). Ширина ×\(w\) умножает и \(C\), и \(N_F\): операций и параметров становится в \(w^2\) раз больше. Разрешение ×\(r\) умножает и строки, и столбцы карт: операций в \(r^2\) раз больше, а параметров столько же. Глубина ×\(d\) умножает число слоёв, и всё растёт в \(d\) раз:</p>
+
+  <div class="formula">
+    \[ \text{операции} \times d \cdot w^2 \cdot r^2 \]
+    \[ \text{параметры} \times d \cdot w^2 \]
+  </div>
+
+  <p>Одна ручка быстро упирается: очень глубокая сеть почти не лучше просто глубокой, а большой картинке нужны и слои, чтобы receptive field покрыл крупные объекты, и каналы для мелких деталей. Правило <mark class="key"><span class="en" lang="en">compound scaling</span></mark> растит всё вместе, одним числом \(\phi\). Это рассуждение, формула и коэффициенты — из статьи, на слайде их нет; лабораторная курса берёт те же:</p>
+
+  <div class="formula">
+    \[ d = \alpha^{\phi}, \quad w = \beta^{\phi}, \quad r = \gamma^{\phi} \]
+    \[ \alpha \cdot \beta^2 \cdot \gamma^2 \approx 2 \]
+    <dl class="legend">
+      <dt>\(\phi\)</dt><dd><span class="en" lang="en">compound coefficient</span>: сколько раз удвоить бюджет операций</dd>
+      <dt>\(\alpha, \beta, \gamma \ge 1\)</dt><dd>доли глубины, ширины и разрешения; их один раз подобрали на базовой сети: \(1.2,\ 1.1,\ 1.15\)</dd>
+    </dl>
+  </div>
+
+  <p>Квадраты при \(\beta\) и \(\gamma\) — те самые \(w^2\) и \(r^2\), так что \(\alpha\beta^2\gamma^2\) — множитель операций за один шаг \(\phi\). С этими коэффициентами он равен \(1.2 \cdot 1.21 \cdot 1.3225 \approx 1.92\). При \(\phi = 3\) глубина вырастает в 1.73 раза, ширина в 1.33, вход с 224 до 341 пикселя, а операции в \(1.92^3 \approx 7.1\) раза, почти \(2^3\).</p>
+
+  <p>EfficientNet — не одна сеть, а семейство, "a family of networks" (<a class="slide-ref" href="assets/slides/s10_130.webp" data-deck="s10" data-slide="130">слайд 130 лекции 10</a>). Базовую EfficientNet-B0 нашёл автоматический поиск архитектуры, B1…B7 — она же, выращенная по правилу (этого на слайдах нет). B0 собрана из блоков MBConv: свёртка 1&#160;×&#160;1 расширяет каналы, depthwise-свёртка ищет узоры, SE выставляет ползунки, ещё одна 1&#160;×&#160;1 сжимает каналы обратно, и есть короткий путь в обход, как в ResNet. Обе идеи этого урока сидят в одном блоке.</p>
+
+  <figure class="tbl-fig">
+    <figcaption>Точность top-1 на ImageNet и число параметров (<a class="slide-ref" href="assets/slides/s10_132.webp" data-deck="s10" data-slide="132">слайд 132 лекции 10</a>).</figcaption>
+    <div class="scroll-x">
+      <table class="tbl">
+        <thead><tr><th>Сеть</th><th>Top-1</th><th>Параметры</th></tr></thead>
+        <tbody>
+          <tr><td>ResNet-152</td><td class="num">77.8&#160;%</td><td class="num">60M</td></tr>
+          <tr class="is-key"><td>EfficientNet-B1</td><td class="num">78.8&#160;%</td><td class="num">7.8M</td></tr>
+          <tr><td>ResNeXt-101</td><td class="num">80.9&#160;%</td><td class="num">84M</td></tr>
+          <tr class="is-key"><td>EfficientNet-B3</td><td class="num">81.1&#160;%</td><td class="num">12M</td></tr>
+          <tr><td>SENet</td><td class="num">82.7&#160;%</td><td class="num">146M</td></tr>
+          <tr class="is-key"><td>EfficientNet-B4</td><td class="num">82.6&#160;%</td><td class="num">19M</td></tr>
+          <tr><td>GPipe</td><td class="num">84.3&#160;%</td><td class="num">556M</td></tr>
+          <tr class="is-key"><td>EfficientNet-B7</td><td class="num">84.4&#160;%</td><td class="num">66M</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </figure>
+
+  <p>В PyTorch предобученная B0 берётся из torchvision. Её голова <code>model.classifier</code> — это <code>Dropout(0.2)</code> и <code>Linear(1280, 1000)</code>, и под свои классы меняют только второй слой (заморозка и fine-tuning — в <a href="l71.html">уроке 71</a>):</p>
+
+  <pre><code>import torch.nn as nn
+from torchvision import models
+
+weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1
+model = models.efficientnet_b0(weights=weights)
+model.classifier[1] = nn.Linear(1280, num_classes)  # было 1000</code></pre>
+
+  <p>B0 обучена на картинках <span class="nw">224 × 224</span>; старшие версии — на больших, B7 — на <span class="nw">600 × 600</span>: разрешение растёт вместе с \(\phi\).</p>
+</section>
+
+<section id="l77-compare">
+  <h2>Три числа каждой сети</h2>
+
+  <p>Знаменитые сети сведены на один график (<a class="slide-ref" href="assets/slides/s09_071.webp" data-deck="s09" data-slide="71-76">слайды 71–76 лекции 9</a>; он же на <a class="slide-ref" href="assets/slides/s10_134.webp" data-deck="s10" data-slide="134-139">слайдах 134–139 лекции 10</a>). По оси x — операции на одну картинку, "Operations [G-Ops]"; по оси y — "Top-1 accuracy [%]" на ImageNet; площадь пузыря — число параметров. Три числа, и ни одно не следует из другого. Виджет показывает тот же график и рядом — что делают с ними три ручки EfficientNet.</p>
+
+  <p>О единицах (на слайдах этого нет): G-Ops графика — примерно вдвое больше, чем умножений-сложений, потому что умножение и сложение считаются отдельно. У VGG-16 около 15.5 миллиарда умножений-сложений, на графике — около 31. В формулах MobileNet «операция» — одно умножение-сложение.</p>
+
+  <div class="widget" id="l77-w-scale">
+    <h3 class="widget-title">Три ручки и три оси</h3>
+    <p class="widget-intro">Сверху — схема сети: базовая и выращенная (число блоков следует глубине, число листов — ширине, их размер — разрешению). Кнопка ставит \(d = 1.2^{\phi}\), \(w = 1.1^{\phi}\), \(r = 1.15^{\phi}\). Ниже — график слайдов; числа прочитаны с него приблизительно. Нажми на пузырь, чтобы прочитать его три числа.</p>
+    <ol class="tasks">
+      <li>Подвинь только ширину до ×2. Угадай, во сколько раз вырастут операции и параметры.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>В 4 раза и то и другое: у каждого фильтра вдвое больше входных каналов, и самих фильтров вдвое больше.</p></details>
+      </li>
+      <li>Сбрось и подвинь только разрешение до ×2. Что теперь?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Операции ×4, параметры ×1: картинка 448 вместо 224, позиций вчетверо больше, а веса те же. Сеть стала медленнее, но не тяжелее — на графике она уехала бы вправо, а пузырь остался бы прежним.</p></details>
+      </li>
+      <li>Поставь \(\phi = 3\) и нажми кнопку. Какой множитель операций получится и почему он близок к 8?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>\(d = 1.73\), \(w = 1.33\), \(r = 1.52\) (вход 340 пикселей), операции ×7.07, параметры ×3.06. Каждый шаг \(\phi\) умножает операции на \(\alpha\beta^2\gamma^2 \approx 1.92\), три шага — почти \(2^3\).</p></details>
+      </li>
+      <li>Подсвети AlexNet, потом ResNet. Найди сеть, у которой параметров меньше, чем у AlexNet, а операций больше.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Например, ResNet-50: около 26 млн параметров против 61 млн у AlexNet, но около 8 G-Ops против 2. Большой пузырь не значит «далеко вправо»: у AlexNet большинство весов в dense-слоях, где каждый вес работает один раз на картинку, а вес свёртки работает в каждой позиции карты.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l77-w-scale', function (root, ui) {
+    var sD = ui.slider({ label: 'глубина ×d', min: 1, max: 3, step: 0.01, value: 1 });
+    var sW = ui.slider({ label: 'ширина ×w', min: 1, max: 2, step: 0.01, value: 1 });
+    var sR = ui.slider({ label: 'разрешение ×r', min: 1, max: 2, step: 0.01, value: 1 });
+    var sP = ui.slider({ label: 'φ для кнопки', min: 0, max: 4, step: 1, value: 1 });
+    ui.button('по правилу EfficientNet', function () {
+      var p = Math.round(sP.value);
+      sD.set(+Math.pow(1.2, p).toFixed(2), true); sW.set(+Math.pow(1.1, p).toFixed(2), true); sR.set(+Math.pow(1.15, p).toFixed(2), true);
+    }, { kind: 'primary' });
+    ui.button('сбросить', function () { sD.set(1, true); sW.set(1, true); sR.set(1, true); }, { kind: 'ghost', icon: 'refresh' });
+    var hl = ui.select('на графике подсветить', [
+      { value: 'none', label: 'ничего' }, { value: 'vgg', label: 'VGG' }, { value: 'alex', label: 'AlexNet' },
+      { value: 'inc', label: 'Inception и GoogLeNet' }, { value: 'mob', label: 'MobileNet и SqueezeNet' },
+      { value: 'res', label: 'ResNet' }, { value: 'eff', label: 'EfficientNet B0 и B4 (не на слайде)' }], null, 'none');
+
+    // name, G-Ops, top-1 %, parameters (millions), group, parameters as shown
+    var NETS = [
+      ['VGG-19', 39.3, 70.7, 144, 'vgg', '≈ 144 млн'], ['VGG-16', 31.0, 70.6, 138, 'vgg', '≈ 138 млн'],
+      ['AlexNet', 2.3, 54.6, 61, 'alex', '≈ 61 млн'], ['BN-AlexNet', 1.4, 56.7, 61, 'alex', '≈ 61 млн'],
+      ['ResNet-152', 23.1, 77.8, 60, 'res', '≈ 60 млн'], ['ResNet-101', 15.7, 77.7, 44.5, 'res', '≈ 45 млн'],
+      ['Inception-v4', 18.5, 80.3, 43, 'inc', '≈ 43 млн'], ['ResNet-50', 8.3, 76.0, 25.6, 'res', '≈ 26 млн'],
+      ['Inception-v3', 11.5, 78.6, 24, 'inc', '≈ 24 млн'], ['Xception', 16.8, 79.0, 23, 'other', '≈ 23 млн'],
+      ['ResNet-34', 7.3, 73.3, 21.8, 'res', '≈ 22 млн'], ['DenseNet-201', 8.7, 77.4, 20, 'other', '≈ 20 млн'],
+      ['EfficientNet-B4', 8.3, 82.6, 19, 'eff', '19 млн'], ['DenseNet-169', 6.9, 76.3, 14, 'other', '≈ 14 млн'],
+      ['ResNet-18', 3.6, 69.7, 11.7, 'res', '≈ 12 млн'], ['DenseNet-121', 5.7, 75.0, 8, 'other', '≈ 8 млн'],
+      ['BN-NIN', 2.5, 62.7, 7.6, 'other', 'меньше 10 млн'], ['GoogLeNet', 3.0, 68.7, 6.6, 'inc', '≈ 7 млн'],
+      ['EfficientNet-B0', 0.8, 77.1, 5.3, 'eff', '≈ 5.3 млн'], ['MobileNet-v1', 1.2, 70.9, 4.2, 'mob', '≈ 4 млн'],
+      ['MobileNet-v2', 0.6, 71.8, 3.5, 'mob', '≈ 3.5 млн'], ['ShuffleNet', 1.6, 62.2, 2, 'other', 'меньше 5 млн'],
+      ['SqueezeNet', 1.7, 57.5, 1.2, 'mob', '≈ 1.2 млн'], ['fd-MobileNet', 0.4, 65.3, 1, 'mob', 'меньше 5 млн'],
+      ['ENet', 1.6, 68.4, 0.4, 'other', 'меньше 5 млн']];
+    var chosen = null;
+
+    var svg = ui.svg(560, 170, { label: 'Схема базовой и выращенной сети: число блоков, листов и их размер' });
+    var layer = Course.svg('g', {}, svg);
+    function S(tag, attrs) { return Course.svg(tag, attrs, layer); }
+    function row(yMid, d, w, r, label, base) {
+      var n = Math.max(1, Math.round(4 * d)), k = Course.clamp(Math.round(3 * w), 1, 5), side = 22 * r, off = 5, x = 84;
+      S('text', { x: 10, y: yMid + 5, class: 'tx-sm', text: label });
+      for (var i = 0; i < n; i++) {
+        var wb = side + off * (k - 1);
+        if (x + wb > 548) { S('text', { x: x, y: yMid + 6, class: 'tx-lg', text: '…' }); break; }
+        for (var j = 0; j < k; j++) {
+          S('rect', { x: x + off * j, y: yMid - (side + off * (k - 1)) / 2 + off * j, width: side, height: side, class: base ? 'fi-paper st-muted dash' : 'fi-paper' });
+        }
+        x += wb + 10;
+      }
+    }
+    function sketch() {
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
+      row(30, 1, 1, 1, 'база', true);
+      row(118, sD.value, sW.value, sR.value, 'после', false);
+    }
+
+    var plot = ui.plot({ x: [0, 45], y: [50, 84], xLabel: 'Operations, G-Ops', yLabel: 'Top-1, %', aspect: 1.5,
+      label: 'Пузырьковая диаграмма сетей: операции по оси x, точность top-1 по оси y, площадь пузыря пропорциональна числу параметров' });
+    function rad(n) { return Math.max(3, 2.4 * Math.sqrt(n[3])); }
+    function lit(n) { return hl.value !== 'none' && n[4] === hl.value; }
+    plot.draw(function (g) {
+      NETS.forEach(function (n) {
+        if (n[4] === 'eff' && hl.value !== 'eff') return;
+        var on = lit(n);
+        g.circle(n[1], n[2], rad(n), { px: true, color: on ? 'key' : 'muted', alpha: on ? 0.6 : 0.22, stroke: on ? 'ink' : 'muted' });
+      });
+      NETS.forEach(function (n) {
+        if (!(lit(n) || n[0] === chosen)) return;
+        if (n[4] === 'eff' && hl.value !== 'eff') return;
+        var right = n[1] < 30;
+        g.text(n[1], n[2], n[0], { align: right ? 'left' : 'right', baseline: 'middle', dx: right ? rad(n) + 4 : -rad(n) - 4, size: 11 });
+        if (n[0] === chosen) g.circle(n[1], n[2], rad(n) + 3, { px: true, color: 'ink', fill: false, width: 2 });
+      });
+    });
+    plot.onPointer({ down: function (p) {
+      var best = null, bd = 1e9;
+      NETS.forEach(function (n) {
+        if (n[4] === 'eff' && hl.value !== 'eff') return;
+        var q = plot.toPx(n[1], n[2]), dist = Math.hypot(q.x - p.px, q.y - p.py) - rad(n);
+        if (dist < bd) { bd = dist; best = n; }
+      });
+      chosen = best && bd < 12 ? best[0] : null;
+    } });
+    ui.legend([{ label: 'сеть: площадь ∝ параметрам', color: 'muted', mark: 'dot' }, { label: 'подсвеченная группа', color: 'key', mark: 'dot' }]);
+
+    var roO = ui.readout('операции ×'), roP = ui.readout('параметры ×'), roR = ui.readout('вход, пикселей');
+    var roN = ui.readout('сеть на графике');
+    ui.onChange(function () {
+      var d = sD.value, w = sW.value, r = sR.value;
+      sketch();
+      roO.set(d * w * w * r * r);
+      roP.set(d * w * w);
+      roR.set('224 → ' + Math.round(224 * r));
+      var n = null;
+      NETS.forEach(function (m) { if (m[0] === chosen) n = m; });
+      roN.set(n ? n[0] + ': ≈ ' + n[1] + ' G-Ops, top-1 ≈ ' + n[2] + ' %, ' + n[5] + ' параметров' : 'нажми на пузырь');
+    });
+  });
+  </script>
+
+  <p>Подписи слайдов к этому графику — четыре утверждения.</p>
+
+  <ul>
+    <li>"VGGs are the least efficient: very large computational and memory usage" (<a class="slide-ref" href="assets/slides/s09_072.webp" data-deck="s09" data-slide="72">слайд 72 лекции 9</a>). VGG-16 и VGG-19 — около 31 и 39 G-Ops и самые большие пузыри, 138 и 144 млн параметров, при точности около 71&#160;%. Почти столько же даёт MobileNet-v1 примерно за 1 G-Op. Почему VGG так дорога — в уроке 73.</li>
+    <li>"AlexNet are the least performing and not particularly efficient" (<a class="slide-ref" href="assets/slides/s09_074.webp" data-deck="s09" data-slide="74">слайд 74</a>). Около 55&#160;% и большой пузырь, 61 млн параметров, — но всего около 2 G-Ops. Параметры и операции — разные оси: у ResNet-50 параметров меньше, а операций почти вчетверо больше.</li>
+    <li>"Mobile net and squeezenet are instead designed for improving efficiency" (<a class="slide-ref" href="assets/slides/s09_076.webp" data-deck="s09" data-slide="76">слайд 76</a>). Они прижаты к левому краю: около 1 G-Op и крошечные пузыри.</li>
+    <li>"Inception models are the most efficient and best performing" (<a class="slide-ref" href="assets/slides/s09_073.webp" data-deck="s09" data-slide="73">слайд 73</a>). Inception-v4 — самая точная сеть графика, около 80&#160;% при 18 G-Ops. Но «самые эффективные» они только среди больших и точных: точности на одну операцию у MobileNet намного больше.</li>
+  </ul>
+
+  <p>Подпись "Inception v4 combines ResNet and Inception" (<a class="slide-ref" href="assets/slides/s09_073.webp" data-deck="s09" data-slide="73,75">слайды 73 и 75 лекции 9</a>) неверна: Inception-v4 — чистая Inception-сеть (урок 75) без residual connections (урок 76), а гибриды с ними в той же статье Szegedy et al. (2016) называются Inception-ResNet. Экзамен может процитировать подписи слайдов дословно: знай и их, и обе поправки.</p>
+
+  <h3>Ответ на задачку</h3>
+
+  <p>Как EfficientNet-B1 обходит ResNet-152 при 7.8 млн параметров против 60? Каждая свёртка внутри MBConv, которая смотрит на соседей, — depthwise: с фильтрами 3&#160;×&#160;3 такой слой стоит примерно в 8–9 раз дешевле обычного. SE за небольшую добавку параметров даёт каждому каналу громкость, решённую по всей картинке. А правило масштабирования тратит бюджет поровну на глубину, ширину и разрешение, вместо того чтобы громоздить слои, как ResNet-152. Выигрыш не от одного трюка, а от дешёвых кирпичей и правильных пропорций.</p>
+</section>
+
+<section id="l77-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="numeric" data-points="3" data-answer="29302784" data-tol="0" id="l77-exam-macs">
+    <div class="exam-q" lang="en">
+      <p>A convolutional layer maps a \(112 \times 112 \times 32\) volume to a \(112 \times 112 \times 64\) volume with \(3 \times 3\) filters, stride 1, "same" padding and no biases. How many multiply-adds does its depthwise separable version need?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en">
+        <p>With \(D_F^2 = 112^2 = 12\,544\) output positions:</p>
+        \[ \text{depthwise: } 9 \cdot 32 \cdot 12\,544 = 3\,612\,672 \]
+        \[ \text{pointwise: } 32 \cdot 12\,544 \cdot 64 = 25\,690\,112 \]
+        <p>Total: 29,302,784 multiply-adds, with \(9 \cdot 32 + 32 \cdot 64 = 2\,336\) weights.</p>
+        <p>Standard convolution: \(9 \cdot 32 \cdot 64 = 18\,432\) weights and \(18\,432 \cdot 12\,544 = 231\,211\,008\) multiply-adds. Ratio \(1/64 + 1/9 \approx 0.127\), about 7.9 times cheaper.</p>
+      </div>
+      <div class="exam-note"><p>Проверяют, что ты помнишь, какой шаг смешивает каналы: у depthwise нет множителя \(N\), у pointwise нет \(D_K^2\). Частая ошибка — забыть \(D_F^2 = 12\,544\) и ответить числом параметров.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="3" id="l77-exam-limit">
+    <div class="exam-q" lang="en">
+      <p>Why can a depthwise separable convolution with \(3 \times 3\) kernels never be more than 9 times cheaper than a standard convolution? Which of its two steps dominates the cost when \(N = 256\)?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The cost ratio is \(1/N + 1/D_K^2\): the depthwise step costs \(1/N\) of the standard layer and the pointwise step \(1/D_K^2\). The pointwise step is a standard convolution with a \(1 \times 1\) instead of a \(D_K \times D_K\) window, so it alone costs \(1/D_K^2 = 1/9\) of the standard layer, whatever \(N\) is; the ratio is always larger than \(1/9\). The pointwise step costs \(N / D_K^2\) times the depthwise one: with \(N = 256\) about 28 times more, so it dominates both parameters and operations.</p></div>
+      <div class="exam-note"><p>Полный ответ говорит, какое слагаемое чьё: \(1/N\) — доля depthwise, \(1/D_K^2\) — доля pointwise. Перепутать их легко, и тогда объяснение предела выходит наоборот.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="3" id="l77-exam-n1">
+    <div class="exam-q" lang="en">
+      <p>Consider a layer with a single output filter (\(N = 1\)) on an \(M\)-channel input. Is its depthwise separable version cheaper than the standard convolution? Is it less expressive? Why is the answer to the second question different when \(N \gt 1\)?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>It is not cheaper: the ratio is \(1 + 1/D_K^2\), the separable layer has \(M\) extra weights (e.g. 30 instead of 27 for a \(3 \times 3 \times 3\) filter). It is not less expressive either: any \(D_K \times D_K \times M\) filter is obtained with depthwise kernels \(d_m = w(\cdot,\cdot,m)\) and pointwise weights \(p_m = 1\); the scalars can always be absorbed into the kernels. For \(N \gt 1\), filter \(n\) of the separable layer is \(p_{n,m} d_m\): all \(N\) filters share the same \(M\) spatial kernels and differ only by per-channel scalars, while a standard layer chooses \(N \cdot M\) independent kernels. It is a constrained standard convolution.</p></div>
+      <div class="exam-note"><p>Здесь проверяют, понимаешь ли ты замечание "when N = 1 they coincide" (<a class="slide-ref" href="assets/slides/s09_064.webp" data-deck="s09" data-slide="64-65">слайды 64–65 лекции 9</a>): совпадает выразительность, стоимость — нет.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="3" data-answer="8464" data-tol="0" id="l77-exam-se">
+    <div class="exam-q" lang="en">
+      <p>A squeeze-and-excitation block is applied to a \(28 \times 28 \times 256\) volume, with a bottleneck of \(C' = 16\) units and biases in both fully connected layers. Give the shape of the data after each step and the number of parameters of the block.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Squeeze (GAP): \(1 \times 1 \times 256\), no parameters. Excitation: FC \(256 \to 16\) with ReLU, \(256 \cdot 16 + 16\) parameters; FC \(16 \to 256\) with sigmoid, \(16 \cdot 256 + 256\) parameters; output 256 gains in \((0, 1)\). Rescaling: \(28 \times 28 \times 256\), each channel multiplied by its gain, no parameters. Total \(4\,112 + 4\,352 = 8\,464\).</p></div>
+      <div class="exam-note"><p>Формула \(2CC' + C' + C\). Без смещений было бы \(2CC' = 8\,192\) — так считают в статье; читай условие, есть ли bias.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="3.69" data-tol="0.05" id="l77-exam-phi">
+    <div class="exam-q" lang="en">
+      <p>EfficientNet scales depth by \(\alpha^{\phi}\), width by \(\beta^{\phi}\) and input resolution by \(\gamma^{\phi}\), with \(\alpha = 1.2\), \(\beta = 1.1\), \(\gamma = 1.15\). By what factor do the operations of the network grow for \(\phi = 2\)? Explain why width and resolution enter squared.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>The multiply-adds of a convolutional layer are proportional to (input channels × output channels) × (rows × columns of the output). Width multiplies both channel counts (\(\beta^2\)), resolution multiplies both rows and columns (\(\gamma^2\)), depth multiplies the number of layers (\(\alpha\)). Factor: \((1.2 \cdot 1.1^2 \cdot 1.15^2)^2 = 1.92^2 \approx 3.69\), close to \(2^2\).</p></div>
+      <div class="exam-note"><p>Если спросят про параметры: разрешение их не меняет, так что параметры растут как \((\alpha\beta^2)^{\phi}\).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l77-exam-chart">
+    <div class="exam-q" lang="en"><p>Looking at the comparison chart of famous architectures (x: operations, y: top-1 accuracy, bubble area: parameters), which statements are correct? Select all that apply.</p></div>
+    <ul class="options" lang="en">
+      <li data-correct>VGG-16 needs more operations than ResNet-152 and is less accurate. <span class="fb">Около 31 против 23 G-Ops и около 71 против 78 %.</span></li>
+      <li data-correct>AlexNet has more parameters than ResNet-50 but needs fewer operations. <span class="fb">61 против 26 млн параметров, но около 2 против 8 G-Ops: веса dense-слоёв работают по разу.</span></li>
+      <li>Inception-v4 adds residual connections to Inception modules. <span class="fb">Так написано на слайдах, но residual connections добавляют гибриды Inception-ResNet, а Inception-v4 — чистая Inception-сеть.</span></li>
+      <li>Doubling the input resolution of a CNN doubles its number of parameters. <span class="fb">Параметры от размера карт не зависят; вчетверо растут операции.</span></li>
+      <li data-correct>MobileNet-v1 reaches about the accuracy of VGG-16 with far fewer operations. <span class="fb">Около 71 % при примерно 1 G-Op против 31.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Correct: the first, second and fifth statements. Parameters (bubble area) and operations (x position) are different axes; Inception-v4 is a pure Inception network, the residual hybrids are Inception-ResNet; resolution changes operations, not parameters.</p></div>
+      <div class="exam-note"><p>Проверяют, что ты читаешь три оси графика по отдельности и знаешь две неточности подписей.</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l77-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">Depthwise-свёртка 3&#160;×&#160;3 применена к объёму с 32 каналами. Сколько карт у неё на выходе?</p>
+    <ul class="options">
+      <li data-correct>32 <span class="fb">У каждого канала свой фильтр, и каждый даёт одну карту: каналы не смешиваются и не складываются.</span></li>
+      <li>1 <span class="fb">Одна карта получилась бы у одного обычного фильтра, который складывает все каналы.</span></li>
+      <li>Сколько задано фильтров \(N\) <span class="fb">\(N\) появляется только на pointwise-шаге.</span></li>
+      <li>\(32 \cdot 9\) <span class="fb">288 — это число весов depthwise-шага, а не карт.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Что верно про pointwise-шаг separable-свёртки?</p>
+    <ul class="options">
+      <li data-correct>Он смешивает каналы в каждой клетке отдельно <span class="fb">Фильтр \(1 \times 1 \times M\) — взвешенная сумма \(M\) чисел одной позиции.</span></li>
+      <li data-correct>При \(N \gt D_K^2\) он дороже depthwise-шага <span class="fb">Отношение их стоимостей \(N / D_K^2\).</span></li>
+      <li>Он смотрит на соседние пиксели <span class="fb">Окно у него в одну клетку: соседей видит только depthwise-шаг.</span></li>
+      <li>Число его параметров растёт с размером карты \(D_F\) <span class="fb">Параметров \(M N\) при любом \(D_F\); от \(D_F\) зависят только операции.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Слой 256 → 256 каналов. Фильтры 3&#160;×&#160;3 заменили на 5&#160;×&#160;5. Во сколько раз separable-версия дешевле обычной теперь?</p>
+    <ul class="options">
+      <li>Примерно в 9 раз <span class="fb">9 — предел для 3 × 3. С ростом \(D_K\) предел \(D_K^2\) тоже растёт.</span></li>
+      <li data-correct>Примерно в 23 раза <span class="fb">\(1 / (1/256 + 1/25) \approx 22.8\).</span></li>
+      <li>В 256 раз <span class="fb">Pointwise-шаг один стоит \(1/D_K^2 = 1/25\) обычной свёртки, так что больше чем в 25 раз не выйдет.</span></li>
+      <li>Так же, как при 3 × 3 <span class="fb">Отношение \(1/N + 1/D_K^2\) зависит от \(D_K\).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Две разные картинки проходят через один и тот же обученный SE-блок. Что у них будет разным?</p>
+    <ul class="options">
+      <li>Веса \(W_1\) и \(W_2\) <span class="fb">Веса выучены один раз и для всех картинок одни.</span></li>
+      <li data-correct>Множители каналов \(\vb{F}'\) <span class="fb">Их считают из средних карт этой картинки, поэтому громкость каналов зависит от входа.</span></li>
+      <li>Число параметров блока <span class="fb">Оно задано \(C\) и \(C'\): \(2CC' + C' + C\).</span></li>
+      <li>Форма выхода <span class="fb">Выход всегда той же формы, что и \(U\): \(H \times W \times C\).</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Что делает множитель \(\vb{F}'_k\) с картой \(U_k\)?</p>
+    <ul class="options">
+      <li data-correct>Умножает все её позиции на одно и то же число <span class="fb">\(\tilde X_k = \vb{F}'_k U_k\): узор карты остаётся, меняется сила.</span></li>
+      <li>Усиливает только самые яркие позиции <span class="fb">Множитель один на всю карту, позиции он не различает.</span></li>
+      <li>Нормирует карты так, чтобы множители всех каналов давали в сумме 1 <span class="fb">Так было бы с softmax; сигмоида даёт каждому каналу свой множитель независимо.</span></li>
+      <li>Сдвигает карту к месту, где объект <span class="fb">SE ничего не сдвигает и не знает о позициях: он работает со средними.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">У свёрточной сети увеличили только разрешение входа: 224 → 448. Что произошло?</p>
+    <ul class="options">
+      <li data-correct>Операции ×4, параметры не изменились <span class="fb">Позиций вчетверо больше, а веса фильтров те же.</span></li>
+      <li>Операции ×2, параметры ×2 <span class="fb">Сторона выросла вдвое, а позиций — вчетверо; веса от размера карт не зависят.</span></li>
+      <li>Операции ×4, параметры ×4 <span class="fb">Так было бы при удвоении ширины.</span></li>
+      <li>Операции ×2, параметры не изменились <span class="fb">Разрешение входит в операции в квадрате: строки и столбцы.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">На графике сравнения у AlexNet большой пузырь, но маленький x. Почему?</p>
+    <ul class="options">
+      <li data-correct>Большинство её весов в dense-слоях, где каждый вес работает один раз на картинку <span class="fb">Вес свёртки работает в каждой позиции карты, вес dense-слоя — один раз: много параметров не значит много операций.</span></li>
+      <li>Площадь пузыря показывает точность <span class="fb">Точность — ось y; площадь — параметры.</span></li>
+      <li>У AlexNet нет свёрточных слоёв <span class="fb">Их пять (урок 73).</span></li>
+      <li>Ось x показывает число слоёв <span class="fb">Ось x — операции на одну картинку.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l77-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>Обычная свёртка ищет узор и смешивает каналы одним фильтром. Depthwise separable делит это на два шага: depthwise — один фильтр \(D_K \times D_K\) на канал, без смешивания; pointwise — \(N\) фильтров \(1 \times 1 \times M\), только смешивание.</li>
+    <li>Стоимость: обычная \(M D_F^2 D_K^2 N\) операций и \(D_K^2 M N\) весов; separable \(D_K^2 M D_F^2 + M D_F^2 N\) и \(M(D_K^2 + N)\). Оба отношения равны \(1/N + 1/D_K^2\): экономия не больше \(D_K^2\), для 3&#160;×&#160;3 — до 9 раз, и основную цену платит свёртка 1&#160;×&#160;1.</li>
+    <li>Цена экономии: все \(N\) фильтров собраны из одних \(M\) ядер. При \(N = 1\) выразительность та же, но separable дороже на \(M\) весов.</li>
+    <li>SE-блок: squeeze (GAP, \(1 \times 1 \times C\)) → excitation (MLP \(C \to C' \to C\), ReLU и сигмоида) → каждая карта умножается на свой множитель из \((0, 1)\). Множители зависят от картинки; параметров \(2CC' + C' + C\).</li>
+    <li>Ширина и разрешение стоят в квадрате, глубина линейно: операции растут как \(d w^2 r^2\), параметры как \(d w^2\). EfficientNet растит всё вместе: \(d = \alpha^{\phi}\), \(w = \beta^{\phi}\), \(r = \gamma^{\phi}\), \(\alpha\beta^2\gamma^2 \approx 2\).</li>
+    <li>Точность, операции и параметры — три разные оси: VGG дорога по всем, AlexNet тяжела, но не медленна, MobileNet дешева. Inception-v4 — без residual connections, гибриды называются Inception-ResNet.</li>
+  </ul>
+</section>
+
+<section class="resources" id="l77-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="video" data-when="во время">
+      <a class="res-title" href="https://www.youtube.com/watch?v=vVaRhZXovbw" target="_blank" rel="noopener">Groups, Depthwise, and Depthwise-Separable Convolution</a>
+      <span class="res-by">Animated AI</span><span class="res-dur">6 мин</span>
+      <p class="res-why">Depthwise и pointwise как движущиеся трёхмерные блоки, и заодно что значит <code>groups=</code> в PyTorch. Смотри перед счётом стоимости.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://eli.thegreenplace.net/2018/depthwise-separable-convolutions-for-machine-learning/" target="_blank" rel="noopener">Depthwise separable convolutions for machine learning</a>
+      <span class="res-by">Eli Bendersky</span>
+      <p class="res-why">Тот же счёт на другом примере (3 входных канала, 16 фильтров: 432 веса против 75) — сверить свой ответ.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="после">
+      <a class="res-title" href="https://amaarora.github.io/posts/2020-07-24-SeNet.html" target="_blank" rel="noopener">Squeeze and Excitation Networks Explained with PyTorch Implementation</a>
+      <span class="res-by">Aman Arora</span>
+      <p class="res-why">SE-блок в пятнадцати строках PyTorch и как его вставляют в ResNet.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://research.google/blog/efficientnet-improving-accuracy-and-efficiency-through-automl-and-model-scaling/" target="_blank" rel="noopener">EfficientNet: Improving Accuracy and Efficiency through AutoML and Model Scaling</a>
+      <span class="res-by">Google Research blog</span>
+      <p class="res-why">Картинка из пяти панелей: шире, глубже, больше вход и всё вместе. Лучшая иллюстрация compound scaling.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Мы научились считать, сколько стоит сеть, и не заглянули внутрь ни одного фильтра. Что выучил нейрон в глубине сети — что ему «нравится»?</p>
+</aside>
+
+</main>
+</body>
+</html>
