@@ -1,5 +1,5 @@
 window.SYLLABUS = {
-  course: { id: 'an2dl', title: 'Тетрадь AN2DL', subtitle: 'Нейросети с нуля: главы 1–7 конспекта и лабы на PyTorch, с рисунками и живыми демонстрациями', sourceLabel: 'Конспект, стр.', sourceGenitive: 'конспекта', examLang: 'en', footer: 'самостоятельный разбор неофициального конспекта курса Artificial Neural Networks and Deep Learning (Politecnico di Milano) и его лабораторных на PyTorch. Где конспект ошибается, урок говорит, как правильно.',
+  course: { id: 'an2dl', title: 'Тетрадь AN2DL', subtitle: 'Нейросети с нуля: главы 1–7 конспекта, лекции 8–10 и лабы на PyTorch, с рисунками и живыми демонстрациями', sourceLabel: 'Конспект, стр.', sourceGenitive: 'конспекта', examLang: 'en', footer: 'самостоятельный разбор неофициального конспекта курса Artificial Neural Networks and Deep Learning (Politecnico di Milano), слайдов лекций 8–10 и лабораторных на PyTorch. Где источник ошибается, урок говорит, как правильно.',
     decks: {
       s01: { lecture: 1, label: 'Лекция 1', title: 'Machine Learning vs Deep Learning', file: '01 - DeepLearningIntro.pdf', slides: 36 },
       s02: { lecture: 2, label: 'Лекция 2', title: 'From Perceptrons to Feed Forward Neural Networks', file: '02 - Perceptron2NeuralNetworks.pdf', slides: 55, printed: { from: 52, offset: 1 } },
@@ -8,7 +8,10 @@ window.SYLLABUS = {
       s04: { lecture: 4, label: 'Лекция 4', title: 'Recurrent Neural Networks', file: '04 - RecurrentNeuralNetworks.pdf', slides: 70,
              printed: [{ from: 5, to: 5, offset: 1 }, { from: 6, to: 14, offset: 3 }, { from: 15, to: 31, offset: 4 }, { from: 33, to: 53, offset: 4 }, { from: 55, offset: 10 }] },
       s06: { lecture: 6, label: 'Лекция 6', title: 'Image Classification', file: '2026_AN2DL_06_Image_Classification_updated.pdf', slides: 130 },
-      s07: { lecture: 7, label: 'Лекция 7', title: 'Convolutional Neural Networks', file: '2026_AN2DL_07_CNNs.pdf', slides: 143 }
+      s07: { lecture: 7, label: 'Лекция 7', title: 'Convolutional Neural Networks', file: '2026_AN2DL_07_CNNs.pdf', slides: 143 },
+      s08: { lecture: 8, label: 'Лекция 8', title: 'CNN Anatomy and Practical Solutions for Training', file: '2026_AN2DL_08_CNN_TL_Data_Scarcity.pdf', slides: 138 },
+      s09: { lecture: 9, label: 'Лекция 9', title: 'Famous CNN Architectures and CNN Visualization', file: '2026_AN2DL_09_CNN_Famous_Architectures_upd.pdf', slides: 118 },
+      s10: { lecture: 10, label: 'Лекция 10', title: 'CNN for Weakly Supervised Localization', file: '2026_AN2DL_10_WSL_Explanations_Advanced_Architectures.pdf', slides: 139 }
     } },
   modules: [
     { id: 'm1', title: 'Что такое deep learning', source: 'Конспект, гл. 1 · стр. 8–34 · слайды лекции 1', lessons: [
@@ -94,6 +97,26 @@ window.SYLLABUS = {
       { id: 'l64', file: 'l64.html', title: 'LeNet-5 по слоям', teaser: 'Первая знаменитая CNN: архитектура, код, размеры и 61 706 параметров слой за слоем — и почему с padding их становится 136 586.', minutes: 20, pages: '574–583', slides: 'лекция 7, слайды 115–126' },
       { id: 'l65', file: 'l65.html', title: 'Цвет стоит 300 параметров', teaser: 'Почему свёртка выигрывает у MLP на пикселях: local connectivity и общие веса, цветной вход, размер картинки и результаты LeNet-5.', minutes: 25, pages: '584–587', slides: 'лекция 7, слайды 127–131' },
       { id: 'l66', file: 'l66.html', title: 'Пространство, где похожее рядом', teaser: 'Latent representation: t-SNE признаков AlexNet против t-SNE пикселей, поиск похожих картинок и 1-NN в пространстве признаков.', minutes: 30, pages: '588–598', slides: 'лекция 7, слайды 132–143' }
+    ] },
+    { id: 'm10', title: 'Как учить CNN на практике', source: 'Слайды лекций 8 и 10', lessons: [
+      { id: 'l67', file: 'l67.html', title: 'Свёртка — это тоже матрица', teaser: 'Convolutional layer как огромная матрица из нулей и девяти повторяющихся чисел: sparse connectivity, weight sharing и почему свёртка equivariant, а не invariant к сдвигам.', minutes: 30, slides: 'лекция 8, слайды 2–18', ready: false },
+      { id: 'l68', file: 'l68.html', title: 'Сколько пикселей видит нейрон', teaser: 'Receptive field: как он растёт от слоя к слою и почему pooling его умножает — две задачи со слайдов шаг за шагом — и куда идёт градиент через max pooling и ReLU.', minutes: 30, slides: 'лекция 8, слайды 19–35', ready: false },
+      { id: 'l69', file: 'l69.html', title: 'Больше данных из тех же картинок', teaser: 'Data augmentation: какие преобразования сохраняют метку, mixup, инвариантность, которую даёт augmentation, дисбаланс классов и «скрытые следы», на которых сеть учится жульничать.', minutes: 30, slides: 'лекция 8, слайды 52–80', ready: false },
+      { id: 'l70', file: 'l70.html', title: 'Голосование на тесте', teaser: 'Test-time augmentation, transforms в PyTorch для обучения и для inference, confusion matrix и ROC — и кейс контроля кремниевых пластин, где всё решила augmentation.', minutes: 35, slides: 'лекция 8, слайды 81–105', ready: false },
+      { id: 'l71', file: 'l71.html', title: 'Чужая сеть как фундамент', teaser: 'Transfer learning и fine-tuning: почему признаки ImageNet годятся для чужих задач, что замораживать, когда и как размораживать — и как это пишется в PyTorch.', minutes: 25, slides: 'лекция 8, слайды 107–130', ready: false },
+      { id: 'l72', file: 'l72.html', title: 'Нормировать, чтобы учиться', teaser: 'Preprocessing для CNN, batch normalization по каналам (BatchNorm2d, её параметры и режим inference) и multi-label: когда на картинке несколько ответов сразу.', minutes: 30, slides: 'лекция 10, слайды 2–18' }
+    ] },
+    { id: 'm11', title: 'Знаменитые архитектуры', source: 'Слайды лекций 8, 9 и 10', lessons: [
+      { id: 'l73', file: 'l73.html', title: 'Глубже и мельче', teaser: 'AlexNet и что сделало 2012 год возможным, VGG: почему стопка свёрток 3×3 лучше одной большой и где у VGG16 живут параметры.', minutes: 30, slides: 'лекция 8, слайды 36–51; лекция 9, слайды 19–37', ready: false },
+      { id: 'l74', file: 'l74.html', title: 'Среднее вместо миллиона весов', teaser: 'Network in Network и global average pooling: зачем заменять dense-слои средним по карте, почему так меньше переобучения и больше устойчивости к сдвигам.', minutes: 25, slides: 'лекция 9, слайды 38–58; лекция 10, слайды 95–97', ready: false },
+      { id: 'l75', file: 'l75.html', title: 'Все фильтры сразу', teaser: 'Inception и GoogLeNet: параллельные ветки разного масштаба, свёртки 1×1 как бутылочное горлышко и сколько вычислений они экономят.', minutes: 30, slides: 'лекция 10, слайды 66–94', ready: false },
+      { id: 'l76', file: 'l76.html', title: 'Короткий путь для градиента', teaser: 'ResNet: почему глубокая сеть учится хуже мелкой, skip connections и residual learning — и родня: Wide ResNet, ResNeXt, DenseNet.', minutes: 30, slides: 'лекция 10, слайды 98–129', ready: false },
+      { id: 'l77', file: 'l77.html', title: 'Сеть для телефона', teaser: 'MobileNet и depthwise separable convolutions, squeeze-and-excitation, EfficientNet с compound scaling — и сравнение сетей по точности, операциям и параметрам.', minutes: 30, slides: 'лекция 9, слайды 59–76; лекция 10, слайды 130–139', ready: false }
+    ] },
+    { id: 'm12', title: 'Что видит сеть', source: 'Слайды лекций 9 и 10', lessons: [
+      { id: 'l78', file: 'l78.html', title: 'Что нравится нейрону', teaser: 'Фильтры первого слоя, патчи, на которые нейрон откликается сильнее всего, и gradient ascent по входу: иерархия признаков от краёв до целых объектов.', minutes: 30, slides: 'лекция 9, слайды 77–101', ready: false },
+      { id: 'l79', file: 'l79.html', title: 'Где на картинке класс', teaser: 'Class activation mapping: GAP и один dense-слой превращают классификатор в карту «где класс» — weakly supervised localization без единой рамки в разметке.', minutes: 30, slides: 'лекция 10, слайды 19–38', ready: false },
+      { id: 'l80', file: 'l80.html', title: 'Почему сеть так решила', teaser: 'Saliency maps, clever Hans и смещения датасета, Grad-CAM для любой CNN и augmented Grad-CAM, который повышает разрешение карты.', minutes: 30, slides: 'лекция 10, слайды 39–65', ready: false }
     ] }
   ],
   extras: [

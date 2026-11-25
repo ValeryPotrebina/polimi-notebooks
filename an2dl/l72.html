@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex, nofollow">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Нормировать, чтобы учиться · Тетрадь AN2DL</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@400..700&amp;family=Geologica:wght@300..800&amp;family=JetBrains+Mono:wght@400..700&amp;family=Literata:ital,opsz,wght@0,7..72,400..700;1,7..72,400..700&amp;display=swap">
+<link rel="stylesheet" href="assets/course.css">
+<script src="assets/syllabus.js"></script>
+<script src="assets/course.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg-full.min.js"></script>
+<style>
+/* invisible click targets of the tensor widget */
+.l72-hit { fill: none; stroke: none; pointer-events: all; cursor: pointer; }
+</style>
+</head>
+<body>
+<main class="lesson" data-lesson="l72">
+
+<header class="lesson-head">
+  <h1>Нормировать, чтобы учиться</h1>
+  <p class="lede">После этого урока ты выберешь предобработку для CNN, посчитаешь параметры и статистики BatchNorm2d, свернёшь её в свёртку на тесте и переделаешь классификатор под несколько меток сразу.</p>
+</header>
+
+<div class="hook" data-label="Задачка для разгона">
+  <p>Берёшь ResNet, обученную на ImageNet, и замораживаешь её целиком: <code>backbone.requires_grad_(False)</code>. Ни один градиент её больше не тронет. Сверху ставишь новую голову, включаешь <code>model.train()</code> и одну эпоху учишь только голову. Потом сравниваешь числа внутри замороженной части с теми, что были до эпохи. Часть из них изменилась.</p>
+  <p>Какие числа сдвинулись без единого градиента, и почему при <span class="en" lang="en">fine-tuning</span> замороженную часть принято держать в другом режиме? Ответ — в третьем разделе. По дороге выяснится, какие числа сеть ждёт на входе, а в конце — что делать, если на снимке и собака, и кошка.</p>
+</div>
+
+<section id="l72-prep">
+  <h2>Где у данных начало координат</h2>
+
+  <p>Представь два признака: один меняется от 0 до 1, другой от 0 до 1000. Шаг градиентного спуска с одним <span class="en" lang="en">learning rate</span> для второго веса огромен, для первого ничтожен. Поверхность ошибки — длинная узкая долина, и спуск скачет поперёк неё (<a href="l13.html">урок 13</a>). Если же все входы положительны, градиенты всех весов одного нейрона получают один знак, и веса движутся зигзагом. Обе беды лечит одно и то же: сдвинуть данные к нулю и выровнять разбросы (это объяснение из CS231n, на слайдах его нет).</p>
+
+  <p>Поэтому <span class="en" lang="en">normalization</span> полезна оптимизаторам на градиентах: она приводит данные "around the origin" и к похожим диапазонам, а на предобработанных данных модель учится легче и меньше чувствительна к возмущениям параметров (<a class="slide-ref" href="assets/slides/s10_003.webp" data-deck="s10" data-slide="3">слайд 3 лекции 10</a>).</p>
+
+  <p>Предобработок четыре, и каждая следующая делает больше предыдущей (<a class="slide-ref" href="assets/slides/s10_004.webp" data-deck="s10" data-slide="4-5">слайды 4–5 лекции 10</a>):</p>
+  <ul>
+    <li><mark class="key"><span class="en" lang="en">zero-centering</span></mark> — вычесть из каждого признака его среднее: <code>X -= np.mean(X, axis=0)</code>;</li>
+    <li><span class="en" lang="en">normalization</span> — после этого поделить каждый признак на его стандартное отклонение: <code>X /= np.std(X, axis=0)</code>;</li>
+    <li><span class="en" lang="en">decorrelation</span> — повернуть центрированное облако на главные оси PCA, чтобы матрица ковариации стала диагональной ("diagonal covariance matrix");</li>
+    <li><span class="en" lang="en">whitening</span> — после поворота ещё поделить каждое главное направление на его разброс: "covariance = identity".</li>
+  </ul>
+  <p>Последние две — <span class="en" lang="en">PCA-based preprocessing</span>, и делают их после центрирования. Первые две уже встречались в <a href="l26.html">уроке 26</a>, на картинке из лекции 3.</p>
+
+  <div class="widget" id="l72-w-ladder">
+    <h3 class="widget-title">Четыре кнопки</h3>
+    <p class="widget-intro">Синие точки — 300 примеров с двумя признаками \(x_1\), \(x_2\), сильно связанными друг с другом. Кнопки применяют к исходному облаку одну из четырёх предобработок; все статистики взяты с исходных данных. Пунктир — главные оси облака, по два разброса в каждую сторону от центра.</p>
+    <ol class="tasks">
+      <li>Нажми «нормализовать». Станет ли облако круглым? Сначала ответь, потом смотри на поле «корреляция».
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Нет. Разбросы стали 1.00 и 1.00, средние — нули, но корреляция осталась 0.90: облако по-прежнему лежит по диагонали. <span class="en" lang="en">Normalization</span> выравнивает масштабы осей и не трогает связь между признаками.</p></details>
+      </li>
+      <li>Нажми «декоррелировать». Что теперь равно нулю, а что нет?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Корреляция стала 0.00, облако легло вдоль горизонтальной оси. Зато разбросы разные: 3.19 вдоль главной оси и 0.49 поперёк. Ковариация диагональная, но не единичная.</p></details>
+      </li>
+      <li>Только «отбелить» делает облако круглым. Почему тогда CNN останавливаются на шаге «нормализовать», да ещё и по каналам? Прикинь размер матрицы ковариации для картинки 224 × 224 × 3.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Признаков \(224 \cdot 224 \cdot 3 = 150\,528\), матрица ковариации \(150\,528 \times 150\,528\) — около \(2.3 \cdot 10^{10}\) чисел. Ещё два довода (их нет на слайдах): поворот на главные оси перемешивает пиксели и разрушает пространственную структуру, на которую опирается свёртка, а деление на маленький разброс раздувает шум.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l72-w-ladder', function (root, ui) {
+    var M = 300, MX = 2, MY = 1, SX = 1.2, SY = 3, R = 0.9;
+    function mean2(p) { var a = 0, b = 0; p.forEach(function (q) { a += q[0]; b += q[1]; }); return [a / p.length, b / p.length]; }
+    function cov2(p) {
+      var m = mean2(p), a = 0, b = 0, d = 0;
+      p.forEach(function (q) { var u = q[0] - m[0], v = q[1] - m[1]; a += u * u; b += u * v; d += v * v; });
+      return { m: m, a: a / p.length, b: b / p.length, d: d / p.length };
+    }
+    function eig2(a, b, d) {                                   // symmetric 2x2: eigenvalues l1 >= l2, unit eigenvector of l1
+      var tr = a + d, disc = Math.sqrt(Math.max(0, (a - d) * (a - d) / 4 + b * b));
+      var l1 = tr / 2 + disc, l2 = tr / 2 - disc, vx, vy, n;
+      if (Math.abs(b) > 1e-12) { vx = b; vy = l1 - a; } else if (a >= d) { vx = 1; vy = 0; } else { vx = 0; vy = 1; }
+      n = Math.sqrt(vx * vx + vy * vy); vx /= n; vy /= n;
+      if (vx < 0) { vx = -vx; vy = -vy; }
+      return { l1: l1, l2: l2, v1: [vx, vy], v2: [-vy, vx] };
+    }
+    /* 300 draws made exactly white (mean 0, covariance I), then given the target mean and covariance */
+    var rng = Course.rng(72), z = [], i;
+    for (i = 0; i < M; i++) z.push([rng.normal(0, 1), rng.normal(0, 1)]);
+    var c0 = cov2(z), e0 = eig2(c0.a, c0.b, c0.d);
+    z = z.map(function (q) {
+      var u = q[0] - c0.m[0], v = q[1] - c0.m[1];
+      var p1 = (u * e0.v1[0] + v * e0.v1[1]) / Math.sqrt(e0.l1), p2 = (u * e0.v2[0] + v * e0.v2[1]) / Math.sqrt(e0.l2);
+      return [p1, p2];
+    });
+    var X = z.map(function (q) {                               // Cholesky of [[SX^2, R SX SY], [R SX SY, SY^2]]
+      return [MX + SX * q[0], MY + SY * (R * q[0] + Math.sqrt(1 - R * R) * q[1])];
+    });
+    var C = cov2(X), E = eig2(C.a, C.b, C.d), sx = Math.sqrt(C.a), sy = Math.sqrt(C.d);
+    var NAMES = ['исходные данные', '1 · центрировать', '2 · нормализовать', '3 · декоррелировать (PCA)', '4 · отбелить (whiten)'];
+    function target(k) {
+      return X.map(function (q) {
+        var u = q[0] - C.m[0], v = q[1] - C.m[1], p1, p2;
+        if (k === 0) return [q[0], q[1]];
+        if (k === 1) return [u, v];
+        if (k === 2) return [u / sx, v / sy];
+        p1 = u * E.v1[0] + v * E.v1[1]; p2 = u * E.v2[0] + v * E.v2[1];
+        if (k === 3) return [p1, p2];
+        return [p1 / Math.sqrt(E.l1), p2 / Math.sqrt(E.l2)];
+      });
+    }
+    var state = 0, cur = target(0), from = cur, to = cur, t0 = 0, busy = false;
+    function go(k) {
+      state = k; from = cur.map(function (q) { return [q[0], q[1]]; }); to = target(k);
+      if (typeof window.requestAnimationFrame !== 'function') { cur = to; return; }
+      t0 = 0;
+      if (!busy) { busy = true; window.requestAnimationFrame(tick); }
+    }
+    function tick(ts) {
+      if (!t0) t0 = ts;
+      var t = Math.min(1, (ts - t0) / 550), s = t * t * (3 - 2 * t);
+      cur = from.map(function (q, j) { return [q[0] + (to[j][0] - q[0]) * s, q[1] + (to[j][1] - q[1]) * s]; });
+      ui.redraw();
+      if (t < 1) window.requestAnimationFrame(tick); else { busy = false; cur = to; ui.redraw(); }
+    }
+    ui.button('исходные', function () { go(0); }, { kind: 'ghost', icon: 'refresh' });
+    ui.button('центрировать', function () { go(1); });
+    ui.button('нормализовать', function () { go(2); });
+    ui.button('декоррелировать', function () { go(3); });
+    ui.button('отбелить', function () { go(4); }, { kind: 'primary' });
+    var showAx = ui.toggle('главные оси', true);
+    var roStep = ui.readout('сейчас'), roM = ui.readout('средние x̄₁, x̄₂'), roS = ui.readout('разбросы s₁, s₂'),
+        roR = ui.readout('корреляция r'), roC = ui.readout('ковариация');
+    var plot = ui.plot({ x: [-10, 10], y: [-10, 10], equalAspect: true, aspect: 1.45, xLabel: 'x_1', yLabel: 'x_2',
+      label: 'Облако из 300 точек с двумя коррелированными признаками до и после выбранной предобработки' });
+    plot.draw(function (g) {
+      var c = cov2(cur), e = eig2(c.a, c.b, c.d), m = c.m;
+      g.points(cur, { color: 's1', r: 2.6 });
+      if (showAx.value) {
+        [[e.v1, e.l1], [e.v2, e.l2]].forEach(function (p) {
+          var L = 2 * Math.sqrt(Math.max(0, p[1]));
+          g.line([[m[0] - L * p[0][0], m[1] - L * p[0][1]], [m[0] + L * p[0][0], m[1] + L * p[0][1]]], { color: 'ink', dash: [6, 4], width: 2.5 });
+        });
+      }
+      g.points([m], { color: 'ink', shape: 'plus', r: 7 });
+    });
+    ui.legend([{ label: 'примеры', color: 's1', mark: 'dot' }, { label: 'главные оси', color: 'ink', mark: 'dash' }]);
+    ui.onChange(function () {
+      var c = cov2(target(state)), F = Course.fmt, r = c.b / Math.sqrt(c.a * c.d);
+      roStep.set(NAMES[state]);
+      roM.set(F(c.m[0], 2) + ', ' + F(c.m[1], 2));
+      roS.set(F(Math.sqrt(c.a), 2) + ', ' + F(Math.sqrt(c.d), 2));
+      roR.set(F(Math.abs(r) < 5e-4 ? 0 : r, 2));
+      roC.set('[' + F(c.a, 2) + '  ' + F(c.b, 2) + ' ; ' + F(c.b, 2) + '  ' + F(c.d, 2) + ']');
+    });
+  });
+  </script>
+
+  <h3>Что делают с картинками</h3>
+
+  <p>Для CNN отбеливание почти не используют: "PCA Whitening/Preprocessing is not common in CNN training". Обычно делают две вещи: центрируют данные и нормируют каждый пиксель ("zero-center the data, normalize every pixel", <a class="slide-ref" href="assets/slides/s10_006.webp" data-deck="s10" data-slide="6">слайд 6 лекции 10</a>). Какими числами пиксель сдвигают и делят, бывает по-разному: три варианта на примере ImageNet, картинки <span class="nw">[224, 224, 3]</span>, различаются тем, сколько чисел хранит каждый.</p>
+
+  <figure class="fig fig--plain" id="l72-fig-stats">
+    <svg class="dia" viewBox="0 0 560 230" role="img" aria-label="Три способа вычитать среднее: AlexNet хранит среднюю картинку 3@224x224, 150 528 чисел; VGG хранит три средних по каналам; ResNet хранит три средних и три стандартных отклонения">
+      <text x="95" y="24" class="tx-mid tx-bold">AlexNet</text>
+      <text x="280" y="24" class="tx-mid tx-bold">VGG</text>
+      <text x="465" y="24" class="tx-mid tx-bold">ResNet</text>
+      <rect x="50" y="46" width="70" height="70" class="fi-paper"/>
+      <rect x="58" y="54" width="70" height="70" class="fi-paper"/>
+      <rect x="66" y="62" width="70" height="70" class="fi-paper"/>
+      <text x="101" y="104" class="tx-mid tx-lg">μ</text>
+      <text x="95" y="160" class="tx-mid tx-mono">3@224x224</text>
+      <rect x="235" y="70" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="265" y="70" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="295" y="70" width="30" height="30" class="fw-s1 st-s1"/>
+      <text x="250" y="90" class="tx-mid tx-mono">R</text>
+      <text x="280" y="90" class="tx-mid tx-mono">G</text>
+      <text x="310" y="90" class="tx-mid tx-mono">B</text>
+      <text x="218" y="90" class="tx-end">μ</text>
+      <text x="280" y="160" class="tx-mid">μ канала</text>
+      <rect x="430" y="52" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="460" y="52" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="490" y="52" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="430" y="94" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="460" y="94" width="30" height="30" class="fw-s1 st-s1"/>
+      <rect x="490" y="94" width="30" height="30" class="fw-s1 st-s1"/>
+      <text x="445" y="72" class="tx-mid tx-mono">R</text>
+      <text x="475" y="72" class="tx-mid tx-mono">G</text>
+      <text x="505" y="72" class="tx-mid tx-mono">B</text>
+      <text x="445" y="114" class="tx-mid tx-mono">R</text>
+      <text x="475" y="114" class="tx-mid tx-mono">G</text>
+      <text x="505" y="114" class="tx-mid tx-mono">B</text>
+      <text x="414" y="72" class="tx-end">μ</text>
+      <text x="414" y="114" class="tx-end">σ</text>
+      <text x="465" y="160" class="tx-mid">μ и σ канала</text>
+      <text x="95" y="200" class="tx-mid tx-bold">150 528 чисел</text>
+      <text x="280" y="200" class="tx-mid tx-bold">3 числа</text>
+      <text x="465" y="200" class="tx-mid tx-bold">3 + 3 числа</text>
+    </svg>
+    <figcaption><b>Рис. 1.</b> Что хранит предобработка (<a class="slide-ref" href="assets/slides/s10_006.webp" data-deck="s10" data-slide="6">слайд 6 лекции 10</a>). AlexNet вычитает среднюю картинку: своё среднее для каждой позиции и каждого канала. VGG вычитает три средних по каналам. ResNet вычитает их и делит на три стандартных отклонения по каналам.</figcaption>
+  </figure>
+
+  <p>Последний вариант — тот, что сегодня стоит перед предобученными сетями torchvision. Для канала \(j\) среднее \(\mu_j\) и стандартное отклонение \(\sigma_j\) считают по всем обучающим картинкам и всем их пикселям, а потом каждый пиксель канала нормируют этими двумя числами:</p>
+
+  \[ I'(r,c,j) = \frac{I(r,c,j) - \mu_j}{\sigma_j} \]
+
+  <h3>Статистика — часть модели</h3>
+
+  <p>Главное правило раздела: "Normalization statistics are parameters of your ML model" (<a class="slide-ref" href="assets/slides/s10_007.webp" data-deck="s10" data-slide="7">слайд 7 лекции 10</a>). Из него следуют три вещи.</p>
+  <ul>
+    <li>Статистику считают только по <span class="en" lang="en">training set</span> и потом теми же числами нормируют <span class="en" lang="en">validation</span> и <span class="en" lang="en">test</span>. Среднее <span class="en" lang="en">test set</span> для <span class="en" lang="en">test set</span> — это подсмотренный ответ.</li>
+    <li>"Do not normalize first and then split": если нормировать до разбиения, в среднее попадут валидационные и тестовые картинки, и оценка качества выйдет оптимистичной (утечка, как в <a href="l18.html">уроке 18</a>).</li>
+    <li>С предобученной моделью надо "import (and use!)" её собственную функцию предобработки.</li>
+  </ul>
+
+  <p class="memo"><mark class="key">Средние и разбросы предобработки — такие же параметры модели, как веса: их оценивают один раз на обучающих данных и больше не трогают.</mark></p>
+
+  <p>Третий пункт — про чужие очки. Предобученная ResNet привыкла смотреть на пиксели ImageNet, нормированные числами ImageNet: на картинках, приведённых к <span class="nw">[0, 1]</span>, это <span class="en" lang="en">mean</span> <span class="nw">0.485 / 0.456 / 0.406</span> и <span class="en" lang="en">std</span> <span class="nw">0.229 / 0.224 / 0.225</span> для каналов R, G, B. Её первые фильтры настроены на входы именно с такой нормировкой. Если пересчитать «правильные» средние по своему датасету, сеть увидит сдвинутые и растянутые входы.</p>
+
+  <p>Поэтому с предобученной сетью берут её статистику. В torchvision эти очки лежат прямо в весах: <code>weights.transforms()</code> меняет размер, вырезает центр, переводит пиксели в <span class="nw">[0, 1]</span> и нормирует числами ImageNet (урок 71). Свою статистику считают только для сети, которую учат с нуля: по обучающей части, а нормируют ею все три части (этого кода на слайдах нет):</p>
+
+<pre><code>import torch
+from torchvision import transforms
+
+# a network trained from scratch: statistics
+# of the TRAINING split only, 3 + 3 numbers
+x = torch.stack([img for img, _ in train_set])  # (N, 3, H, W)
+mean = x.mean(dim=(0, 2, 3))
+std = x.std(dim=(0, 2, 3))
+
+# the same numbers for train, validation and test
+normalise = transforms.Normalize(mean.tolist(), std.tolist())</code></pre>
+</section>
+
+<section id="l72-bn">
+  <h2>Одна кривая на канал</h2>
+
+  <p>Предобработка нормирует вход сети. Но второй слой получает выходы первого, и их распределение гуляет с каждым шагом обучения. В <a href="l26.html">уроке 26</a> это лечила <mark class="key"><span class="en" lang="en">batch normalization</span></mark> (BN): каждый нейрон «оценивается по кривой» — его значения нормируются средним и разбросом по текущему <span class="en" lang="en">mini-batch</span>. Там у каждого нейрона была своя кривая. Чем в свёрточном слое заменить «нейрон»?</p>
+
+  <p>Выход свёрточного слоя на <span class="en" lang="en">mini-batch</span> — тензор <span class="nw">(N, C, H, W)</span>: \(N\) картинок, у каждой \(C\) карт размера \(H \times W\). Карта \(j\) — это один фильтр, приложенный ко всем позициям, с одними и теми же весами (<a href="l59.html">урок 59</a>). Значит, все позиции канала — один и тот же «нейрон», и статистика у них должна быть общей. Это как оценка по кривой в школе с несколькими предметами: математику, физику и литературу нормируют отдельно, но каждую — по всем ученикам и всем вопросам сразу. Предмет — канал, ученики — картинки <span class="en" lang="en">mini-batch</span>, вопросы — позиции \((r, c)\).</p>
+
+  <p>Слайд записывает <span class="en" lang="en">z-score normalization</span> так (<a class="slide-ref" href="assets/slides/s10_009.webp" data-deck="s10" data-slide="9">слайд 9 лекции 10</a>):</p>
+
+  \[ x_i' = \frac{x_i - E[x_i]}{\sqrt{\mathrm{var}[x_i]}} \]
+
+  <p>и подчёркивает: \(E[x_i]\) и \(\sqrt{\mathrm{var}[x_i]}\) "are computed from each batch and separately for each channel!" Расписанная по индексам, BN считает для канала \(j\) среднее и дисперсию по \(N \cdot H \cdot W\) значениям:</p>
+
+  <div class="formula">
+    \[ \mu_j = \frac{1}{NHW}\sum_{n,r,c} x_n(r,c,j) \]
+    \[ \sigma_j^2 = \frac{1}{NHW}\sum_{n,r,c} \bigl(x_n(r,c,j) - \mu_j\bigr)^2 \]
+    \[ y_n(r,c,j) = \gamma_j\,\frac{x_n(r,c,j) - \mu_j}{\sqrt{\sigma_j^2 + \epsilon}} + \beta_j \]
+    <dl class="legend">
+      <dt>\(x_n(r,c,j)\)</dt><dd>значение карты \(j\) картинки \(n\) в позиции \((r, c)\): вход слоя BN, то есть выход свёртки</dd>
+      <dt>\(\mu_j,\ \sigma_j^2\)</dt><dd>среднее и дисперсия канала \(j\) по <span class="en" lang="en">mini-batch</span> (на слайдах \(E[x_i]\) и \(\mathrm{var}[x_i]\))</dd>
+      <dt>\(\gamma_j,\ \beta_j\)</dt><dd><span class="en" lang="en">scale</span> и <span class="en" lang="en">shift</span> канала \(j\), обучаемые</dd>
+      <dt>\(\epsilon\)</dt><dd>маленькая константа против деления на ноль, в PyTorch \(10^{-5}\)</dd>
+    </dl>
+  </div>
+
+  <p>На рисунке слайда тензор нарисован кубиком. У <span class="en" lang="en">Batch Norm</span> синий слой занимает один канал C и тянется через всю ось N и все H, W; три соседних кубика — другие нормализации, они берут другие куски того же тензора. Виджет ниже разворачивает этот кубик в таблицу карт.</p>
+
+  <div class="widget" id="l72-w-share">
+    <h3 class="widget-title">Кто делит одно среднее</h3>
+    <p class="widget-intro">Тензор <span class="nw">(N, C, H, W) = (3, 4, 3, 3)</span>: столбец — одна картинка <span class="en" lang="en">mini-batch</span>, строка — один канал, в каждой клетке значение выхода свёртки. Щёлкни по клетке (или выбери картинку и канал ползунками): жёлтым подсветятся все значения, которые нормируются тем же средним и той же дисперсией. LayerNorm, InstanceNorm и GroupNorm — для сравнения, их нет на слайдах.</p>
+    <ol class="tasks">
+      <li>Режим BatchNorm2d. Сколько клеток загорится, если щёлкнуть по каналу 2 первой картинки? Предскажи формулой, потом щёлкни.
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Вся строка канала 2: \(N \cdot H \cdot W = 3 \cdot 3 \cdot 3 = 27\) клеток, во всех картинках и на всех позициях. Пар \((\mu, \sigma^2)\) у слоя столько, сколько каналов, — четыре.</p></details>
+      </li>
+      <li>Пощёлкай по разным строкам и сравни \(\mu\) каналов 1 и 4. Почему одна общая статистика на весь тензор была бы плохой идеей?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>У канала 1 \(\mu = 1.89\), у канала 4 — \(6.74\). Каналы — разные фильтры с разными шкалами. Общее среднее сдвинуло бы канал 1 в минус, а канал 4 в плюс, и ничего бы не выровняло.</p></details>
+      </li>
+      <li>Переключи на LayerNorm, потом на InstanceNorm. Какая из трёх нормализаций зависит от того, какие ещё картинки попали в <span class="en" lang="en">mini-batch</span>?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Только BatchNorm: её строка проходит через все картинки. LayerNorm горит столбцом (одна картинка, все каналы, 36 значений), InstanceNorm — одной картой (9 значений). Обе считаются внутри одной картинки, поэтому им всё равно, кто соседи, и они одинаково работают на обучении и на тесте.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l72-w-share', function (root, ui) {
+    /* x[n][j][r][c]: N = 3 images, C = 4 channels, 3 x 3 maps (fixed numbers, seed 72 in the build notes) */
+    var X = [[[[1,2,3],[0,1,1],[3,3,2]],[[8,6,8],[5,8,7],[6,7,5]],[[4,5,4],[4,3,4],[4,4,4]],[[6,7,5],[7,9,9],[6,6,7]]],
+             [[[2,1,1],[2,3,2],[0,2,2]],[[5,3,6],[7,7,7],[7,8,3]],[[3,4,4],[5,4,4],[4,3,4]],[[6,6,9],[6,7,7],[9,7,6]]],
+             [[[1,3,3],[3,2,1],[3,1,3]],[[5,4,5],[6,8,5],[5,2,8]],[[3,3,3],[4,4,4],[4,4,4]],[[9,7,6],[6,4,6],[7,6,6]]]];
+    var N = 3, CH = 4, S = 3, CELL = 32, MAP = S * CELL, X0 = 150, DX = MAP + 40, Y0 = 50, DY = MAP + 22;
+    var MODES = [
+      { value: 'bn', label: 'BatchNorm2d (слайды)' },
+      { value: 'ln', label: 'LayerNorm (сверх слайдов)' },
+      { value: 'in', label: 'InstanceNorm (сверх слайдов)' },
+      { value: 'gn', label: 'GroupNorm, 2 группы (сверх слайдов)' }
+    ];
+    var mode = ui.select('нормализация', MODES, null, 'bn');
+    var sn = ui.slider({ label: 'картинка n', min: 1, max: N, step: 1, value: 1 });
+    var sj = ui.slider({ label: 'канал j', min: 1, max: CH, step: 1, value: 1 });
+    var pos = { r: 1, c: 1 };
+    var roCount = ui.readout('одно среднее — по'), roPairs = ui.readout('пар (μ, σ²) в слое'),
+        roStat = ui.readout('μ и σ этой группы'), roPar = ui.readout('слой хранит');
+    var svg = ui.svg(560, 520, { label: 'Тензор из трёх картинок по четыре канала размером 3 на 3; подсвечены значения, которые нормируются одной статистикой' });
+    function add(tag, attrs) { return Course.svg(tag, attrs, svg); }
+    function shares(n, j, n0, j0) {
+      var m = mode.value;
+      if (m === 'bn') return j === j0;
+      if (m === 'ln') return n === n0;
+      if (m === 'in') return n === n0 && j === j0;
+      return n === n0 && Math.floor(j / 2) === Math.floor(j0 / 2);
+    }
+    function group() {
+      var n0 = Math.round(sn.value) - 1, j0 = Math.round(sj.value) - 1, v = [], n, j, r, c;
+      for (n = 0; n < N; n++) for (j = 0; j < CH; j++) if (shares(n, j, n0, j0))
+        for (r = 0; r < S; r++) for (c = 0; c < S; c++) v.push(X[n][j][r][c]);
+      var m = 0, q = 0;
+      v.forEach(function (a) { m += a; }); m /= v.length;
+      v.forEach(function (a) { q += (a - m) * (a - m); });
+      return { n0: n0, j0: j0, count: v.length, mean: m, sd: Math.sqrt(q / v.length) };
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var G = group(), n, j, r, c, x, y;
+      for (n = 0; n < N; n++) add('text', { x: X0 + n * DX + MAP / 2, y: 30, 'class': 'tx-mid', text: 'картинка ' + (n + 1) });
+      for (j = 0; j < CH; j++) add('text', { x: X0 - 14, y: Y0 + j * DY + MAP / 2 + 5, 'class': 'tx-end', text: 'канал ' + (j + 1) });
+      for (n = 0; n < N; n++) for (j = 0; j < CH; j++) {
+        x = X0 + n * DX; y = Y0 + j * DY;
+        if (shares(n, j, G.n0, G.j0)) add('rect', { x: x, y: y, width: MAP, height: MAP, 'class': 'fw-key st-none' });
+        for (r = 0; r < S; r++) for (c = 0; c < S; c++) {
+          add('rect', { x: x + c * CELL, y: y + r * CELL, width: CELL, height: CELL, 'class': 'st-muted sw-1' });
+          add('text', { x: x + c * CELL + CELL / 2, y: y + r * CELL + CELL / 2 + 5, 'class': 'tx-mono tx-mid', text: String(X[n][j][r][c]) });
+        }
+        add('rect', { x: x, y: y, width: MAP, height: MAP, 'class': 'sw-2' });
+      }
+      x = X0 + G.n0 * DX + pos.c * CELL; y = Y0 + G.j0 * DY + pos.r * CELL;
+      add('rect', { x: x + 2, y: y + 2, width: CELL - 4, height: CELL - 4, 'class': 'sw-3' });
+      for (n = 0; n < N; n++) for (j = 0; j < CH; j++) for (r = 0; r < S; r++) for (c = 0; c < S; c++) (function (n, j, r, c) {
+        add('rect', { x: X0 + n * DX + c * CELL, y: Y0 + j * DY + r * CELL, width: CELL, height: CELL, 'class': 'l72-hit',
+          onclick: function () { pos = { r: r, c: c }; sn.set(n + 1, true); sj.set(j + 1, true); ui.changed(); } });
+      })(n, j, r, c);
+    }
+    ui.onChange(function () {
+      var G = group(), m = mode.value, F = Course.fmt;
+      var cnt = { bn: 'N·H·W = 3·3·3', ln: 'C·H·W = 4·3·3', 'in': 'H·W = 3·3', gn: '(C/2)·H·W = 2·3·3' }[m];
+      var pairs = { bn: 'C = 4', ln: 'N = 3', 'in': 'N·C = 12', gn: 'N·2 = 6' }[m];
+      roCount.set(cnt + ' = ' + G.count + ' значениям');
+      roPairs.set(pairs);
+      roStat.set('μ = ' + F(G.mean, 2) + ', σ = ' + F(G.sd, 2));
+      roPar.set(m === 'bn' ? 'γ, β: 2C = 8 обучаемых; running mean, running var: 2C = 8' : 'сверх слайдов, не считаем');
+      draw();
+    });
+    Course.onTheme(draw);
+  });
+  </script>
+
+  <p>Под кубиками на слайде стоит вопрос: "There are no trainable parameters here: Can we get more flexibility than z-score normalization?" Ответ — тот же, что в <a href="l26.html">уроке 26</a>: после нормировки слой растягивает и сдвигает результат обучаемыми числами (<a class="slide-ref" href="assets/slides/s10_010.webp" data-deck="s10" data-slide="10">слайд 10 лекции 10</a>). На слайде это \(y_{i,j} = \gamma_j x_i' + \beta_j\), где \(j\) — канал: "We have \(\gamma\) and \(\beta\) for each channel of the input activation". Сеть сама решает, какое среднее (\(\beta_j\)) и какой разброс (\(\gamma_j\)) нужны каналу, и может даже вернуть всё как было, выучив \(\gamma_j = \sigma_j\), \(\beta_j = \mu_j\).</p>
+
+  <p>Среднее и разброс по <span class="en" lang="en">batch</span>, наоборот, "non-trainable parameters": их не учат градиентом, их считают. На <a class="slide-ref" href="assets/slides/s10_010.webp" data-deck="s10" data-slide="10">слайде 10 лекции 10</a> корень \(\sqrt{\mathrm{var}[x_i]}\) назван "variance", но это стандартное отклонение, а слой хранит дисперсию \(\sigma_j^2\); вопрос экзамена может быть составлен словами слайда, так что знай и напечатанное название, и верное.</p>
+
+  <p><a class="slide-ref" href="assets/slides/s10_011.webp" data-deck="s10" data-slide="11">Слайд 11 лекции 10</a> повторяет алгоритм Ioffe и Szegedy — те же четыре шага с \(\epsilon\) в знаменателе, что разобраны на числах в <a href="l26.html">уроке 26</a>. Для свёрточного слоя меняется только одно: «<span class="en" lang="en">mini-batch</span>» одного канала состоит не из \(N\), а из \(N \cdot H \cdot W\) значений.</p>
+</section>
+
+<section id="l72-modes">
+  <h2>Обучение, тест и замороженная сеть</h2>
+
+  <p>На обучении \(\mu_j\) и \(\sigma_j^2\) берутся из текущего <span class="en" lang="en">mini-batch</span>. На тесте так нельзя: предсказание для одной картинки зависело бы от того, какие картинки оказались с ней в одной пачке, а картинка, пришедшая одна, нормировалась бы только по собственным картам. Поэтому "after training, these are replaced by (running) averages computed on training samples" (<a class="slide-ref" href="assets/slides/s10_010.webp" data-deck="s10" data-slide="10">слайд 10 лекции 10</a>). Слой копит их по ходу обучения, после каждого <span class="en" lang="en">mini-batch</span>:</p>
+
+  \[ \mu_{\mathrm{run}} \leftarrow (1 - 0.1)\,\mu_{\mathrm{run}} + 0.1\,\mu_j \]
+
+  <p>и так же для дисперсии. Число 0.1 — параметр <code>momentum</code> слоя в PyTorch (<a class="slide-ref" href="assets/slides/s10_013.webp" data-deck="s10" data-slide="13">слайд 13 лекции 10</a>), в <a href="l26.html">уроке 26</a> он обозначен \(\alpha\). С оптимизатором с моментом он ничего общего не имеет.</p>
+
+  <p>Отдельное предупреждение: "This layer behaves differently during training and inference, like dropout" (<a class="slide-ref" href="assets/slides/s10_015.webp" data-deck="s10" data-slide="15">слайд 15 лекции 10</a>). В PyTorch режим переключают для всей модели сразу. <code>model.train()</code>: BN нормирует статистикой <span class="en" lang="en">batch</span> и обновляет <span class="en" lang="en">running averages</span>. <code>model.eval()</code>: BN нормирует накопленными числами и ничего не обновляет. Без <code>eval()</code> перед проверкой ответ на одну картинку зависит от соседей, а архив статистики дописывается тестовыми данными.</p>
+
+  <h3>Ответ на задачку</h3>
+
+  <p>Вот что сдвинулось в замороженной ResNet: <code>running_mean</code> и <code>running_var</code> каждого слоя BatchNorm2d (и счётчик <code>num_batches_tracked</code>). Это не параметры, а буферы: градиент их не трогает, и <code>requires_grad_(False)</code> к ним не относится. Их обновляет сам прямой проход в режиме <code>train()</code>.</p>
+
+  <p>За эпоху на новом датасете статистика замороженных слоёв переехала на новые данные, а замороженные веса после них ждут старую, с ImageNet. С маленькими <span class="en" lang="en">mini-batch</span> она к тому же шумит. Поэтому при <span class="en" lang="en">fine-tuning</span> (урок 71) замороженную часть держат в режиме <code>eval()</code>, даже когда остальная модель учится:</p>
+
+<pre><code>model.train()      # the head learns
+backbone.eval()    # frozen BN layers keep
+                   # the ImageNet statistics</code></pre>
+
+  <h3>На тесте BN — просто прямая</h3>
+
+  <p>"During testing batch normalization becomes a linear operator! Can be fused with the previous fully-connected or conv layer" (<a class="slide-ref" href="assets/slides/s10_012.webp" data-deck="s10" data-slide="12">слайд 12 лекции 10</a>). На тесте \(\mu_{\mathrm{run}}\), \(\sigma^2_{\mathrm{run}}\), \(\gamma_j\), \(\beta_j\) — четыре константы канала, и слой превращается в \(y = s\,x + \text{const}\). А такую операцию можно спрятать внутрь свёртки, которая стоит перед ним. Пусть фильтр \(j\) свёртки с весами \(\vb{w}^j\) и смещением \(b^j\) даёт канал \(j\): \(x = (\vb{w}^j)\T \vb{p}_{r,c} + b^j\), где \(\vb{p}_{r,c}\) — развёрнутое в вектор окно входа (<a href="l58.html#l58-neuron">урок 58</a>).</p>
+
+  <ol class="steps" id="l72-steps-fuse">
+    <li><p>На тесте слой BN канала \(j\) — формула с одними константами:</p>
+      \[ y = \gamma_j\,\frac{x - \mu_{\mathrm{run}}}{\sqrt{\sigma^2_{\mathrm{run}} + \epsilon}} + \beta_j \]</li>
+    <li><p>Обозначим множитель \(s_j = \gamma_j / \sqrt{\sigma^2_{\mathrm{run}} + \epsilon}\) и раскроем скобки. Получилась прямая со сдвигом — строго говоря, аффинное, а не линейное отображение:</p>
+      \[ y = s_j\,x + (\beta_j - s_j\,\mu_{\mathrm{run}}) \]</li>
+    <li><p>Подставим выход свёртки \(x = (\vb{w}^j)\T \vb{p}_{r,c} + b^j\):</p>
+      \[ y = s_j (\vb{w}^j)\T \vb{p}_{r,c} + s_j b^j + \beta_j - s_j\,\mu_{\mathrm{run}} \]</li>
+    <li><p>Сгруппируем. Это снова свёртка, только с другими весами и смещением:</p>
+      \[ \vb{w}'^j = s_j\, \vb{w}^j \]
+      \[ b'^j = s_j\,(b^j - \mu_{\mathrm{run}}) + \beta_j \]</li>
+    <li><p>На числах урока 26 (\(\mu_{\mathrm{run}} = 4\), \(\sigma^2_{\mathrm{run}} = 5\), \(\gamma = 2\), \(\beta = 1\), \(\epsilon \approx 0\)) и свёртке 1 × 1 с весом 0.5 и смещением 1:</p>
+      \[ s = 2/\sqrt{5} = 0.894 \]
+      \[ w' = 0.894 \cdot 0.5 = 0.447 \]
+      \[ b' = 0.894 \cdot (1 - 4) + 1 = -1.683 \]</li>
+  </ol>
+
+  <figure class="fig fig--pair fig--plain" id="l72-fig-fuse">
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 330" role="img" aria-label="До свёртки: вход u = 2 проходит свёртку с весом 0.5 и смещением 1, затем BN с running mean 4, running variance 5, gamma 2, beta 1, и даёт y = −0.789">
+        <text x="150" y="24" class="tx-mid tx-mono">u = 2</text>
+        <line x1="150" y1="34" x2="150" y2="62" marker-end="url(#arr)"/>
+        <rect x="40" y="66" width="220" height="56" class="fi-paper sw-2"/>
+        <text x="150" y="90" class="tx-mid tx-bold">Conv</text>
+        <text x="150" y="112" class="tx-mid tx-mono">w = 0.5, b = 1</text>
+        <line x1="150" y1="122" x2="150" y2="158" marker-end="url(#arr)"/>
+        <text x="162" y="146" class="tx-mono">x = 2</text>
+        <rect x="40" y="162" width="220" height="80" class="fi-paper sw-2"/>
+        <text x="150" y="186" class="tx-mid tx-bold">BN (eval)</text>
+        <text x="150" y="208" class="tx-mid tx-mono">μ = 4, σ² = 5</text>
+        <text x="150" y="230" class="tx-mid tx-mono">γ = 2, β = 1</text>
+        <line x1="150" y1="242" x2="150" y2="276" marker-end="url(#arr)"/>
+        <text x="150" y="304" class="tx-mid tx-mono tx-bold">y = −0.789</text>
+      </svg>
+      <p class="fig-label">До: свёртка, потом BN</p>
+    </div>
+    <div class="fig-panel">
+      <svg class="dia" viewBox="0 0 300 330" role="img" aria-label="После: вход u = 2 проходит одну свёртку с весом 0.447 и смещением −1.683 и даёт тот же y = −0.789">
+        <text x="150" y="24" class="tx-mid tx-mono">u = 2</text>
+        <line x1="150" y1="34" x2="150" y2="62" marker-end="url(#arr)"/>
+        <rect x="40" y="66" width="220" height="176" class="fi-paper sw-2"/>
+        <rect x="40" y="66" width="220" height="176" class="hl"/>
+        <text x="150" y="120" class="tx-mid tx-bold">Conv′</text>
+        <text x="150" y="150" class="tx-mid tx-mono">w′ = 0.447</text>
+        <text x="150" y="176" class="tx-mid tx-mono">b′ = −1.683</text>
+        <text x="150" y="216" class="tx-hand tx-mid">BN внутри</text>
+        <line x1="150" y1="242" x2="150" y2="276" marker-end="url(#arr)"/>
+        <text x="150" y="304" class="tx-mid tx-mono tx-bold">y = −0.789</text>
+      </svg>
+      <p class="fig-label">После: одна свёртка</p>
+    </div>
+    <figcaption><b>Рис. 2.</b> На тесте BN сворачивается в предыдущую свёртку. Слева два слоя: \(0.5 \cdot 2 + 1 = 2\), затем \(0.894 \cdot (2 - 4) + 1 = -0.789\). Справа один слой с пересчитанными весом и смещением: \(0.447 \cdot 2 - 1.683 = -0.789\). Ответ тот же, а вычислений на тесте не прибавилось.</figcaption>
+  </figure>
+
+  <p>Отсюда пункт "Zero overhead at test-time: can be fused with conv!" из списка достоинств (<a class="slide-ref" href="assets/slides/s10_015.webp" data-deck="s10" data-slide="15">слайд 15 лекции 10</a>). Сворачивать можно, когда BN стоит сразу за свёрткой или полносвязным слоем, без нелинейности между ними — как в стандартном блоке ниже.</p>
+</section>
+
+<section id="l72-code">
+  <h2>BatchNorm2d в коде: параметры и место</h2>
+
+  <p>В PyTorch слой для тензоров <span class="nw">(N, C, H, W)</span> — <code>nn.BatchNorm2d</code> (<a class="slide-ref" href="assets/slides/s10_013.webp" data-deck="s10" data-slide="13">слайд 13 лекции 10</a>):</p>
+
+<pre><code>torch.nn.BatchNorm2d(num_features, eps=1e-05, momentum=0.1,
+                     affine=True, device=None, dtype=None)
+
+# With Learnable Parameters
+m = nn.BatchNorm2d(100)
+# Without Learnable Parameters
+m = nn.BatchNorm2d(100, affine=False)</code></pre>
+
+  <p><code>num_features</code> — это \(C\), число каналов входа. <code>eps</code> — \(\epsilon\) в знаменателе. <code>momentum</code> — вес свежего <span class="en" lang="en">batch</span> в <span class="en" lang="en">running averages</span>; <code>None</code> даёт простое среднее по всем <span class="en" lang="en">batch</span> ("cumulative moving average"). <code>affine=False</code> убирает \(\gamma\) и \(\beta\): остаётся чистый <span class="en" lang="en">z-score</span>. В нынешней сигнатуре есть ещё <code>track_running_stats=True</code>; слайд его не печатает.</p>
+
+  <h3>Сколько чисел хранит слой</h3>
+
+  <p>На каждый канал \(\gamma\) и \(\beta\) — "Trainable Parameters: 2 × C", плюс <span class="en" lang="en">running mean</span> и <span class="en" lang="en">running variance</span> — "Non-Trainable Parameters: 2 × C", итого "Total Parameters: 4 × C" (<a class="slide-ref" href="assets/slides/s10_014.webp" data-deck="s10" data-slide="14">слайд 14 лекции 10</a>). Для входа <span class="nw">(N, 64, H, W)</span>: 128 обучаемых + 128 отслеживаемых = 256. От \(N\), \(H\) и \(W\) счёт не зависит. В коде число будет другим: <code>sum(p.numel() for p in bn.parameters())</code> для <code>BatchNorm2d(64)</code> вернёт 128, потому что PyTorch хранит <span class="en" lang="en">running statistics</span> как буферы, а не параметры. На экзамене отвечай, как на слайде: \(2C\) обучаемых и \(2C\) необучаемых.</p>
+
+  <h3>Стандартный блок</h3>
+
+  <p>Смещение свёртки перед BN бесполезно: BN вычитает среднее канала, а вместе с ним и любую добавленную к каналу константу, \(\mathrm{BN}(x + b) = \mathrm{BN}(x)\) (<a href="l26.html">урок 26</a>). Его работу делает \(\beta_j\). Поэтому свёртку перед BN создают с <code>bias=False</code>:</p>
+
+<pre><code>block = nn.Sequential(
+    # (3*3*64)*128 = 73 728 weights, no bias
+    nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+    # 2*128 = 256 trainable, 256 running statistics
+    nn.BatchNorm2d(128),
+    nn.ReLU(),
+)</code></pre>
+
+  <p>Со смещением у свёртки было бы на 128 параметров больше, \(73\,856\), и все 128 лишние. В современных CNN BN стоит после практически каждой свёртки, блоком <span class="en" lang="en">conv → BN → ReLU</span>: так устроены ResNet и остальные сети torchvision с BN. Фраза <a class="slide-ref" href="assets/slides/s10_012.webp" data-deck="s10" data-slide="12">слайда 12 лекции 10</a>, что BN "typically" ставят между FC-слоями и лишь "sometimes" между свёрточными, устарела: уже <a class="slide-ref" href="assets/slides/s10_013.webp" data-deck="s10" data-slide="13">слайд 13 лекции 10</a> посвящён <code>BatchNorm2d</code>, версии для свёрток (экзамен может взять формулировку слайда, так что знай и её, и нынешнюю практику).</p>
+
+  <p>Почему BN стоит почти везде — список достоинств со <a class="slide-ref" href="assets/slides/s10_015.webp" data-deck="s10" data-slide="15">слайда 15 лекции 10</a> (механизмы разобраны в <a href="l26.html">уроке 26</a>):</p>
+  <ul>
+    <li>"Makes deep networks much easier to train!", "Improves gradient flow";</li>
+    <li>"Allows higher learning rates, faster convergence";</li>
+    <li>"Networks become more robust to initialization";</li>
+    <li>"Acts as regularization during training": выход каждой картинки зависит от случайных соседей по <span class="en" lang="en">batch</span>;</li>
+    <li>"Zero overhead at test-time: can be fused with conv!"</li>
+  </ul>
+  <p>И одно предупреждение: разное поведение на обучении и на тесте — то самое, на котором попалась замороженная ResNet.</p>
+</section>
+
+<section id="l72-multi">
+  <h2>Радио или галочки</h2>
+
+  <p>На фотографии со слайда собака разинула пасть над головой рыжей кошки (<a class="slide-ref" href="assets/slides/s10_017.webp" data-deck="s10" data-slide="17">слайд 17 лекции 10</a>). Какой класс должен вернуть классификатор? Правильный ответ — оба. Но все классификаторы курса до сих пор возвращали ровно одну метку: softmax на выходе (<a href="l11.html#l11-multi">урок 11</a>) делает из оценок вероятности, которые в сумме дают 1, и ответ — самый вероятный класс. Хочется классификатор, который возвращает "a varying number of labels" — переменное число меток, в том числе ни одной.</p>
+
+  <p>Это разница между двумя типами вопросов в анкете. Softmax — <b>радиокнопки</b>: «какое одно животное на фото?» — выбор одной кнопки снимает остальные. <mark class="key"><span class="en" lang="en">Multi-label classification</span></mark> — <b>галочки</b>: «отметь всех, кого видишь», любое число, хоть ни одного. Рецепт — три пункта (<a class="slide-ref" href="assets/slides/s10_018.webp" data-deck="s10" data-slide="18">слайд 18 лекции 10</a>):</p>
+  <ul>
+    <li>"Replacing the softmax activation in the output layer with a sigmoid activation in each output neuron";</li>
+    <li>\(i\)-й выход предсказывает вероятность \(p_i \in [0, 1]\) принадлежности к классу \(i\) "in a non-exclusive manner" — независимо от остальных;</li>
+    <li>"The model must be trained with the binary cross-entropy loss function".</li>
+  </ul>
+
+  <figure class="fig fig--plain" id="l72-fig-head">
+    <svg class="dia" viewBox="0 0 560 250" role="img" aria-label="Multi-label голова: признаки из FEN и GAP идут в полносвязный слой, у каждого из трёх выходов своя сигмоида; кошка 0.88 и собака 0.73 выше порога, машина 0.05 ниже; цель (1, 1, 0)">
+      <rect x="20" y="70" width="60" height="70" class="fi-paper"/>
+      <rect x="28" y="78" width="60" height="70" class="fi-paper"/>
+      <rect x="36" y="86" width="60" height="70" class="fi-paper"/>
+      <text x="62" y="186" class="tx-mid tx-sm">FEN</text>
+      <line x1="102" y1="120" x2="144" y2="120" marker-end="url(#arr)"/>
+      <text x="122" y="100" class="tx-mid tx-sm">GAP</text>
+      <rect x="150" y="50" width="16" height="140" class="fi-paper"/>
+      <line x1="166" y1="120" x2="224" y2="62"/>
+      <line x1="166" y1="120" x2="224" y2="120"/>
+      <line x1="166" y1="120" x2="224" y2="178"/>
+      <text x="186" y="30" class="tx-mid tx-sm">Dense</text>
+      <circle cx="240" cy="60" r="16" class="fi-paper sw-2"/>
+      <circle cx="240" cy="120" r="16" class="fi-paper sw-2"/>
+      <circle cx="240" cy="180" r="16" class="fi-paper sw-2"/>
+      <rect x="276" y="46" width="32" height="28" class="fw-s3 st-s3"/>
+      <rect x="276" y="106" width="32" height="28" class="fw-s3 st-s3"/>
+      <rect x="276" y="166" width="32" height="28" class="fw-s3 st-s3"/>
+      <text x="292" y="66" class="tx-mid">σ</text>
+      <text x="292" y="126" class="tx-mid">σ</text>
+      <text x="292" y="186" class="tx-mid">σ</text>
+      <line x1="256" y1="60" x2="274" y2="60"/>
+      <line x1="256" y1="120" x2="274" y2="120"/>
+      <line x1="256" y1="180" x2="274" y2="180"/>
+      <text x="324" y="65" class="tx-mono">p₁ = 0.88</text>
+      <text x="324" y="125" class="tx-mono">p₂ = 0.73</text>
+      <text x="324" y="185" class="tx-mono">p₃ = 0.05</text>
+      <rect x="436" y="50" width="20" height="20" class="sw-2"/>
+      <rect x="436" y="110" width="20" height="20" class="sw-2"/>
+      <rect x="436" y="170" width="20" height="20" class="sw-2"/>
+      <path d="M440 60 L445 66 L453 54" class="sw-3"/>
+      <path d="M440 120 L445 126 L453 114" class="sw-3"/>
+      <text x="466" y="65">кошка</text>
+      <text x="466" y="125">собака</text>
+      <text x="466" y="185">машина</text>
+      <text x="280" y="232" class="tx-mid">цель t = (1, 1, 0), сумма p = 1.66</text>
+    </svg>
+    <figcaption><b>Рис. 3.</b> Multi-label классификатор отличается от обычного только выходом: признаки (FEN + GAP или flatten) и полносвязные слои те же, но у каждого из \(L\) выходов своя сигмоида. Каждая галочка ставится независимо: здесь две из трёх, а сумма вероятностей не равна 1.</figcaption>
+  </figure>
+
+  <p>"These probabilities do not sum to 1": фото может принадлежать нескольким классам сразу, и картинку со слайда, скорее всего, отнесут и к «dog», и к «cat». Цель обучения — не <span class="en" lang="en">one-hot</span>, а <span class="en" lang="en">multi-hot</span> вектор \(t\): единицы у всех присутствующих классов. Каждый выход — свой вопрос «да / нет», то есть своя монетка, как в <a href="l11.html">уроке 11</a>, и ошибка — сумма <span class="en" lang="en">binary cross-entropy</span> по \(L\) выходам (формулы на слайде нет):</p>
+
+  \[ \begin{aligned} E = -\sum_{i=1}^{L} \bigl[ &amp; t_i \ln p_i \\ &amp; + (1 - t_i) \ln (1 - p_i) \bigr] \end{aligned} \]
+
+  <p>Метку \(i\) ставят, если \(p_i \gt \tau\), обычно \(\tau = 0.5\); если ни одна \(p_i\) не прошла порог, ответ — пустое множество. Для логитов <span class="nw">(2, 1, −3)</span> кошки, собаки и машины с целью <span class="nw">(1, 1, 0)</span> ошибка равна \(0.127 + 0.313 + 0.049 = 0.489\).</p>
+
+  <div class="widget" id="l72-w-radio">
+    <h3 class="widget-title">Радио или галочки</h3>
+    <p class="widget-intro">Три логита — выходы последнего слоя до активации — идут в две головы сразу. Сверху softmax: полоски в сумме дают 1, выбирается одна кнопка. Снизу независимые сигмоиды: галочка ставится каждому классу, у которого \(p_i\) выше порога \(\tau\).</p>
+    <ol class="tasks">
+      <li>Логиты <span class="nw">(2, 1, −3)</span>, как стоят. Что ответит каждая голова?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Softmax: кошка, 0.73 (собака 0.27, машина 0.00). Сигмоиды: кошка 0.88 и собака 0.73 — обе галочки; машина 0.05 — нет. Сумма сигмоид 1.66.</p></details>
+      </li>
+      <li>Подними логит собаки с 1 до 3. Что случится с вероятностью кошки в каждой голове?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>В softmax кошка упала с 0.73 до 0.27: классы делят одну единицу, и рост собаки отнимает у кошки. Сигмоида кошки осталась 0.88: её никто не трогал. Это и значит "non-exclusive".</p></details>
+      </li>
+      <li>На фото нет ни одного из трёх классов: поставь логиты <span class="nw">(−3, −2, −4)</span>. Что ответят головы?
+        <details class="answer"><summary>Что должно получиться</summary>
+          <p>Softmax всё равно выбирает: собака, 0.67 — сказать «никого нет» он не может. Все сигмоиды ниже 0.5 (0.05, 0.12, 0.02): ни одной галочки, пустой ответ.</p></details>
+      </li>
+    </ol>
+  </div>
+  <script>
+  Course.widget('l72-w-radio', function (root, ui) {
+    var NAMES = ['кошка', 'собака', 'машина'], INIT = [2, 1, -3];
+    var sl = NAMES.map(function (nm, i) { return ui.slider({ label: 'логит: ' + nm, min: -5, max: 5, step: 0.1, value: INIT[i] }); });
+    var tau = ui.slider({ label: 'порог τ', min: 0.05, max: 0.95, step: 0.05, value: 0.5 });
+    var roSm = ui.readout('ответ softmax'), roSg = ui.readout('ответ сигмоид'), roSum = ui.readout('сумма сигмоид');
+    var svg = ui.svg(560, 370, { label: 'Одни и те же три логита через softmax (радиокнопки, сумма 1) и через независимые сигмоиды с порогом (галочки)' });
+    function add(tag, a) { return Course.svg(tag, a, svg); }
+    var BX = 190, BW = 260;
+    function state() {
+      var s = sl.map(function (x) { return x.value; }), mx = Math.max.apply(null, s);
+      var e = s.map(function (v) { return Math.exp(v - mx); }), z = e.reduce(function (a, b) { return a + b; }, 0);
+      var sm = e.map(function (v) { return v / z; }), sg = s.map(function (v) { return 1 / (1 + Math.exp(-v)); });
+      var best = 0; sm.forEach(function (v, i) { if (v > sm[best]) best = i; });
+      return { sm: sm, sg: sg, best: best, on: sg.map(function (v) { return v > tau.value; }) };
+    }
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var S = state(), F = Course.fmt, i, y, tx;
+      add('text', { x: 30, y: 28, 'class': 'tx-bold', text: 'softmax: одна метка' });
+      add('text', { x: 30, y: 208, 'class': 'tx-bold', text: 'сигмоиды: каждая сама' });
+      for (i = 0; i < 3; i++) {
+        y = 60 + i * 40;
+        add('circle', { cx: 40, cy: y, r: 9, 'class': 'sw-2' });
+        if (i === S.best) add('circle', { cx: 40, cy: y, r: 4.5, 'class': 'fi-ink st-none' });
+        add('text', { x: 62, y: y + 5, text: NAMES[i] });
+        add('rect', { x: BX, y: y - 10, width: BW, height: 20, 'class': 'st-muted sw-1' });
+        if (S.sm[i] > 0.0005) add('rect', { x: BX, y: y - 10, width: BW * S.sm[i], height: 20, 'class': 'fw-s3 st-s3' });
+        add('text', { x: BX + BW + 14, y: y + 5, 'class': 'tx-mono', text: F(S.sm[i], 2) });
+        y = 240 + i * 40;
+        add('rect', { x: 31, y: y - 9, width: 18, height: 18, 'class': 'sw-2' });
+        if (S.on[i]) add('path', { d: 'M34 ' + y + ' L39 ' + (y + 5) + ' L47 ' + (y - 6), 'class': 'sw-3' });
+        add('text', { x: 62, y: y + 5, text: NAMES[i] });
+        add('rect', { x: BX, y: y - 10, width: BW, height: 20, 'class': 'st-muted sw-1' });
+        if (S.sg[i] > 0.0005) add('rect', { x: BX, y: y - 10, width: BW * S.sg[i], height: 20, 'class': 'fw-s3 st-s3' });
+        add('text', { x: BX + BW + 14, y: y + 5, 'class': 'tx-mono', text: F(S.sg[i], 2) });
+      }
+      tx = BX + BW * tau.value;
+      add('line', { x1: tx, y1: 222, x2: tx, y2: 336, 'class': 'sw-2 dash' });
+      add('text', { x: tx, y: 356, 'class': 'tx-mid tx-mono', text: 'τ = ' + F(tau.value, 2) });
+      add('text', { x: BX + BW + 60, y: 28, 'class': 'tx-end tx-muted', text: 'сумма 1.00' });
+    }
+    ui.onChange(function () {
+      var S = state(), lab = [];
+      S.on.forEach(function (v, i) { if (v) lab.push(NAMES[i]); });
+      roSm.set(NAMES[S.best] + ' (' + Course.fmt(S.sm[S.best], 2) + ')');
+      roSg.set(lab.length ? lab.join(', ') : 'ни одной метки');
+      roSum.set(S.sg[0] + S.sg[1] + S.sg[2]);
+      draw();
+    });
+    Course.onTheme(draw);
+  });
+  </script>
+
+  <p>В PyTorch сигмоиду в модель обычно не ставят: последний слой выдаёт логиты, а <code>nn.BCEWithLogitsLoss</code> применяет сигмоиду и <span class="en" lang="en">binary cross-entropy</span> вместе, так численно устойчивее. Цель — <span class="en" lang="en">float</span>-тензор из нулей и единиц той же формы, что выход. <code>nn.CrossEntropyLoss</code> сюда не годится: внутри него softmax, и классы снова начнут делить одну единицу (этого кода на слайдах нет).</p>
+
+<pre><code>head = nn.Linear(d, L)            # no sigmoid in the model
+loss_fn = nn.BCEWithLogitsLoss()
+logits = head(features)           # shape (N, L)
+# targets: float multi-hot, shape (N, L)
+loss = loss_fn(logits, targets)
+
+# inference: a threshold for every class
+labels = torch.sigmoid(logits) &gt; 0.5</code></pre>
+
+  <p>Порог не обязан быть общим: его можно подобрать для каждого класса отдельно на <span class="en" lang="en">validation set</span>. Та же фотография с собакой и кошкой вернётся в уроке 79 с другим вопросом: сеть сказала «оба» — а где на картинке каждый?</p>
+</section>
+
+<section id="l72-exam" class="no-num">
+  <h2>В формате экзамена</h2>
+
+  <div class="exam" data-kind="numeric" data-points="1" data-answer="16384" data-tol="0.5" id="l72-exam-count">
+    <div class="exam-q" lang="en">
+      <p>A convolutional layer outputs a tensor of shape \((N, C, H, W) = (16, 64, 32, 32)\), followed by <code>nn.BatchNorm2d(64)</code>. During training, over how many values is the mean of each channel computed?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>BatchNorm2d computes one mean and one variance per channel, over the batch and all spatial positions: \(N \cdot H \cdot W = 16 \cdot 32 \cdot 32 = 16\,384\) values. There are 64 such means, one per channel.</p></div>
+      <div class="exam-note"><p>Проверяют «по каналу, по N, H, W». Типичные неверные ответы: 16 (как будто нормируют только по batch, по одному значению на позицию) и \(64 \cdot 32 \cdot 32\) (так считает LayerNorm).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="73984" data-tol="0.5" id="l72-exam-params">
+    <div class="exam-q" lang="en">
+      <p>Count the trainable parameters of <code>nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)</code> followed by <code>nn.BatchNorm2d(128)</code>. Why is the convolution created without bias?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Convolution: \((3 \cdot 3 \cdot 64) \cdot 128 = 73\,728\). BatchNorm2d: \(\gamma\) and \(\beta\) per channel, \(2 \cdot 128 = 256\). Total trainable: \(73\,984\). BN also stores \(2 \cdot 128 = 256\) non-trainable statistics (running mean and running variance), \(4C = 512\) numbers in total. The bias is redundant: BN subtracts the channel mean, which cancels any constant added to the channel, and \(\beta\) takes its role.</p></div>
+      <div class="exam-note"><p>Два места для ошибки: забыть, что \(\gamma, \beta\) — по каналу (а не по позиции), и посчитать <span class="en" lang="en">running statistics</span> обучаемыми. Если спрашивают «all parameters» по <a class="slide-ref" href="assets/slides/s10_014.webp" data-deck="s10" data-slide="14">слайду 14 лекции 10</a>, ответ BN — \(4C\).</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="numeric" data-points="2" data-answer="-1.683" data-tol="0.005" id="l72-exam-fuse">
+    <div class="exam-q" lang="en">
+      <p>At test time a batch-normalization channel has running mean 4, running variance 5, \(\gamma = 2\), \(\beta = 1\), and \(\epsilon \approx 0\). It follows a \(1 \times 1\) convolution whose weight is 0.5 and bias is 1 for that channel. Fold BN into the convolution: what is the bias of the fused convolution (three decimals)?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>At test time BN is the affine map \(y = s\,x + (\beta - s\,\mu)\) with \(s = \gamma / \sqrt{\sigma^2 + \epsilon} = 2 / \sqrt{5} = 0.894\). Substituting \(x = w u + b\): \(w' = s\,w = 0.447\) and</p>
+        \[ \begin{aligned} b' &amp;= s\,(b - \mu) + \beta \\ &amp;= 0.894 \cdot (1 - 4) + 1 = -1.683 \end{aligned} \]</div>
+      <div class="exam-note"><p>Проверка на одном входе: при \(u = 2\) обе версии дают \(-0.789\). Если вышло \(-2.578\), смещение свёртки забыто.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="2" id="l72-exam-stats">
+    <div class="exam-q" lang="en">
+      <p>Why must the mean and standard deviation used to normalize the inputs be computed on the training set only? What changes when you fine-tune a network pretrained on ImageNet?</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Normalization statistics are parameters of the model. Estimating them on validation or test data leaks information from those sets into training and makes the performance estimate optimistic; so we split first, compute the statistics on the training split and apply the same numbers to validation and test. A pretrained network was trained on inputs normalized with its own statistics (ImageNet: mean 0.485, 0.456, 0.406 and std 0.229, 0.224, 0.225 per channel), so we must use its preprocessing function, not statistics of our dataset.</p></div>
+      <div class="exam-note"><p>Ключевые слова: "parameters of the model", "split first", "apply to validation and test", "use the pretrained model's preprocessing". Числа ImageNet называть не обязательно, но они показывают, что ты понимаешь, о чём речь.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="open" data-points="3" id="l72-exam-modes">
+    <div class="exam-q" lang="en">
+      <p>Batch normalization behaves differently during training and inference. Explain the difference, what goes wrong if you forget <code>model.eval()</code>, and why BN adds no cost at test time.</p>
+    </div>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>During training BN normalizes each channel with the mean and variance of the current mini-batch (over N, H, W) and updates running averages of them (momentum 0.1 in PyTorch). At inference the running averages are used. Without <code>model.eval()</code> a prediction depends on the other images in the batch and the running statistics are overwritten by test data. At test time the mean, variance, \(\gamma\) and \(\beta\) are constants, so BN is an affine map per channel and can be fused into the preceding convolution: \(w' = s\,w\), \(b' = s\,(b - \mu) + \beta\), with \(s = \gamma / \sqrt{\sigma^2 + \epsilon}\).</p></div>
+      <div class="exam-note"><p>Три части — три балла. Слово "affine" (на слайде "linear operator") плюс формула свёртки показывают, что фраза "can be fused" понята, а не заучена.</p></div>
+    </details>
+  </div>
+
+  <div class="exam" data-kind="mcq" data-points="2" id="l72-exam-multi">
+    <div class="exam-q" lang="en">
+      <p>A CNN must return every object class present in an image, possibly none. Which modifications of a standard softmax classifier are needed? Select all that apply.</p>
+    </div>
+    <ul class="options" lang="en">
+      <li data-correct>A sigmoid activation in each output neuron instead of the softmax <span class="fb">Каждый выход отвечает на свой вопрос «да / нет», независимо от остальных.</span></li>
+      <li data-correct>Training with the binary cross-entropy loss on a multi-hot target <span class="fb">Это прямо третий пункт <a class="slide-ref" href="assets/slides/s10_018.webp" data-deck="s10" data-slide="18">слайда 18 лекции 10</a>: каждый выход — монетка Бернулли.</span></li>
+      <li data-correct>A threshold applied to each output independently <span class="fb">Метка ставится, если \(p_i \gt \tau\); если не прошёл ни один выход, ответ пустой.</span></li>
+      <li>Keeping the softmax and returning every class with probability above 0.5 <span class="fb">Softmax даёт в сумме 1, поэтому выше 0.5 может оказаться не больше одного класса: кошку и собаку сразу он не вернёт.</span></li>
+      <li>Training with categorical cross-entropy on a one-hot target <span class="fb">One-hot кодирует ровно одну метку, а categorical cross-entropy содержит softmax: классы опять конкурируют.</span></li>
+    </ul>
+    <details class="exam-solution">
+      <summary>Show model answer</summary>
+      <div class="exam-answer" lang="en"><p>Replace the softmax with one sigmoid per output, so that each \(p_i \in [0, 1]\) is predicted in a non-exclusive way, train with binary cross-entropy on multi-hot targets, and assign label \(i\) when \(p_i\) exceeds a threshold. The outputs no longer sum to 1, and any number of labels, including none, can be returned.</p></div>
+      <div class="exam-note"><p>Экзаменатор проверяет, что ты понимаешь, почему softmax не годится: классы делят одну единицу. Запомни фразу слайда "These probabilities do not sum to 1".</p></div>
+    </details>
+  </div>
+</section>
+
+<section class="quiz" id="l72-quiz">
+  <h2>Проверь себя</h2>
+
+  <div class="q">
+    <p class="q-text">После шага <span class="en" lang="en">normalization</span> у каждого признака среднее 0 и разброс 1. Что можно сказать о связи между признаками?</p>
+    <ul class="options">
+      <li>Её больше нет: признаки стали независимыми <span class="fb">Деление на разброс меняет масштаб каждой оси отдельно и не трогает корреляцию: в виджете она так и осталась 0.90.</span></li>
+      <li data-correct>Она осталась прежней: корреляция не меняется от сдвига и масштаба <span class="fb">Да. Убрать её может только поворот на главные оси — <span class="en" lang="en">decorrelation</span>.</span></li>
+      <li>Ковариация стала единичной матрицей <span class="fb">Это <span class="en" lang="en">whitening</span>. После нормализации на диагонали единицы, но вне диагонали остаётся корреляция.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Выход свёртки имеет форму <span class="nw">(8, 32, 14, 14)</span>, за ней <code>BatchNorm2d</code>. Сколько разных средних слой считает на одном шаге обучения?</p>
+    <ul class="options">
+      <li data-correct>32 <span class="fb">По одному на канал, каждое — по \(8 \cdot 14 \cdot 14 = 1568\) значениям.</span></li>
+      <li>8 <span class="fb">Это одно среднее на картинку — так считает LayerNorm.</span></li>
+      <li>\(8 \cdot 32 = 256\) <span class="fb">По одному на карту каждой картинки — это InstanceNorm.</span></li>
+      <li>\(32 \cdot 14 \cdot 14 = 6272\) <span class="fb">Так было бы, если бы каждая позиция была своим нейроном. Но позиции канала — один фильтр с общими весами, и статистика у них общая.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Среднее и разброс по каналам посчитали по всему датасету, а потом разбили его на <span class="en" lang="en">train / validation / test</span>. Что не так?</p>
+    <ul class="options">
+      <li data-correct>В статистику попали валидационные и тестовые картинки: утечка, оценка качества выйдет оптимистичной <span class="fb">Да: статистика — параметр модели, и её, как веса, учат только на обучающих данных.</span></li>
+      <li>Ничего: средние по всему датасету точнее <span class="fb">Точнее, но это знание о тесте, которого у модели в реальной работе не будет.</span></li>
+      <li>Нормализация до разбиения ломает метки классов <span class="fb">Метки она не трогает; проблема в том, откуда взяты числа.</span></li>
+    </ul>
+  </div>
+
+  <div class="q" data-type="multi">
+    <p class="q-text">Что меняется в слое <code>BatchNorm2d</code> после <code>model.eval()</code>? Отметь всё верное.</p>
+    <ul class="options">
+      <li data-correct>Он нормирует <span class="en" lang="en">running mean</span> и <span class="en" lang="en">running variance</span>, а не статистикой <span class="en" lang="en">batch</span> <span class="fb">Это и есть режим inference.</span></li>
+      <li data-correct>Он перестаёт обновлять <span class="en" lang="en">running statistics</span> <span class="fb">Да: в <code>eval()</code> прямой проход их не трогает. Поэтому замороженный backbone держат в <code>eval()</code>.</span></li>
+      <li data-correct>Ответ на картинку перестаёт зависеть от остальных картинок <span class="en" lang="en">batch</span> <span class="fb">Все числа слоя теперь константы.</span></li>
+      <li>\(\gamma\) и \(\beta\) перестают получать градиент <span class="fb">Нет: <code>eval()</code> меняет поведение слоя, а не <code>requires_grad</code>. Градиент по \(\gamma\), \(\beta\) по-прежнему считается, если сделать backward.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Зачем свёртку перед BN создают с <code>bias=False</code>?</p>
+    <ul class="options">
+      <li data-correct>BN вычитает среднее канала и вместе с ним любую константу; роль смещения играет \(\beta\) <span class="fb">Верно: \(\mathrm{BN}(x + b) = \mathrm{BN}(x)\), так что 128 смещений свёртки на 128 каналов были бы лишними параметрами.</span></li>
+      <li>Со смещением BN нельзя свернуть в свёртку на тесте <span class="fb">Можно: в формуле \(b' = s\,(b - \mu_{\mathrm{run}}) + \beta\) смещение просто входит в новое.</span></li>
+      <li>Со смещением обучение расходится <span class="fb">Не расходится: смещение просто ничего не делает, его градиент равен нулю.</span></li>
+    </ul>
+  </div>
+
+  <div class="q">
+    <p class="q-text">Multi-label классификатор выдал логиты <span class="nw">(−1, −2, −3)</span>, порог 0.5. Сколько меток он вернёт?</p>
+    <ul class="options">
+      <li data-correct>Ни одной <span class="fb">Все логиты отрицательны, значит все сигмоиды меньше 0.5 (0.27, 0.12, 0.05). Порог 0.5 — это логит 0.</span></li>
+      <li>Одну, первый класс <span class="fb">Так ответил бы softmax: он выбирает всегда. Сигмоиды смотрят на каждый класс отдельно.</span></li>
+      <li>Все три <span class="fb">Сигмоида отрицательного логита меньше 0.5.</span></li>
+    </ul>
+  </div>
+</section>
+
+<section class="recap" id="l72-recap">
+  <h2>Унести с собой</h2>
+  <ul>
+    <li>Лестница предобработки: <span class="en" lang="en">zero-centering</span> → <span class="en" lang="en">normalization</span> (разбросы равны, корреляция осталась) → <span class="en" lang="en">decorrelation</span> (PCA, ковариация диагональна) → <span class="en" lang="en">whitening</span> (ковариация единичная). CNN обходятся вычитанием среднего и нормировкой: средняя картинка (AlexNet, 150 528 чисел), средние каналов (VGG, 3), средние и разбросы каналов (ResNet, 3 + 3), \(I'(r,c,j) = (I(r,c,j) - \mu_j)/\sigma_j\).</li>
+    <li>"Normalization statistics are parameters of your ML model": считаются на <span class="en" lang="en">training split</span> после разбиения и применяются к <span class="en" lang="en">validation</span> и <span class="en" lang="en">test</span>; у предобученной сети — её предобработка (ImageNet: 0.485 / 0.456 / 0.406 и 0.229 / 0.224 / 0.225, <code>weights.transforms()</code>).</li>
+    <li>BatchNorm2d нормирует каждый канал по \(N \cdot H \cdot W\) значениям и применяет свои \(\gamma_j\), \(\beta_j\): \(y = \gamma_j (x - \mu_j)/\sqrt{\sigma_j^2 + \epsilon} + \beta_j\).</li>
+    <li>На обучении — статистика <span class="en" lang="en">batch</span> и обновление <span class="en" lang="en">running averages</span> (<code>momentum=0.1</code>), на тесте — только они: <code>model.train()</code> против <code>model.eval()</code>. Буферы BN обновляет прямой проход, поэтому <code>requires_grad_(False)</code> их не замораживает.</li>
+    <li>На тесте BN аффинна и сворачивается в предыдущую свёртку: \(s = \gamma/\sqrt{\sigma^2_{\mathrm{run}} + \epsilon}\), \(w' = s\,w\), \(b' = s\,(b - \mu_{\mathrm{run}}) + \beta\).</li>
+    <li>Параметры BatchNorm2d(C): \(2C\) обучаемых + \(2C\) <span class="en" lang="en">running statistics</span> = \(4C\) по слайду (<code>parameters()</code> в PyTorch покажет \(2C\)). Блок <span class="en" lang="en">conv → BN → ReLU</span> стоит после почти каждой свёртки, свёртка — с <code>bias=False</code>.</li>
+    <li>Multi-label: сигмоида на каждом выходе вместо softmax, <span class="en" lang="en">binary cross-entropy</span> на <span class="en" lang="en">multi-hot</span> цели (<code>nn.BCEWithLogitsLoss</code>), порог для каждого класса; вероятности не складываются в 1, меток может быть сколько угодно, в том числе ни одной.</li>
+  </ul>
+</section>
+
+<section class="resources" id="l72-resources">
+  <h2>Что посмотреть и почитать</h2>
+  <ul class="res-list">
+    <li class="res" data-kind="reading" data-when="до урока">
+      <a class="res-title" href="https://cs231n.github.io/neural-networks-2/" target="_blank" rel="noopener">Neural Networks Part 2: Setting up the Data and the Loss</a>
+      <span class="res-by">Stanford CS231n</span><span class="res-dur">10 мин</span>
+      <p class="res-why">Картинки <a class="slide-ref" href="assets/slides/s10_004.webp" data-deck="s10" data-slide="4-5">слайдов 4–5 лекции 10</a> взяты отсюда. Раздел Data Preprocessing — лестница от центрирования до whitening и правило «статистика только по train»; в разделе про loss есть и независимые бинарные классификаторы для нескольких атрибутов.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/vision/stable/models.html" target="_blank" rel="noopener">Models and pre-trained weights</a>
+      <span class="res-by">torchvision</span>
+      <p class="res-why">Откуда берётся <code>weights.transforms()</code> и почему предобработка зависит от того, как модель учили. Там же предупреждение, что BatchNorm ведёт себя по-разному в <code>train()</code> и <code>eval()</code>.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/docs/2.15/generated/torch.nn.modules.batchnorm.BatchNorm2d.html" target="_blank" rel="noopener">torch.nn.BatchNorm2d</a>
+      <span class="res-by">PyTorch</span>
+      <p class="res-why">Оригинал <a class="slide-ref" href="assets/slides/s10_013.webp" data-deck="s10" data-slide="13">слайда 13 лекции 10</a>: формула с \(\epsilon\), формула обновления <span class="en" lang="en">running statistics</span> с momentum и параметр <code>track_running_stats</code>, которого нет на слайде.</p>
+    </li>
+    <li class="res" data-kind="reading" data-when="во время">
+      <a class="res-title" href="https://docs.pytorch.org/docs/2.15/generated/torch.nn.BCEWithLogitsLoss.html" target="_blank" rel="noopener">torch.nn.BCEWithLogitsLoss</a>
+      <span class="res-by">PyTorch</span>
+      <p class="res-why">Loss для multi-label в одну строку: сигмоида и BCE вместе. Пример с <code>pos_weight</code> пригодится, когда положительных меток класса мало.</p>
+    </li>
+    <li class="res" data-kind="book" data-when="после">
+      <a class="res-title" href="https://d2l.ai/chapter_convolutional-modern/batch-norm.html" target="_blank" rel="noopener">Dive into Deep Learning, 8.5 Batch Normalization</a>
+      <span class="res-by">Zhang, Lipton, Li, Smola</span>
+      <p class="res-why">Самое ясное письменное объяснение «по каналу, по \(m \cdot p \cdot q\) значениям», реализация BN с нуля и честный рассказ о споре вокруг internal covariate shift.</p>
+    </li>
+  </ul>
+</section>
+
+<aside class="bridge">
+  <p>Нормировка по каналам сделала глубокие сети обучаемыми. А как устроены сами глубокие сети, ради которых всё это делалось, — почему VGG складывает стопки маленьких свёрток 3 × 3 вместо одной большой и где у неё прячутся параметры?</p>
+</aside>
+
+</main>
+</body>
+</html>
