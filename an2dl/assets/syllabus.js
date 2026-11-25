@@ -116,11 +116,11 @@ window.SYLLABUS = {
     { id: 'm12', title: 'Что видит сеть', source: 'Слайды лекций 9 и 10', lessons: [
       { id: 'l78', file: 'l78.html', title: 'Что нравится нейрону', teaser: 'Фильтры первого слоя, патчи, на которые нейрон откликается сильнее всего, и gradient ascent по входу: иерархия признаков от краёв до целых объектов.', minutes: 30, slides: 'лекция 9, слайды 77–101' },
       { id: 'l79', file: 'l79.html', title: 'Где на картинке класс', teaser: 'Class activation mapping: GAP и один dense-слой превращают классификатор в карту «где класс» — weakly supervised localization без единой рамки в разметке.', minutes: 30, slides: 'лекция 10, слайды 19–38' },
-      { id: 'l80', file: 'l80.html', title: 'Почему сеть так решила', teaser: 'Saliency maps, clever Hans и смещения датасета, Grad-CAM для любой CNN и augmented Grad-CAM, который повышает разрешение карты.', minutes: 30, slides: 'лекция 10, слайды 39–65', ready: false }
+      { id: 'l80', file: 'l80.html', title: 'Почему сеть так решила', teaser: 'Saliency maps, clever Hans и смещения датасета, Grad-CAM для любой CNN и augmented Grad-CAM, который повышает разрешение карты.', minutes: 30, slides: 'лекция 10, слайды 39–65' }
     ] }
   ],
   extras: [
-    { id: 'exam', file: 'exam.html', title: 'Экзаменационный тренажёр', teaser: '383 вопроса в формате экзамена AN2DL с модельными ответами на английском: фильтры по типу и модулю, случайная десятка.' },
+    { id: 'exam', file: 'exam.html', title: 'Экзаменационный тренажёр', teaser: '460 вопросов в формате экзамена AN2DL с модельными ответами на английском: фильтры по типу и модулю, случайная десятка.' },
     { id: 'glossary', file: 'glossary.html', title: 'Словарь EN → RU', teaser: '258 терминов из уроков 1–27, которые прозвучат на лекции и на экзамене: что они значат и в каком уроке разобраны. С поиском.' }
   ]
 };
